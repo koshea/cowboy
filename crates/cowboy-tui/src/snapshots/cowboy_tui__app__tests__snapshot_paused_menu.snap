@@ -10,7 +10,7 @@ expression: render(&app)
 │   ╭ Paused ──────────────────────────────────────────────────────╮   │
 │   │Agent paused.                                                 │   │
 │   │                                                              │───╯
-│   │[r]esume  [i]nstruct  [k]ill command  [e]nd session           │───╮
+│   │[r]esume  [i]nstruct  [k]ill command  [d]etach  [e]nd session │───╮
 │   │                                                              │es │
 │   │                                                              │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │

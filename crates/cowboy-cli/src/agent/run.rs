@@ -4,7 +4,7 @@
 
 use anyhow::Result;
 use cowboy_core::config::AgentBehavior;
-use cowboy_core::model::{ChatResponse, Message, ModelClient, Role, ToolDef};
+use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDef};
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
@@ -532,7 +532,7 @@ impl<'a> AgentLoop<'a> {
 
     /// Call the model, streaming deltas to the UI, racing cancellation.
     async fn call_model(&mut self) -> Result<ChatResponse> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Delta>();
         let fut = self.model.chat(&self.messages, &self.tools, Some(tx));
         tokio::pin!(fut);
         loop {
@@ -542,17 +542,27 @@ impl<'a> AgentLoop<'a> {
                     anyhow::bail!("interrupted");
                 }
                 Some(piece) = rx.recv() => {
-                    self.ui.model_delta(&piece);
+                    emit_delta(self.ui, piece);
                 }
                 res = &mut fut => {
                     while let Ok(piece) = rx.try_recv() {
-                        self.ui.model_delta(&piece);
+                        emit_delta(self.ui, piece);
                     }
                     self.ui.model_done();
                     return res.map_err(Into::into);
                 }
             }
         }
+    }
+}
+
+/// Route a streamed delta to the UI (answer text vs. dimmed reasoning). A free
+/// function so it borrows only the UI, not all of `self` (the in-flight chat
+/// future holds an immutable borrow of the loop).
+fn emit_delta(ui: &mut dyn AgentUi, piece: Delta) {
+    match piece {
+        Delta::Content(t) => ui.model_delta(&t),
+        Delta::Reasoning(t) => ui.model_reasoning(&t),
     }
 }
 
@@ -622,7 +632,7 @@ mod tests {
             &self,
             _messages: &[Message],
             _tools: &[ToolDef],
-            deltas: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+            deltas: Option<tokio::sync::mpsc::UnboundedSender<Delta>>,
         ) -> Result<ChatResponse, cowboy_core::Error> {
             let r = self
                 .responses
@@ -631,7 +641,7 @@ mod tests {
                 .pop_front()
                 .unwrap_or_default();
             if let (Some(tx), Some(c)) = (deltas, &r.content) {
-                let _ = tx.send(c.clone());
+                let _ = tx.send(Delta::Content(c.clone()));
             }
             Ok(r)
         }

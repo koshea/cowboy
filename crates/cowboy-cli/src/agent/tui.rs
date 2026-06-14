@@ -29,12 +29,16 @@ pub enum AgentCmd {
     Message(String),
     /// Switch the active model to this name (applies from the next turn).
     SwitchModel(String),
+    /// Detach this client, leaving the session running for later re-attach.
+    Detach,
 }
 
 /// Events the agent loop / control server send to the TUI event loop.
 #[derive(Debug)]
 pub enum UiEvent {
     Delta(String),
+    /// Streamed "thinking" (reasoning) text, rendered dimmed.
+    Reasoning(String),
     ModelDone,
     CommandStart(String),
     CommandOutput(String),
@@ -74,6 +78,9 @@ pub struct TuiUi {
 impl AgentUi for TuiUi {
     fn model_delta(&mut self, text: &str) {
         let _ = self.tx.send(UiEvent::Delta(text.to_string()));
+    }
+    fn model_reasoning(&mut self, text: &str) {
+        let _ = self.tx.send(UiEvent::Reasoning(text.to_string()));
     }
     fn model_done(&mut self) {
         let _ = self.tx.send(UiEvent::ModelDone);
@@ -329,6 +336,7 @@ fn event_loop(
         while let Ok(ev) = events.try_recv() {
             match ev {
                 UiEvent::Delta(t) => app.stream(&t),
+                UiEvent::Reasoning(t) => app.stream_reasoning(&t),
                 UiEvent::ModelDone => app.commit_stream(),
                 UiEvent::CommandStart(c) => {
                     app.commit_stream();
@@ -573,6 +581,14 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 app.status = "interrupting turn…".into();
                 app.mode = ctx.mode_before_overlay.clone();
             }
+            KeyCode::Char('d') => {
+                // Detach: leave the session running and exit this client.
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::Detach);
+                }
+                app.status = "detaching…".into();
+                return true; // exit the event loop; the worker keeps running
+            }
             KeyCode::Char('e') => {
                 // End the session: drop the task sender so the agent finalizes.
                 ctx.task_tx.take();
@@ -627,7 +643,9 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             if trimmed.is_empty() {
                 // nothing to do
             } else if let Some(rest) = trimmed.strip_prefix('/') {
-                handle_command(rest, app, &mut ctx);
+                if handle_command(rest, app, &mut ctx) {
+                    return true;
+                }
             } else if let Some(tx) = ctx.task_tx {
                 app.push(LineKind::User, msg.clone());
                 ctx.history.push(msg.clone());
@@ -652,12 +670,15 @@ const HELP_LINES: &[&str] = &[
     "  /diff          show the working-tree diff",
     "  /copy          copy the last answer to the clipboard",
     "  /clear         clear the view (conversation memory is kept)",
+    "  /detach        leave the session running and exit (re-attach later)",
     "  /quit          end the session",
     "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
 ];
 
 /// Handle a `/command` typed into the input (the leading `/` is stripped).
-fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) {
+/// Handle a `/command`. Returns `true` if the client should exit the event loop
+/// now (e.g. `/detach`).
+fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
     let mut parts = input.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next();
@@ -735,11 +756,20 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) {
             }
             app.status = "ending session…".into();
         }
+        "detach" => {
+            // Leave the session running; exit this client for later re-attach.
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::Detach);
+            }
+            app.status = "detaching…".into();
+            return true;
+        }
         other => app.push(
             LineKind::Error,
             format!("unknown command /{other} — try /help"),
         ),
     }
+    false
 }
 
 /// The most recent final answer (or agent message) text, for `/copy`.

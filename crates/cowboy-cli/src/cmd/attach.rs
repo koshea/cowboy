@@ -216,12 +216,19 @@ pub async fn bridge(
     let cmd_out = out_tx.clone();
     let cmd_pump = tokio::task::spawn_blocking(move || {
         while let Ok(cmd) = task_rx.recv() {
+            // An explicit detach leaves the session running; stop the pump
+            // without sending End.
+            if let AgentCmd::Detach = cmd {
+                let _ = cmd_out.send(ClientMsg::Detach);
+                return;
+            }
             if read_only {
                 continue;
             }
             let msg = match cmd {
                 AgentCmd::Message(m) => ClientMsg::Message(m),
                 AgentCmd::SwitchModel(n) => ClientMsg::SwitchModel(n),
+                AgentCmd::Detach => unreachable!("handled above"),
             };
             if cmd_out.send(msg).is_err() {
                 return;
@@ -338,6 +345,7 @@ fn title_for(info: &SessionInfo) -> String {
 fn to_ui_event(e: UiEventMsg) -> UiEvent {
     match e {
         UiEventMsg::Delta(t) => UiEvent::Delta(t),
+        UiEventMsg::Reasoning(t) => UiEvent::Reasoning(t),
         UiEventMsg::ModelDone => UiEvent::ModelDone,
         UiEventMsg::CommandStart(c) => UiEvent::CommandStart(c),
         UiEventMsg::CommandOutput(c) => UiEvent::CommandOutput(c),

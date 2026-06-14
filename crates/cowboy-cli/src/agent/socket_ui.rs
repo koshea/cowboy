@@ -59,6 +59,18 @@ struct Inner {
     pending_approvals: std::sync::Mutex<HashMap<u64, oneshot::Sender<(Verdict, ApprovalScope)>>>,
     /// Outstanding `ask_user` questions awaiting a client answer.
     pending_asks: std::sync::Mutex<HashMap<u64, std::sync::mpsc::Sender<String>>>,
+    /// Live progress, mirrored from the event stream so the daemon registry
+    /// (`cowboy sessions`) can show real numbers without parsing the journal.
+    stats: std::sync::Mutex<SessionStats>,
+}
+
+/// Snapshot of a session's live progress for the daemon registry.
+#[derive(Clone, Default)]
+pub struct SessionStats {
+    pub turn: u64,
+    pub tokens: (u64, u64),
+    pub diffstat: String,
+    pub running_command: Option<String>,
 }
 
 /// Handle to the worker's UI: cloneable, shared between the agent loop (which
@@ -105,6 +117,7 @@ impl SocketUi {
             next_req_id: AtomicU64::new(0),
             pending_approvals: std::sync::Mutex::new(HashMap::new()),
             pending_asks: std::sync::Mutex::new(HashMap::new()),
+            stats: std::sync::Mutex::new(SessionStats::default()),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -131,6 +144,7 @@ impl SocketUi {
     /// Journal + broadcast a display event (worker-originated events like
     /// `DiffStat`/`Title`/`Processes`/`TurnDone` use this directly).
     pub fn emit(&self, event: UiEventMsg) {
+        self.track(&event);
         let mut j = self.inner.journal.lock().unwrap();
         let seq = j.len;
         let line = serde_json::to_string(&event).unwrap_or_default();
@@ -139,6 +153,27 @@ impl SocketUi {
         j.len += 1;
         drop(j);
         let _ = self.inner.live.send(ServerMsg::Event { seq, event });
+    }
+
+    /// Mirror progress-bearing events into `stats` for the daemon registry.
+    fn track(&self, event: &UiEventMsg) {
+        let mut s = self.inner.stats.lock().unwrap();
+        match event {
+            UiEventMsg::Tokens { input, output } => s.tokens = (*input, *output),
+            UiEventMsg::DiffStat(d) => s.diffstat = d.clone(),
+            UiEventMsg::TurnDone => {
+                s.turn += 1;
+                s.running_command = None;
+            }
+            UiEventMsg::CommandStart(c) => s.running_command = Some(c.clone()),
+            UiEventMsg::CommandEnd { .. } => s.running_command = None,
+            _ => {}
+        }
+    }
+
+    /// A snapshot of live progress for the daemon registry.
+    pub fn stats(&self) -> SessionStats {
+        self.inner.stats.lock().unwrap().clone()
     }
 
     /// Broadcast a terminal `Ended` to attached clients (worker shutting down).
@@ -180,6 +215,9 @@ impl SocketUi {
 impl AgentUi for SocketUi {
     fn model_delta(&mut self, text: &str) {
         self.emit(UiEventMsg::Delta(text.to_string()));
+    }
+    fn model_reasoning(&mut self, text: &str) {
+        self.emit(UiEventMsg::Reasoning(text.to_string()));
     }
     fn model_done(&mut self) {
         self.emit(UiEventMsg::ModelDone);

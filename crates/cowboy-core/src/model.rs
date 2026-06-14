@@ -5,7 +5,6 @@
 //! on `async-openai`. The trait keeps the agent loop testable without a live
 //! endpoint (tests provide a scripted fake).
 
-use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
@@ -13,7 +12,6 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionTool, ChatCompletionTools,
     CreateChatCompletionRequestArgs, FunctionCall, FunctionObjectArgs,
 };
-use async_openai::Client;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -97,23 +95,36 @@ pub struct ChatResponse {
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// A streamed piece of a model response: visible answer text, or the model's
+/// "thinking" (reasoning) which is shown but never folded into the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    Content(String),
+    Reasoning(String),
+}
+
 /// An OpenAI-compatible chat client. Streaming, cancellable (drop the future),
 /// works against any OpenAI-compatible backend via a custom base URL.
 #[async_trait]
 pub trait ModelClient: Send + Sync {
-    /// Run one chat turn. Streamed text deltas are sent to `deltas` (if any);
-    /// the assembled response (content + tool calls) is returned.
+    /// Run one chat turn. Streamed [`Delta`]s (answer text + reasoning) are sent
+    /// to `deltas` (if any); the assembled response (content + tool calls) is
+    /// returned. Reasoning is not part of the returned content.
     async fn chat(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
-        deltas: Option<UnboundedSender<String>>,
+        deltas: Option<UnboundedSender<Delta>>,
     ) -> Result<ChatResponse>;
 }
 
-/// `async-openai`-backed implementation.
+/// OpenAI-compatible client. Requests are built with `async-openai`'s typed
+/// args, but streaming is done over a hand-rolled SSE parse so provider
+/// `reasoning_content` (dropped by the typed stream) reaches the UI.
 pub struct OpenAiClient {
-    client: Client<OpenAIConfig>,
+    http: reqwest::Client,
+    base_url: String,
+    api_key: String,
     model: String,
     temperature: f32,
     max_tokens: u32,
@@ -123,10 +134,6 @@ impl OpenAiClient {
     /// Build from a fully-resolved model (provider credentials joined with the
     /// model definition by [`crate::config::resolve_model`]).
     pub fn from_resolved(model: &ResolvedModel) -> Result<Self> {
-        let config = OpenAIConfig::new()
-            .with_api_base(model.base_url.clone())
-            .with_api_key(model.api_key.clone());
-
         // Forward custom headers (provider defaults + per-model overrides).
         let mut headers = reqwest::header::HeaderMap::new();
         for (k, v) in &model.headers {
@@ -143,7 +150,9 @@ impl OpenAiClient {
             .map_err(oa_err)?;
 
         Ok(Self {
-            client: Client::with_config(config).with_http_client(http),
+            http,
+            base_url: model.base_url.trim_end_matches('/').to_string(),
+            api_key: model.api_key.clone(),
             model: model.model.clone(),
             temperature: model.temperature,
             max_tokens: model.max_tokens,
@@ -270,13 +279,52 @@ impl ToolCallAccumulator {
     }
 }
 
+/// Minimal view of an OpenAI-compatible streaming chunk that also captures
+/// provider `reasoning_content` (aliased `reasoning`), which the typed
+/// `async-openai` delta discards.
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolChunk>>,
+}
+#[derive(Deserialize)]
+struct ToolChunk {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<FnChunk>,
+}
+#[derive(Deserialize)]
+struct FnChunk {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
 #[async_trait]
 impl ModelClient for OpenAiClient {
     async fn chat(
         &self,
         messages: &[Message],
         tools: &[ToolDef],
-        deltas: Option<UnboundedSender<String>>,
+        deltas: Option<UnboundedSender<Delta>>,
     ) -> Result<ChatResponse> {
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder
@@ -288,36 +336,73 @@ impl ModelClient for OpenAiClient {
             builder.tools(to_openai_tools(tools)?);
         }
         let request = builder.build().map_err(oa_err)?;
+        let mut body = serde_json::to_value(&request).map_err(|e| Error::Model(e.to_string()))?;
+        body["stream"] = serde_json::Value::Bool(true);
 
-        let mut stream = self
-            .client
-            .chat()
-            .create_stream(request)
+        let resp = self
+            .http
+            .post(format!("{}/chat/completions", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&body)
+            .send()
             .await
             .map_err(oa_err)?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(Error::Model(format!(
+                "chat request failed ({code}): {text}"
+            )));
+        }
 
         let mut content = String::new();
         let mut acc = ToolCallAccumulator::default();
-        while let Some(item) = stream.next().await {
-            let response = item.map_err(oa_err)?;
-            let Some(choice) = response.choices.into_iter().next() else {
-                continue;
-            };
-            if let Some(text) = choice.delta.content {
-                if !text.is_empty() {
+        let mut buf = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.map_err(oa_err)?));
+            // SSE: process complete `\n`-terminated lines, leaving any partial
+            // line in the buffer for the next chunk.
+            while let Some(nl) = buf.find('\n') {
+                let line: String = buf.drain(..=nl).collect();
+                let Some(data) = line.trim().strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    return Ok(ChatResponse {
+                        content: (!content.is_empty()).then_some(content),
+                        tool_calls: acc.finish(),
+                    });
+                }
+                let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
+                    continue; // skip keep-alives / unparseable frames
+                };
+                let Some(choice) = chunk.choices.into_iter().next() else {
+                    continue;
+                };
+                if let Some(r) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
                     if let Some(tx) = &deltas {
-                        let _ = tx.send(text.clone());
+                        let _ = tx.send(Delta::Reasoning(r));
+                    }
+                }
+                if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+                    if let Some(tx) = &deltas {
+                        let _ = tx.send(Delta::Content(text.clone()));
                     }
                     content.push_str(&text);
                 }
-            }
-            if let Some(calls) = choice.delta.tool_calls {
-                for tc in calls {
-                    let (name, args) = match tc.function {
-                        Some(f) => (f.name, f.arguments),
-                        None => (None, None),
-                    };
-                    acc.apply(tc.index as usize, tc.id, name, args);
+                if let Some(calls) = choice.delta.tool_calls {
+                    for tc in calls {
+                        let (name, args) = match tc.function {
+                            Some(f) => (f.name, f.arguments),
+                            None => (None, None),
+                        };
+                        acc.apply(tc.index as usize, tc.id, name, args);
+                    }
                 }
             }
         }

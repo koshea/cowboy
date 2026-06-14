@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use cowboy_core::config::ResolvedModel;
-use cowboy_core::model::{Message, ModelClient, OpenAiClient, ToolDef};
+use cowboy_core::model::{Delta, Message, ModelClient, OpenAiClient, ToolDef};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -62,12 +62,56 @@ async fn streams_and_assembles_text() {
     assert_eq!(resp.content.as_deref(), Some("Hello, world"));
     assert!(resp.tool_calls.is_empty());
 
-    // Deltas were streamed in order.
+    // Content deltas were streamed in order.
     let mut got = String::new();
     while let Ok(piece) = rx.try_recv() {
-        got.push_str(&piece);
+        if let Delta::Content(t) = piece {
+            got.push_str(&t);
+        }
     }
     assert_eq!(got, "Hello, world");
+}
+
+fn reasoning_chunk(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "test-model",
+        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+    })
+}
+
+#[tokio::test]
+async fn streams_reasoning_separately_from_content() {
+    let server = MockServer::start().await;
+    let body = sse(&[
+        reasoning_chunk("let me think… "),
+        reasoning_chunk("ok."),
+        content_chunk("the answer"),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], Some(tx))
+        .await
+        .unwrap();
+
+    // Reasoning is streamed but NOT folded into the answer.
+    assert_eq!(resp.content.as_deref(), Some("the answer"));
+
+    let (mut reasoning, mut content) = (String::new(), String::new());
+    while let Ok(piece) = rx.try_recv() {
+        match piece {
+            Delta::Reasoning(t) => reasoning.push_str(&t),
+            Delta::Content(t) => content.push_str(&t),
+        }
+    }
+    assert_eq!(reasoning, "let me think… ok.");
+    assert_eq!(content, "the answer");
 }
 
 #[tokio::test]

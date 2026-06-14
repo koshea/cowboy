@@ -60,6 +60,9 @@ pub struct App {
     pub transcript: Vec<TranscriptLine>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
+    /// In-progress streamed "thinking" (reasoning), shown dimmed and cleared
+    /// when the response commits. Never added to the transcript.
+    pub reasoning: String,
     /// Network activity log (gateway decisions).
     pub activity: Vec<String>,
     /// Managed processes: (name, status).
@@ -126,6 +129,7 @@ impl App {
             tokens_out: 0,
             transcript: Vec::new(),
             streaming: String::new(),
+            reasoning: String::new(),
             activity: Vec::new(),
             processes: Vec::new(),
             textarea: TextArea::default(),
@@ -241,8 +245,16 @@ impl App {
         self.streaming.push_str(text);
     }
 
-    /// Commit any streamed text to the transcript as an Agent line.
+    /// Append streamed reasoning ("thinking") text, shown dimmed until the
+    /// response commits.
+    pub fn stream_reasoning(&mut self, text: &str) {
+        self.reasoning.push_str(text);
+    }
+
+    /// Commit any streamed text to the transcript as an Agent line, and drop the
+    /// transient "thinking" buffer.
     pub fn commit_stream(&mut self) {
+        self.reasoning.clear();
         if !self.streaming.is_empty() {
             let text = std::mem::take(&mut self.streaming);
             self.push(LineKind::Agent, text);
@@ -383,7 +395,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             area,
             "Paused",
             "Agent paused.",
-            "[r]esume  [i]nstruct  [k]ill command  [e]nd session",
+            "[r]esume  [i]nstruct  [k]ill command  [d]etach  [e]nd session",
         ),
         _ => {}
     }
@@ -416,6 +428,25 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
+    }
+    // Dimmed "thinking" (reasoning) stream, shown above the answer while it
+    // streams and cleared once the response commits.
+    if !app.reasoning.is_empty() {
+        if spacer_before(prev, LineKind::Agent) {
+            lines.push(Line::from(""));
+        }
+        let dim = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC);
+        for (i, raw) in app.reasoning.lines().enumerate() {
+            let text = if i == 0 {
+                format!("💭 {raw}")
+            } else {
+                format!("   {raw}")
+            };
+            lines.push(Line::from(Span::styled(text, dim)));
+        }
+        prev = Some(LineKind::Agent);
     }
     if !app.streaming.is_empty() {
         if spacer_before(prev, LineKind::Agent) {

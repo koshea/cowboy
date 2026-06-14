@@ -279,16 +279,25 @@ pub enum DaemonResp {
 #[serde(rename_all = "snake_case")]
 pub enum UiEventMsg {
     Delta(String),
+    /// The model's streamed "thinking" (reasoning), shown dimmed and never
+    /// folded into the answer.
+    Reasoning(String),
     ModelDone,
     CommandStart(String),
     CommandOutput(String),
-    CommandEnd { code: i32, output: String },
+    CommandEnd {
+        code: i32,
+        output: String,
+    },
     ToolUse(String),
     Final(String),
     Notice(String),
     NetEvent(String),
     DiffStat(String),
-    Tokens { input: u64, output: u64 },
+    Tokens {
+        input: u64,
+        output: u64,
+    },
     Title(String),
     Processes(Vec<(String, String)>),
     TurnDone,

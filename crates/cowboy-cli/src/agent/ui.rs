@@ -8,6 +8,8 @@ use std::io::Write;
 pub trait AgentUi {
     /// A streamed token of model output.
     fn model_delta(&mut self, text: &str);
+    /// A streamed token of the model's "thinking" (reasoning). Default: ignored.
+    fn model_reasoning(&mut self, _text: &str) {}
     /// The model finished a turn (flush the streamed line).
     fn model_done(&mut self) {}
     /// A shell command is starting.
@@ -34,6 +36,7 @@ pub trait AgentUi {
 #[derive(Default)]
 pub struct ConsoleUi {
     streaming: bool,
+    reasoning: bool,
     /// When set (subagent runs via `COWBOY_PRINT_FINAL_ONLY`), suppress all
     /// intermediate output and print only the final message — so the caller can
     /// capture the subagent's answer from stdout.
@@ -54,6 +57,10 @@ impl AgentUi for ConsoleUi {
         if self.final_only {
             return;
         }
+        if self.reasoning {
+            print!("\x1b[0m"); // close the dim "thinking" block
+            self.reasoning = false;
+        }
         if !self.streaming {
             print!("\n\x1b[36m"); // cyan
             self.streaming = true;
@@ -62,10 +69,23 @@ impl AgentUi for ConsoleUi {
         let _ = std::io::stdout().flush();
     }
 
+    fn model_reasoning(&mut self, text: &str) {
+        if self.final_only {
+            return;
+        }
+        if !self.reasoning {
+            print!("\n\x1b[2m"); // dim
+            self.reasoning = true;
+        }
+        print!("{text}");
+        let _ = std::io::stdout().flush();
+    }
+
     fn model_done(&mut self) {
-        if self.streaming {
+        if self.streaming || self.reasoning {
             println!("\x1b[0m");
             self.streaming = false;
+            self.reasoning = false;
             let _ = std::io::stdout().flush();
         }
     }

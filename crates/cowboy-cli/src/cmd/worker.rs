@@ -131,14 +131,15 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let st = hb_ui.stats();
                 let resp = daemon::request(DaemonReq::UpdateSession {
                     id: hb_id.clone(),
                     status: SessionStatus::Running,
-                    turn: 0,
-                    tokens: (0, 0),
-                    diffstat: String::new(),
+                    turn: st.turn,
+                    tokens: st.tokens,
+                    diffstat: st.diffstat,
                     attached_clients: hb_ui.attached(),
-                    running_command: None,
+                    running_command: st.running_command,
                     branch: None,
                 })
                 .await;
