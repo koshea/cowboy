@@ -178,6 +178,7 @@ fn start(sock: &Path, root: &Path, task: Option<&str>) -> DaemonResp {
             task: task.map(str::to_string),
             mode: LeaseMode::Exclusive,
             force: false,
+            resume: None,
         },
     )
     .expect("daemon reachable")

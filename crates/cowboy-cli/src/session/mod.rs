@@ -153,6 +153,72 @@ pub fn latest_session_dir(root: &Path) -> Option<PathBuf> {
     dir.is_dir().then_some(dir)
 }
 
+/// The id of the most recent session for a project (via the `LATEST` pointer),
+/// if its directory still exists.
+pub fn latest_session_id(root: &Path) -> Option<String> {
+    let sessions = root.join(".cowboy").join("sessions");
+    let id = std::fs::read_to_string(sessions.join("LATEST")).ok()?;
+    let id = id.trim().to_string();
+    sessions.join(&id).is_dir().then_some(id)
+}
+
+/// Load a prior session's conversation transcript so a new session can continue
+/// it. Drops any leading system message (the new session supplies its own
+/// up-to-date system prompt) and trims a trailing, incomplete tool-call turn
+/// (e.g. from a crashed session) so the history is valid to resume from.
+pub fn load_history(root: &Path, id: &str) -> Result<Vec<Message>> {
+    use std::io::BufRead;
+    let path = root
+        .join(".cowboy")
+        .join("sessions")
+        .join(id)
+        .join("transcript.jsonl");
+    let file = File::open(&path)
+        .with_context(|| format!("opening transcript {} (no such session?)", path.display()))?;
+    let mut msgs: Vec<Message> = Vec::new();
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(m) = serde_json::from_str::<Message>(&line) {
+            // The new session owns the system prompt; skip any saved one.
+            if m.role == cowboy_core::model::Role::System {
+                continue;
+            }
+            msgs.push(m);
+        }
+    }
+    sanitize_history(&mut msgs);
+    Ok(msgs)
+}
+
+/// Trim a trailing assistant tool-call turn whose tool results are missing or
+/// incomplete (providers reject an unanswered tool call). Walks back from the
+/// end to the last assistant message bearing tool calls and, if not every call
+/// id has a following `Tool` result, drops that assistant and anything after it.
+fn sanitize_history(msgs: &mut Vec<Message>) {
+    use cowboy_core::model::Role;
+    let Some(asst_idx) = msgs
+        .iter()
+        .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+    else {
+        return;
+    };
+    let answered: std::collections::HashSet<&str> = msgs[asst_idx + 1..]
+        .iter()
+        .filter(|m| m.role == Role::Tool)
+        .filter_map(|m| m.tool_call_id.as_deref())
+        .collect();
+    let complete = msgs[asst_idx]
+        .tool_calls
+        .iter()
+        .all(|tc| answered.contains(tc.id.as_str()));
+    if !complete {
+        msgs.truncate(asst_idx);
+    }
+}
+
 /// Append a value as one JSON line to `path` (best-effort; used by the control
 /// pipeline for `network.jsonl` / `approvals.jsonl`, which run on other tasks).
 pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) {
@@ -204,5 +270,79 @@ mod tests {
         // LATEST points at this session.
         let latest = std::fs::read_to_string(tmp.path().join(".cowboy/sessions/LATEST")).unwrap();
         assert_eq!(latest, log.id());
+    }
+
+    use cowboy_core::model::{Role, ToolCall};
+
+    #[test]
+    fn load_history_drops_system_and_resolves_latest() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let id = {
+            let mut log = SessionLogger::create(tmp.path()).unwrap();
+            log.log_message(&Message::system("OLD SYSTEM PROMPT"));
+            log.log_message(&Message::user("first task"));
+            log.log_message(&Message::new(Role::Assistant, "did it"));
+            log.id().to_string()
+        };
+
+        assert_eq!(latest_session_id(tmp.path()).as_deref(), Some(id.as_str()));
+        let hist = load_history(tmp.path(), &id).unwrap();
+        // System prompt is dropped; the user+assistant turn is kept in order.
+        assert_eq!(hist.len(), 2);
+        assert_eq!(hist[0].role, Role::User);
+        assert_eq!(hist[0].content, "first task");
+        assert_eq!(hist[1].role, Role::Assistant);
+        assert!(!hist.iter().any(|m| m.role == Role::System));
+    }
+
+    #[test]
+    fn sanitize_drops_trailing_incomplete_tool_turn() {
+        // user, assistant(tool_calls a+b), tool(a)  — b is unanswered (crash).
+        let mut msgs = vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "a".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCall {
+                        id: "b".into(),
+                        name: "shell".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            },
+            Message::tool_result("a", "ok"),
+        ];
+        sanitize_history(&mut msgs);
+        // The incomplete assistant turn (and its partial result) is removed.
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+    }
+
+    #[test]
+    fn sanitize_keeps_complete_tool_turn() {
+        let mut msgs = vec![
+            Message::user("go"),
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_call_id: None,
+                tool_calls: vec![ToolCall {
+                    id: "a".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            Message::tool_result("a", "ok"),
+        ];
+        let before = msgs.len();
+        sanitize_history(&mut msgs);
+        assert_eq!(msgs.len(), before);
     }
 }

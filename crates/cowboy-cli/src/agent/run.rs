@@ -360,6 +360,18 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
+    /// Seed the conversation with a prior session's history (for resume/
+    /// continue), inserted right after the always-kept system message. The new
+    /// session keeps its own system prompt; `history` should be system-free
+    /// (see [`crate::session::load_history`]).
+    pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        // Insert after messages[0] (system), preserving order, before any task.
+        for (i, m) in history.into_iter().enumerate() {
+            self.messages.insert(1 + i, m);
+        }
+        self
+    }
+
     /// Set the active model's per-1M-token USD pricing (used for the running
     /// cost estimate; `None` disables cost tracking for this model).
     pub fn with_pricing(
@@ -1238,6 +1250,30 @@ mod tests {
         )
         .with_memory_context("   ".into());
         assert_eq!(agent2.messages.len(), 1);
+    }
+
+    #[test]
+    fn with_history_inserts_after_system_in_order() {
+        let history = vec![
+            Message::user("earlier task"),
+            Message::new(Role::Assistant, "earlier answer"),
+        ];
+        let mut ui = RecordingUi::default();
+        let agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_history(history);
+        // [system, user(earlier), assistant(earlier)] — system stays first.
+        assert_eq!(agent.messages.len(), 3);
+        assert_eq!(agent.messages[0].role, Role::System);
+        assert_eq!(agent.messages[1].role, Role::User);
+        assert_eq!(agent.messages[1].content, "earlier task");
+        assert_eq!(agent.messages[2].role, Role::Assistant);
     }
 
     #[tokio::test]

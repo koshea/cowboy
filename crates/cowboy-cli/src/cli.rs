@@ -38,6 +38,14 @@ pub struct Cli {
     #[arg(long)]
     pub force_same_worktree: bool,
 
+    /// Continue the most recent session in this worktree, keeping its history.
+    #[arg(long = "continue")]
+    pub continue_latest: bool,
+
+    /// Resume a specific session by id, keeping its conversation history.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub resume: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -52,6 +60,27 @@ impl Cli {
             force: self.force_same_worktree,
         }
     }
+
+    /// Which prior session (if any) to continue. An explicit `--resume <id>`
+    /// wins over `--continue` (latest).
+    pub fn resume_spec(&self) -> Option<ResumeSpec> {
+        if let Some(id) = &self.resume {
+            Some(ResumeSpec::Id(id.clone()))
+        } else if self.continue_latest {
+            Some(ResumeSpec::Latest)
+        } else {
+            None
+        }
+    }
+}
+
+/// Which prior session to continue.
+#[derive(Debug, Clone)]
+pub enum ResumeSpec {
+    /// The most recent session in the worktree (the `LATEST` pointer).
+    Latest,
+    /// A specific session id.
+    Id(String),
 }
 
 /// How to resolve a same-worktree collision, set from CLI flags (otherwise the
@@ -155,6 +184,9 @@ pub struct SessionWorkerArgs {
     /// Register with (and heartbeat to) the daemon.
     #[arg(long)]
     pub register: bool,
+    /// Continue a prior session: load its transcript as the starting history.
+    #[arg(long)]
+    pub resume: Option<String>,
 }
 
 #[derive(Debug, Args)]

@@ -149,6 +149,10 @@ pub enum DaemonReq {
         /// Steal a *stale* lease on this worktree (never a live one).
         #[serde(default)]
         force: bool,
+        /// Continue a prior session's conversation: load its transcript as the
+        /// new session's starting history.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
     },
     ListSessions {
         #[serde(default)]
@@ -397,6 +401,7 @@ mod tests {
                 task: Some("fix tests".into()),
                 mode: LeaseMode::Exclusive,
                 force: false,
+                resume: None,
             },
         });
         roundtrip(&DaemonRequest {

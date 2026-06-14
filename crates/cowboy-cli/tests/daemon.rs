@@ -510,6 +510,7 @@ fn start_session_spawns_and_registers_a_worker() {
             task: None,
             mode: LeaseMode::Exclusive,
             force: false,
+            resume: None,
         },
     ) {
         Some(DaemonResp::Started { id, worker_sock }) => (id, worker_sock),

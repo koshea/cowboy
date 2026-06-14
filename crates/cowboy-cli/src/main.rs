@@ -14,9 +14,10 @@ async fn main() -> Result<()> {
     init_tracing(cli.verbose);
 
     let start_flags = cli.start_flags();
+    let resume = cli.resume_spec();
     match cli.command {
         // Bare `cowboy` or `cowboy "<task>"` -> session engine (Slice D).
-        None => cmd::session::run(cli.task, start_flags).await,
+        None => cmd::session::run(cli.task, start_flags, resume).await,
         Some(Command::Init(args)) => cmd::init::run(args),
         Some(Command::Doctor) => cmd::doctor::run().await,
         Some(Command::Shell) => cmd::run::shell().await,
@@ -49,6 +50,7 @@ async fn main() -> Result<()> {
                 sock: a.sock,
                 id: a.id,
                 register: a.register,
+                resume: a.resume,
             })
             .await
         }

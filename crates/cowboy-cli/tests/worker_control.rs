@@ -130,6 +130,7 @@ fn start(fx: &Fixture, task: Option<&str>) -> std::path::PathBuf {
             task: task.map(str::to_string),
             mode: LeaseMode::Exclusive,
             force: false,
+            resume: None,
         },
     ) {
         Some(DaemonResp::Started { worker_sock, .. }) => worker_sock,

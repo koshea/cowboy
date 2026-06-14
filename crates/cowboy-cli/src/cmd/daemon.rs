@@ -436,7 +436,8 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             task,
             mode,
             force,
-        } => start_session(daemon, root, task, mode, force).await,
+            resume,
+        } => start_session(daemon, root, task, mode, force, resume).await,
         DaemonReq::AcquireLease { key, session, mode } => {
             let mut d = daemon.lock().await;
             let k = Daemon::lease_key(&key);
@@ -605,6 +606,7 @@ async fn start_session(
     task: Option<String>,
     mode: LeaseMode,
     force: bool,
+    resume: Option<String>,
 ) -> DaemonResp {
     let key = Daemon::lease_key(&root);
     // Acquire the worktree lease up front (exclusive sessions only). On conflict
@@ -647,6 +649,9 @@ async fn start_session(
         .stderr(std::process::Stdio::null());
     if let Some(t) = &task {
         cmd.arg("--task").arg(t);
+    }
+    if let Some(r) = &resume {
+        cmd.arg("--resume").arg(r);
     }
     let child = match cmd.spawn() {
         Ok(c) => c,

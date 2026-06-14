@@ -25,9 +25,24 @@ use crate::net::control;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
 
-pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
+pub async fn run(
+    task: Option<String>,
+    flags: StartFlags,
+    resume: Option<crate::cli::ResumeSpec>,
+) -> Result<()> {
     let root = crate::cmd::project_root()?;
     let paths = ConfigPaths::for_root(&root);
+
+    // Resolve a `--continue`/`--resume` request to a concrete session id, up
+    // front against the starting worktree.
+    let resume_id = match &resume {
+        Some(crate::cli::ResumeSpec::Id(id)) => Some(id.clone()),
+        Some(crate::cli::ResumeSpec::Latest) => match crate::session::latest_session_id(&root) {
+            Some(id) => Some(id),
+            None => anyhow::bail!("no prior session to continue in this worktree"),
+        },
+        None => None,
+    };
 
     // Providers are host-owned (home dir); models may be user- or project-level.
     let providers = ProvidersConfig::load_global().context("loading providers.yaml")?;
@@ -66,6 +81,7 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
                 task: task.clone(),
                 mode: LeaseMode::Exclusive,
                 force,
+                resume: resume_id.clone(),
             })
             .await
             .context("starting session via cowboyd")?;
@@ -142,6 +158,14 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
         let coordinated = coordinate_oneshot(&root, &id, &task).await?;
 
         let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
+        // Continue a prior session if asked (load its transcript as history).
+        let history = match &resume_id {
+            Some(id) => crate::session::load_history(&root, id).unwrap_or_else(|e| {
+                eprintln!("could not resume {id}: {e}");
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
         let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -166,6 +190,7 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
         )
         .with_logger(logger)
         .with_memory_context(memory_ctx)
+        .with_history(history)
         .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
         let result = agent.run(&task).await;
         agent.shutdown().await; // stop managed processes

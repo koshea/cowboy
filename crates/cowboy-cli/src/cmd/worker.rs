@@ -40,6 +40,8 @@ pub struct WorkerArgs {
     pub id: Option<String>,
     /// Register with + heartbeat to the daemon.
     pub register: bool,
+    /// Continue a prior session: load its transcript as the starting history.
+    pub resume: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -177,6 +179,23 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
 
     let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
+    // Continue a prior session if asked (load its transcript as history).
+    let history = match &args.resume {
+        Some(id) => match crate::session::load_history(&root, id) {
+            Ok(h) => {
+                ui.emit(UiEventMsg::Notice(format!(
+                    "continuing session {id} ({} prior messages)",
+                    h.len()
+                )));
+                h
+            }
+            Err(e) => {
+                ui.emit(UiEventMsg::Notice(format!("could not resume {id}: {e}")));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
@@ -187,6 +206,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     )
     .with_logger(logger)
     .with_memory_context(memory_ctx)
+    .with_history(history)
     .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
 
     // Rebuilds the model client for `/model <name>` (provider creds stay
