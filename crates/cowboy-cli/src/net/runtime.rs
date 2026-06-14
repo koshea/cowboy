@@ -52,8 +52,8 @@ impl AgentRuntime {
         }
     }
 
-    /// The stable container name for this project (used in diagnostics/tests).
-    #[allow(dead_code)]
+    /// The stable container name for this project (also used to let a subagent
+    /// reuse this session's container).
     pub fn container_name(&self) -> &str {
         &self.container_name
     }

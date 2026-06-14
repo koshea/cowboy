@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
         Some(Command::Run { command }) => cmd::run::run(command).await,
         Some(Command::Patch(args)) => cmd::patch::run(args).await,
         Some(Command::Proc(args)) => cmd::proc::run(args).await,
+        Some(Command::Skill(args)) => cmd::skill::run(args),
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
     }

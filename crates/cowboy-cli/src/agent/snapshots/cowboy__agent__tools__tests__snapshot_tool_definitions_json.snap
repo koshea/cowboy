@@ -67,5 +67,32 @@ expression: defs
       "title": "AskUserArgs",
       "type": "object"
     }
+  },
+  {
+    "description": "Delegate a large, independent sub-task to a fresh subagent that shares this workspace/container. Returns the subagent's final summary. Use for focused work you want handled with its own context.",
+    "name": "subagent",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `subagent` tool.",
+      "properties": {
+        "context": {
+          "default": null,
+          "description": "Optional extra context to prepend (the subagent starts with a fresh conversation, so include anything it needs to know).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task": {
+          "description": "A focused, self-contained task for the subagent to complete.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "task"
+      ],
+      "title": "SubagentArgs",
+      "type": "object"
+    }
   }
 ]

@@ -26,16 +26,26 @@ pub trait AgentUi {
 #[derive(Default)]
 pub struct ConsoleUi {
     streaming: bool,
+    /// When set (subagent runs via `COWBOY_PRINT_FINAL_ONLY`), suppress all
+    /// intermediate output and print only the final message — so the caller can
+    /// capture the subagent's answer from stdout.
+    final_only: bool,
 }
 
 impl ConsoleUi {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            final_only: std::env::var("COWBOY_PRINT_FINAL_ONLY").is_ok(),
+            ..Default::default()
+        }
     }
 }
 
 impl AgentUi for ConsoleUi {
     fn model_delta(&mut self, text: &str) {
+        if self.final_only {
+            return;
+        }
         if !self.streaming {
             print!("\n\x1b[36m"); // cyan
             self.streaming = true;
@@ -53,10 +63,16 @@ impl AgentUi for ConsoleUi {
     }
 
     fn command_start(&mut self, command: &str) {
+        if self.final_only {
+            return;
+        }
         println!("\x1b[1;33m$ {command}\x1b[0m");
     }
 
     fn command_end(&mut self, exit_code: i32, output: &str) {
+        if self.final_only {
+            return;
+        }
         print!("{output}");
         if !output.ends_with('\n') {
             println!();
@@ -67,10 +83,19 @@ impl AgentUi for ConsoleUi {
     }
 
     fn final_message(&mut self, message: &str) {
-        println!("\n\x1b[1;32m✓ {message}\x1b[0m");
+        if self.final_only {
+            // Plain final answer for machine capture (subagent result).
+            println!("{message}");
+        } else {
+            println!("\n\x1b[1;32m✓ {message}\x1b[0m");
+        }
     }
 
     fn ask_user(&mut self, question: &str) -> String {
+        // A subagent is non-interactive; don't block on input.
+        if self.final_only {
+            return String::new();
+        }
         use std::io::BufRead;
         println!("\x1b[1;35m? {question}\x1b[0m");
         print!("> ");
@@ -81,6 +106,9 @@ impl AgentUi for ConsoleUi {
     }
 
     fn notice(&mut self, msg: &str) {
+        if self.final_only {
+            return;
+        }
         eprintln!("\x1b[2m{msg}\x1b[0m");
     }
 }

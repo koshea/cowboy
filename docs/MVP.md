@@ -17,9 +17,23 @@ cowboy run <cmd>           # run a command in the agent container
 cowboy shell               # interactive shell in the agent container
 cowboy patch show|save|apply|check|revert
 cowboy proc list|start|stop|restart|logs <name>
+cowboy skill list|show <name>            # agent skills (.cowboy/skills/)
 cowboy logs                # list past sessions
 cowboy replay <id>         # replay a past session
 ```
+
+## Skills & subagents
+
+- **Skills** are reusable instructions in `.cowboy/skills/<name>/SKILL.md`
+  (YAML frontmatter `name`/`description`, then a markdown body), discovered from
+  the project and `~/.config/cowboy/skills/`. The agent finds them with
+  `cowboy skill list` and pulls a skill's instructions into context with
+  `cowboy skill show <name>` — both run through the `shell` tool (skills are CLI,
+  not a built-in tool, so humans/CI use the same commands).
+- **Subagents** let the agent delegate a focused sub-task via the `subagent`
+  tool. It recursively invokes `cowboy` in one-shot mode, reusing the same
+  container (so the subagent shares the workspace and gateway), and folds the
+  subagent's final answer back into the parent's context. Nesting is depth-limited.
 
 ## How a session works
 

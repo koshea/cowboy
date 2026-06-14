@@ -49,6 +49,9 @@ pub enum Command {
     /// Managed long-running process commands.
     Proc(ProcArgs),
 
+    /// List or show agent skills (reusable instructions under .cowboy/skills/).
+    Skill(SkillArgs),
+
     /// List session logs.
     Logs,
 
@@ -94,6 +97,20 @@ pub enum PatchCommand {
 pub struct ProcArgs {
     #[command(subcommand)]
     pub command: ProcCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct SkillArgs {
+    #[command(subcommand)]
+    pub command: SkillCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// List available skills (name + description).
+    List,
+    /// Print a skill's instructions (to follow / pull into context).
+    Show { name: String },
 }
 
 #[derive(Debug, Subcommand)]

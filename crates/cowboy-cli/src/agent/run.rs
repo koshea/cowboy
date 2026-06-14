@@ -7,7 +7,7 @@ use cowboy_core::config::AgentBehavior;
 use cowboy_core::model::{ChatResponse, Message, ModelClient, Role, ToolDef};
 use tokio_util::sync::CancellationToken;
 
-use super::tools::{self, AskUserArgs, FinalArgs, ShellArgs};
+use super::tools::{self, AskUserArgs, FinalArgs, ShellArgs, SubagentArgs};
 use super::ui::AgentUi;
 use crate::net::runtime::AgentRuntime;
 use crate::session::SessionLogger;
@@ -22,6 +22,10 @@ and run code inside the container. Use the `shell` tool for almost all work.
 Cowboy-specific helpers are CLIs you invoke through `shell`, e.g. `cowboy patch \
 show` and `cowboy proc start <name>`. You do not need to ask before ordinary \
 development actions inside the container.
+
+Reusable skills may be available: run `cowboy skill list` to see them and \
+`cowboy skill show <name>` to read a skill's instructions, then follow them. \
+For a large, independent sub-task, use the `subagent` tool to delegate it.
 
 The runtime enforces network, host, and secret permissions outside your control. \
 If a command cannot access something, observe the failure and continue.
@@ -40,6 +44,8 @@ pub struct AgentLoop<'a> {
     /// Model context window (tokens) for history pruning.
     context_window: usize,
     pruned_notified: bool,
+    /// Recursion depth for subagents (0 = top-level).
+    subagent_depth: usize,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -47,6 +53,8 @@ pub struct AgentLoop<'a> {
 
 /// Tokens reserved for the model's response + tool schemas when budgeting.
 const RESPONSE_HEADROOM: usize = 4096;
+/// Maximum subagent nesting depth (prevents runaway recursion).
+const MAX_SUBAGENT_DEPTH: usize = 2;
 
 impl<'a> AgentLoop<'a> {
     pub fn new(
@@ -65,6 +73,10 @@ impl<'a> AgentLoop<'a> {
             cancel,
             context_window,
             pruned_notified: false,
+            subagent_depth: std::env::var("COWBOY_SUBAGENT_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
@@ -240,6 +252,15 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_SUBAGENT => {
+                    let args: SubagentArgs = parse_args(&call.arguments)?;
+                    let result = self.run_subagent(&args).await;
+                    let tool_msg = Message::tool_result(&call.id, result);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 other => {
                     self.messages.push(Message::tool_result(
                         &call.id,
@@ -249,6 +270,54 @@ impl<'a> AgentLoop<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Run a subagent by recursively invoking the `cowboy` CLI in one-shot mode,
+    /// reusing this session's container (via `COWBOY_CONTAINER_NAME`) so the
+    /// subagent shares the workspace and gateway. Returns its final answer.
+    async fn run_subagent(&mut self, args: &SubagentArgs) -> String {
+        if self.subagent_depth >= MAX_SUBAGENT_DEPTH {
+            return format!(
+                "error: maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached; do this work directly"
+            );
+        }
+        let exe = match std::env::current_exe() {
+            Ok(e) => e,
+            Err(e) => return format!("subagent error: cannot locate cowboy binary: {e}"),
+        };
+        let task = match &args.context {
+            Some(ctx) if !ctx.is_empty() => format!("{ctx}\n\n{}", args.task),
+            _ => args.task.clone(),
+        };
+        self.ui.notice(&format!("↳ subagent: {}", args.task));
+
+        let output = tokio::process::Command::new(exe)
+            .arg(&task)
+            .current_dir(self.runtime.root())
+            .env("COWBOY_CONTAINER_NAME", self.runtime.container_name())
+            .env(
+                "COWBOY_SUBAGENT_DEPTH",
+                (self.subagent_depth + 1).to_string(),
+            )
+            .env("COWBOY_PRINT_FINAL_ONLY", "1")
+            // Don't let the child's logs corrupt the parent TUI/console.
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await;
+
+        match output {
+            Ok(o) => {
+                self.ui.notice("↳ subagent finished");
+                let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if result.is_empty() {
+                    "subagent produced no final answer".to_string()
+                } else {
+                    result
+                }
+            }
+            Err(e) => format!("subagent failed to start: {e}"),
+        }
     }
 
     /// Call the model, streaming deltas to the UI, racing cancellation.
@@ -479,6 +548,29 @@ mod tests {
         assert!(res.is_none());
         assert!(ui.notices.iter().any(|n| n.contains("max_iterations")));
         assert_eq!(ui.commands.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn subagent_respects_max_depth() {
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.subagent_depth = MAX_SUBAGENT_DEPTH; // already at the limit
+        let result = agent
+            .run_subagent(&super::super::tools::SubagentArgs {
+                task: "do a thing".into(),
+                context: None,
+            })
+            .await;
+        // At max depth it returns an error string without spawning a subprocess.
+        assert!(result.contains("maximum subagent depth"), "got: {result}");
     }
 
     #[tokio::test]

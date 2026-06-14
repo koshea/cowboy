@@ -9,6 +9,7 @@ use serde::Deserialize;
 pub const TOOL_SHELL: &str = "shell";
 pub const TOOL_FINAL: &str = "final";
 pub const TOOL_ASK_USER: &str = "ask_user";
+pub const TOOL_SUBAGENT: &str = "subagent";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -32,6 +33,17 @@ pub struct FinalArgs {
 pub struct AskUserArgs {
     /// A question for the user when the agent is genuinely blocked.
     pub question: String,
+}
+
+/// Arguments for the `subagent` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct SubagentArgs {
+    /// A focused, self-contained task for the subagent to complete.
+    pub task: String,
+    /// Optional extra context to prepend (the subagent starts with a fresh
+    /// conversation, so include anything it needs to know).
+    #[serde(default)]
+    pub context: Option<String>,
 }
 
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
@@ -62,6 +74,14 @@ pub fn definitions() -> Vec<ToolDef> {
                 .into(),
             parameters: schema_for::<AskUserArgs>(),
         },
+        ToolDef {
+            name: TOOL_SUBAGENT.into(),
+            description: "Delegate a large, independent sub-task to a fresh subagent that shares \
+                          this workspace/container. Returns the subagent's final summary. Use for \
+                          focused work you want handled with its own context."
+                .into(),
+            parameters: schema_for::<SubagentArgs>(),
+        },
     ]
 }
 
@@ -70,9 +90,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn definitions_cover_the_minimal_surface() {
+    fn definitions_cover_the_tool_surface() {
         let names: Vec<_> = definitions().into_iter().map(|d| d.name).collect();
-        assert_eq!(names, vec!["shell", "final", "ask_user"]);
+        assert_eq!(names, vec!["shell", "final", "ask_user", "subagent"]);
     }
 
     #[test]
