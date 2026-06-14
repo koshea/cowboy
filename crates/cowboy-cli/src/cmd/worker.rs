@@ -5,6 +5,7 @@
 //! attach to. Survives client detach. Spawned by the daemon (or run directly for
 //! testing). Not for interactive use.
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -12,9 +13,9 @@ use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
 use cowboy_core::daemonproto::{
-    ClientMsg, DaemonReq, LeaseMode, SessionInfo, SessionStatus, UiEventMsg,
+    ClientMsg, DaemonReq, InterruptKind, LeaseMode, SessionInfo, SessionStatus, UiEventMsg,
 };
-use cowboy_core::model::OpenAiClient;
+use cowboy_core::model::{ModelClient, OpenAiClient};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::socket_ui::SocketUi;
@@ -178,17 +179,98 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     )
     .with_logger(logger);
 
-    // Seed the initial task, then service client messages.
+    // Rebuilds the model client for `/model <name>` (provider creds stay
+    // host-owned; the agent only ever sees a built client).
+    let resolve: Resolver = {
+        let providers = providers.clone();
+        let user = user_models.clone();
+        let project = project_models.clone();
+        Box::new(move |name: &str| {
+            let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
+            let cw = r.context_window as usize;
+            let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
+            Ok((client, cw))
+        })
+    };
+
+    // Service client messages. A running turn is cancellable: `Interrupt`
+    // cancels it (concurrently — control messages are read *while* the turn
+    // runs), `End` stops the session, `SwitchModel` swaps the model, and extra
+    // `Message`s queue behind the current turn.
+    let mut queue: VecDeque<String> = VecDeque::new();
     if let Some(task) = args.task.clone() {
-        run_turn(&mut agent, &emitter, &root, &task).await;
+        queue.push_back(task);
     }
-    while let Some(msg) = cmd_rx.recv().await {
-        match msg {
-            ClientMsg::Message(m) => run_turn(&mut agent, &emitter, &root, &m).await,
-            ClientMsg::End => break,
-            // Ask/Approval replies are resolved inside SocketUi and never arrive
-            // here. SwitchModel / Interrupt: later milestones.
-            _ => {}
+    'serve: loop {
+        let next = match queue.pop_front() {
+            Some(m) => m,
+            None => match cmd_rx.recv().await {
+                None => break,
+                Some(ClientMsg::Message(m)) => m,
+                Some(ClientMsg::End) => break,
+                Some(ClientMsg::SwitchModel(name)) => {
+                    apply_switch(&mut agent, &resolve, &emitter, &name);
+                    continue;
+                }
+                // No turn is running; interrupts and other control messages are
+                // no-ops.
+                _ => continue,
+            },
+        };
+
+        let mut end = false;
+        let mut switch_to: Option<String> = None;
+        {
+            let tc = CancellationToken::new();
+            let turn = run_turn(&mut agent, &emitter, &root, &next, tc.clone());
+            tokio::pin!(turn);
+            loop {
+                tokio::select! {
+                    _ = &mut turn => break, // turn finished (emits TurnDone)
+                    ctl = cmd_rx.recv() => match ctl {
+                        None => {
+                            tc.cancel();
+                            let _ = (&mut turn).await;
+                            end = true;
+                            break;
+                        }
+                        Some(ClientMsg::Interrupt { kind }) => {
+                            tc.cancel();
+                            emitter.emit(UiEventMsg::Notice("interrupting current turn…".into()));
+                            let _ = (&mut turn).await; // unwinds + emits TurnDone
+                            match kind {
+                                InterruptKind::End => end = true,
+                                // Turn / Instruct: drop queued work, return to idle.
+                                _ => queue.clear(),
+                            }
+                            break;
+                        }
+                        Some(ClientMsg::End) => {
+                            tc.cancel();
+                            let _ = (&mut turn).await;
+                            end = true;
+                            break;
+                        }
+                        // Queue further input to run after this turn.
+                        Some(ClientMsg::Message(m)) => queue.push_back(m),
+                        // Swapping the model needs &mut agent, so finish the
+                        // current turn first, then apply below.
+                        Some(ClientMsg::SwitchModel(n)) => {
+                            tc.cancel();
+                            let _ = (&mut turn).await;
+                            switch_to = Some(n);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        if let Some(n) = switch_to {
+            apply_switch(&mut agent, &resolve, &emitter, &n);
+        }
+        if end {
+            break 'serve;
         }
     }
 
@@ -253,9 +335,29 @@ async fn run_control_pipeline(
     }
 }
 
-/// Run one turn and emit the post-turn indicators (diff, processes, title).
-async fn run_turn(agent: &mut AgentLoop<'_>, ui: &SocketUi, root: &std::path::Path, msg: &str) {
-    let tc = CancellationToken::new();
+/// Rebuilds a model client by name (host-owned creds in, built client out).
+type Resolver = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize)>>;
+
+/// Apply a `/model` switch: re-resolve and swap the client, or report why not.
+fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
+    match resolve(name) {
+        Ok((client, cw)) => {
+            agent.set_model(client, cw);
+            ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
+        }
+        Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),
+    }
+}
+
+/// Run one turn under `tc` and emit the post-turn indicators (diff, processes,
+/// title). Returns when the turn completes or `tc` is cancelled.
+async fn run_turn(
+    agent: &mut AgentLoop<'_>,
+    ui: &SocketUi,
+    root: &std::path::Path,
+    msg: &str,
+    tc: CancellationToken,
+) {
     let _ = agent.run_turn(msg, tc).await;
     let (diff, procs) = post_turn_indicators(root);
     ui.emit(UiEventMsg::DiffStat(diff));
