@@ -78,6 +78,13 @@ pub struct AgentLoop<'a> {
     /// Running session token estimates (tiktoken-based; provider-independent).
     tokens_in: u64,
     tokens_out: u64,
+    /// USD per 1M input/output tokens (None when the model's pricing is unknown).
+    price_in: Option<f64>,
+    price_out: Option<f64>,
+    /// Running estimated session spend in USD (0.0 when pricing is unknown).
+    cost_usd: f64,
+    /// One-shot latch so the 80%-of-budget warning fires only once.
+    budget_warned: bool,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -123,6 +130,10 @@ impl<'a> AgentLoop<'a> {
             last_final: None,
             tokens_in: 0,
             tokens_out: 0,
+            price_in: None,
+            price_out: None,
+            cost_usd: 0.0,
+            budget_warned: false,
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
@@ -142,6 +153,56 @@ impl<'a> AgentLoop<'a> {
         }
         self.tokens_out += out;
         self.ui.tokens(self.tokens_in, self.tokens_out);
+        if let (Some(pi), Some(po)) = (self.price_in, self.price_out) {
+            self.cost_usd =
+                (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po;
+            self.ui.cost(self.cost_usd);
+        }
+    }
+
+    /// Hard stop reason if a configured budget has been reached, else `None`.
+    fn budget_reached(&self) -> Option<String> {
+        let b = &self.behavior;
+        let used = self.tokens_in + self.tokens_out;
+        if b.token_budget > 0 && used >= b.token_budget {
+            return Some(format!(
+                "token budget reached ({used} tokens ≥ {}); stopping",
+                b.token_budget
+            ));
+        }
+        if b.cost_budget_usd > 0.0 && self.cost_usd >= b.cost_budget_usd {
+            return Some(format!(
+                "cost budget reached (${:.2} ≥ ${:.2}); stopping",
+                self.cost_usd, b.cost_budget_usd
+            ));
+        }
+        None
+    }
+
+    /// Emit a one-time notice when usage crosses 80% of a configured budget.
+    fn maybe_warn_budget(&mut self) {
+        if self.budget_warned {
+            return;
+        }
+        let b = &self.behavior;
+        let used = self.tokens_in + self.tokens_out;
+        let warn = if b.token_budget > 0 && used as f64 >= 0.8 * b.token_budget as f64 {
+            Some(format!(
+                "approaching token budget ({used}/{} tokens)",
+                b.token_budget
+            ))
+        } else if b.cost_budget_usd > 0.0 && self.cost_usd >= 0.8 * b.cost_budget_usd {
+            Some(format!(
+                "approaching cost budget (${:.2}/${:.2})",
+                self.cost_usd, b.cost_budget_usd
+            ))
+        } else {
+            None
+        };
+        if let Some(w) = warn {
+            self.ui.notice(&w);
+            self.budget_warned = true;
+        }
     }
 
     /// Approximate token count of a message (content + tool-call arguments).
@@ -267,11 +328,31 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
-    /// Swap the model client (and its context window) mid-session, keeping the
-    /// conversation. Used by the `/model` command.
-    pub fn set_model(&mut self, model: Box<dyn ModelClient>, context_window: usize) {
+    /// Set the active model's per-1M-token USD pricing (used for the running
+    /// cost estimate; `None` disables cost tracking for this model).
+    pub fn with_pricing(
+        mut self,
+        input_per_mtok: Option<f64>,
+        output_per_mtok: Option<f64>,
+    ) -> Self {
+        self.price_in = input_per_mtok;
+        self.price_out = output_per_mtok;
+        self
+    }
+
+    /// Swap the model client (and its context window + pricing) mid-session,
+    /// keeping the conversation. Used by the `/model` command.
+    pub fn set_model(
+        &mut self,
+        model: Box<dyn ModelClient>,
+        context_window: usize,
+        price_in: Option<f64>,
+        price_out: Option<f64>,
+    ) {
         self.model = model;
         self.context_window = context_window;
+        self.price_in = price_in;
+        self.price_out = price_out;
     }
 
     /// Run one conversational turn for `task`, keeping the conversation (and the
@@ -325,6 +406,13 @@ impl<'a> AgentLoop<'a> {
                 self.ui.notice("interrupted");
                 return Ok(None);
             }
+
+            // Stop before spending more if a usage budget has been reached.
+            if let Some(reason) = self.budget_reached() {
+                self.ui.notice(&reason);
+                return Ok(None);
+            }
+            self.maybe_warn_budget();
 
             // Keep history within the model's context window.
             self.fit_context().await;
@@ -855,9 +943,13 @@ mod tests {
         finals: Vec<String>,
         notices: Vec<String>,
         tool_uses: Vec<String>,
+        costs: Vec<f64>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
+        fn cost(&mut self, usd: f64) {
+            self.costs.push(usd);
+        }
         fn command_start(&mut self, command: &str) {
             self.commands.push(command.to_string());
         }
@@ -947,6 +1039,63 @@ mod tests {
         assert_eq!(final_msg.as_deref(), Some("done; tests pass"));
         assert_eq!(ui.commands, vec!["ls"]);
         assert_eq!(ui.finals, vec!["done; tests pass"]);
+    }
+
+    #[tokio::test]
+    async fn stops_when_token_budget_reached_and_reports_cost() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_exec_stream()
+            .returning(|_, _, _, _, _, _, chunks| {
+                let _ = chunks.send("out\n".into());
+                Ok((ExecResult { exit_code: 0 }, "out\n".into()))
+            });
+
+        // The model keeps asking for shell (never finals); only the budget stops it.
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: Some("working".into()),
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
+            },
+            ChatResponse {
+                content: Some("still working".into()),
+                tool_calls: vec![tool_call("2", "shell", r#"{"command":"ls"}"#)],
+            },
+        ]);
+
+        // token_budget of 1 trips on the second iteration (after the first turn's
+        // tokens are accounted), before another model call is made.
+        let behavior = cowboy_core::config::AgentBehavior {
+            token_budget: 1,
+            ..cowboy_core::config::AgentBehavior::default()
+        };
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            behavior,
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_pricing(Some(3.0), Some(15.0)); // priced → cost is reported
+        let out = agent.run("go").await.unwrap();
+
+        assert_eq!(out, None, "the budget stops the run with no final answer");
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("token budget reached")),
+            "expected a budget-stop notice, got {:?}",
+            ui.notices
+        );
+        assert!(
+            ui.costs.last().copied().unwrap_or(0.0) > 0.0,
+            "a priced model should report a running cost"
+        );
     }
 
     #[test]

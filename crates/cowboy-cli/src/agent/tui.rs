@@ -63,6 +63,8 @@ pub enum UiEvent {
     DiffStat(String),
     /// Running session token estimate (input, output).
     Tokens(u64, u64),
+    /// Running estimated session spend in USD.
+    Cost(f64),
     /// Update the transcript title (cwd + branch context).
     Title(String),
     /// Managed processes (name, status) for the process pane.
@@ -103,6 +105,9 @@ impl AgentUi for TuiUi {
     }
     fn tokens(&mut self, input: u64, output: u64) {
         let _ = self.tx.send(UiEvent::Tokens(input, output));
+    }
+    fn cost(&mut self, usd: f64) {
+        let _ = self.tx.send(UiEvent::Cost(usd));
     }
     fn final_message(&mut self, message: &str) {
         let _ = self.tx.send(UiEvent::Final(message.to_string()));
@@ -407,6 +412,7 @@ fn event_loop(
                     app.tokens_in = i;
                     app.tokens_out = o;
                 }
+                UiEvent::Cost(usd) => app.cost_usd = usd,
                 UiEvent::Title(t) => app.title = t,
                 UiEvent::Processes(procs) => app.processes = procs,
                 UiEvent::TurnDone => {

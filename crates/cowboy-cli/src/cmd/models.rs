@@ -105,6 +105,8 @@ fn setup() -> Result<()> {
                 top_p: None,
                 stop: Vec::new(),
                 extra: BTreeMap::new(),
+                input_cost_per_mtok: None,
+                output_cost_per_mtok: None,
                 headers: BTreeMap::new(),
             },
         );
@@ -340,6 +342,8 @@ fn add(a: AddArgs) -> Result<()> {
         stop: Vec::new(),
         extra: BTreeMap::new(),
         headers: BTreeMap::new(),
+        input_cost_per_mtok: d.input_cost_per_mtok,
+        output_cost_per_mtok: d.output_cost_per_mtok,
     };
 
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
@@ -403,6 +407,7 @@ pub fn save_user_model(
         bail!("no providers configured; run `cowboy models setup`");
     }
     let provider = sole_provider(&providers)?;
+    let d = model_defaults::lookup(id);
     let def = ModelDef {
         provider,
         model: id.to_string(),
@@ -414,6 +419,8 @@ pub fn save_user_model(
         stop: Vec::new(),
         extra: BTreeMap::new(),
         headers: BTreeMap::new(),
+        input_cost_per_mtok: d.input_cost_per_mtok,
+        output_cost_per_mtok: d.output_cost_per_mtok,
     };
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();

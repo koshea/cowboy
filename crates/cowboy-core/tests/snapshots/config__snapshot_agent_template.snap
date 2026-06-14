@@ -12,6 +12,11 @@ agent:
   model_timeout_seconds: 120
   max_iterations: 100
   max_command_output_bytes: 60000
+  # Optional usage budgets (0 = no limit). The session stops once a budget is
+  # reached, with a soft warning at 80%. The cost estimate uses the model's
+  # per-token pricing (see `cowboy models` / model-defaults).
+  # token_budget: 0
+  # cost_budget_usd: 0.0
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md

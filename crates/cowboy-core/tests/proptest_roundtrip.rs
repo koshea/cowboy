@@ -44,6 +44,8 @@ fn arb_agent_config() -> impl Strategy<Value = AgentConfig> {
                     model_timeout_seconds,
                     max_iterations,
                     max_command_output_bytes,
+                    token_budget: 0,
+                    cost_budget_usd: 0.0,
                 },
                 session: SessionConfig { scratchpad },
                 processes,

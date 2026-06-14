@@ -298,6 +298,8 @@ pub enum UiEventMsg {
         input: u64,
         output: u64,
     },
+    /// Running estimated session spend in USD.
+    Cost(f64),
     Title(String),
     Processes(Vec<(String, String)>),
     TurnDone,
@@ -455,6 +457,7 @@ mod tests {
             input: 1200,
             output: 340,
         });
+        roundtrip(&UiEventMsg::Cost(0.42));
         roundtrip(&UiEventMsg::Processes(vec![(
             "web".into(),
             "running".into(),

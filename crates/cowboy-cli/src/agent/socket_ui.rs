@@ -240,6 +240,9 @@ impl AgentUi for SocketUi {
     fn tokens(&mut self, input: u64, output: u64) {
         self.emit(UiEventMsg::Tokens { input, output });
     }
+    fn cost(&mut self, usd: f64) {
+        self.emit(UiEventMsg::Cost(usd));
+    }
     fn final_message(&mut self, message: &str) {
         self.emit(UiEventMsg::Final(message.to_string()));
     }

@@ -24,6 +24,8 @@ pub trait AgentUi {
     }
     /// Running session token estimate (input/output). Default: ignored.
     fn tokens(&mut self, _input: u64, _output: u64) {}
+    /// Running estimated session spend in USD. Default: ignored.
+    fn cost(&mut self, _usd: f64) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question; return their answer.

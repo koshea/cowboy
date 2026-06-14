@@ -3,10 +3,13 @@
 # Override or extend without a code release via ~/.config/cowboy/model-defaults.yaml
 # (same schema; entries there win). Match by exact `id` or by `prefix`
 # (longest match wins). Fields: name, context_window, max_tokens, temperature,
-# reasoning_effort (minimal|low|medium|high), chat (default true).
+# reasoning_effort (minimal|low|medium|high), chat (default true),
+# input_cost_per_mtok / output_cost_per_mtok (USD per 1M tokens, for the
+# running cost estimate; omit when unknown).
 #
 # Values are best-effort baselines you can tweak per-model when adding one; the
-# point is sensible prefills, not perfection.
+# point is sensible prefills, not perfection. Prices in particular drift — treat
+# the cost estimate as a rough guide and override locally for billing accuracy.
 version: 1
 models:
   # --- Anthropic (200K context, extended thinking) ------------------------
@@ -16,17 +19,23 @@ models:
     max_tokens: 32000
     temperature: 1.0
     reasoning_effort: high
+    input_cost_per_mtok: 15.0
+    output_cost_per_mtok: 75.0
   - prefix: anthropic/claude-sonnet
     name: "Claude Sonnet"
     context_window: 200000
     max_tokens: 32000
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 3.0
+    output_cost_per_mtok: 15.0
   - prefix: anthropic/claude-haiku
     name: "Claude Haiku"
     context_window: 200000
     max_tokens: 16000
     temperature: 1.0
+    input_cost_per_mtok: 0.8
+    output_cost_per_mtok: 4.0
   - prefix: anthropic/claude-fable
     name: "Claude Fable"
     context_window: 200000
@@ -39,12 +48,16 @@ models:
     max_tokens: 32000
     temperature: 1.0
     reasoning_effort: high
+    input_cost_per_mtok: 15.0
+    output_cost_per_mtok: 75.0
   - id: anthropic/claude-sonnet-4-6
     name: "Claude Sonnet 4.6"
     context_window: 200000
     max_tokens: 32000
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 3.0
+    output_cost_per_mtok: 15.0
 
   # --- Cerebras -----------------------------------------------------------
   - id: cerebras/zai-glm-4.7
@@ -53,12 +66,16 @@ models:
     max_tokens: 16384
     temperature: 0.6
     reasoning_effort: high
+    input_cost_per_mtok: 0.6
+    output_cost_per_mtok: 2.2
   - id: cerebras/gpt-oss-120b
     name: "Cerebras: GPT-OSS 120B"
     context_window: 131072
     max_tokens: 32768
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 0.15
+    output_cost_per_mtok: 0.6
 
   # --- Fireworks ----------------------------------------------------------
   - id: fireworks/accounts/fireworks/models/glm-5p1
@@ -67,28 +84,38 @@ models:
     max_tokens: 32768
     temperature: 0.6
     reasoning_effort: high
+    input_cost_per_mtok: 0.55
+    output_cost_per_mtok: 2.19
   - id: fireworks/accounts/fireworks/models/kimi-k2p5
     name: "Fireworks: Kimi K2.5"
     context_window: 262144
     max_tokens: 32768
     temperature: 0.6
+    input_cost_per_mtok: 0.6
+    output_cost_per_mtok: 2.5
   - id: fireworks/accounts/fireworks/models/kimi-k2p6
     name: "Fireworks: Kimi K2.6"
     context_window: 262144
     max_tokens: 32768
     temperature: 0.6
+    input_cost_per_mtok: 0.6
+    output_cost_per_mtok: 2.5
   - id: fireworks/accounts/fireworks/models/deepseek-v4-pro
     name: "Fireworks: DeepSeek V4 Pro"
     context_window: 163840
     max_tokens: 32768
     temperature: 0.6
     reasoning_effort: high
+    input_cost_per_mtok: 0.9
+    output_cost_per_mtok: 2.5
   - prefix: fireworks/accounts/fireworks/models/gpt-oss
     name: "Fireworks: GPT-OSS"
     context_window: 131072
     max_tokens: 32768
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 0.15
+    output_cost_per_mtok: 0.6
 
   # --- OpenAI -------------------------------------------------------------
   # gpt-5.x family (reasoning); codex/mini/nano inherit via prefix.
@@ -98,28 +125,38 @@ models:
     max_tokens: 65536
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 1.25
+    output_cost_per_mtok: 10.0
   - prefix: openai/gpt-4.1
     name: "GPT-4.1"
     context_window: 1000000
     max_tokens: 32768
     temperature: 0.2
+    input_cost_per_mtok: 2.0
+    output_cost_per_mtok: 8.0
   - prefix: openai/gpt-4o
     name: "GPT-4o"
     context_window: 128000
     max_tokens: 16384
     temperature: 0.2
+    input_cost_per_mtok: 2.5
+    output_cost_per_mtok: 10.0
   - prefix: openai/o3
     name: "OpenAI o3"
     context_window: 200000
     max_tokens: 100000
     temperature: 1.0
     reasoning_effort: high
+    input_cost_per_mtok: 2.0
+    output_cost_per_mtok: 8.0
   - prefix: openai/o4-mini
     name: "OpenAI o4-mini"
     context_window: 200000
     max_tokens: 100000
     temperature: 1.0
     reasoning_effort: high
+    input_cost_per_mtok: 1.1
+    output_cost_per_mtok: 4.4
 
   # --- Gemini -------------------------------------------------------------
   - prefix: gemini/gemini-3
@@ -128,25 +165,35 @@ models:
     max_tokens: 65536
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 2.0
+    output_cost_per_mtok: 12.0
   - prefix: gemini/gemini-2.5-pro
     name: "Gemini 2.5 Pro"
     context_window: 1048576
     max_tokens: 65536
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 1.25
+    output_cost_per_mtok: 10.0
   - prefix: gemini/gemini-2.5-flash
     name: "Gemini 2.5 Flash"
     context_window: 1048576
     max_tokens: 65536
     temperature: 1.0
+    input_cost_per_mtok: 0.3
+    output_cost_per_mtok: 2.5
   - prefix: gemini/gemini-pro
     name: "Gemini Pro"
     context_window: 1048576
     max_tokens: 65536
     temperature: 1.0
     reasoning_effort: medium
+    input_cost_per_mtok: 1.25
+    output_cost_per_mtok: 10.0
   - prefix: gemini/gemini-flash
     name: "Gemini Flash"
     context_window: 1048576
     max_tokens: 65536
     temperature: 1.0
+    input_cost_per_mtok: 0.3
+    output_cost_per_mtok: 2.5

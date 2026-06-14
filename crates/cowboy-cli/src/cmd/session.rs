@@ -165,7 +165,8 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
             &mut ui,
         )
         .with_logger(logger)
-        .with_memory_context(memory_ctx);
+        .with_memory_context(memory_ctx)
+        .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
         let result = agent.run(&task).await;
         agent.shutdown().await; // stop managed processes
 

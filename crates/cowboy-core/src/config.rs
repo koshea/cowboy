@@ -209,6 +209,14 @@ pub struct AgentBehavior {
     pub max_iterations: u32,
     #[serde(default = "default_max_output")]
     pub max_command_output_bytes: usize,
+    /// Stop the session once total (input+output) tokens reach this many
+    /// (0 = no limit). A soft warning fires at 80%.
+    #[serde(default)]
+    pub token_budget: u64,
+    /// Stop the session once estimated model spend reaches this many USD
+    /// (0 = no limit; requires the model's pricing to be known). Warns at 80%.
+    #[serde(default)]
+    pub cost_budget_usd: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -345,6 +353,12 @@ pub struct ModelDef {
     /// Per-model header overrides (merged over the provider's headers).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// USD per 1M input (prompt) tokens, for cost estimation (omitted when unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost_per_mtok: Option<f64>,
+    /// USD per 1M output (completion) tokens, for cost estimation (omitted when unknown).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost_per_mtok: Option<f64>,
 }
 
 /// A fully-resolved model ready to build a client from: provider credentials
@@ -363,6 +377,8 @@ pub struct ResolvedModel {
     pub stop: Vec<String>,
     pub extra: BTreeMap<String, serde_json::Value>,
     pub headers: BTreeMap<String, String>,
+    pub input_cost_per_mtok: Option<f64>,
+    pub output_cost_per_mtok: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +524,8 @@ impl Default for AgentBehavior {
             model_timeout_seconds: default_model_timeout(),
             max_iterations: default_max_iterations(),
             max_command_output_bytes: default_max_output(),
+            token_budget: 0,
+            cost_budget_usd: 0.0,
         }
     }
 }
@@ -813,6 +831,8 @@ pub fn resolve_model(
         stop: def.stop.clone(),
         extra: def.extra.clone(),
         headers,
+        input_cost_per_mtok: def.input_cost_per_mtok,
+        output_cost_per_mtok: def.output_cost_per_mtok,
     })
 }
 
@@ -953,6 +973,11 @@ agent:
   model_timeout_seconds: 120
   max_iterations: 100
   max_command_output_bytes: 60000
+  # Optional usage budgets (0 = no limit). The session stops once a budget is
+  # reached, with a soft warning at 80%. The cost estimate uses the model's
+  # per-token pricing (see `cowboy models` / model-defaults).
+  # token_budget: 0
+  # cost_budget_usd: 0.0
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md

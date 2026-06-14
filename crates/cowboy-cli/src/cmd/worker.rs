@@ -186,7 +186,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         &mut ui,
     )
     .with_logger(logger)
-    .with_memory_context(memory_ctx);
+    .with_memory_context(memory_ctx)
+    .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
 
     // Rebuilds the model client for `/model <name>` (provider creds stay
     // host-owned; the agent only ever sees a built client).
@@ -197,8 +198,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         Box::new(move |name: &str| {
             let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
             let cw = r.context_window as usize;
+            let pricing = (r.input_cost_per_mtok, r.output_cost_per_mtok);
             let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
-            Ok((client, cw))
+            Ok((client, cw, pricing))
         })
     };
 
@@ -345,13 +347,16 @@ async fn run_control_pipeline(
 }
 
 /// Rebuilds a model client by name (host-owned creds in, built client out).
-type Resolver = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize)>>;
+/// Yields the client, its context window, and its (input, output) per-1M-token
+/// USD pricing for the cost estimate.
+type Resolver =
+    Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, (Option<f64>, Option<f64>))>>;
 
 /// Apply a `/model` switch: re-resolve and swap the client, or report why not.
 fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
     match resolve(name) {
-        Ok((client, cw)) => {
-            agent.set_model(client, cw);
+        Ok((client, cw, (price_in, price_out))) => {
+            agent.set_model(client, cw, price_in, price_out);
             ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
         }
         Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),

@@ -169,6 +169,8 @@ pub struct App {
     /// Running session token estimate (input/prompt, output/completion).
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Running estimated session spend in USD (0.0 when pricing is unknown).
+    pub cost_usd: f64,
     pub transcript: Vec<TranscriptLine>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
@@ -243,6 +245,7 @@ impl App {
             diff: String::new(),
             tokens_in: 0,
             tokens_out: 0,
+            cost_usd: 0.0,
             transcript: Vec::new(),
             streaming: String::new(),
             reasoning: String::new(),
@@ -906,11 +909,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     // Right side: running token estimate, then the working-tree diff summary.
     let mut segs: Vec<String> = Vec::new();
     if app.tokens_in > 0 || app.tokens_out > 0 {
-        segs.push(format!(
+        let mut seg = format!(
             "~{}↑ {}↓",
             fmt_count(app.tokens_in),
             fmt_count(app.tokens_out)
-        ));
+        );
+        if app.cost_usd > 0.0 {
+            seg.push_str(&format!(" ${}", fmt_cost(app.cost_usd)));
+        }
+        segs.push(seg);
     }
     if !app.diff.is_empty() {
         segs.push(app.diff.clone());
@@ -943,6 +950,15 @@ fn fmt_count(n: u64) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+/// USD to two decimals, but a tiny nonzero spend shows `<0.01` rather than `0.00`.
+fn fmt_cost(usd: f64) -> String {
+    if usd > 0.0 && usd < 0.005 {
+        "<0.01".to_string()
+    } else {
+        format!("{usd:.2}")
     }
 }
 
@@ -1192,6 +1208,14 @@ mod tests {
         assert_eq!(fmt_count(1200), "1.2k");
         assert_eq!(fmt_count(45_000), "45k");
         assert_eq!(fmt_count(1_250_000), "1.2M");
+    }
+
+    #[test]
+    fn fmt_cost_handles_tiny_and_normal_spend() {
+        assert_eq!(fmt_cost(0.0), "0.00");
+        assert_eq!(fmt_cost(0.002), "<0.01");
+        assert_eq!(fmt_cost(0.04), "0.04");
+        assert_eq!(fmt_cost(12.3), "12.30");
     }
 
     #[test]
