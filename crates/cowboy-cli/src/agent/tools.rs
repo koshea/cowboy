@@ -88,4 +88,20 @@ mod tests {
         let s = schema.to_string();
         assert!(s.contains("command"));
     }
+
+    #[test]
+    fn snapshot_tool_definitions_json() {
+        // The exact tool payload sent to the model is reviewed deliberately.
+        let defs: Vec<_> = definitions()
+            .into_iter()
+            .map(|d| {
+                serde_json::json!({
+                    "name": d.name,
+                    "description": d.description,
+                    "parameters": d.parameters,
+                })
+            })
+            .collect();
+        insta::assert_json_snapshot!(defs);
+    }
 }

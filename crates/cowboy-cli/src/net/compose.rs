@@ -39,6 +39,75 @@ struct RawCompose {
     networks: BTreeMap<String, serde_yaml_ng::Value>,
 }
 
+/// Candidate networks the agent could join for a detected project (the implicit
+/// default network plus any explicitly declared ones, prefixed by project name).
+pub fn candidate_networks(p: &ComposeProject) -> Vec<String> {
+    let mut nets = vec![p.default_network.clone()];
+    let project = p.default_network.trim_end_matches("_default");
+    for n in &p.declared_networks {
+        nets.push(format!("{project}_{n}"));
+    }
+    nets.sort();
+    nets.dedup();
+    nets
+}
+
+/// Detect a Compose project and, on a terminal, prompt the user to approve the
+/// agent joining its networks. Approved networks are persisted to
+/// `security.yaml` (`networks.compose.approved`). No-op when no Compose file is
+/// found or when not attached to a terminal.
+pub fn prompt_and_persist(root: &Path) -> anyhow::Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let Some(project) = detect(root)? else {
+        return Ok(());
+    };
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(());
+    }
+
+    let paths = cowboy_core::config::ConfigPaths::for_root(root);
+    let mut security = match cowboy_core::config::SecurityConfig::load(&paths.security) {
+        Ok(s) => s,
+        Err(_) => return Ok(()), // no security.yaml yet; nothing to persist into
+    };
+
+    println!(
+        "\nDetected Docker Compose project ({}): services [{}]",
+        project
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?"),
+        project.services.join(", ")
+    );
+
+    let mut changed = false;
+    for net in candidate_networks(&project) {
+        if security.networks.compose.approved.contains(&net) {
+            continue;
+        }
+        print!("  Allow the agent container to join network `{net}`? [y/N] ");
+        std::io::stdout().flush().ok();
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if matches!(line.trim(), "y" | "Y" | "yes") {
+            security.networks.compose.approved.push(net.clone());
+            changed = true;
+            println!("    approved {net}");
+        }
+    }
+
+    if changed {
+        security.save(&paths.security)?;
+        println!(
+            "  updated {} (networks.compose.approved)",
+            paths.security.display()
+        );
+    }
+    Ok(())
+}
+
 /// Find the first Compose file in `root`, if any.
 pub fn find(root: &Path) -> Option<PathBuf> {
     CANDIDATES
@@ -93,5 +162,18 @@ mod tests {
     fn sanitizes_project_names() {
         assert_eq!(sanitize_project_name("My App!"), "myapp");
         assert_eq!(sanitize_project_name("my_proj-1"), "my_proj-1");
+    }
+
+    #[test]
+    fn candidate_networks_includes_default_and_declared() {
+        let p = ComposeProject {
+            path: "compose.yaml".into(),
+            services: vec!["web".into()],
+            declared_networks: vec!["backend".into()],
+            default_network: "myapp_default".into(),
+        };
+        let nets = candidate_networks(&p);
+        assert!(nets.contains(&"myapp_default".to_string()));
+        assert!(nets.contains(&"myapp_backend".to_string()));
     }
 }

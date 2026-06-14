@@ -440,6 +440,17 @@ impl SecurityConfig {
         Ok(())
     }
 
+    /// Serialize and write back to `path`. Note: this rewrites the file and
+    /// does not preserve comments — used after an interactive approval updates
+    /// `networks.compose.approved`.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let yaml = serde_yaml_ng::to_string(self).map_err(|e| Error::Invalid(e.to_string()))?;
+        std::fs::write(path, yaml).map_err(|source| Error::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
     /// Returns warnings for dangerous-but-permitted options. The host process
     /// should surface these to the user; they do not block startup.
     pub fn warnings(&self) -> Vec<String> {

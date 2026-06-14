@@ -150,6 +150,11 @@ fn network_boundary_is_enforced() {
     let metadata = wget("http://169.254.169.254");
     // 4. Non-80/443 port dropped by the forward chain (not an open router).
     let high_port = wget("https://1.1.1.1:9999");
+    // 5. The agent cannot change its own network config (NET_ADMIN dropped),
+    //    so it cannot escape the forced route.
+    let route_change_denied = !cowboy(&["run", "ip", "link", "set", "eth0", "down"])
+        .status
+        .success();
 
     // Cleanup BEFORE asserting so a failure never leaks containers/networks.
     let _ = Std::new("docker").args(["rm", "-f", &agent_name]).output();
@@ -170,5 +175,9 @@ fn network_boundary_is_enforced() {
     assert!(
         !high_port,
         "non-80/443 port must be dropped (gateway is not an open router)"
+    );
+    assert!(
+        route_change_denied,
+        "agent must not be able to change its network config (NET_ADMIN dropped)"
     );
 }

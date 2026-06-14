@@ -3,20 +3,20 @@ source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
 ┌ cowboy ───────────────────────────────────────┐┌ network ────────────┐
-│you build the project                          ││                     │
+│you fix the failing test                       ││ask example.com:443  │
+│$ cargo test                                   ││                     │
+│test result: FAILED                            ││                     │
+│Looking at the failure...                      ││                     │
 │                                               ││                     │
 │                                               ││                     │
+│                                               │└─────────────────────┘
+│                                               │┌ processes ──────────┐
+│                                               ││no managed processes │
 │                                               ││                     │
-│   ┌ Network approval ────────────────────────────────────────────┐   │
-│   │github.com:443                                                │   │
-│   │                                                              │───┘
-│   │[o]nce [s]ession [p]roject [g]lobal [d]eny                    │───┐
-│   │                                                              │es │
-│   │                                                              │   │
-│   └──────────────────────────────────────────────────────────────┘   │
+│                                               ││                     │
 │                                               ││                     │
 └───────────────────────────────────────────────┘└─────────────────────┘
-   approval — ready
+⠷  running — exec: cargo test
 ┌ type a message · Enter send · Ctrl-C interrupt ──────────────────────┐
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘

@@ -37,16 +37,23 @@ pub struct AgentLoop<'a> {
     tools: Vec<ToolDef>,
     behavior: AgentBehavior,
     cancel: CancellationToken,
+    /// Model context window (tokens) for history pruning.
+    context_window: usize,
+    pruned_notified: bool,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
 }
+
+/// Tokens reserved for the model's response + tool schemas when budgeting.
+const RESPONSE_HEADROOM: usize = 4096;
 
 impl<'a> AgentLoop<'a> {
     pub fn new(
         model: Box<dyn ModelClient>,
         runtime: AgentRuntime,
         behavior: AgentBehavior,
+        context_window: usize,
         cancel: CancellationToken,
         ui: &'a mut dyn AgentUi,
     ) -> Self {
@@ -56,9 +63,48 @@ impl<'a> AgentLoop<'a> {
             tools: tools::definitions(),
             behavior,
             cancel,
+            context_window,
+            pruned_notified: false,
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
+        }
+    }
+
+    /// Approximate token count of a message (content + tool-call arguments).
+    fn message_tokens(m: &Message) -> usize {
+        let mut n = cowboy_core::tokens::count(&m.content) + 4;
+        for tc in &m.tool_calls {
+            n += cowboy_core::tokens::count(&tc.arguments)
+                + cowboy_core::tokens::count(&tc.name)
+                + 4;
+        }
+        n
+    }
+
+    /// Prune the oldest history to keep the conversation within the context
+    /// window (minus response headroom). The system message is always kept, and
+    /// we never leave an orphan tool-result at the front.
+    fn fit_context(&mut self) {
+        let budget = self.context_window.saturating_sub(RESPONSE_HEADROOM);
+        if budget == 0 {
+            return;
+        }
+        let mut pruned = false;
+        while self.messages.len() > 2 {
+            let total: usize = self.messages.iter().map(Self::message_tokens).sum();
+            if total <= budget {
+                break;
+            }
+            self.messages.remove(1);
+            while self.messages.len() > 1 && self.messages[1].role == Role::Tool {
+                self.messages.remove(1);
+            }
+            pruned = true;
+        }
+        if pruned && !self.pruned_notified {
+            self.pruned_notified = true;
+            self.ui.notice("context window full; pruned older history");
         }
     }
 
@@ -68,9 +114,23 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
+    /// Run the loop for `task`, then finalize the session log (diff + summary)
+    /// regardless of how it ended.
+    pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
+        let outcome = self.run_inner(task).await;
+        if let Some(l) = &self.logger {
+            let final_msg = match &outcome {
+                Ok(Some(m)) => Some(m.as_str()),
+                _ => None,
+            };
+            l.finalize(final_msg);
+        }
+        outcome
+    }
+
     /// Run the loop for `task` until completion, cancellation, or the iteration
     /// cap. Returns the final message if the agent produced one.
-    pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
+    async fn run_inner(&mut self, task: &str) -> Result<Option<String>> {
         let user_msg = Message::user(task);
         if let Some(l) = &mut self.logger {
             l.log_message(&user_msg);
@@ -82,6 +142,9 @@ impl<'a> AgentLoop<'a> {
                 self.ui.notice("interrupted");
                 return Ok(None);
             }
+
+            // Keep history within the model's context window.
+            self.fit_context();
 
             let response = match self.call_model().await {
                 Ok(r) => r,
@@ -159,7 +222,7 @@ impl<'a> AgentLoop<'a> {
                     let truncated = truncate(&output, self.behavior.max_command_output_bytes);
                     self.ui.command_end(result.exit_code, &truncated);
                     if let Some(l) = &mut self.logger {
-                        l.log_command(&args.command, result.exit_code, duration_ms, output.len());
+                        l.log_command(&args.command, result.exit_code, duration_ms, &output);
                     }
                     let observation = format!("[exit code: {}]\n{}", result.exit_code, truncated);
                     let tool_msg = Message::tool_result(&call.id, observation);
@@ -362,6 +425,7 @@ mod tests {
             Box::new(model),
             runtime_with(docker),
             behavior,
+            200_000,
             cancel,
             &mut ui,
         );
@@ -407,6 +471,7 @@ mod tests {
             Box::new(looping),
             runtime_with(docker),
             behavior,
+            200_000,
             CancellationToken::new(),
             &mut ui,
         );
@@ -414,6 +479,30 @@ mod tests {
         assert!(res.is_none());
         assert!(ui.notices.iter().any(|n| n.contains("max_iterations")));
         assert_eq!(ui.commands.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn fit_context_prunes_old_history_keeping_system() {
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            RESPONSE_HEADROOM + 20, // tiny effective budget (~20 tokens)
+            CancellationToken::new(),
+            &mut ui,
+        );
+        for i in 0..40 {
+            agent.messages.push(Message::user(format!(
+                "message number {i} with several words here"
+            )));
+        }
+        let before = agent.messages.len();
+        agent.fit_context();
+        assert!(agent.messages.len() < before, "should have pruned");
+        assert_eq!(agent.messages[0].role, Role::System, "system kept");
+        assert!(ui.notices.iter().any(|n| n.contains("pruned")));
     }
 
     #[test]

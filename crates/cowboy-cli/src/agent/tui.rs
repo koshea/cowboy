@@ -12,6 +12,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
+use cowboy_core::netproto::{ApprovalScope, Verdict};
 use cowboy_tui::{draw, App, LineKind, Mode};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -21,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::ui::AgentUi;
 
-/// Events the agent loop sends to the TUI event loop.
+/// Events the agent loop / control server send to the TUI event loop.
 pub enum UiEvent {
     Delta(String),
     ModelDone,
@@ -30,6 +31,13 @@ pub enum UiEvent {
     Final(String),
     Notice(String),
     Ask(String, Sender<String>),
+    /// A network approval request: destination label + a reply channel.
+    Approval(
+        String,
+        tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>,
+    ),
+    /// A network decision the gateway made, for the activity log.
+    NetEvent(String),
     Done,
 }
 
@@ -114,6 +122,9 @@ fn event_loop(
     let mut app = App::new(title.to_string());
     app.push(LineKind::User, user_task);
     let mut pending_reply: Option<Sender<String>> = None;
+    let mut pending_approval: Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>> = None;
+    // Mode to restore after an overlay (approval/paused) is dismissed.
+    let mut mode_before_overlay = Mode::Running;
 
     loop {
         // Drain agent events.
@@ -145,6 +156,14 @@ fn event_loop(
                     app.mode = Mode::AwaitingInput(q);
                     pending_reply = Some(reply);
                 }
+                UiEvent::Approval(dest, reply) => {
+                    if !matches!(app.mode, Mode::Approval(_) | Mode::Paused) {
+                        mode_before_overlay = app.mode.clone();
+                    }
+                    app.mode = Mode::Approval(dest);
+                    pending_approval = Some(reply);
+                }
+                UiEvent::NetEvent(line) => app.activity(line),
                 UiEvent::Done => {
                     if app.mode != Mode::Done {
                         app.mode = Mode::Done;
@@ -160,7 +179,13 @@ fn event_loop(
         // Handle input with a short poll so the spinner animates.
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(key) = event::read()? {
-                if handle_key(key, &mut app, &mut pending_reply, &cancel) {
+                let ctx = KeyCtx {
+                    pending_reply: &mut pending_reply,
+                    pending_approval: &mut pending_approval,
+                    mode_before_overlay: &mut mode_before_overlay,
+                    cancel: &cancel,
+                };
+                if handle_key(Event::Key(key), key, &mut app, ctx) {
                     break;
                 }
             }
@@ -169,35 +194,76 @@ fn event_loop(
     Ok(())
 }
 
-/// Returns true if the loop should exit.
-fn handle_key(
-    key: KeyEvent,
-    app: &mut App,
-    pending_reply: &mut Option<Sender<String>>,
-    cancel: &CancellationToken,
-) -> bool {
-    // Ctrl-C interrupts the agent.
+/// Mutable context handed to the key handler.
+struct KeyCtx<'a> {
+    pending_reply: &'a mut Option<Sender<String>>,
+    pending_approval: &'a mut Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>>,
+    mode_before_overlay: &'a mut Mode,
+    cancel: &'a CancellationToken,
+}
+
+/// Returns true if the loop should exit. `event` is the full crossterm event
+/// (fed to the input editor); `key` is its key form (for shortcuts).
+fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
+    // Ctrl-C opens the interrupt menu (unless one is already open / done).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        cancel.cancel();
-        app.status = "interrupting…".into();
+        if matches!(app.mode, Mode::Running | Mode::AwaitingInput(_)) {
+            *ctx.mode_before_overlay = app.mode.clone();
+            app.mode = Mode::Paused;
+        }
         return false;
     }
+
+    // Network approval modal.
+    if let Mode::Approval(_) = &app.mode {
+        let decision = match key.code {
+            KeyCode::Char('o') => Some((Verdict::Allow, ApprovalScope::Once)),
+            KeyCode::Char('s') => Some((Verdict::Allow, ApprovalScope::Session)),
+            KeyCode::Char('p') => Some((Verdict::Allow, ApprovalScope::Project)),
+            KeyCode::Char('g') => Some((Verdict::Allow, ApprovalScope::Global)),
+            KeyCode::Char('d') | KeyCode::Esc => Some((Verdict::Deny, ApprovalScope::Once)),
+            _ => None,
+        };
+        if let Some(d) = decision {
+            if let Some(reply) = ctx.pending_approval.take() {
+                let _ = reply.send(d);
+            }
+            app.mode = ctx.mode_before_overlay.clone();
+        }
+        return false;
+    }
+
+    // Interrupt menu: resume / instruct / kill / end.
+    if app.mode == Mode::Paused {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Esc => app.mode = ctx.mode_before_overlay.clone(),
+            KeyCode::Char('e') | KeyCode::Char('k') => {
+                ctx.cancel.cancel();
+                app.status = "interrupting…".into();
+                app.mode = ctx.mode_before_overlay.clone();
+            }
+            KeyCode::Char('i') => {
+                app.activity("instruct: type in the input box, then resume");
+                app.mode = ctx.mode_before_overlay.clone();
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     match (&app.mode, key.code) {
         (Mode::Done, KeyCode::Char('q')) | (Mode::Done, KeyCode::Esc) => return true,
         (Mode::AwaitingInput(_), KeyCode::Enter) => {
-            let answer = std::mem::take(&mut app.input);
+            let answer = app.take_input();
             app.push(LineKind::User, answer.clone());
-            if let Some(reply) = pending_reply.take() {
+            if let Some(reply) = ctx.pending_reply.take() {
                 let _ = reply.send(answer);
             }
             app.mode = Mode::Running;
             app.status = "running".into();
         }
-        (_, KeyCode::Char(c)) => app.input.push(c),
-        (_, KeyCode::Backspace) => {
-            app.input.pop();
-        }
-        _ => {}
+        // Everything else is text input for the editor.
+        _ => app.input_event(event),
     }
     false
 }

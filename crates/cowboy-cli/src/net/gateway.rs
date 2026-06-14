@@ -32,28 +32,39 @@ pub struct GatewayNetwork {
     pub bridge_gateway: String,
     pub egress_subnet: String,
     policy_file: PathBuf,
-    /// Host control socket path; wired into the TUI ask-server in Slice D.
-    #[allow(dead_code)]
+    /// Host control socket path the gateway connects to for `ask` decisions.
     control_sock: PathBuf,
 }
 
 impl GatewayNetwork {
     /// Derive networking parameters for a project, keyed by a 32-bit hash so
     /// concurrent projects get non-overlapping subnets and distinct names.
-    pub fn for_project(hash: u32, security: &SecurityConfig) -> Result<Self> {
+    /// Persisted approvals under `root/.cowboy/approvals.json` are merged into
+    /// the policy the gateway loads.
+    pub fn for_project(
+        hash: u32,
+        security: &SecurityConfig,
+        root: &std::path::Path,
+    ) -> Result<Self> {
         let octet = (hash % 200 + 20) as u8; // 20..=219
         let subnet = format!("10.88.{octet}.0/24");
         let bridge_gateway = format!("10.88.{octet}.1");
         let gateway_ip = format!("10.88.{octet}.2");
         let egress_subnet = format!("10.89.{octet}.0/24");
 
+        // Merge previously persisted project/global approvals into the policy.
+        let mut policy = security.network_policy.clone();
+        super::approvals::merge_into(&mut policy, &super::approvals::load(root));
+
         let policy_file = std::env::temp_dir().join(format!("cowboy-policy-{hash:08x}.json"));
-        let json = serde_json::to_string_pretty(&security.network_policy)
-            .context("serializing network policy")?;
+        let json = serde_json::to_string_pretty(&policy).context("serializing network policy")?;
         std::fs::write(&policy_file, json)
             .with_context(|| format!("writing policy file {}", policy_file.display()))?;
 
-        let run_dir = PathBuf::from("/run/cowboy");
+        // Host-writable runtime dir for the control socket (mounted into the
+        // gateway). Avoids needing root-owned /run.
+        let run_dir = std::env::temp_dir().join("cowboy-run");
+        let _ = std::fs::create_dir_all(&run_dir);
         let control_sock = run_dir.join(format!("control-{hash:08x}.sock"));
 
         Ok(Self {
@@ -69,20 +80,43 @@ impl GatewayNetwork {
         })
     }
 
+    /// The container path the control socket is mounted at.
+    fn control_sock_container_path(&self) -> String {
+        let name = self
+            .control_sock
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("control.sock");
+        format!("/run/cowboy/{name}")
+    }
+
     /// Build the gateway container spec.
     fn gateway_spec(&self) -> ContainerSpec {
         let policy = self.policy_file.to_string_lossy().into_owned();
+        let sock_dir = self
+            .control_sock
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "/tmp".into());
         ContainerSpec {
             name: self.gateway_name.clone(),
             image: GATEWAY_IMAGE.to_string(),
             workdir: String::new(),
-            mounts: vec![BindMount::ro(policy, "/etc/cowboy/policy.json")],
+            mounts: vec![
+                BindMount::ro(policy, "/etc/cowboy/policy.json"),
+                // Mount the runtime dir so the host-created socket is visible.
+                BindMount::rw(sock_dir, "/run/cowboy"),
+            ],
             env: vec![
                 (
                     "COWBOY_POLICY_FILE".into(),
                     "/etc/cowboy/policy.json".into(),
                 ),
                 ("COWBOY_AGENT_SUBNET".into(), self.subnet.clone()),
+                (
+                    "COWBOY_CONTROL_SOCK".into(),
+                    self.control_sock_container_path(),
+                ),
             ],
             network: Some(self.internal_net.clone()),
             ip: Some(self.gateway_ip.clone()),
@@ -182,8 +216,7 @@ impl GatewayNetwork {
         Ok(())
     }
 
-    /// Path to the host control socket (used by the TUI ask-server in Slice D).
-    #[allow(dead_code)]
+    /// Path to the host control socket.
     pub fn control_sock(&self) -> &std::path::Path {
         &self.control_sock
     }

@@ -3,20 +3,20 @@ source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
 ┌ cowboy ───────────────────────────────────────┐┌ network ────────────┐
-│you build the project                          ││                     │
+│you do work                                    ││                     │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
-│   ┌ Network approval ────────────────────────────────────────────┐   │
-│   │github.com:443                                                │   │
+│   ┌ Paused ──────────────────────────────────────────────────────┐   │
+│   │Agent paused.                                                 │   │
 │   │                                                              │───┘
-│   │[o]nce [s]ession [p]roject [g]lobal [d]eny                    │───┐
+│   │[r]esume  [i]nstruct  [k]ill command  [e]nd session           │───┐
 │   │                                                              │es │
 │   │                                                              │   │
 │   └──────────────────────────────────────────────────────────────┘   │
 │                                               ││                     │
 └───────────────────────────────────────────────┘└─────────────────────┘
-   approval — ready
+   paused — ready
 ┌ type a message · Enter send · Ctrl-C interrupt ──────────────────────┐
 │                                                                      │
 └──────────────────────────────────────────────────────────────────────┘

@@ -71,6 +71,28 @@ async fn streams_and_assembles_text() {
 }
 
 #[tokio::test]
+async fn chat_is_cancelled_by_dropping_the_future() {
+    let server = MockServer::start().await;
+    // Respond, but only after a delay; we cancel before it arrives.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("late")]), "text/event-stream")
+                .set_delay(std::time::Duration::from_secs(5)),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_profile(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let msgs = [Message::user("hi")];
+    let fut = client.chat(&msgs, &[], None);
+    // Dropping the future on timeout cancels the in-flight request.
+    let res = tokio::time::timeout(std::time::Duration::from_millis(300), fut).await;
+    assert!(res.is_err(), "expected cancellation (timeout), got {res:?}");
+}
+
+#[tokio::test]
 async fn assembles_streamed_tool_call() {
     let server = MockServer::start().await;
     // Tool call split across two chunks (id+name first, then argument fragments).

@@ -40,6 +40,17 @@ fn templates_parse_and_validate() {
 }
 
 #[test]
+fn security_config_save_roundtrips() {
+    let tmp = tempdir();
+    let mut cfg = SecurityConfig::default();
+    cfg.networks.compose.approved.push("myapp_default".into());
+    let p = tmp.path().join("security.yaml");
+    cfg.save(&p).unwrap();
+    let reloaded = SecurityConfig::load(&p).unwrap();
+    assert_eq!(reloaded.networks.compose.approved, vec!["myapp_default"]);
+}
+
+#[test]
 fn security_invariant_rejects_mounting_security_file() {
     let mut cfg = SecurityConfig::default();
     cfg.container.mounts.push(Mount {

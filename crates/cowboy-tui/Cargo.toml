@@ -8,6 +8,9 @@ license.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 anyhow.workspace = true
+tui-textarea.workspace = true
+ansi-to-tui.workspace = true
+throbber-widgets-tui.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

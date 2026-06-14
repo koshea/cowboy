@@ -16,11 +16,10 @@ use cowboy_core::config::{self, SecurityConfig};
 use super::docker::{BindMount, ContainerSpec, ContainerState, DockerCli, ExecResult};
 use super::gateway::GatewayNetwork;
 
-/// Embedded default image sources, so `cowboy` can build `cowboy/agent:local`
-/// with no registry or external files.
-const EMBEDDED_DOCKERFILE: &str = include_str!("../../../../docker/agent.Dockerfile");
-const EMBEDDED_ENTRYPOINT: &str = include_str!("../../../../docker/agent-entrypoint.sh");
 const DEFAULT_IMAGE: &str = "cowboy/agent:local";
+/// Repo root baked in at build time; the default source root for building the
+/// bundled images when `COWBOY_SRC` is not set.
+const COMPILE_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// Orchestrates the agent container for a single project.
 pub struct AgentRuntime {
@@ -40,7 +39,7 @@ impl AgentRuntime {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| container_name_for(&root));
         let gateway = if security.networks.isolated.enabled {
-            GatewayNetwork::for_project(project_hash(&root), &security).ok()
+            GatewayNetwork::for_project(project_hash(&root), &security, &root).ok()
         } else {
             None
         };
@@ -57,6 +56,18 @@ impl AgentRuntime {
     #[allow(dead_code)]
     pub fn container_name(&self) -> &str {
         &self.container_name
+    }
+
+    /// The host control socket path, when network isolation is enabled.
+    pub fn control_sock(&self) -> Option<std::path::PathBuf> {
+        self.gateway
+            .as_ref()
+            .map(|g| g.control_sock().to_path_buf())
+    }
+
+    /// The project root (for approval persistence).
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Build the container spec, applying mounts and the security mask.
@@ -167,14 +178,18 @@ impl AgentRuntime {
                 .await;
         }
 
-        // The bundled default image is built from embedded sources.
+        // The bundled default image is built from the cowboy source tree.
         if image == DEFAULT_IMAGE {
-            tracing::info!(%image, "building bundled agent image (first run; this may take a while)");
-            let ctx = write_embedded_context()?;
-            return self
-                .docker
-                .build_image(&ctx.join("agent.Dockerfile"), &ctx, image)
-                .await;
+            if let Some(src) = default_image_source_root() {
+                let dockerfile = src.join("docker").join("agent.Dockerfile");
+                tracing::info!(%image, src = %src.display(),
+                    "building bundled agent image (first run; this may take a few minutes)");
+                return self.docker.build_image(&dockerfile, &src, image).await;
+            }
+            anyhow::bail!(
+                "agent image {DEFAULT_IMAGE} not found and no source tree to build it from.\n\
+                 Build it with `docker/build.sh agent` (or set COWBOY_SRC to the cowboy repo)."
+            );
         }
 
         // Otherwise assume it's a registry image.
@@ -236,7 +251,9 @@ impl AgentRuntime {
     ) -> Result<(ExecResult, String)> {
         self.ensure_running().await?;
         let workdir = cwd.unwrap_or(&self.security.container.workdir);
-        let argv = vec!["sh".to_string(), "-lc".to_string(), command.to_string()];
+        // Non-login `sh -c` so the container's ENV PATH (rust/go toolchains) is
+        // inherited; a login shell would reset PATH via /etc/profile.
+        let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         let fut = self
             .docker
             .exec_capture(&self.container_name, workdir, &argv);
@@ -313,17 +330,19 @@ fn ensure_mask_file() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Write the embedded Dockerfile + entrypoint (+ a stub helper) to a temp build
-/// context and return its path.
-fn write_embedded_context() -> Result<PathBuf> {
-    let dir = std::env::temp_dir().join("cowboy-agent-build");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("agent.Dockerfile"), EMBEDDED_DOCKERFILE)?;
-    std::fs::write(dir.join("agent-entrypoint.sh"), EMBEDDED_ENTRYPOINT)?;
-    // Placeholder for the in-container helper until Slice F ships the real one.
-    let stub = "#!/bin/sh\necho 'cowboy helper: not yet bundled in this image' >&2\nexit 1\n";
-    std::fs::write(dir.join("cowboy-agent"), stub)?;
-    Ok(dir)
+/// Locate the cowboy source tree for building the bundled images: `COWBOY_SRC`
+/// if set, else the repo root baked in at compile time. Returns None if neither
+/// contains `docker/agent.Dockerfile`.
+fn default_image_source_root() -> Option<PathBuf> {
+    let candidates = [
+        std::env::var("COWBOY_SRC").ok().map(PathBuf::from),
+        Some(PathBuf::from(COMPILE_REPO_ROOT)),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|p| p.join("docker").join("agent.Dockerfile").exists())
+        .and_then(|p| std::fs::canonicalize(p).ok())
 }
 
 #[cfg(test)]

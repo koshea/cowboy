@@ -1,12 +1,15 @@
 //! Renderable TUI state and drawing. The CLI owns the event loop and feeds
-//! this `App`; here we keep only state + a pure `draw` so rendering is
+//! this `App`; here we keep state + a pure `draw` so rendering is
 //! snapshot-testable with `ratatui::backend::TestBackend`.
 
+use ansi_to_tui::IntoText;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use throbber_widgets_tui::{Throbber, ThrobberState};
+use tui_textarea::TextArea;
 
 /// Kind of a transcript line (drives color/prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,15 +33,10 @@ pub struct TranscriptLine {
 /// Interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    /// Agent is working.
     Running,
-    /// Waiting for the user to answer an `ask_user` question.
     AwaitingInput(String),
-    /// A network approval prompt is showing.
     Approval(String),
-    /// Paused via interrupt; showing the menu.
     Paused,
-    /// Session finished.
     Done,
 }
 
@@ -49,12 +47,15 @@ pub struct App {
     pub transcript: Vec<TranscriptLine>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
-    pub input: String,
+    /// Network activity log (gateway decisions).
+    pub activity: Vec<String>,
+    /// Managed processes: (name, status).
+    pub processes: Vec<(String, String)>,
+    /// Input editor (multi-line, cursor) via tui-textarea.
+    pub textarea: TextArea<'static>,
     pub mode: Mode,
-    pub spinner_frame: usize,
+    pub throbber: ThrobberState,
 }
-
-const SPINNER: [&str; 4] = ["|", "/", "-", "\\"];
 
 impl App {
     pub fn new(title: impl Into<String>) -> Self {
@@ -63,9 +64,11 @@ impl App {
             status: "ready".into(),
             transcript: Vec::new(),
             streaming: String::new(),
-            input: String::new(),
+            activity: Vec::new(),
+            processes: Vec::new(),
+            textarea: TextArea::default(),
             mode: Mode::Running,
-            spinner_frame: 0,
+            throbber: ThrobberState::default(),
         }
     }
 
@@ -76,7 +79,11 @@ impl App {
         });
     }
 
-    /// Append streamed agent text.
+    /// Append a network activity line.
+    pub fn activity(&mut self, line: impl Into<String>) {
+        self.activity.push(line.into());
+    }
+
     pub fn stream(&mut self, text: &str) {
         self.streaming.push_str(text);
     }
@@ -90,7 +97,24 @@ impl App {
     }
 
     pub fn tick(&mut self) {
-        self.spinner_frame = (self.spinner_frame + 1) % SPINNER.len();
+        self.throbber.calc_next();
+    }
+
+    /// Current input text.
+    pub fn input_text(&self) -> String {
+        self.textarea.lines().join("\n")
+    }
+
+    /// Feed a key event to the input editor.
+    pub fn input_event(&mut self, event: crossterm::event::Event) {
+        self.textarea.input(event);
+    }
+
+    /// Clear the input editor, returning its prior content.
+    pub fn take_input(&mut self) -> String {
+        let text = self.input_text();
+        self.textarea = TextArea::default();
+        text
     }
 }
 
@@ -124,21 +148,34 @@ fn style_for(kind: LineKind) -> (&'static str, Style) {
 /// Draw the whole UI.
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
-    let chunks = Layout::default()
+    let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),    // transcript
+            Constraint::Min(3),    // main
             Constraint::Length(1), // status bar
             Constraint::Length(3), // input
         ])
         .split(area);
 
-    draw_transcript(f, app, chunks[0]);
-    draw_status(f, app, chunks[1]);
-    draw_input(f, app, chunks[2]);
+    // Main row: transcript on the left, side panels on the right.
+    let main = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
+        .split(rows[0]);
+    draw_transcript(f, app, main[0]);
+
+    let side = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(main[1]);
+    draw_activity(f, app, side[0]);
+    draw_processes(f, app, side[1]);
+
+    draw_status(f, app, rows[1]);
+    draw_input(f, app, rows[2]);
 
     match &app.mode {
-        Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, &app.input),
+        Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, "type your answer · Enter"),
         Mode::Approval(p) => draw_modal(
             f,
             area,
@@ -161,6 +198,13 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for entry in &app.transcript {
         let (prefix, style) = style_for(entry.kind);
+        // Render command output through the ANSI parser (preserves colors).
+        if entry.kind == LineKind::Output {
+            if let Ok(text) = entry.text.clone().into_text() {
+                lines.extend(text.lines);
+                continue;
+            }
+        }
         for (i, raw) in entry.text.lines().enumerate() {
             let text = if i == 0 {
                 format!("{prefix}{raw}")
@@ -180,7 +224,6 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", app.title));
-    // Show the tail that fits.
     let inner_height = area.height.saturating_sub(2) as usize;
     let start = lines.len().saturating_sub(inner_height);
     let visible: Vec<Line> = lines.into_iter().skip(start).collect();
@@ -190,12 +233,42 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let spin = if app.mode == Mode::Running {
-        SPINNER[app.spinner_frame]
+fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
+    let inner = area.height.saturating_sub(2) as usize;
+    let start = app.activity.len().saturating_sub(inner);
+    let lines: Vec<Line> = app.activity[start..]
+        .iter()
+        .map(|l| {
+            Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(Color::DarkGray),
+            ))
+        })
+        .collect();
+    let para = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" network "))
+        .wrap(Wrap { trim: true });
+    f.render_widget(para, area);
+}
+
+fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line> = if app.processes.is_empty() {
+        vec![Line::from(Span::styled(
+            "no managed processes",
+            Style::default().fg(Color::DarkGray),
+        ))]
     } else {
-        " "
+        app.processes
+            .iter()
+            .map(|(n, s)| Line::from(format!("{n}  {s}")))
+            .collect()
     };
+    let para =
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" processes "));
+    f.render_widget(para, area);
+}
+
+fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mode = match &app.mode {
         Mode::Running => "running",
         Mode::AwaitingInput(_) => "awaiting input",
@@ -203,9 +276,18 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Paused => "paused",
         Mode::Done => "done",
     };
-    let text = format!(" {spin} {mode} — {}", app.status);
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+    if app.mode == Mode::Running {
+        // Animate via a throwaway clone (draw takes &App).
+        let mut ts = app.throbber.clone();
+        f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
+    }
+    let text = format!(" {mode} — {}", app.status);
     let para = Paragraph::new(text).style(Style::default().bg(Color::Blue).fg(Color::White));
-    f.render_widget(para, area);
+    f.render_widget(para, cols[1]);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
@@ -217,8 +299,9 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {hint} "));
-    let para = Paragraph::new(format!("> {}", app.input)).block(block);
-    f.render_widget(para, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    f.render_widget(&app.textarea, inner);
 }
 
 fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) {
@@ -250,9 +333,8 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// Render the app to a fixed-size buffer and return it as text.
     fn render(app: &App) -> String {
-        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         let mut out = String::new();
@@ -267,12 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_running_transcript() {
+    fn snapshot_running_with_panes() {
         let mut app = App::new("cowboy");
         app.status = "exec: cargo test".into();
         app.push(LineKind::User, "fix the failing test");
         app.push(LineKind::Command, "cargo test");
         app.push(LineKind::Output, "test result: FAILED");
+        app.activity("ask example.com:443");
         app.stream("Looking at the failure...");
         insta::assert_snapshot!(render(&app));
     }
@@ -281,16 +364,15 @@ mod tests {
     fn snapshot_approval_modal() {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "build the project");
-        app.mode = Mode::Approval("github.com:443 (HTTPS)".into());
+        app.mode = Mode::Approval("github.com:443".into());
         insta::assert_snapshot!(render(&app));
     }
 
     #[test]
-    fn snapshot_done() {
+    fn snapshot_paused_menu() {
         let mut app = App::new("cowboy");
-        app.push(LineKind::Final, "Implemented the fix; tests pass.");
-        app.mode = Mode::Done;
-        app.status = "finished".into();
+        app.push(LineKind::User, "do work");
+        app.mode = Mode::Paused;
         insta::assert_snapshot!(render(&app));
     }
 
@@ -302,5 +384,20 @@ mod tests {
         assert_eq!(app.transcript.len(), 1);
         assert_eq!(app.transcript[0].kind, LineKind::Agent);
         assert!(app.streaming.is_empty());
+    }
+
+    #[test]
+    fn input_editing_via_textarea() {
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        let mut app = App::new("t");
+        for c in ['h', 'i'] {
+            app.input_event(Event::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.input_text(), "hi");
+        assert_eq!(app.take_input(), "hi");
+        assert_eq!(app.input_text(), "");
     }
 }

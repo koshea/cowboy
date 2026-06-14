@@ -16,6 +16,21 @@ struct Proc {
     procs: std::collections::BTreeMap<String, ProcessDef>,
     proc_dir: String,
     workdir: String,
+    root: std::path::PathBuf,
+}
+
+#[derive(serde::Serialize)]
+struct ProcessRecord<'a> {
+    ts_ms: u128,
+    name: &'a str,
+    action: &'a str,
+}
+
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 pub async fn run(args: ProcArgs) -> Result<()> {
@@ -26,13 +41,14 @@ pub async fn run(args: ProcArgs) -> Result<()> {
     let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
     let workdir = security.container.workdir.clone();
     let proc_dir = format!("{workdir}/.cowboy/proc");
-    let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
+    let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security);
 
     let ctx = Proc {
         runtime,
         procs: agent_cfg.processes,
         proc_dir,
         workdir,
+        root,
     };
 
     match args.command {
@@ -50,6 +66,20 @@ impl Proc {
             let avail: Vec<_> = self.procs.keys().cloned().collect();
             anyhow::anyhow!("no process named {name:?}; defined: {avail:?}")
         })
+    }
+
+    /// Record a process lifecycle event to the latest session's processes.jsonl.
+    fn log_event(&self, name: &str, action: &str) {
+        if let Some(dir) = crate::session::latest_session_dir(&self.root) {
+            crate::session::append_jsonl(
+                &dir.join("processes.jsonl"),
+                &ProcessRecord {
+                    ts_ms: now_ms(),
+                    name,
+                    action,
+                },
+            );
+        }
     }
 
     fn pid_file(&self, name: &str) -> String {
@@ -118,6 +148,7 @@ impl Proc {
         if res.exit_code != 0 {
             bail!("failed to start {name}: {}", out.trim());
         }
+        self.log_event(name, "start");
         println!("started {name}: {}", def.command);
         Ok(())
     }
@@ -136,6 +167,7 @@ impl Proc {
             .runtime
             .run_capture(&script, None, CONTROL_TIMEOUT)
             .await?;
+        self.log_event(name, "stop");
         println!("{name}: {}", out.trim());
         Ok(())
     }

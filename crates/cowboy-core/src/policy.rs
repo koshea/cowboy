@@ -78,6 +78,14 @@ fn matches_ruleset(
 
 /// A domain rule matches the host exactly, or as a parent (`github.com` matches
 /// `api.github.com`). Matching is case-insensitive and ignores a trailing dot.
+///
+/// ```
+/// use cowboy_core::policy::domain_matches;
+/// assert!(domain_matches("github.com", "api.github.com"));
+/// assert!(domain_matches("github.com", "GitHub.com"));
+/// assert!(!domain_matches("github.com", "notgithub.com"));
+/// assert!(!domain_matches("github.com", "github.com.evil.com"));
+/// ```
 pub fn domain_matches(rule: &str, host: &str) -> bool {
     let rule = rule.trim_end_matches('.').to_ascii_lowercase();
     let host = host.trim_end_matches('.').to_ascii_lowercase();

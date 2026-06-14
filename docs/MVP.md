@@ -38,8 +38,14 @@ cowboy replay <id>         # replay a past session
 
 - Linux-only; macOS/Windows are out of scope for the MVP.
 - The default agent image (`cowboy/agent:local`) is built locally on first run.
-- The TUI network-approval modal renders, but the host-side control-socket
-  server that feeds live "ask" prompts is a follow-up; until then unknown egress
-  fails closed (denied) — the boundary is intact.
-- Token-aware context compaction (tiktoken) is a follow-up; output is truncated
-  by byte budget.
+- Network egress uses a live host control socket: in the TUI, asks open an
+  approval modal (`allow once/session/project/global` or deny); project/global
+  approvals persist to `.cowboy/approvals.json` and merge into the policy on the
+  next run. Non-interactive runs fail closed (deny) and log the decision.
+- Context is kept within the model's window via `tiktoken`-based token counting
+  (oldest history is pruned); command output is additionally byte-capped.
+- Process-group termination is enforced **in the container** (the proc
+  supervisor uses `setsid` + `kill -<pgid>`); `cowboy shell` uses `docker exec
+  -it` for the container PTY. A transient agent command that hits its timeout
+  kills the local exec client — fully reaping a still-running in-container
+  process on timeout is a follow-up.

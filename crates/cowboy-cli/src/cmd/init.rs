@@ -25,6 +25,9 @@ pub fn run(args: InitArgs) -> Result<()> {
         maybe_git_init(&root)?;
     }
 
+    // Offer to approve Compose networks for the agent (interactive only).
+    crate::net::compose::prompt_and_persist(&root)?;
+
     println!("\nInitialized cowboy config in {}", paths.dir.display());
     println!("  - {} (host-owned, never mounted)", config::SECURITY_FILE);
     println!("  - {} (mounted into the container)", config::AGENT_FILE);

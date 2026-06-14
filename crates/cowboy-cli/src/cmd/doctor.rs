@@ -79,6 +79,9 @@ pub async fn run() -> Result<()> {
         anyhow::bail!("doctor found {} problem(s)", r.failures);
     }
     println!("All checks passed ({} warning(s)).", r.warnings);
+
+    // Offer Compose network approval (interactive only; no-op otherwise).
+    compose::prompt_and_persist(&root)?;
     Ok(())
 }
 

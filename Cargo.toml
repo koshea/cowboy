@@ -6,6 +6,7 @@ members = [
     "crates/cowboy-tui",
     "crates/cowboy-gateway",
 ]
+exclude = ["examples"]
 
 [workspace.package]
 version = "0.1.0"
@@ -44,13 +45,12 @@ tui-textarea = "0.7"
 ansi-to-tui = "7"
 throbber-widgets-tui = "0.8"
 
-# process / pty
-process-wrap = { version = "8", features = ["tokio1"] }
-portable-pty = "0.8"
+# Note: process-group termination is done in-container (proc supervisor uses
+# `setsid` + `kill -<pgid>`), and `cowboy shell` uses `docker exec -it` for the
+# container PTY — so `process-wrap`/`portable-pty` (local-process crates) are
+# not needed for the docker-exec model.
 
-# gateway networking
-hickory-server = "0.25"
-hickory-resolver = "0.25"
+# gateway networking (DNS forwarder is a small UDP relay over hickory-proto)
 hickory-proto = "0.25"
 tls-parser = "0.12"
 socket2 = { version = "0.5", features = ["all"] }

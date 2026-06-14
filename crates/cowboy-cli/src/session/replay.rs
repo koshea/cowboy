@@ -90,6 +90,28 @@ pub fn replay(root: &Path, id: &str) -> Result<()> {
         }
     }
 
+    // Other artifacts: line counts + diff presence.
+    for (label, file) in [
+        ("network decisions", "network.jsonl"),
+        ("approvals", "approvals.jsonl"),
+        ("process events", "processes.jsonl"),
+    ] {
+        if let Ok(text) = std::fs::read_to_string(dir.join(file)) {
+            let n = text.lines().filter(|l| !l.trim().is_empty()).count();
+            if n > 0 {
+                println!("--- {label} ({n}) ---");
+                for line in text.lines().take(20) {
+                    println!("  {line}");
+                }
+            }
+        }
+    }
+    if let Ok(meta) = std::fs::metadata(dir.join("diff.patch")) {
+        if meta.len() > 0 {
+            println!("--- diff.patch ({} bytes) ---", meta.len());
+        }
+    }
+
     if let Ok(final_md) = std::fs::read_to_string(dir.join("final.md")) {
         println!("\n\x1b[1;32m✓ {final_md}\x1b[0m");
     }
@@ -121,7 +143,7 @@ mod tests {
                 arguments: "{\"command\":\"ls\"}".into(),
             }],
         });
-        log.log_command("ls", 0, 5, 10);
+        log.log_command("ls", 0, 5, "file listing\n");
         log.write_final("done");
         let id = log.id().to_string();
         drop(log);

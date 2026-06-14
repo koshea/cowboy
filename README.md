@@ -49,7 +49,16 @@ docs/
 ## Development
 
 ```sh
-cargo test                          # unit + integration (Docker E2E auto-skips if absent)
+cargo nextest run                   # unit + integration (Docker E2E auto-skips if absent)
+cargo test --doc                    # doctests (nextest doesn't run these)
 cargo test -- --ignored gateway     # the full network-boundary E2E (builds the gateway image)
 cargo clippy --workspace --all-targets
+
+# Coverage (cargo-llvm-cov). On a rustup toolchain `llvm-tools-preview` is used
+# automatically; on a system-LLVM toolchain point it at the matching version:
+LLVM_COV=/usr/lib/llvm/<v>/bin/llvm-cov \
+LLVM_PROFDATA=/usr/lib/llvm/<v>/bin/llvm-profdata \
+  cargo llvm-cov nextest --summary-only
 ```
+
+Build the container images: `docker/build.sh` (or `docker/build.sh agent|gateway`).
