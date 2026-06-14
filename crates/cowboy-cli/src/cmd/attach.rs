@@ -11,7 +11,10 @@
 use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::Result;
-use cowboy_core::daemonproto::{ClientMsg, InterruptKind, ServerMsg, SessionInfo, UiEventMsg};
+use cowboy_core::daemonproto::{
+    AttachTarget, ClientMsg, DaemonReq, DaemonResp, InterruptKind, ServerMsg, SessionInfo,
+    UiEventMsg,
+};
 use cowboy_core::netproto::encode_line;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -20,19 +23,56 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::tui::{run_event_loop, AgentCmd, SessionCtx, TurnCancel, UiEvent};
 
-/// Attach to a worker by socket path (id-based attach via the daemon is wired in
-/// a later milestone).
+/// Attach to a session: by id (via the daemon) or, for testing, a worker socket
+/// path directly.
 pub async fn run(target: String) -> Result<()> {
-    let sock = std::path::PathBuf::from(&target);
-    if !sock.exists() {
-        anyhow::bail!("no session socket at {target} (id-based attach needs the daemon)");
+    // Direct socket path (mainly for tests / debugging).
+    let p = std::path::PathBuf::from(&target);
+    if p.exists() && p.extension().is_some_and(|e| e == "sock") {
+        let ctx = SessionCtx {
+            root: std::env::current_dir().unwrap_or_default(),
+            models: Vec::new(),
+            current_model: String::new(),
+        };
+        return attach_socket(&p, "cowboy", Vec::new(), ctx);
     }
+
+    // Otherwise treat it as a session id and ask the daemon where to attach.
+    let info = match crate::cmd::daemon::request(DaemonReq::GetSession { id: target.clone() }).await
+    {
+        Ok(DaemonResp::Session { info }) => info,
+        Ok(DaemonResp::Err { message }) => anyhow::bail!(message),
+        Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
+        Err(e) => anyhow::bail!("cowboyd not reachable: {e}"),
+    };
+    let resp = crate::cmd::daemon::request(DaemonReq::AttachSession { id: target }).await?;
+    let target = match resp {
+        DaemonResp::Attach { target } => target,
+        DaemonResp::Err { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
     let ctx = SessionCtx {
-        root: std::env::current_dir().unwrap_or_default(),
+        root: info.root.clone(),
         models: Vec::new(),
         current_model: String::new(),
     };
-    attach_socket(&sock, "cowboy", Vec::new(), ctx)
+    let title = title_for(&info);
+    match target {
+        AttachTarget::Live { worker_sock } => attach_socket(
+            &worker_sock,
+            &title,
+            vec![format!("attached to {}", info.id)],
+            ctx,
+        ),
+        AttachTarget::Replay { status, .. } => {
+            // Read-only journal replay lands in a later milestone.
+            println!(
+                "session {} is {status:?}; read-only replay is not yet available",
+                info.id
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Run the TUI attached to `sock`. The terminal event loop runs on this thread;

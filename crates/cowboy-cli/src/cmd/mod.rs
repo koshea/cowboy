@@ -12,6 +12,7 @@ pub mod patch;
 pub mod proc;
 pub mod run;
 pub mod session;
+pub mod sessions;
 pub mod skill;
 pub mod worker;
 

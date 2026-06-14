@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
-    DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode, SessionId, SessionInfo,
+    AttachTarget, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode, SessionId,
+    SessionInfo, SessionStatus,
 };
 use cowboy_core::netproto::encode_line;
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,14 @@ struct State {
 struct Daemon {
     state: State,
     state_path: PathBuf,
+    next_seq: u64,
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl Daemon {
@@ -88,11 +97,14 @@ impl Daemon {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        Self { state, state_path }
+        Self {
+            state,
+            state_path,
+            next_seq: 0,
+        }
     }
 
     /// Persist the registry atomically (temp file + rename).
-    #[allow(dead_code)] // called from M4 onward (session registration)
     fn save(&self) {
         if let Some(parent) = self.state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -145,6 +157,14 @@ pub async fn serve() -> Result<()> {
     }
 }
 
+/// Path to the `cowboy` client binary (sibling of this `cowboyd`).
+fn worker_binary() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .map(|e| e.with_file_name("cowboy"))
+        .unwrap_or_else(|| PathBuf::from("cowboy"))
+}
+
 /// A held advisory lock file; released when dropped (process exit).
 struct LockGuard {
     _file: std::fs::File,
@@ -189,7 +209,7 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<(
 
 /// Handle one request. Milestones extend this match; unimplemented ops return
 /// a clear error rather than panicking.
-async fn dispatch(req: DaemonReq, daemon: &Mutex<Daemon>) -> DaemonResp {
+async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
     match req {
         DaemonReq::Ping => {
             let d = daemon.lock().await;
@@ -210,9 +230,208 @@ async fn dispatch(req: DaemonReq, daemon: &Mutex<Daemon>) -> DaemonResp {
                 .collect();
             DaemonResp::Sessions { sessions }
         }
+        DaemonReq::GetSession { id } => {
+            let d = daemon.lock().await;
+            match d.state.sessions.get(&id) {
+                Some(info) => DaemonResp::Session { info: info.clone() },
+                None => DaemonResp::Err {
+                    message: format!("no such session: {id}"),
+                },
+            }
+        }
+        DaemonReq::StartSession { root, task, mode } => {
+            start_session(daemon, root, task, mode).await
+        }
+        DaemonReq::AttachSession { id } => {
+            let d = daemon.lock().await;
+            match d.state.sessions.get(&id) {
+                None => DaemonResp::Err {
+                    message: format!("no such session: {id}"),
+                },
+                Some(info) => {
+                    let live = !info.status.is_terminal() && info.worker_sock.is_some();
+                    if live {
+                        DaemonResp::Attach {
+                            target: AttachTarget::Live {
+                                worker_sock: info.worker_sock.clone().unwrap(),
+                            },
+                        }
+                    } else if let Some(journal) = info.journal_path.clone() {
+                        DaemonResp::Attach {
+                            target: AttachTarget::Replay {
+                                journal_path: journal,
+                                status: info.status,
+                            },
+                        }
+                    } else {
+                        DaemonResp::Err {
+                            message: "session has no journal".into(),
+                        }
+                    }
+                }
+            }
+        }
+        DaemonReq::DetachSession { .. } => DaemonResp::Detached,
+        DaemonReq::RegisterWorker { info } => {
+            let mut d = daemon.lock().await;
+            d.state.sessions.insert(info.id.clone(), info);
+            d.save();
+            DaemonResp::Registered
+        }
+        DaemonReq::UpdateSession {
+            id,
+            status,
+            turn,
+            tokens,
+            diffstat,
+            attached_clients,
+            running_command,
+            branch,
+        } => {
+            let mut d = daemon.lock().await;
+            if let Some(s) = d.state.sessions.get_mut(&id) {
+                s.status = status;
+                s.turn = turn;
+                s.tokens = tokens;
+                s.diffstat = diffstat;
+                s.attached_clients = attached_clients;
+                s.running_command = running_command;
+                if branch.is_some() {
+                    s.branch = branch;
+                }
+                s.last_heartbeat_ms = now_ms();
+            }
+            d.save();
+            DaemonResp::Updated
+        }
+        DaemonReq::Heartbeat { id, .. } => {
+            let mut d = daemon.lock().await;
+            if let Some(s) = d.state.sessions.get_mut(&id) {
+                s.last_heartbeat_ms = now_ms();
+            }
+            DaemonResp::Updated
+        }
+        DaemonReq::CompleteSession { id } => {
+            let mut d = daemon.lock().await;
+            if let Some(s) = d.state.sessions.get_mut(&id) {
+                s.status = SessionStatus::Completed;
+                s.worker_sock = None;
+            }
+            d.save();
+            DaemonResp::Completed
+        }
+        DaemonReq::FailSession { id, error } => {
+            let mut d = daemon.lock().await;
+            if let Some(s) = d.state.sessions.get_mut(&id) {
+                s.status = SessionStatus::Failed;
+                s.worker_sock = None;
+                s.running_command = Some(format!("error: {error}"));
+            }
+            d.save();
+            DaemonResp::Failed
+        }
         other => DaemonResp::Err {
             message: format!("operation not implemented yet: {other:?}"),
         },
+    }
+}
+
+/// Spawn a worker process for a new session, supervise it, and return its
+/// socket once it is listening.
+async fn start_session(
+    daemon: &Arc<Mutex<Daemon>>,
+    root: PathBuf,
+    task: Option<String>,
+    mode: LeaseMode,
+) -> DaemonResp {
+    let id = {
+        let mut d = daemon.lock().await;
+        d.next_seq += 1;
+        format!("{}-{}", now_ms(), d.next_seq)
+    };
+    let sock = runtime_dir().join(format!("s-{id}.sock"));
+    let journal = root.join(".cowboy/sessions").join(&id).join("events.jsonl");
+
+    let mut cmd = tokio::process::Command::new(worker_binary());
+    cmd.arg("x-session-worker")
+        .arg("--root")
+        .arg(&root)
+        .arg("--id")
+        .arg(&id)
+        .arg("--sock")
+        .arg(&sock)
+        .arg("--register")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if let Some(t) = &task {
+        cmd.arg("--task").arg(t);
+    }
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return DaemonResp::Err {
+                message: format!("spawning worker: {e}"),
+            }
+        }
+    };
+    let pid = child.id();
+
+    {
+        let mut d = daemon.lock().await;
+        d.state.sessions.insert(
+            id.clone(),
+            SessionInfo {
+                id: id.clone(),
+                root: root.clone(),
+                task,
+                status: SessionStatus::Starting,
+                pid,
+                branch: None,
+                container_name: None,
+                worker_sock: Some(sock.clone()),
+                journal_path: Some(journal),
+                lease_mode: Some(mode),
+                started_ms: now_ms(),
+                last_heartbeat_ms: now_ms(),
+                turn: 0,
+                tokens: (0, 0),
+                attached_clients: 0,
+                diffstat: String::new(),
+                running_command: None,
+            },
+        );
+        d.save();
+    }
+
+    // Supervise: when the child exits without a terminal message, mark stale.
+    let sup = daemon.clone();
+    let sup_id = id.clone();
+    tokio::spawn(async move {
+        let mut child = child;
+        let _ = child.wait().await;
+        let mut d = sup.lock().await;
+        if let Some(s) = d.state.sessions.get_mut(&sup_id) {
+            if !s.status.is_terminal() {
+                s.status = SessionStatus::Stale;
+                s.worker_sock = None;
+            }
+        }
+        d.save();
+    });
+
+    // Wait for the worker to bind its socket.
+    for _ in 0..100 {
+        if sock.exists() {
+            return DaemonResp::Started {
+                id,
+                worker_sock: sock,
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    DaemonResp::Err {
+        message: "worker did not start (socket never appeared)".into(),
     }
 }
 

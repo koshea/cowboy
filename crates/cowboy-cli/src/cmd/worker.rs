@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
-use cowboy_core::daemonproto::{ClientMsg, LeaseMode, SessionInfo, SessionStatus, UiEventMsg};
+use cowboy_core::daemonproto::{
+    ClientMsg, DaemonReq, LeaseMode, SessionInfo, SessionStatus, UiEventMsg,
+};
 use cowboy_core::model::OpenAiClient;
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +31,10 @@ pub struct WorkerArgs {
     pub task: Option<String>,
     /// Override the per-session socket path (defaults to runtime dir / s-<id>).
     pub sock: Option<PathBuf>,
+    /// Daemon-assigned session id.
+    pub id: Option<String>,
+    /// Register with + heartbeat to the daemon.
+    pub register: bool,
 }
 
 fn now_ms() -> u64 {
@@ -64,10 +70,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let context_window = resolved.context_window as usize;
     let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
 
-    let logger = crate::session::SessionLogger::create(&root).ok();
+    let logger = match &args.id {
+        Some(id) => crate::session::SessionLogger::create_with_id(&root, id).ok(),
+        None => crate::session::SessionLogger::create(&root).ok(),
+    };
     let id = logger
         .as_ref()
         .map(|l| l.id().to_string())
+        .or_else(|| args.id.clone())
         .unwrap_or_else(|| format!("{}-{}", now_ms(), std::process::id()));
     let session_dir = logger
         .as_ref()
@@ -99,10 +109,33 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         running_command: None,
     };
 
+    let reg_info = info.clone();
     let (mut ui, mut cmd_rx) = SocketUi::bind(&sock, &journal, info).await?;
     let emitter = ui.clone(); // post-turn events without borrowing `ui`
-                              // So a manual client / the daemon can locate the socket.
-    println!("{}", sock.display());
+    println!("{}", sock.display()); // so the daemon/manual client can locate it
+
+    // Register with the daemon + heartbeat (daemon-managed sessions only).
+    if args.register {
+        let _ = daemon::request(DaemonReq::RegisterWorker { info: reg_info }).await;
+        let hb_id = id.clone();
+        let hb_ui = emitter.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                let _ = daemon::request(DaemonReq::UpdateSession {
+                    id: hb_id.clone(),
+                    status: SessionStatus::Running,
+                    turn: 0,
+                    tokens: (0, 0),
+                    diffstat: String::new(),
+                    attached_clients: hb_ui.attached(),
+                    running_command: None,
+                    branch: None,
+                })
+                .await;
+            }
+        });
+    }
 
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security);
     let mut agent = AgentLoop::new(
@@ -130,6 +163,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     agent.shutdown().await;
     agent.finalize_session();
+    emitter.end("session ended");
+    if args.register {
+        let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
+    }
     Ok(())
 }
 

@@ -21,8 +21,9 @@ use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
 
 use super::ui::AgentUi;
 
-/// Live broadcast item: a journaled event with its sequence number.
-type Live = (u64, UiEventMsg);
+/// Live broadcast item: a server message (journaled `Event`s plus control
+/// messages like `Ask`/`Approval`/`Ended`).
+type Live = ServerMsg;
 
 struct Journal {
     file: std::fs::File,
@@ -115,7 +116,14 @@ impl SocketUi {
         let _ = j.file.flush();
         j.len += 1;
         drop(j);
-        let _ = self.inner.live.send((seq, event));
+        let _ = self.inner.live.send(ServerMsg::Event { seq, event });
+    }
+
+    /// Broadcast a terminal `Ended` to attached clients (worker shutting down).
+    pub fn end(&self, reason: &str) {
+        let _ = self.inner.live.send(ServerMsg::Ended {
+            reason: reason.to_string(),
+        });
     }
 }
 
@@ -224,11 +232,9 @@ async fn serve_client(
     let live = tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok((seq, event)) => {
-                    if send(&live_writer, &ServerMsg::Event { seq, event })
-                        .await
-                        .is_err()
-                    {
+                Ok(msg) => {
+                    let ended = matches!(msg, ServerMsg::Ended { .. });
+                    if send(&live_writer, &msg).await.is_err() || ended {
                         break;
                     }
                 }
@@ -259,7 +265,7 @@ async fn serve_client(
 }
 
 /// Read journaled events `[since..len)` (0-based seq = line number).
-fn read_journal_slice(path: &Path, since: u64, len: u64) -> Vec<Live> {
+fn read_journal_slice(path: &Path, since: u64, len: u64) -> Vec<(u64, UiEventMsg)> {
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };

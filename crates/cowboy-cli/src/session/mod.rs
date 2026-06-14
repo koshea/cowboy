@@ -48,7 +48,13 @@ fn now_ms() -> u128 {
 impl SessionLogger {
     /// Create a new session directory under `root/.cowboy/sessions/`.
     pub fn create(root: &Path) -> Result<Self> {
-        let id = format!("{}-{}", now_ms(), std::process::id());
+        Self::create_with_id(root, &format!("{}-{}", now_ms(), std::process::id()))
+    }
+
+    /// Create a session with a caller-supplied id (used by the daemon-managed
+    /// worker so the registry id and the session dir agree).
+    pub fn create_with_id(root: &Path, id: &str) -> Result<Self> {
+        let id = id.to_string();
         let dir = root.join(".cowboy").join("sessions").join(&id);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating session dir {}", dir.display()))?;

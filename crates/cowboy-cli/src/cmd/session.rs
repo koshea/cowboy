@@ -4,35 +4,27 @@
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
-use std::sync::mpsc::Sender as StdSender;
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
+use cowboy_core::daemonproto::{DaemonReq, DaemonResp, LeaseMode};
 use cowboy_core::model::OpenAiClient;
 use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::tui::{run_event_loop, AgentCmd, SessionCtx, TuiUi, TurnCancel, UiEvent};
+use crate::agent::tui::SessionCtx;
 use crate::agent::{AgentLoop, ConsoleUi};
+use crate::cmd::daemon;
+use crate::net::control;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::AgentRuntime;
-use crate::net::{approvals, control};
-
-/// Builds a model client (and its context window) by profile name, for the
-/// `/model` command. Captures the host-owned providers + model configs.
-type ModelResolver =
-    Box<dyn Fn(&str) -> Result<(Box<dyn cowboy_core::model::ModelClient>, usize)> + Send>;
 
 pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
     let root = crate::cmd::project_root()?;
     let paths = ConfigPaths::for_root(&root);
-
-    let security = SecurityConfig::load(&paths.security)
-        .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-    let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
 
     // Providers are host-owned (home dir); models may be user- or project-level.
     let providers = ProvidersConfig::load_global().context("loading providers.yaml")?;
@@ -51,80 +43,57 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
         None,
     )?;
 
-    let context_window = resolved.context_window as usize;
-    let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
     let interactive = std::io::stdout().is_terminal();
-    let logger = crate::session::SessionLogger::create(&root).ok();
-    if let Some(l) = &logger {
-        if !interactive {
-            eprintln!("session: {}", l.id());
-        }
-    }
-    let intro = welcome_lines(&root, &resolved, logger.as_ref().map(|l| l.id()));
-    let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
 
-    let cancel = CancellationToken::new();
-    let signal_cancel = cancel.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            signal_cancel.cancel();
-        }
-    });
-
-    let behavior = agent_cfg.agent;
     if interactive {
-        // Merged model names + the active default, for the `/model` command.
-        let mut model_names: Vec<String> = Vec::new();
-        if let Some(u) = &user_models {
-            model_names.extend(u.models.keys().cloned());
-        }
-        if let Some(p) = &project_models {
-            model_names.extend(p.models.keys().cloned());
-        }
-        model_names.sort();
-        model_names.dedup();
-        let current_model = project_models
-            .as_ref()
-            .and_then(|p| p.default.clone())
-            .or_else(|| user_models.as_ref().and_then(|u| u.default.clone()))
-            .unwrap_or_default();
-
-        // Resolver the agent thread calls on `/model <name>` to rebuild the
-        // client (provider creds stay host-owned).
-        let resolve: ModelResolver = {
-            let providers = providers.clone();
-            let user = user_models.clone();
-            let project = project_models.clone();
-            Box::new(move |name: &str| {
-                let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
-                let cw = r.context_window as usize;
-                let client: Box<dyn cowboy_core::model::ModelClient> =
-                    Box::new(OpenAiClient::from_resolved(&r)?);
-                Ok((client, cw))
-            })
+        // Interactive sessions run in a daemon-managed worker; this process is a
+        // thin client that starts (or, later, reuses) the session and attaches.
+        let (model_names, current_model) = models_and_default(&user_models, &project_models);
+        daemon::ensure_running().await?;
+        let resp = daemon::request(DaemonReq::StartSession {
+            root: root.clone(),
+            task: task.clone(),
+            mode: LeaseMode::Exclusive,
+        })
+        .await
+        .context("starting session via cowboyd")?;
+        let (id, sock) = match resp {
+            DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+            DaemonResp::Err { message } => anyhow::bail!(message),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
         };
-
-        // Load straight into the full-screen UI; the first message is entered
-        // there (no pre-prompt). An empty task means "start on the welcome
-        // screen and wait for input".
-        run_tui(
-            task.unwrap_or_default(),
-            intro,
-            Box::new(model),
-            runtime,
-            behavior,
-            context_window,
-            logger,
-            model_names,
+        let intro = welcome_lines(&root, &resolved, Some(&id));
+        let title = context_title(&root);
+        let ctx = SessionCtx {
+            root,
+            models: model_names,
             current_model,
-            resolve,
-        )
+        };
+        crate::cmd::attach::attach_socket(&sock, &title, intro, ctx)
     } else {
-        // Non-interactive: prompt on stdin if no task was given; asks fail closed.
+        // Non-interactive: prompt on stdin if no task was given; run in-process
+        // (the daemon still tracks a lease in a later milestone). Asks fail closed.
         let Some(task) = resolve_task(task)? else {
             println!("nothing to do.");
             return Ok(());
         };
+        let security = SecurityConfig::load(&paths.security)
+            .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
+        let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
+        let context_window = resolved.context_window as usize;
+        let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
+        let logger = crate::session::SessionLogger::create(&root).ok();
+        if let Some(l) = &logger {
+            eprintln!("session: {}", l.id());
+        }
+        let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
+        let cancel = CancellationToken::new();
+        let signal_cancel = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal_cancel.cancel();
+            }
+        });
         let sock = runtime.control_sock();
         let session_dir = logger.as_ref().map(|l| l.dir().to_path_buf());
         if let Some(sock) = sock {
@@ -134,7 +103,7 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
         let mut agent = AgentLoop::new(
             Box::new(model),
             runtime,
-            behavior,
+            agent_cfg.agent,
             context_window,
             cancel,
             &mut ui,
@@ -144,6 +113,28 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
         agent.shutdown().await; // stop managed processes
         Ok(())
     }
+}
+
+/// Merged model names (user + project) and the effective default, for `/model`.
+fn models_and_default(
+    user: &Option<ModelsConfig>,
+    project: &Option<ModelsConfig>,
+) -> (Vec<String>, String) {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(u) = user {
+        names.extend(u.models.keys().cloned());
+    }
+    if let Some(p) = project {
+        names.extend(p.models.keys().cloned());
+    }
+    names.sort();
+    names.dedup();
+    let default = project
+        .as_ref()
+        .and_then(|p| p.default.clone())
+        .or_else(|| user.as_ref().and_then(|u| u.default.clone()))
+        .unwrap_or_default();
+    (names, default)
 }
 
 /// Build the welcome-banner lines shown at the top of the TUI: project + model
@@ -236,129 +227,6 @@ fn resolve_task(task: Option<String>) -> Result<Option<String>> {
     Ok((!t.is_empty()).then_some(t))
 }
 
-/// Run the conversational ratatui front-end: the agent runs a turn loop on a
-/// dedicated thread (its own runtime), the main thread owns the terminal. The
-/// conversation (and container) persist across turns until the user ends it.
-#[allow(clippy::too_many_arguments)]
-fn run_tui(
-    task: String,
-    intro: Vec<String>,
-    model: Box<dyn cowboy_core::model::ModelClient>,
-    runtime: AgentRuntime,
-    behavior: cowboy_core::config::AgentBehavior,
-    context_window: usize,
-    logger: Option<crate::session::SessionLogger>,
-    model_names: Vec<String>,
-    current_model: String,
-    resolve: ModelResolver,
-) -> Result<()> {
-    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
-    let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
-    let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let agent_turn_cancel = turn_cancel.clone();
-    let seed = (!task.is_empty()).then_some(task);
-    let root = runtime.root().to_path_buf();
-    // Persistent title surfaces the working directory + git branch.
-    let title = context_title(&root);
-
-    // Control pipeline on its OWN always-on thread. This binds the host control
-    // socket immediately — before the gateway is ever started — and keeps it
-    // responsive between turns, so network `ask`s always reach the approval
-    // modal (the agent thread's runtime only runs during a turn).
-    let session_dir = logger.as_ref().map(|l| l.dir().to_path_buf());
-    if let Some(sock) = runtime.control_sock() {
-        let control_tx = ui_tx.clone();
-        let root = runtime.root().to_path_buf();
-        std::thread::spawn(move || {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            rt.block_on(run_control_tui(sock, root, session_dir, control_tx));
-        });
-    }
-
-    let handle = std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = ui_tx.send(UiEvent::Notice(format!("runtime error: {e}")));
-                let _ = ui_tx.send(UiEvent::Done);
-                return;
-            }
-        };
-
-        // Separate sender for turn/session signals (the agent holds &mut ui).
-        let loop_tx = ui_tx.clone();
-        let mut ui = TuiUi { tx: ui_tx };
-        {
-            let mut agent = AgentLoop::new(
-                model,
-                runtime,
-                behavior,
-                context_window,
-                CancellationToken::new(),
-                &mut ui,
-            )
-            .with_logger(logger);
-
-            // One command per loop; the conversation persists in `agent`.
-            while let Ok(cmd) = task_rx.recv() {
-                match cmd {
-                    AgentCmd::SwitchModel(name) => match resolve(&name) {
-                        Ok((client, cw)) => {
-                            agent.set_model(client, cw);
-                            let _ = loop_tx.send(UiEvent::Notice(format!("model is now {name}")));
-                        }
-                        Err(e) => {
-                            let _ =
-                                loop_tx.send(UiEvent::Notice(format!("model switch failed: {e}")));
-                        }
-                    },
-                    AgentCmd::Message(msg) => {
-                        let tc = CancellationToken::new();
-                        *agent_turn_cancel.lock().unwrap() = Some(tc.clone());
-                        let _ = rt.block_on(agent.run_turn(&msg, tc));
-                        *agent_turn_cancel.lock().unwrap() = None;
-                        // Post-turn indicators: working-tree diff, processes, and
-                        // the title (the branch may change, e.g. a commit).
-                        let (diff, procs) = post_turn_indicators(agent.root());
-                        let _ = loop_tx.send(UiEvent::DiffStat(diff));
-                        let _ = loop_tx.send(UiEvent::Processes(procs));
-                        let _ = loop_tx.send(UiEvent::Title(context_title(agent.root())));
-                        let _ = loop_tx.send(UiEvent::TurnDone);
-                    }
-                }
-            }
-            rt.block_on(agent.shutdown()); // stop managed processes
-            agent.finalize_session();
-        }
-        let _ = loop_tx.send(UiEvent::Done);
-    });
-
-    let session_ctx = SessionCtx {
-        root,
-        models: model_names,
-        current_model,
-    };
-    run_event_loop(
-        &title,
-        intro,
-        seed,
-        ui_rx,
-        task_tx,
-        turn_cancel,
-        session_ctx,
-    )?;
-    let _ = handle.join();
-    Ok(())
-}
-
 /// Compute the post-turn TUI indicators from the host side: a `git diff
 /// --shortstat` summary (empty if not a repo / no changes) and the list of
 /// managed processes (one `<name>.pid` file each under `.cowboy/proc/`).
@@ -435,62 +303,6 @@ fn verdict_str(v: Verdict) -> &'static str {
         Verdict::Allow => "allow",
         Verdict::Deny => "deny",
         Verdict::Ask => "ask",
-    }
-}
-
-/// Serve the control socket and route asks to the TUI, logging decisions.
-async fn run_control_tui(
-    sock: PathBuf,
-    root: PathBuf,
-    session_dir: Option<PathBuf>,
-    ui_tx: StdSender<UiEvent>,
-) {
-    let (approvals_tx, mut approvals_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        let _ = control::serve(sock, approvals_tx, events_tx).await;
-    });
-
-    // Event consumer: log to network.jsonl + show in the activity log.
-    let ev_dir = session_dir.clone();
-    let ev_ui = ui_tx.clone();
-    tokio::spawn(async move {
-        while let Some((attempt, verdict, reason)) = events_rx.recv().await {
-            log_network(&ev_dir, &attempt, verdict, &reason);
-            let _ = ev_ui.send(UiEvent::NetEvent(format!(
-                "{} {} ({reason})",
-                verdict_str(verdict),
-                attempt.label()
-            )));
-        }
-    });
-
-    // Approval consumer: prompt the user, persist project/global, reply.
-    while let Some(req) = approvals_rx.recv().await {
-        let (utx, urx) = tokio::sync::oneshot::channel();
-        if ui_tx
-            .send(UiEvent::Approval(req.attempt.label(), utx))
-            .is_err()
-        {
-            let _ = req.reply.send((Verdict::Deny, ApprovalScope::Once));
-            continue;
-        }
-        let (verdict, scope) = urx.await.unwrap_or((Verdict::Deny, ApprovalScope::Once));
-        if verdict == Verdict::Allow
-            && matches!(scope, ApprovalScope::Project | ApprovalScope::Global)
-        {
-            let _ = approvals::append(&root, &req.attempt);
-        }
-        log_approval(&session_dir, &req.attempt, verdict, scope);
-        log_network(&session_dir, &req.attempt, verdict, "user decision");
-        // Surface the decided ask in the activity pane (the gateway emits no
-        // event for `ask` verdicts — the host owns the outcome).
-        let _ = ui_tx.send(UiEvent::NetEvent(format!(
-            "{} {} (you decided)",
-            verdict_str(verdict),
-            req.attempt.label()
-        )));
-        let _ = req.reply.send((verdict, scope));
     }
 }
 

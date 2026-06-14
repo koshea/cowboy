@@ -64,6 +64,9 @@ pub enum Command {
         target: String,
     },
 
+    /// List sessions tracked by the daemon.
+    Sessions,
+
     /// List session logs.
     Logs,
 
@@ -95,6 +98,12 @@ pub struct SessionWorkerArgs {
     /// Override the per-session socket path.
     #[arg(long)]
     pub sock: Option<std::path::PathBuf>,
+    /// Daemon-assigned session id (used for the session dir + registry).
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Register with (and heartbeat to) the daemon.
+    #[arg(long)]
+    pub register: bool,
 }
 
 #[derive(Debug, Args)]

@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         Some(Command::Skill(args)) => cmd::skill::run(args),
         Some(Command::Down(args)) => cmd::down::run(args).await,
         Some(Command::Attach { target }) => cmd::attach::run(target).await,
+        Some(Command::Sessions) => cmd::sessions::run().await,
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
@@ -34,6 +35,8 @@ async fn main() -> Result<()> {
                 root: a.root,
                 task: a.task,
                 sock: a.sock,
+                id: a.id,
+                register: a.register,
             })
             .await
         }
