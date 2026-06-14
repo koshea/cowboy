@@ -268,9 +268,16 @@ async fn attach_existing(id: &str, ctx: SessionCtx, read_only: bool) -> Result<(
 }
 
 /// Ask the daemon to create a new worktree off `root` for `task` and return its
-/// path (worktree creation itself lands with the worktree commands).
+/// path. Warns first if the base repo has uncommitted changes (they don't carry
+/// into the new worktree, which checks out committed HEAD).
 async fn create_worktree_for(root: &std::path::Path, task: Option<&str>) -> Result<PathBuf> {
-    let branch = format!("cowboy/{}", branch_slug(task));
+    if crate::net::worktree::is_dirty(root) {
+        println!(
+            "warning: the current worktree has uncommitted changes; the new worktree \
+             will start from the last commit (those changes won't carry over)."
+        );
+    }
+    let branch = format!("cowboy/{}", crate::net::worktree::slugify(task));
     let resp = daemon::request(DaemonReq::CreateWorktree {
         repo: root.to_path_buf(),
         branch,
@@ -285,25 +292,6 @@ async fn create_worktree_for(root: &std::path::Path, task: Option<&str>) -> Resu
         }
         DaemonResp::Err { message } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
-    }
-}
-
-/// A short branch slug from a task description (fallback `work`).
-fn branch_slug(task: Option<&str>) -> String {
-    let raw = task.unwrap_or("work").to_lowercase();
-    let mut slug: String = raw
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
-    while slug.contains("--") {
-        slug = slug.replace("--", "-");
-    }
-    let slug = slug.trim_matches('-');
-    let slug: String = slug.chars().take(40).collect();
-    if slug.is_empty() {
-        "work".into()
-    } else {
-        slug
     }
 }
 

@@ -109,6 +109,9 @@ pub enum Command {
     /// Session maintenance (reap stale records and their leases).
     Session(SessionCmdArgs),
 
+    /// List or create git worktrees for parallel sessions.
+    Worktree(WorktreeArgs),
+
     /// List session logs.
     Logs,
 
@@ -229,6 +232,24 @@ pub enum SessionCommand {
         /// Show what would be reaped without changing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct WorktreeArgs {
+    #[command(subcommand)]
+    pub command: WorktreeCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorktreeCommand {
+    /// List git worktrees and any session occupying each.
+    List,
+    /// Create a `cowboy/<slug>` worktree off the current repo.
+    Create {
+        /// Task/branch hint used for the slug (e.g. "fix login").
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
     },
 }
 

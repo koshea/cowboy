@@ -90,6 +90,9 @@ pub async fn run() -> Result<()> {
     // Compose detection.
     r.check("compose", check_compose(&root));
 
+    // Coordination daemon.
+    r.check("cowboyd", check_daemon().await);
+
     println!();
     if r.failures > 0 {
         println!("{} failure(s), {} warning(s).", r.failures, r.warnings);
@@ -100,6 +103,18 @@ pub async fn run() -> Result<()> {
     // Offer Compose network approval (interactive only; no-op otherwise).
     compose::prompt_and_persist(&root)?;
     Ok(())
+}
+
+/// Ping the coordination daemon. Not running is informational (it auto-starts
+/// on the next `cowboy` session), so this only ever warns.
+async fn check_daemon() -> Status {
+    use cowboy_core::daemonproto::{DaemonReq, DaemonResp};
+    match crate::cmd::daemon::request(DaemonReq::Ping).await {
+        Ok(DaemonResp::Pong {
+            version, sessions, ..
+        }) => Status::Ok(format!("running (v{version}, {sessions} session(s))")),
+        _ => Status::Warn("not running (auto-starts on the next `cowboy` session)".into()),
+    }
 }
 
 fn check_platform() -> Status {

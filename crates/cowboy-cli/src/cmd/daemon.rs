@@ -561,8 +561,33 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                 leases_released,
             }
         }
-        other => DaemonResp::Err {
-            message: format!("operation not implemented yet: {other:?}"),
+        // Worktree create/list are pure git/fs — no registry lock needed. List
+        // is annotated with any session that holds each worktree's lease.
+        DaemonReq::CreateWorktree { repo, branch, path } => {
+            match crate::net::worktree::create(&repo, Some(&branch), path) {
+                Ok((path, branch)) => DaemonResp::WorktreeCreated { path, branch },
+                Err(e) => DaemonResp::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        DaemonReq::ListWorktrees { repo } => match crate::net::worktree::list(&repo) {
+            Ok(mut list) => {
+                let d = daemon.lock().await;
+                for w in &mut list {
+                    let key = Daemon::lease_key(&w.path);
+                    if let Some(lease) = d.state.leases.get(&key) {
+                        w.session = Some(lease.session.clone());
+                        if let Some(s) = d.state.sessions.get(&lease.session) {
+                            w.status = s.status;
+                        }
+                    }
+                }
+                DaemonResp::Worktrees { list }
+            }
+            Err(e) => DaemonResp::Err {
+                message: e.to_string(),
+            },
         },
     }
 }

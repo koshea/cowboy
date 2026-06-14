@@ -10,3 +10,4 @@ pub mod control;
 pub mod docker;
 pub mod gateway;
 pub mod runtime;
+pub mod worktree;

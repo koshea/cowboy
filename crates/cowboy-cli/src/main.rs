@@ -33,6 +33,10 @@ async fn main() -> Result<()> {
                 cmd::sessions::cleanup(dry_run).await
             }
         },
+        Some(Command::Worktree(args)) => match args.command {
+            cowboy_cli::cli::WorktreeCommand::List => cmd::worktree::list().await,
+            cowboy_cli::cli::WorktreeCommand::Create { name } => cmd::worktree::create(name).await,
+        },
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),

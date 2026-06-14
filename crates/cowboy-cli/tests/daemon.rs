@@ -167,6 +167,68 @@ fn registry_register_attach_complete() {
     assert!(state_file.exists(), "state.json should be written");
 }
 
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let ok = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .expect("run git")
+        .status
+        .success();
+    assert!(ok, "git {args:?} failed");
+}
+
+/// CreateWorktree/ListWorktrees over the wire: the daemon shells out to git and
+/// the new `cowboy/<slug>` branch shows up in the listing.
+#[test]
+fn create_and_list_worktrees_over_the_wire() {
+    let repo = assert_fs::TempDir::new().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "t@t"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("README"), "hi").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-qm", "init"]);
+
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+
+    let path = match request(
+        &sock,
+        DaemonReq::CreateWorktree {
+            repo: repo.path().to_path_buf(),
+            branch: "cowboy/feature".into(),
+            path: None,
+        },
+    ) {
+        Some(DaemonResp::WorktreeCreated { path, branch }) => {
+            assert_eq!(branch, "cowboy/feature");
+            path
+        }
+        other => panic!("expected WorktreeCreated, got {other:?}"),
+    };
+    assert!(path.exists(), "worktree dir should exist");
+
+    match request(
+        &sock,
+        DaemonReq::ListWorktrees {
+            repo: repo.path().to_path_buf(),
+        },
+    ) {
+        Some(DaemonResp::Worktrees { list }) => {
+            assert!(
+                list.iter().any(|w| w.branch == "cowboy/feature"),
+                "listing should include the new worktree: {list:?}"
+            );
+        }
+        other => panic!("expected Worktrees, got {other:?}"),
+    }
+}
+
 /// On restart the daemon reconciles `state.json`: a session whose worker is
 /// gone (here, its worktree root no longer exists) is marked `Stale`.
 #[test]
