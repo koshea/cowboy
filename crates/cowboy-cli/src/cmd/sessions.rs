@@ -36,6 +36,46 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// `cowboy session cleanup [--dry-run]` — reap stale session records and
+/// release their leases. Worktrees and branches are never touched.
+pub async fn cleanup(dry_run: bool) -> Result<()> {
+    let resp = match daemon::request(DaemonReq::CleanupStale { dry_run }).await {
+        Ok(r) => r,
+        Err(_) => {
+            println!("nothing to clean up (cowboyd not running)");
+            return Ok(());
+        }
+    };
+    let (reclaimed, leases_released) = match resp {
+        DaemonResp::CleanedUp {
+            reclaimed,
+            leases_released,
+        } => (reclaimed, leases_released),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    };
+    if reclaimed.is_empty() {
+        println!("no stale sessions to reap");
+        return Ok(());
+    }
+    let verb = if dry_run { "would reap" } else { "reaped" };
+    println!("{verb} {} stale session(s):", reclaimed.len());
+    for id in &reclaimed {
+        println!("  {id}");
+    }
+    if !leases_released.is_empty() {
+        let verb = if dry_run { "would free" } else { "freed" };
+        println!("{verb} {} worktree lease(s):", leases_released.len());
+        for key in &leases_released {
+            println!("  {}", key.display());
+        }
+    }
+    println!(
+        "\nworktrees and branches are left untouched; remove orphaned containers \
+         with `cowboy down`."
+    );
+    Ok(())
+}
+
 fn status_str(s: SessionStatus) -> &'static str {
     match s {
         SessionStatus::Starting => "starting",

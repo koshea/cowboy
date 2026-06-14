@@ -103,6 +103,16 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// A session is heartbeat-stale after this long without an update. Workers
+/// heartbeat every 5s, so this tolerates several missed beats.
+const STALE_AFTER_MS: u64 = 30_000;
+
+/// Is a process alive? `kill(pid, 0)` succeeds for a live process we can signal
+/// and fails with ESRCH if it's gone. Used for worker liveness.
+fn pid_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
 impl Daemon {
     fn load(state_path: PathBuf) -> Self {
         let state = std::fs::read_to_string(&state_path)
@@ -198,6 +208,61 @@ impl Daemon {
         self.state.leases.retain(|_, l| l.session != session);
     }
 
+    /// Mark crashed/abandoned sessions `Stale`. A non-terminal session is stale
+    /// if its worker pid is dead, its worktree root has vanished, or (when
+    /// `check_heartbeat`) it hasn't heartbeat within [`STALE_AFTER_MS`]. The
+    /// heartbeat check is skipped on daemon startup, where on-disk timestamps are
+    /// stale by construction (a surviving worker re-heartbeats within seconds).
+    /// Stale sessions keep their lease (reclaim needs `--force` or `cleanup`).
+    fn sweep_stale(&mut self, check_heartbeat: bool) -> Vec<SessionId> {
+        let now = now_ms();
+        let mut newly = Vec::new();
+        for (id, s) in self.state.sessions.iter_mut() {
+            if s.status.is_terminal() {
+                continue; // already terminal/stale
+            }
+            let pid_dead = s.pid.is_some_and(|p| !pid_alive(p));
+            let root_gone = !s.root.exists();
+            let hb_stale =
+                check_heartbeat && now.saturating_sub(s.last_heartbeat_ms) > STALE_AFTER_MS;
+            if pid_dead || root_gone || hb_stale {
+                s.status = SessionStatus::Stale;
+                s.worker_sock = None;
+                newly.push(id.clone());
+            }
+        }
+        newly
+    }
+
+    /// Reap `Stale` session records and release their leases. Returns the reaped
+    /// session ids and the worktree keys whose lease was freed. Completed/Failed
+    /// records are kept (intentional history). Never touches worktrees/branches.
+    fn cleanup_stale(&mut self, dry_run: bool) -> (Vec<SessionId>, Vec<PathBuf>) {
+        // Refresh staleness first (pid/root) so just-crashed sessions are caught
+        // even between heartbeat sweeps.
+        self.sweep_stale(true);
+        let reap: Vec<SessionId> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.status == SessionStatus::Stale)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let released: Vec<PathBuf> = self
+            .state
+            .leases
+            .iter()
+            .filter(|(_, l)| reap.contains(&l.session))
+            .map(|(k, _)| PathBuf::from(k))
+            .collect();
+        if !dry_run {
+            self.state.sessions.retain(|id, _| !reap.contains(id));
+            self.state.leases.retain(|_, l| !reap.contains(&l.session));
+            self.save();
+        }
+        (reap, released)
+    }
+
     /// Persist the registry atomically (temp file + rename).
     fn save(&self) {
         if let Some(parent) = self.state_path.parent() {
@@ -233,6 +298,34 @@ pub async fn serve() -> Result<()> {
     tracing::info!(sock = %sock.display(), "cowboyd listening");
 
     let daemon = Arc::new(Mutex::new(Daemon::load(state_path())));
+
+    // Reconcile on startup: any session whose worker pid is dead (or whose
+    // worktree is gone) is marked Stale. Surviving workers re-heartbeat and
+    // recover. Heartbeat age is ignored here (on-disk timestamps are old).
+    {
+        let mut d = daemon.lock().await;
+        let reaped = d.sweep_stale(false);
+        if !reaped.is_empty() {
+            tracing::info!(?reaped, "marked dead sessions stale on startup");
+            d.save();
+        }
+    }
+
+    // Periodic staleness sweep so crashed/abandoned workers are noticed even
+    // without a client poking the daemon.
+    let sweeper = daemon.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            tick.tick().await;
+            let mut d = sweeper.lock().await;
+            let newly = d.sweep_stale(true);
+            if !newly.is_empty() {
+                tracing::info!(?newly, "sessions went stale");
+                d.save();
+            }
+        }
+    });
 
     loop {
         let (stream, _) = match listener.accept().await {
@@ -409,20 +502,27 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             branch,
         } => {
             let mut d = daemon.lock().await;
-            if let Some(s) = d.state.sessions.get_mut(&id) {
-                s.status = status;
-                s.turn = turn;
-                s.tokens = tokens;
-                s.diffstat = diffstat;
-                s.attached_clients = attached_clients;
-                s.running_command = running_command;
-                if branch.is_some() {
-                    s.branch = branch;
+            match d.state.sessions.get_mut(&id) {
+                Some(s) => {
+                    s.status = status;
+                    s.turn = turn;
+                    s.tokens = tokens;
+                    s.diffstat = diffstat;
+                    s.attached_clients = attached_clients;
+                    s.running_command = running_command;
+                    if branch.is_some() {
+                        s.branch = branch;
+                    }
+                    s.last_heartbeat_ms = now_ms();
+                    d.save();
+                    DaemonResp::Updated
                 }
-                s.last_heartbeat_ms = now_ms();
+                // The daemon forgot this session (restarted / cleaned). Tell the
+                // worker so it can re-register.
+                None => DaemonResp::Err {
+                    message: format!("no such session: {id}"),
+                },
             }
-            d.save();
-            DaemonResp::Updated
         }
         DaemonReq::Heartbeat { id, .. } => {
             let mut d = daemon.lock().await;
@@ -452,6 +552,14 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             d.release_all_for(&id);
             d.save();
             DaemonResp::Failed
+        }
+        DaemonReq::CleanupStale { dry_run } => {
+            let mut d = daemon.lock().await;
+            let (reclaimed, leases_released) = d.cleanup_stale(dry_run);
+            DaemonResp::CleanedUp {
+                reclaimed,
+                leases_released,
+            }
         }
         other => DaemonResp::Err {
             message: format!("operation not implemented yet: {other:?}"),
@@ -740,6 +848,81 @@ mod tests {
         // The holder can.
         d.release("/w", "s1");
         assert!(!d.state.leases.contains_key("/w"));
+    }
+
+    /// A pid that is essentially never alive, for dead-worker tests.
+    const DEAD_PID: u32 = i32::MAX as u32;
+
+    #[test]
+    fn sweep_marks_dead_pid_and_missing_root_stale() {
+        let live_root = assert_fs::TempDir::new().unwrap();
+        let mut d = daemon();
+        // Running but its worker pid is gone -> stale.
+        put_session(&mut d, "dead", SessionStatus::Running);
+        d.state.sessions.get_mut("dead").unwrap().pid = Some(DEAD_PID);
+        d.state.sessions.get_mut("dead").unwrap().root = live_root.path().into();
+        d.state.sessions.get_mut("dead").unwrap().last_heartbeat_ms = now_ms();
+        // Running, our own pid (alive), but its worktree vanished -> stale.
+        put_session(&mut d, "gone-root", SessionStatus::Running);
+        d.state.sessions.get_mut("gone-root").unwrap().pid = Some(std::process::id());
+        d.state.sessions.get_mut("gone-root").unwrap().root = PathBuf::from("/no/such/worktree");
+        d.state
+            .sessions
+            .get_mut("gone-root")
+            .unwrap()
+            .last_heartbeat_ms = now_ms();
+        // Running, alive pid, present root, fresh heartbeat -> stays live.
+        put_session(&mut d, "ok", SessionStatus::Running);
+        d.state.sessions.get_mut("ok").unwrap().pid = Some(std::process::id());
+        d.state.sessions.get_mut("ok").unwrap().root = live_root.path().into();
+        d.state.sessions.get_mut("ok").unwrap().last_heartbeat_ms = now_ms();
+
+        let mut newly = d.sweep_stale(true);
+        newly.sort();
+        assert_eq!(newly, vec!["dead".to_string(), "gone-root".to_string()]);
+        assert_eq!(d.state.sessions["ok"].status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn sweep_without_heartbeat_ignores_age() {
+        let live_root = assert_fs::TempDir::new().unwrap();
+        let mut d = daemon();
+        put_session(&mut d, "old", SessionStatus::Running);
+        d.state.sessions.get_mut("old").unwrap().pid = Some(std::process::id());
+        d.state.sessions.get_mut("old").unwrap().root = live_root.path().into();
+        d.state.sessions.get_mut("old").unwrap().last_heartbeat_ms = 0; // ancient
+
+        // Startup reconciliation (check_heartbeat=false) must not stale it.
+        assert!(d.sweep_stale(false).is_empty());
+        // The periodic sweep (heartbeat-aware) would.
+        assert_eq!(d.sweep_stale(true), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn cleanup_reaps_stale_and_frees_lease_but_keeps_completed() {
+        let mut d = daemon();
+        // A stale session holding a lease.
+        put_session(&mut d, "stale", SessionStatus::Stale);
+        d.state.sessions.get_mut("stale").unwrap().pid = Some(DEAD_PID);
+        d.acquire("/w", "stale", LeaseMode::Exclusive, false)
+            .unwrap();
+        // A completed session (history) — must be kept.
+        put_session(&mut d, "done", SessionStatus::Completed);
+
+        // Dry run changes nothing.
+        let (reap, freed) = d.cleanup_stale(true);
+        assert_eq!(reap, vec!["stale".to_string()]);
+        assert_eq!(freed, vec![PathBuf::from("/w")]);
+        assert!(d.state.sessions.contains_key("stale"));
+        assert!(d.state.leases.contains_key("/w"));
+
+        // Real run reaps the stale record + lease, keeps the completed one.
+        let (reap, freed) = d.cleanup_stale(false);
+        assert_eq!(reap, vec!["stale".to_string()]);
+        assert_eq!(freed, vec![PathBuf::from("/w")]);
+        assert!(!d.state.sessions.contains_key("stale"));
+        assert!(!d.state.leases.contains_key("/w"));
+        assert!(d.state.sessions.contains_key("done"));
     }
 
     #[test]

@@ -28,6 +28,11 @@ async fn main() -> Result<()> {
         Some(Command::Down(args)) => cmd::down::run(args).await,
         Some(Command::Attach { target }) => cmd::attach::run(target).await,
         Some(Command::Sessions) => cmd::sessions::run().await,
+        Some(Command::Session(args)) => match args.command {
+            cowboy_cli::cli::SessionCommand::Cleanup { dry_run } => {
+                cmd::sessions::cleanup(dry_run).await
+            }
+        },
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),

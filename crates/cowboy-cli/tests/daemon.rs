@@ -167,6 +167,102 @@ fn registry_register_attach_complete() {
     assert!(state_file.exists(), "state.json should be written");
 }
 
+/// On restart the daemon reconciles `state.json`: a session whose worker is
+/// gone (here, its worktree root no longer exists) is marked `Stale`.
+#[test]
+fn daemon_reconciles_dead_sessions_on_restart() {
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+
+    {
+        let _d = spawn_daemon(runtime.path(), state.path());
+        assert!(wait_for_pong(&sock));
+        // sample_info's root (/home/me/app) does not exist, so on the next
+        // daemon load this session reconciles to Stale.
+        assert!(matches!(
+            request(
+                &sock,
+                DaemonReq::RegisterWorker {
+                    info: sample_info("zombie")
+                }
+            ),
+            Some(DaemonResp::Registered)
+        ));
+        // It starts out Running.
+        match request(
+            &sock,
+            DaemonReq::GetSession {
+                id: "zombie".into(),
+            },
+        ) {
+            Some(DaemonResp::Session { info }) => assert_eq!(info.status, SessionStatus::Running),
+            other => panic!("expected Session, got {other:?}"),
+        }
+        // _d dropped here -> daemon killed.
+    }
+
+    // Restart against the same state dir.
+    let _d2 = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+    match request(
+        &sock,
+        DaemonReq::GetSession {
+            id: "zombie".into(),
+        },
+    ) {
+        Some(DaemonResp::Session { info }) => assert_eq!(info.status, SessionStatus::Stale),
+        other => panic!("expected Stale session after restart, got {other:?}"),
+    }
+}
+
+/// `CleanupStale` over the wire reaps a stale session and frees its lease.
+#[test]
+fn cleanup_stale_reaps_over_the_wire() {
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+
+    // A session whose root is gone, holding a lease.
+    request(
+        &sock,
+        DaemonReq::RegisterWorker {
+            info: sample_info("z"),
+        },
+    );
+    let key = std::path::PathBuf::from("/home/me/app");
+    assert!(matches!(
+        request(
+            &sock,
+            DaemonReq::AcquireLease {
+                key: key.clone(),
+                session: "z".into(),
+                mode: LeaseMode::Exclusive,
+            },
+        ),
+        Some(DaemonResp::LeaseGranted { .. })
+    ));
+
+    // Cleanup sweeps it stale (root gone), reaps the record, frees the lease.
+    match request(&sock, DaemonReq::CleanupStale { dry_run: false }) {
+        Some(DaemonResp::CleanedUp {
+            reclaimed,
+            leases_released,
+        }) => {
+            assert_eq!(reclaimed, vec!["z".to_string()]);
+            assert_eq!(leases_released, vec![key]);
+        }
+        other => panic!("expected CleanedUp, got {other:?}"),
+    }
+    // The record is gone.
+    assert!(matches!(
+        request(&sock, DaemonReq::GetSession { id: "z".into() }),
+        Some(DaemonResp::Err { .. })
+    ));
+}
+
 /// AcquireLease/ReleaseLease over the wire: a live holder blocks a second
 /// acquirer (LeaseDenied), and a release frees the worktree again.
 #[test]

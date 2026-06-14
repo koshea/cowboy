@@ -120,13 +120,17 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     // Register with the daemon + heartbeat (daemon-managed sessions only).
     if args.register {
-        let _ = daemon::request(DaemonReq::RegisterWorker { info: reg_info }).await;
+        let _ = daemon::request(DaemonReq::RegisterWorker {
+            info: reg_info.clone(),
+        })
+        .await;
         let hb_id = id.clone();
         let hb_ui = emitter.clone();
+        let hb_info = reg_info;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                let _ = daemon::request(DaemonReq::UpdateSession {
+                let resp = daemon::request(DaemonReq::UpdateSession {
                     id: hb_id.clone(),
                     status: SessionStatus::Running,
                     turn: 0,
@@ -137,6 +141,15 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     branch: None,
                 })
                 .await;
+                // The daemon forgot us (it restarted or was cleaned) — re-register
+                // so a surviving worker is re-adopted. A connection error means
+                // the daemon is down; the next tick retries.
+                if matches!(resp, Ok(cowboy_core::daemonproto::DaemonResp::Err { .. })) {
+                    let _ = daemon::request(DaemonReq::RegisterWorker {
+                        info: hb_info.clone(),
+                    })
+                    .await;
+                }
             }
         });
     }

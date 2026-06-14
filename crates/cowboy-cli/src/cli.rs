@@ -106,6 +106,9 @@ pub enum Command {
     /// List sessions tracked by the daemon.
     Sessions,
 
+    /// Session maintenance (reap stale records and their leases).
+    Session(SessionCmdArgs),
+
     /// List session logs.
     Logs,
 
@@ -209,6 +212,23 @@ pub enum ModelsCommand {
         /// Set the user-level (home) default instead of the project default.
         #[arg(short, long)]
         global: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct SessionCmdArgs {
+    #[command(subcommand)]
+    pub command: SessionCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// Reap stale (crashed/abandoned) session records and release their leases.
+    /// Worktrees and branches are never touched.
+    Cleanup {
+        /// Show what would be reaped without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
