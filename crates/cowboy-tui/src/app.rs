@@ -45,7 +45,119 @@ pub enum Mode {
     AwaitingInput(String),
     Approval(String),
     Paused,
+    /// Choosing a model from the provider catalogue (state in `App::model_picker`).
+    ModelPicker,
+    /// Configuring a newly chosen model (state in `App::model_form`).
+    ModelForm,
     Done,
+}
+
+/// Reasoning-effort choices offered in the model form (index order).
+pub const REASONING_OPTS: [&str; 5] = ["none", "minimal", "low", "medium", "high"];
+
+/// One model offered in the `/models` picker. Carries both the existing config
+/// (if any) and the shipped defaults used to prefill a new model's form.
+#[derive(Debug, Clone)]
+pub struct ModelChoice {
+    /// Provider-side id, e.g. `cerebras/zai-glm-4.7`.
+    pub id: String,
+    /// Display label (configured friendly name, else the suggested name).
+    pub label: String,
+    pub configured: bool,
+    pub current: bool,
+    /// The existing config key, if this model is already configured.
+    pub configured_name: Option<String>,
+    // Prefill for a new model's form:
+    pub suggested_name: String,
+    pub context_window: u32,
+    pub max_tokens: u32,
+    pub temperature: f32,
+    /// Reasoning effort label ("low"/"medium"/"high"/"minimal"), or None.
+    pub reasoning: Option<String>,
+}
+
+/// Scrollable model-catalogue picker state.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker {
+    pub entries: Vec<ModelChoice>,
+    pub filter: String,
+    pub selected: usize,
+}
+
+impl ModelPicker {
+    /// Entries matching the current filter (case-insensitive over id + label).
+    pub fn filtered(&self) -> Vec<&ModelChoice> {
+        let f = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|e| {
+                f.is_empty()
+                    || e.id.to_lowercase().contains(&f)
+                    || e.label.to_lowercase().contains(&f)
+            })
+            .collect()
+    }
+    pub fn selected_choice(&self) -> Option<ModelChoice> {
+        self.filtered().get(self.selected).map(|c| (*c).clone())
+    }
+    pub fn move_sel(&mut self, delta: isize) {
+        let n = self.filtered().len();
+        if n == 0 {
+            self.selected = 0;
+            return;
+        }
+        let cur = self.selected.min(n - 1) as isize;
+        self.selected = (cur + delta).rem_euclid(n as isize) as usize;
+    }
+    /// Keep the selection valid after the filter changes.
+    pub fn clamp(&mut self) {
+        let n = self.filtered().len();
+        if self.selected >= n {
+            self.selected = n.saturating_sub(1);
+        }
+    }
+}
+
+/// Editable form for a newly chosen model. Text fields are indices 0..=3
+/// (name, temperature, context window, max output); focus 4 is reasoning effort.
+#[derive(Debug, Clone, Default)]
+pub struct ModelForm {
+    pub id: String,
+    /// [name, temperature, context_window, max_output] as edited text.
+    pub fields: [String; 4],
+    /// Index into [`REASONING_OPTS`].
+    pub reasoning_idx: usize,
+    /// Focused field: 0..=3 text fields, 4 = reasoning effort.
+    pub focus: usize,
+    pub error: Option<String>,
+}
+
+impl ModelForm {
+    pub const FIELD_LABELS: [&'static str; 4] =
+        ["Name", "Temperature", "Context window", "Max output"];
+
+    /// Build a form prefilled from a picker choice's defaults.
+    pub fn from_choice(c: &ModelChoice) -> Self {
+        let reasoning_idx = REASONING_OPTS
+            .iter()
+            .position(|r| Some(*r) == c.reasoning.as_deref())
+            .unwrap_or(0);
+        ModelForm {
+            id: c.id.clone(),
+            fields: [
+                c.suggested_name.clone(),
+                format!("{}", c.temperature),
+                c.context_window.to_string(),
+                c.max_tokens.to_string(),
+            ],
+            reasoning_idx,
+            focus: 0,
+            error: None,
+        }
+    }
+    pub fn reasoning(&self) -> &'static str {
+        REASONING_OPTS[self.reasoning_idx]
+    }
 }
 
 /// Full renderable TUI state.
@@ -83,6 +195,10 @@ pub struct App {
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
+    /// Model-catalogue picker state (set while `mode == ModelPicker`).
+    pub model_picker: Option<ModelPicker>,
+    /// New-model config form state (set while `mode == ModelForm`).
+    pub model_form: Option<ModelForm>,
 }
 
 /// A mouse text selection, in absolute terminal coordinates (col, row).
@@ -140,6 +256,8 @@ impl App {
             max_scroll: std::cell::Cell::new(0),
             selection: None,
             transcript_area: std::cell::Cell::new(Rect::ZERO),
+            model_picker: None,
+            model_form: None,
         }
     }
 
@@ -397,7 +515,177 @@ pub fn draw(f: &mut Frame, app: &App) {
             "Agent paused.",
             "[r]esume  [i]nstruct  [k]ill command  [d]etach  [e]nd session",
         ),
+        Mode::ModelPicker => {
+            if let Some(p) = &app.model_picker {
+                draw_model_picker(f, area, p);
+            }
+        }
+        Mode::ModelForm => {
+            if let Some(form) = &app.model_form {
+                draw_model_form(f, area, form);
+            }
+        }
         _ => {}
+    }
+}
+
+/// Centered rect `w`×`h` (clamped to `area`), cleared for an overlay.
+fn centered(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(2));
+    let h = h.min(area.height.saturating_sub(2));
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
+    let rect = centered(area, 76, 20);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            " Select a model ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Layout: filter line, list, footer.
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let filter = if p.filter.is_empty() {
+        Span::styled("type to filter…", Style::default().fg(Color::DarkGray))
+    } else {
+        Span::styled(format!("/{}", p.filter), Style::default().fg(Color::Yellow))
+    };
+    f.render_widget(Paragraph::new(Line::from(filter)), rows[0]);
+
+    let entries = p.filtered();
+    let view_h = rows[1].height as usize;
+    // Keep the selection in view.
+    let top = p.selected.saturating_sub(view_h.saturating_sub(1));
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, e) in entries.iter().enumerate().skip(top).take(view_h) {
+        let sel = i == p.selected;
+        let marker = if sel { "› " } else { "  " };
+        let mut tag = String::new();
+        if e.current {
+            tag.push_str(" ◉ current");
+        } else if e.configured {
+            tag.push_str(" • configured");
+        }
+        let base = if sel {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let line = format!("{marker}{:<46}{}", trunc(&e.id, 46), tag);
+        lines.push(Line::from(Span::styled(line, base)));
+    }
+    if entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no matches)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), rows[1]);
+
+    let footer = "↑/↓ move · Enter select · Esc cancel · type to filter";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
+    );
+}
+
+fn draw_model_form(f: &mut Frame, area: Rect, form: &ModelForm) {
+    let rect = centered(area, 70, 13);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            format!(" Configure {} ", trunc(&form.id, 40)),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, label) in ModelForm::FIELD_LABELS.iter().enumerate() {
+        let focused = form.focus == i;
+        let val = &form.fields[i];
+        lines.push(field_line(label, val, focused));
+    }
+    // Reasoning effort (field index 4).
+    lines.push(field_line(
+        "Reasoning",
+        &format!("◂ {} ▸", form.reasoning()),
+        form.focus == 4,
+    ));
+    lines.push(Line::from(""));
+    if let Some(err) = &form.error {
+        lines.push(Line::from(Span::styled(
+            err.clone(),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Tab/↑↓ field · ◂▸ effort · Enter/Ctrl-S save · Esc back",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// One labeled form field; the focused field is highlighted with a caret.
+fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
+    let caret = if focused { "› " } else { "  " };
+    let label_style = if focused {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let val_style = if focused {
+        Style::default().add_modifier(Modifier::UNDERLINED)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(format!("{caret}{label:<16}"), label_style),
+        Span::styled(value.to_string(), val_style),
+    ])
+}
+
+/// Truncate a string to `max` chars with an ellipsis.
+fn trunc(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
     }
 }
 
@@ -601,6 +889,8 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::AwaitingInput(_) => "awaiting input",
         Mode::Approval(_) => "approval",
         Mode::Paused => "paused",
+        Mode::ModelPicker => "models",
+        Mode::ModelForm => "models",
         Mode::Done => "done",
     };
     let cols = Layout::default()
@@ -789,6 +1079,57 @@ mod tests {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "do work");
         app.mode = Mode::Paused;
+        insta::assert_snapshot!(render(&app));
+    }
+
+    fn sample_choice(id: &str, label: &str, configured: bool, current: bool) -> ModelChoice {
+        ModelChoice {
+            id: id.into(),
+            label: label.into(),
+            configured,
+            current,
+            configured_name: configured.then(|| label.to_string()),
+            suggested_name: label.into(),
+            context_window: 131072,
+            max_tokens: 16384,
+            temperature: 0.6,
+            reasoning: Some("high".into()),
+        }
+    }
+
+    #[test]
+    fn snapshot_model_picker() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "switch models");
+        app.model_picker = Some(ModelPicker {
+            entries: vec![
+                sample_choice("cerebras/zai-glm-4.7", "Cerebras: GLM 4.7", true, true),
+                sample_choice(
+                    "fireworks/accounts/fireworks/models/glm-5p1",
+                    "Fireworks: GLM 5.1",
+                    false,
+                    false,
+                ),
+                sample_choice("anthropic/claude-opus-4-8", "Claude Opus 4.8", false, false),
+            ],
+            filter: String::new(),
+            selected: 1,
+        });
+        app.mode = Mode::ModelPicker;
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_model_form() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "configure a model");
+        app.model_form = Some(ModelForm::from_choice(&sample_choice(
+            "fireworks/accounts/fireworks/models/glm-5p1",
+            "Fireworks: GLM 5.1",
+            false,
+            false,
+        )));
+        app.mode = Mode::ModelForm;
         insta::assert_snapshot!(render(&app));
     }
 

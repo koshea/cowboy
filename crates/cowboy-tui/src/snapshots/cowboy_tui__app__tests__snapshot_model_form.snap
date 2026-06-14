@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│› configure a model                            ││no network activity  │
+│╭ Configure fireworks/accounts/fireworks/models/glm… ────────────────╮│
+││› Name            Fireworks: GLM 5.1                                ││
+││  Temperature     0.6                                               ││
+││  Context window  131072                                            ││
+││  Max output      16384                                             ││
+││  Reasoning       ◂ high ▸                                          │╯
+││                                                                    │╮
+││Tab/↑↓ field · ◂▸ effort · Enter/Ctrl-S save · Esc back             ││
+││                                                                    ││
+││                                                                    ││
+││                                                                    ││
+╰│                                                                    │╯
+ ╰────────────────────────────────────────────────────────────────────╯
+╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯

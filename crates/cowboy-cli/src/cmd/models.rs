@@ -368,6 +368,64 @@ fn parse_reasoning(s: &str) -> Result<Option<ReasoningEffort>> {
     })
 }
 
+/// Default provider when one isn't named: the only one, else `default`, else err.
+fn sole_provider(providers: &ProvidersConfig) -> Result<String> {
+    if providers.providers.len() == 1 {
+        Ok(providers.providers.keys().next().unwrap().clone())
+    } else if providers.providers.contains_key("default") {
+        Ok("default".to_string())
+    } else {
+        bail!(
+            "multiple providers configured; pass --provider <name> ({})",
+            providers
+                .providers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// Write a model to the user config (used by the TUI `/models` form). Picks the
+/// sole/`default` provider, applies the given settings, and makes it the default
+/// if it's the first model. `reasoning` is `none|minimal|low|medium|high`.
+pub fn save_user_model(
+    name: &str,
+    id: &str,
+    temperature: f32,
+    context_window: u32,
+    max_output: u32,
+    reasoning: &str,
+) -> Result<()> {
+    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    if providers.providers.is_empty() {
+        bail!("no providers configured; run `cowboy models setup`");
+    }
+    let provider = sole_provider(&providers)?;
+    let def = ModelDef {
+        provider,
+        model: id.to_string(),
+        temperature,
+        max_tokens: max_output,
+        context_window,
+        reasoning_effort: parse_reasoning(reasoning)?,
+        top_p: None,
+        stop: Vec::new(),
+        extra: BTreeMap::new(),
+        headers: BTreeMap::new(),
+    };
+    let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
+    let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
+    let first = cfg.models.is_empty();
+    cfg.models.insert(name.to_string(), def);
+    if first || cfg.default.is_none() {
+        cfg.default = Some(name.to_string());
+    }
+    cfg.save(&path)?;
+    Ok(())
+}
+
 // --- helpers ---
 
 /// Load the project-level models file if we're in a project that has one.

@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│╭ Select a model ────────────────────────────────────────────────────╮│
+││type to filter…                                                     ││
+││  cerebras/zai-glm-4.7                           ◉ current          ││
+││› fireworks/accounts/fireworks/models/glm-5p1                       ││
+││  anthropic/claude-opus-4-8                                         ││
+││                                                                    ││
+││                                                                    │╯
+││                                                                    │╮
+││                                                                    ││
+││                                                                    ││
+││                                                                    ││
+││                                                                    ││
+╰│                                                                    │╯
+ │                                                                    │
+╭│↑/↓ move · Enter select · Esc cancel · type to filter               │╮
+│╰────────────────────────────────────────────────────────────────────╯│
+╰──────────────────────────────────────────────────────────────────────╯

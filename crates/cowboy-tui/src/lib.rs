@@ -6,4 +6,6 @@
 
 pub mod app;
 
-pub use app::{draw, App, LineKind, Mode, TranscriptLine};
+pub use app::{
+    draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, TranscriptLine, REASONING_OPTS,
+};

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
-use cowboy_tui::{draw, App, LineKind, Mode};
+use cowboy_tui::{draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, REASONING_OPTS};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
@@ -55,6 +55,8 @@ pub enum UiEvent {
     /// A pending approval was decided elsewhere (another client / timeout);
     /// dismiss the modal if one is showing.
     ApprovalResolved,
+    /// The `/models` catalogue finished loading; open the picker.
+    ModelsFetched(Vec<ModelChoice>),
     /// A network decision the gateway made, for the activity log.
     NetEvent(String),
     /// Working-tree diff summary for the status bar.
@@ -135,6 +137,7 @@ pub fn run_event_loop(
     intro: Vec<String>,
     seed: Option<String>,
     events: Receiver<UiEvent>,
+    ui_tx: Sender<UiEvent>,
     task_tx: Sender<AgentCmd>,
     turn_cancel: TurnCancel,
     ctx: SessionCtx,
@@ -148,6 +151,7 @@ pub fn run_event_loop(
         intro,
         seed,
         events,
+        ui_tx,
         task_tx,
         turn_cancel,
         ctx,
@@ -295,6 +299,7 @@ fn event_loop(
     intro: Vec<String>,
     seed: Option<String>,
     events: Receiver<UiEvent>,
+    ui_tx: Sender<UiEvent>,
     task_tx: Sender<AgentCmd>,
     turn_cancel: TurnCancel,
     mut session: SessionCtx,
@@ -383,6 +388,19 @@ fn event_loop(
                         app.mode = mode_before_overlay.clone();
                     }
                 }
+                UiEvent::ModelsFetched(entries) => {
+                    if entries.is_empty() {
+                        app.push(LineKind::Notice, "no chat models offered by the provider");
+                    } else {
+                        mode_before_overlay = app.mode.clone();
+                        app.model_picker = Some(ModelPicker {
+                            entries,
+                            filter: String::new(),
+                            selected: 0,
+                        });
+                        app.mode = Mode::ModelPicker;
+                    }
+                }
                 UiEvent::NetEvent(line) => app.activity(line),
                 UiEvent::DiffStat(s) => app.diff = s,
                 UiEvent::Tokens(i, o) => {
@@ -427,6 +445,7 @@ fn event_loop(
                         mode_before_overlay: &mut mode_before_overlay,
                         turn_cancel: &turn_cancel,
                         task_tx: &mut task_tx,
+                        ui_tx: &ui_tx,
                         pending_turns: &mut pending_turns,
                         history: &mut history,
                         hist_pos: &mut hist_pos,
@@ -486,6 +505,8 @@ struct KeyCtx<'a> {
     turn_cancel: &'a TurnCancel,
     /// `None` once the session has been ended (sender dropped).
     task_tx: &'a mut Option<Sender<AgentCmd>>,
+    /// For posting client-side async results (e.g. the fetched model list).
+    ui_tx: &'a Sender<UiEvent>,
     pending_turns: &'a mut usize,
     history: &'a mut Vec<String>,
     hist_pos: &'a mut Option<usize>,
@@ -602,6 +623,17 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         return false;
     }
 
+    // Model picker: navigate / filter / select.
+    if app.mode == Mode::ModelPicker {
+        handle_picker_key(key, app, &mut ctx);
+        return false;
+    }
+    // Model config form: edit fields / save / cancel.
+    if app.mode == Mode::ModelForm {
+        handle_form_key(key, app, &mut ctx);
+        return false;
+    }
+
     let editing = matches!(
         app.mode,
         Mode::Idle | Mode::Running | Mode::AwaitingInput(_)
@@ -667,6 +699,7 @@ const HELP_LINES: &[&str] = &[
     "commands:",
     "  /help          show this help",
     "  /model [name]  show or switch the active model",
+    "  /models        browse the provider catalogue and add/select a model",
     "  /diff          show the working-tree diff",
     "  /copy          copy the last answer to the clipboard",
     "  /clear         clear the view (conversation memory is kept)",
@@ -749,6 +782,12 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                 }
             }
         },
+        "models" => {
+            // Fetch the provider catalogue off-thread; the picker opens when the
+            // ModelsFetched event arrives.
+            app.push(LineKind::Notice, "fetching models…");
+            spawn_model_fetch(ctx.ui_tx.clone(), ctx.session.current_model.clone());
+        }
         "quit" | "exit" | "q" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
@@ -770,6 +809,222 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         ),
     }
     false
+}
+
+// --- /models: catalogue picker + config form ------------------------------
+
+/// Fetch the provider catalogue off the UI thread and post the result.
+fn spawn_model_fetch(ui_tx: Sender<UiEvent>, current_name: String) {
+    std::thread::spawn(move || match fetch_model_choices(&current_name) {
+        Ok(choices) => {
+            let _ = ui_tx.send(UiEvent::ModelsFetched(choices));
+        }
+        Err(e) => {
+            let _ = ui_tx.send(UiEvent::Notice(format!("model list failed: {e}")));
+        }
+    });
+}
+
+/// Query every configured provider's `/models`, filter to chat models, and join
+/// with the shipped defaults + existing config into picker choices.
+fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
+    use cowboy_core::config::{expand_env, ConfigPaths, ModelsConfig, ProvidersConfig};
+    use cowboy_core::model::list_models;
+    use cowboy_core::model_defaults;
+
+    let providers = ProvidersConfig::load_global()?;
+    if providers.providers.is_empty() {
+        anyhow::bail!("no providers configured; run `cowboy models setup`");
+    }
+    // Existing config (user + project) for the configured/current markers.
+    let user = ModelsConfig::user_path().and_then(|p| ModelsConfig::load_opt(&p).ok().flatten());
+    let project = ConfigPaths::for_root(crate::cmd::project_root().unwrap_or_default());
+    let project = ModelsConfig::load_opt(&project.models).ok().flatten();
+    let mut id_to_name: std::collections::BTreeMap<String, String> = Default::default();
+    let mut name_to_id: std::collections::BTreeMap<String, String> = Default::default();
+    for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
+        for (k, d) in &cfg.models {
+            id_to_name
+                .entry(d.model.clone())
+                .or_insert_with(|| k.clone());
+            name_to_id.insert(k.clone(), d.model.clone());
+        }
+    }
+    let current_id = name_to_id.get(current_name).cloned();
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out: Vec<ModelChoice> = Vec::new();
+    for p in providers.providers.values() {
+        let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
+        let entries = rt.block_on(list_models(&base, &p.api_key, &p.headers))?;
+        for e in entries {
+            if !model_defaults::is_chat(&e.id) || !seen.insert(e.id.clone()) {
+                continue;
+            }
+            let d = model_defaults::lookup(&e.id);
+            let configured_name = id_to_name.get(&e.id).cloned();
+            let current = current_id.as_deref() == Some(e.id.as_str());
+            out.push(ModelChoice {
+                label: configured_name.clone().unwrap_or_else(|| d.name.clone()),
+                configured: configured_name.is_some(),
+                current,
+                configured_name,
+                suggested_name: d.name,
+                context_window: d.context_window,
+                max_tokens: d.max_tokens,
+                temperature: d.temperature,
+                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
+                id: e.id,
+            });
+        }
+    }
+    // Current first, then configured, then alphabetical.
+    out.sort_by(|a, b| {
+        b.current
+            .cmp(&a.current)
+            .then(b.configured.cmp(&a.configured))
+            .then(a.label.cmp(&b.label))
+    });
+    Ok(out)
+}
+
+fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
+    let Some(p) = app.model_picker.as_mut() else {
+        app.mode = ctx.mode_before_overlay.clone();
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.model_picker = None;
+            app.mode = ctx.mode_before_overlay.clone();
+        }
+        KeyCode::Up => p.move_sel(-1),
+        KeyCode::Down => p.move_sel(1),
+        KeyCode::Backspace => {
+            p.filter.pop();
+            p.clamp();
+        }
+        KeyCode::Enter => {
+            let Some(choice) = p.selected_choice() else {
+                return;
+            };
+            if let Some(name) = choice.configured_name.clone() {
+                // Already configured: just switch to it.
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::SwitchModel(name.clone()));
+                }
+                ctx.session.current_model = name.clone();
+                app.push(LineKind::Notice, format!("model → {name}"));
+                app.model_picker = None;
+                app.mode = ctx.mode_before_overlay.clone();
+            } else {
+                // New model: open the config form prefilled from defaults.
+                app.model_form = Some(ModelForm::from_choice(&choice));
+                app.model_picker = None;
+                app.mode = Mode::ModelForm;
+            }
+        }
+        KeyCode::Char(c) => {
+            p.filter.push(c);
+            p.selected = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_form_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
+    let Some(form) = app.model_form.as_mut() else {
+        app.mode = ctx.mode_before_overlay.clone();
+        return;
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.model_form = None;
+            app.mode = ctx.mode_before_overlay.clone();
+        }
+        KeyCode::Tab | KeyCode::Down => form.focus = (form.focus + 1) % 5,
+        KeyCode::BackTab | KeyCode::Up => form.focus = (form.focus + 4) % 5,
+        KeyCode::Left if form.focus == 4 => {
+            form.reasoning_idx =
+                (form.reasoning_idx + REASONING_OPTS.len() - 1) % REASONING_OPTS.len();
+        }
+        KeyCode::Right if form.focus == 4 => {
+            form.reasoning_idx = (form.reasoning_idx + 1) % REASONING_OPTS.len();
+        }
+        KeyCode::Char('s') if ctrl => save_model_form(app, ctx),
+        KeyCode::Enter => {
+            // Enter on the last fields saves; otherwise advance.
+            if form.focus >= 3 {
+                save_model_form(app, ctx);
+            } else {
+                form.focus += 1;
+            }
+        }
+        KeyCode::Backspace if form.focus < 4 => {
+            form.fields[form.focus].pop();
+        }
+        KeyCode::Char(c) if form.focus < 4 => form.fields[form.focus].push(c),
+        _ => {}
+    }
+}
+
+/// Validate the form, write the model to the user config, and switch to it.
+fn save_model_form(app: &mut App, ctx: &mut KeyCtx) {
+    let Some(form) = app.model_form.as_mut() else {
+        return;
+    };
+    let name = form.fields[0].trim().to_string();
+    if name.is_empty() {
+        form.error = Some("name is required".into());
+        return;
+    }
+    let temp: f32 = match form.fields[1].trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            form.error = Some("temperature must be a number".into());
+            return;
+        }
+    };
+    let context: u32 = match form.fields[2].trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            form.error = Some("context window must be an integer".into());
+            return;
+        }
+    };
+    let max_output: u32 = match form.fields[3].trim().parse() {
+        Ok(v) => v,
+        Err(_) => {
+            form.error = Some("max output must be an integer".into());
+            return;
+        }
+    };
+    let reasoning = form.reasoning().to_string();
+    let id = form.id.clone();
+
+    match crate::cmd::models::save_user_model(&name, &id, temp, context, max_output, &reasoning) {
+        Ok(()) => {
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::SwitchModel(name.clone()));
+            }
+            if !ctx.session.models.iter().any(|m| m == &name) {
+                ctx.session.models.push(name.clone());
+            }
+            ctx.session.current_model = name.clone();
+            app.model_form = None;
+            app.mode = ctx.mode_before_overlay.clone();
+            app.push(LineKind::Notice, format!("saved & switched → {name}"));
+        }
+        Err(e) => {
+            if let Some(form) = app.model_form.as_mut() {
+                form.error = Some(format!("save failed: {e}"));
+            }
+        }
+    }
 }
 
 /// The most recent final answer (or agent message) text, for `/copy`.

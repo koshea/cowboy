@@ -99,6 +99,7 @@ pub fn replay_journal(
     let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     let events = read_journal(journal_path);
+    let loop_tx = ui_tx.clone();
     let feeder = std::thread::spawn(move || {
         for event in events {
             if ui_tx.send(to_ui_event(event)).is_err() {
@@ -109,7 +110,16 @@ pub fn replay_journal(
     });
 
     let intro = vec![format!("replay of {status} session (read-only)")];
-    run_event_loop(title, intro, None, ui_rx, task_tx, turn_cancel, ctx)?;
+    run_event_loop(
+        title,
+        intro,
+        None,
+        ui_rx,
+        loop_tx,
+        task_tx,
+        turn_cancel,
+        ctx,
+    )?;
     let _ = feeder.join();
     Ok(())
 }
@@ -150,6 +160,9 @@ pub fn attach_socket_ro(
     let turn_cancel: TurnCancel =
         std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
 
+    // The event loop keeps a sender too (for client-side async results like the
+    // fetched model list); the bridge thread takes its own clone.
+    let loop_tx = ui_tx.clone();
     let sock = sock.to_path_buf();
     let bridge_cancel = turn_cancel.clone();
     let handle = std::thread::spawn(move || {
@@ -173,7 +186,16 @@ pub fn attach_socket_ro(
         });
     });
 
-    run_event_loop(title, intro, None, ui_rx, task_tx, turn_cancel, ctx)?;
+    run_event_loop(
+        title,
+        intro,
+        None,
+        ui_rx,
+        loop_tx,
+        task_tx,
+        turn_cancel,
+        ctx,
+    )?;
     let _ = handle.join();
     Ok(())
 }
