@@ -305,6 +305,9 @@ pub enum ServerMsg {
     Ask { id: u64, question: String },
     /// A pending network approval; reply with [`ClientMsg::ApprovalReply`].
     Approval { id: u64, dest: String },
+    /// A previously broadcast `Approval` has been decided (by another client or
+    /// on timeout); clients should dismiss its modal.
+    ApprovalResolved { id: u64 },
     /// The session changed lifecycle state.
     Status(SessionStatus),
     /// Terminal: the worker is shutting down; the connection will close.
@@ -426,6 +429,11 @@ mod tests {
             verdict: Verdict::Allow,
             scope: ApprovalScope::Session,
         });
+        roundtrip(&ServerMsg::Approval {
+            id: 2,
+            dest: "example.com:443".into(),
+        });
+        roundtrip(&ServerMsg::ApprovalResolved { id: 2 });
     }
 
     #[test]

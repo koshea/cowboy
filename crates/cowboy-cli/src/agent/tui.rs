@@ -48,6 +48,9 @@ pub enum UiEvent {
         String,
         tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>,
     ),
+    /// A pending approval was decided elsewhere (another client / timeout);
+    /// dismiss the modal if one is showing.
+    ApprovalResolved,
     /// A network decision the gateway made, for the activity log.
     NetEvent(String),
     /// Working-tree diff summary for the status bar.
@@ -363,6 +366,14 @@ fn event_loop(
                     }
                     app.mode = Mode::Approval(dest);
                     pending_approval = Some(reply);
+                }
+                UiEvent::ApprovalResolved => {
+                    // Decided elsewhere: drop our prompt and restore the prior
+                    // mode. (If we were the decider we've already moved on.)
+                    if matches!(app.mode, Mode::Approval(_)) {
+                        pending_approval = None;
+                        app.mode = mode_before_overlay.clone();
+                    }
                 }
                 UiEvent::NetEvent(line) => app.activity(line),
                 UiEvent::DiffStat(s) => app.diff = s,

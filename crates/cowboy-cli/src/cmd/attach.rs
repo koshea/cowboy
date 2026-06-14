@@ -287,6 +287,9 @@ fn handle_server_msg(
                 }
             });
         }
+        ServerMsg::ApprovalResolved { .. } => {
+            let _ = ui_tx.send(UiEvent::ApprovalResolved);
+        }
         ServerMsg::Status(_) => {}
         ServerMsg::Ended { reason } => {
             if !reason.is_empty() {

@@ -298,7 +298,7 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn verdict_str(v: Verdict) -> &'static str {
+pub(crate) fn verdict_str(v: Verdict) -> &'static str {
     match v {
         Verdict::Allow => "allow",
         Verdict::Deny => "deny",
@@ -337,7 +337,7 @@ async fn run_control_autodeny(sock: PathBuf, session_dir: Option<PathBuf>) {
     }
 }
 
-fn log_network(
+pub(crate) fn log_network(
     session_dir: &Option<PathBuf>,
     attempt: &NetworkAttempt,
     verdict: Verdict,
@@ -356,7 +356,7 @@ fn log_network(
     }
 }
 
-fn log_approval(
+pub(crate) fn log_approval(
     session_dir: &Option<PathBuf>,
     attempt: &NetworkAttempt,
     verdict: Verdict,

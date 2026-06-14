@@ -5,21 +5,33 @@
 //! file then switches to the live broadcast — under a single lock, so there are
 //! no gaps or duplicates.
 //!
-//! Network-approval / `ask_user` routing over the socket arrives in a later
-//! milestone; for now `ask_user` returns empty (no attached approver).
+//! Network approvals and `ask_user` are routed to attached clients as
+//! `ServerMsg::Approval`/`Ask`; the first reply wins. Both fail closed when no
+//! client is attached (approvals `Deny`/`Once`, `ask_user` returns "").
 
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{ClientMsg, ServerMsg, SessionInfo, UiEventMsg};
-use cowboy_core::netproto::encode_line;
+use cowboy_core::netproto::{encode_line, ApprovalScope, Verdict};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, mpsc, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
 
 use super::ui::AgentUi;
+
+/// Hard cap on how long a parked gateway connection waits for a verdict before
+/// failing closed. A gateway connection is blocked awaiting this answer, so it
+/// must never hang indefinitely.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// How long `ask_user` waits for a human answer before giving up (returns "").
+const ASK_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Live broadcast item: a server message (journaled `Event`s plus control
 /// messages like `Ask`/`Approval`/`Ended`).
@@ -39,7 +51,14 @@ struct Inner {
     /// Latest snapshot metadata, sent to each new client.
     info: std::sync::Mutex<SessionInfo>,
     /// Count of currently attached clients.
-    attached: std::sync::atomic::AtomicU32,
+    attached: AtomicU32,
+    /// Monotonic id for outstanding `Ask`/`Approval` prompts (disjoint spaces
+    /// are unnecessary — the maps are keyed separately).
+    next_req_id: AtomicU64,
+    /// Outstanding approvals awaiting a client verdict, keyed by request id.
+    pending_approvals: std::sync::Mutex<HashMap<u64, oneshot::Sender<(Verdict, ApprovalScope)>>>,
+    /// Outstanding `ask_user` questions awaiting a client answer.
+    pending_asks: std::sync::Mutex<HashMap<u64, std::sync::mpsc::Sender<String>>>,
 }
 
 /// Handle to the worker's UI: cloneable, shared between the agent loop (which
@@ -82,7 +101,10 @@ impl SocketUi {
             }),
             live,
             info: std::sync::Mutex::new(info),
-            attached: std::sync::atomic::AtomicU32::new(0),
+            attached: AtomicU32::new(0),
+            next_req_id: AtomicU64::new(0),
+            pending_approvals: std::sync::Mutex::new(HashMap::new()),
+            pending_asks: std::sync::Mutex::new(HashMap::new()),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -125,6 +147,34 @@ impl SocketUi {
             reason: reason.to_string(),
         });
     }
+
+    /// Ask attached clients to approve a network destination. Fails closed: with
+    /// zero attached clients (or on timeout) the verdict is `Deny`/`Once` so a
+    /// parked gateway connection never hangs. With clients, the first
+    /// [`ClientMsg::ApprovalReply`] wins; a follow-up `ApprovalResolved` tells
+    /// the others to dismiss their modal.
+    pub async fn request_approval(&self, dest: String) -> (Verdict, ApprovalScope) {
+        if self.attached() == 0 {
+            return (Verdict::Deny, ApprovalScope::Once);
+        }
+        let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending_approvals.lock().unwrap().insert(id, tx);
+        let _ = self.inner.live.send(ServerMsg::Approval {
+            id,
+            dest: dest.clone(),
+        });
+
+        let verdict = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+            Ok(Ok(v)) => v,
+            // Sender dropped (no reply) or timed out -> fail closed.
+            _ => (Verdict::Deny, ApprovalScope::Once),
+        };
+        self.inner.pending_approvals.lock().unwrap().remove(&id);
+        // Tell any other clients still showing this approval to dismiss it.
+        let _ = self.inner.live.send(ServerMsg::ApprovalResolved { id });
+        verdict
+    }
 }
 
 impl AgentUi for SocketUi {
@@ -158,9 +208,25 @@ impl AgentUi for SocketUi {
     fn notice(&mut self, msg: &str) {
         self.emit(UiEventMsg::Notice(msg.to_string()));
     }
-    fn ask_user(&mut self, _question: &str) -> String {
-        // Routed over the socket in a later milestone; no approver yet.
-        String::new()
+    fn ask_user(&mut self, question: &str) -> String {
+        // No attached client can answer -> empty (matches the non-interactive
+        // / subagent contract).
+        if self.attached() == 0 {
+            return String::new();
+        }
+        let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.inner.pending_asks.lock().unwrap().insert(id, tx);
+        let _ = self.inner.live.send(ServerMsg::Ask {
+            id,
+            question: question.to_string(),
+        });
+        // The agent loop blocks here for the answer; the reply arrives on a
+        // socket-server task (separate runtime thread), so this does not
+        // deadlock. First reply wins; timeout yields "".
+        let answer = rx.recv_timeout(ASK_TIMEOUT).unwrap_or_default();
+        self.inner.pending_asks.lock().unwrap().remove(&id);
+        answer
     }
 }
 
@@ -252,10 +318,24 @@ async fn serve_client(
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 if let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) {
-                    if matches!(msg, ClientMsg::Detach) {
-                        break;
+                    match msg {
+                        ClientMsg::Detach => break,
+                        // Approval/ask replies resolve a pending prompt here
+                        // (first reply wins); they never reach the agent loop.
+                        ClientMsg::ApprovalReply { id, verdict, scope } => {
+                            if let Some(tx) = inner.pending_approvals.lock().unwrap().remove(&id) {
+                                let _ = tx.send((verdict, scope));
+                            }
+                        }
+                        ClientMsg::AskReply { id, answer } => {
+                            if let Some(tx) = inner.pending_asks.lock().unwrap().remove(&id) {
+                                let _ = tx.send(answer);
+                            }
+                        }
+                        other => {
+                            let _ = cmd_tx.send(other);
+                        }
                     }
-                    let _ = cmd_tx.send(msg);
                 }
             }
         }
@@ -473,6 +553,143 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Connect a client, complete the handshake (Hello -> Snapshot), and return
+    /// the split halves. After this returns `attached() >= 1` is guaranteed.
+    async fn attach_client(
+        sock: &Path,
+    ) -> (
+        BufReader<tokio::net::unix::OwnedReadHalf>,
+        tokio::net::unix::OwnedWriteHalf,
+    ) {
+        let stream = UnixStream::connect(sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        w.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        assert!(matches!(
+            read_msg(&mut reader).await,
+            ServerMsg::Snapshot { .. }
+        ));
+        (reader, w)
+    }
+
+    async fn send_client(w: &mut tokio::net::unix::OwnedWriteHalf, msg: &ClientMsg) {
+        w.write_all(encode_line(msg).as_bytes()).await.unwrap();
+        w.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn approval_denies_with_zero_clients() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let (ui, _cmd_rx) = SocketUi::bind(
+            &tmp.path().join("s.sock"),
+            &tmp.path().join("events.jsonl"),
+            info(),
+        )
+        .await
+        .unwrap();
+        // No client attached -> fail closed immediately.
+        assert_eq!(
+            ui.request_approval("example.com:443".into()).await,
+            (Verdict::Deny, ApprovalScope::Once)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn approval_first_reply_wins_then_resolves() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+
+        let (mut reader, mut w) = attach_client(&sock).await;
+
+        // Ask for approval in the background; the client answers Allow/Session.
+        let ask_ui = ui.clone();
+        let verdict = tokio::spawn(async move { ask_ui.request_approval("h:443".into()).await });
+
+        let id = match read_msg(&mut reader).await {
+            ServerMsg::Approval { id, dest } => {
+                assert_eq!(dest, "h:443");
+                id
+            }
+            other => panic!("expected Approval, got {other:?}"),
+        };
+        send_client(
+            &mut w,
+            &ClientMsg::ApprovalReply {
+                id,
+                verdict: Verdict::Allow,
+                scope: ApprovalScope::Session,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            verdict.await.unwrap(),
+            (Verdict::Allow, ApprovalScope::Session)
+        );
+        // Other clients are told to dismiss the now-decided modal.
+        match read_msg(&mut reader).await {
+            ServerMsg::ApprovalResolved { id: rid } => assert_eq!(rid, id),
+            other => panic!("expected ApprovalResolved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_empty_with_zero_clients() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let (mut ui, _cmd_rx) = SocketUi::bind(
+            &tmp.path().join("s.sock"),
+            &tmp.path().join("events.jsonl"),
+            info(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ui.ask_user("proceed?"), "");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_user_routes_and_first_reply_wins() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+
+        let (mut reader, mut w) = attach_client(&sock).await;
+
+        // ask_user blocks, so run it on a blocking thread.
+        let mut ask_ui = ui.clone();
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("continue?"));
+
+        let id = match read_msg(&mut reader).await {
+            ServerMsg::Ask { id, question } => {
+                assert_eq!(question, "continue?");
+                id
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        };
+        send_client(
+            &mut w,
+            &ClientMsg::AskReply {
+                id,
+                answer: "yes".into(),
+            },
+        )
+        .await;
+        assert_eq!(answer.await.unwrap(), "yes");
     }
 
     /// `Hello{since_seq: Some(n)}` resumes: the snapshot reports the true
