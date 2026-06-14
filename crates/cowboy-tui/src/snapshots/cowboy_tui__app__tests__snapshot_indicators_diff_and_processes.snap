@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+┌ cowboy · 20260614-abcd ───────────────────────┐┌ network ────────────┐
+│you start the dev server                       ││                     │
+│✓ Server running on :3000.                     ││                     │
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+│                                               │└─────────────────────┘
+│                                               │┌ processes ──────────┐
+│                                               ││web  running         │
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+└───────────────────────────────────────────────┘└─────────────────────┘
+   ready — ready                                            Δ 2f +30 -4
+┌ message cowboy · Enter send · Ctrl-C menu ───────────────────────────┐
+│                                                                      │
+└──────────────────────────────────────────────────────────────────────┘

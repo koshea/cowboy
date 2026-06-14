@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use cowboy_core::config::ModelProfile;
 use cowboy_core::model::{Message, ModelClient, OpenAiClient, ToolDef};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn profile(base_url: String) -> ModelProfile {
@@ -68,6 +68,30 @@ async fn streams_and_assembles_text() {
         got.push_str(&piece);
     }
     assert_eq!(got, "Hello, world");
+}
+
+#[tokio::test]
+async fn forwards_custom_headers() {
+    let server = MockServer::start().await;
+    // The mock only matches if the custom header is present.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header("x-cowboy-test", "abc123"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut p = profile(format!("{}/v1", server.uri()));
+    p.headers.insert("x-cowboy-test".into(), "abc123".into());
+    let client = OpenAiClient::from_profile(&p).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(resp.content.as_deref(), Some("ok"));
 }
 
 #[tokio::test]

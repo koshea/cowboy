@@ -62,9 +62,15 @@ including non-interactively.
 5. Shell commands run in the container; output is streamed to the UI and fed
    back to the model. The session is logged under `.cowboy/sessions/<id>/`.
 
+## Platform support
+
+- **Linux** — supported (the MVP target).
+- **macOS** — planned, not yet implemented (Docker Desktop networking for the
+  gateway needs work).
+- **Windows** — unsupported / out of scope.
+
 ## Status / known MVP limitations
 
-- Linux-only; macOS/Windows are out of scope for the MVP.
 - The default agent image (`cowboy/agent:local`) is built locally on first run.
 - Network egress uses a live host control socket: in the TUI, asks open an
   approval modal (`allow once/session/project/global` or deny); project/global

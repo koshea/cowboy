@@ -25,6 +25,7 @@ schemars.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
@@ -33,3 +34,4 @@ predicates.workspace = true
 insta.workspace = true
 mockall.workspace = true
 tokio.workspace = true
+libc.workspace = true

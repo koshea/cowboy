@@ -80,6 +80,7 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
         )
         .with_logger(logger);
         agent.run(&task).await?;
+        agent.shutdown().await; // stop managed processes
         Ok(())
     }
 }
@@ -115,6 +116,10 @@ fn run_tui(
     let control_tx = ui_tx.clone();
     let agent_turn_cancel = turn_cancel.clone();
     let seed = (!task.is_empty()).then_some(task);
+    let title = match logger.as_ref().map(|l| l.id()) {
+        Some(id) => format!("cowboy · {id}"),
+        None => "cowboy".to_string(),
+    };
 
     let handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -157,16 +162,67 @@ fn run_tui(
                 *agent_turn_cancel.lock().unwrap() = Some(tc.clone());
                 let _ = rt.block_on(agent.run_turn(&msg, tc));
                 *agent_turn_cancel.lock().unwrap() = None;
+                // Post-turn indicators: working-tree diff + managed processes.
+                let (diff, procs) = post_turn_indicators(agent.root());
+                let _ = loop_tx.send(UiEvent::DiffStat(diff));
+                let _ = loop_tx.send(UiEvent::Processes(procs));
                 let _ = loop_tx.send(UiEvent::TurnDone);
             }
+            rt.block_on(agent.shutdown()); // stop managed processes
             agent.finalize_session();
         }
         let _ = loop_tx.send(UiEvent::Done);
     });
 
-    run_event_loop("cowboy", seed, ui_rx, task_tx, turn_cancel)?;
+    run_event_loop(&title, seed, ui_rx, task_tx, turn_cancel)?;
     let _ = handle.join();
     Ok(())
+}
+
+/// Compute the post-turn TUI indicators from the host side: a `git diff
+/// --shortstat` summary (empty if not a repo / no changes) and the list of
+/// managed processes (one `<name>.pid` file each under `.cowboy/proc/`).
+fn post_turn_indicators(root: &std::path::Path) -> (String, Vec<(String, String)>) {
+    let diff = std::process::Command::new("git")
+        .args(["-C"])
+        .arg(root)
+        .args(["diff", "--shortstat"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // "3 files changed, 30 insertions(+), 4 deletions(-)" -> "Δ 3f +30 -4"
+            let num = |kw: &str| {
+                s.split(',')
+                    .find(|p| p.contains(kw))
+                    .and_then(|p| p.trim().split_whitespace().next())
+                    .unwrap_or("0")
+                    .to_string()
+            };
+            format!(
+                "Δ {}f +{} -{}",
+                num("file"),
+                num("insertion"),
+                num("deletion")
+            )
+        })
+        .unwrap_or_default();
+
+    let mut procs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root.join(".cowboy/proc")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) == Some("pid") {
+                if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                    procs.push((name.to_string(), "running".to_string()));
+                }
+            }
+        }
+        procs.sort();
+    }
+    (diff, procs)
 }
 
 // --- control pipeline ---

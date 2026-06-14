@@ -47,6 +47,8 @@ pub enum Mode {
 pub struct App {
     pub title: String,
     pub status: String,
+    /// Working-tree diff summary for the status bar (e.g. `Δ 2 files +30 -4`).
+    pub diff: String,
     pub transcript: Vec<TranscriptLine>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
@@ -65,6 +67,7 @@ impl App {
         Self {
             title: title.into(),
             status: "ready".into(),
+            diff: String::new(),
             transcript: Vec::new(),
             streaming: String::new(),
             activity: Vec::new(),
@@ -289,9 +292,23 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         let mut ts = app.throbber.clone();
         f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
     }
+    let bar = Style::default().bg(Color::Blue).fg(Color::White);
+    // Split the status area: left mode/status, right-aligned diff summary.
+    let (left, right) = if app.diff.is_empty() {
+        (cols[1], None)
+    } else {
+        let w = app.diff.chars().count() as u16 + 1;
+        let s = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(w)])
+            .split(cols[1]);
+        (s[0], Some(s[1]))
+    };
     let text = format!(" {mode} — {}", app.status);
-    let para = Paragraph::new(text).style(Style::default().bg(Color::Blue).fg(Color::White));
-    f.render_widget(para, cols[1]);
+    f.render_widget(Paragraph::new(text).style(bar), left);
+    if let Some(right) = right {
+        f.render_widget(Paragraph::new(format!("{} ", app.diff)).style(bar), right);
+    }
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
@@ -378,6 +395,18 @@ mod tests {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "do work");
         app.mode = Mode::Paused;
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_indicators_diff_and_processes() {
+        let mut app = App::new("cowboy · 20260614-abcd");
+        app.push(LineKind::User, "start the dev server");
+        app.push(LineKind::Final, "Server running on :3000.");
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
+        app.diff = "Δ 2f +30 -4".into();
+        app.processes = vec![("web".into(), "running".into())];
         insta::assert_snapshot!(render(&app));
     }
 

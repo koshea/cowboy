@@ -12,7 +12,9 @@ pub trait AgentUi {
     fn model_done(&mut self) {}
     /// A shell command is starting.
     fn command_start(&mut self, command: &str);
-    /// The command finished with this exit code (output already shown).
+    /// A chunk of live command output (streamed as it arrives).
+    fn command_output(&mut self, _chunk: &str) {}
+    /// The command finished with this exit code (output already streamed).
     fn command_end(&mut self, exit_code: i32, output: &str);
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
@@ -69,13 +71,18 @@ impl AgentUi for ConsoleUi {
         println!("\x1b[1;33m$ {command}\x1b[0m");
     }
 
-    fn command_end(&mut self, exit_code: i32, output: &str) {
+    fn command_output(&mut self, chunk: &str) {
         if self.final_only {
             return;
         }
-        print!("{output}");
-        if !output.ends_with('\n') {
-            println!();
+        print!("{chunk}");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn command_end(&mut self, exit_code: i32, _output: &str) {
+        // Output was already streamed via command_output.
+        if self.final_only {
+            return;
         }
         if exit_code != 0 {
             println!("\x1b[31m[exit {exit_code}]\x1b[0m");

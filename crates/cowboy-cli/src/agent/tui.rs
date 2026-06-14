@@ -27,6 +27,7 @@ pub enum UiEvent {
     Delta(String),
     ModelDone,
     CommandStart(String),
+    CommandOutput(String),
     CommandEnd(i32, String),
     Final(String),
     Notice(String),
@@ -38,6 +39,10 @@ pub enum UiEvent {
     ),
     /// A network decision the gateway made, for the activity log.
     NetEvent(String),
+    /// Working-tree diff summary for the status bar.
+    DiffStat(String),
+    /// Managed processes (name, status) for the process pane.
+    Processes(Vec<(String, String)>),
     /// The agent finished a turn; ready for the next user message.
     TurnDone,
     Done,
@@ -57,6 +62,9 @@ impl AgentUi for TuiUi {
     }
     fn command_start(&mut self, command: &str) {
         let _ = self.tx.send(UiEvent::CommandStart(command.to_string()));
+    }
+    fn command_output(&mut self, chunk: &str) {
+        let _ = self.tx.send(UiEvent::CommandOutput(chunk.to_string()));
     }
     fn command_end(&mut self, exit_code: i32, output: &str) {
         let _ = self
@@ -157,8 +165,11 @@ fn event_loop(
                     app.push(LineKind::Command, c.clone());
                     app.status = format!("exec: {c}");
                 }
-                UiEvent::CommandEnd(code, out) => {
-                    app.push(LineKind::Output, out);
+                UiEvent::CommandOutput(chunk) => {
+                    // Streamed live, one line at a time.
+                    app.push(LineKind::Output, chunk.trim_end_matches('\n'));
+                }
+                UiEvent::CommandEnd(code, _out) => {
                     if code != 0 {
                         app.push(LineKind::Error, format!("[exit {code}]"));
                     }
@@ -183,6 +194,8 @@ fn event_loop(
                     pending_approval = Some(reply);
                 }
                 UiEvent::NetEvent(line) => app.activity(line),
+                UiEvent::DiffStat(s) => app.diff = s,
+                UiEvent::Processes(procs) => app.processes = procs,
                 UiEvent::TurnDone => {
                     pending_turns = pending_turns.saturating_sub(1);
                     app.commit_stream();
@@ -268,8 +281,18 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
     // Interrupt menu: resume / instruct / kill (this turn) / end (session).
     if app.mode == Mode::Paused {
         match key.code {
-            KeyCode::Char('r') | KeyCode::Esc | KeyCode::Char('i') => {
+            KeyCode::Char('r') | KeyCode::Esc => {
                 app.mode = ctx.mode_before_overlay.clone();
+            }
+            KeyCode::Char('i') => {
+                // Instruct: cancel the current turn and drop to Idle with the
+                // input focused. The user's next message starts a fresh turn
+                // with the full conversation (container + history) intact.
+                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
+                    tok.cancel();
+                }
+                app.status = "give a new instruction…".into();
+                app.mode = Mode::Idle;
             }
             KeyCode::Char('k') => {
                 // Cancel just the current turn; the session continues.

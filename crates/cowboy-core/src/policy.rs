@@ -40,11 +40,47 @@ pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, S
         return (Verdict::Allow, format!("allowed by policy ({reason})"));
     }
 
-    // 3. Default for external destinations.
-    (
-        policy.default_external.into(),
-        format!("default_external = {:?}", policy.default_external),
-    )
+    // 3. No rule matched — fall back to the default for the destination's class.
+    let (default, class) = match classify(attempt.ip) {
+        DestClass::Host => (policy.default_host, "default_host"),
+        DestClass::PrivateLan => (policy.default_private_lan, "default_private_lan"),
+        DestClass::External => (policy.default_external, "default_external"),
+    };
+    (default.into(), format!("{class} = {default:?}"))
+}
+
+/// Destination class for choosing which default verdict applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestClass {
+    /// Loopback / the host itself.
+    Host,
+    /// RFC1918 / link-local / unique-local — i.e. the private LAN.
+    PrivateLan,
+    /// Anything else (the public internet).
+    External,
+}
+
+fn classify(ip: Option<IpAddr>) -> DestClass {
+    match ip {
+        None => DestClass::External, // hostname-only: treat as external
+        Some(ip) if ip.is_loopback() => DestClass::Host,
+        Some(IpAddr::V4(v4)) => {
+            if v4.is_private() || v4.is_link_local() {
+                DestClass::PrivateLan
+            } else {
+                DestClass::External
+            }
+        }
+        Some(IpAddr::V6(v6)) => {
+            // Unique-local (fc00::/7) or link-local (fe80::/10) -> private LAN.
+            let seg = v6.segments();
+            if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
+                DestClass::PrivateLan
+            } else {
+                DestClass::External
+            }
+        }
+    }
 }
 
 /// Returns `Some(reason)` if the attempt matches the rule set. When
@@ -139,6 +175,43 @@ mod tests {
         // An unlisted host still asks.
         assert_eq!(
             evaluate(&policy, &attempt(Some("evil.example"), None, 443)).0,
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn destination_class_picks_the_right_default() {
+        use crate::config::DefaultVerdict;
+        // Distinct defaults per class so we can tell which was used.
+        let policy = NetworkPolicy {
+            default_external: DefaultVerdict::Ask,
+            default_private_lan: DefaultVerdict::Deny,
+            default_host: DefaultVerdict::Allow,
+            allow: Default::default(),
+            deny: Default::default(),
+        };
+        // loopback -> host
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("127.0.0.1"), 8080)).0,
+            Verdict::Allow
+        );
+        // RFC1918 -> private lan
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("192.168.1.5"), 443)).0,
+            Verdict::Deny
+        );
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("10.0.0.9"), 443)).0,
+            Verdict::Deny
+        );
+        // public -> external
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("93.184.216.34"), 443)).0,
+            Verdict::Ask
+        );
+        // hostname-only -> external
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("example.com"), None, 443)).0,
             Verdict::Ask
         );
     }

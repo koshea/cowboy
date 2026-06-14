@@ -67,6 +67,8 @@ pub struct ContainerSpec {
     pub sysctls: Vec<(String, String)>,
     /// DNS servers for the container (`--dns`).
     pub dns: Vec<String>,
+    /// Run as this `uid:gid` (`--user`) — used to run the agent non-root.
+    pub user: Option<String>,
     /// Override the image `ENTRYPOINT` (`--entrypoint`).
     pub entrypoint: Option<String>,
     /// Command to run; defaults to `tail -f /dev/null` for keep-alive.
@@ -116,19 +118,41 @@ pub trait DockerCli: Send + Sync {
     /// IDs of cowboy-labelled containers and networks (`(containers, networks)`).
     async fn list_labeled(&self) -> Result<(Vec<String>, Vec<String>)>;
     /// Execute `argv` in the container, inheriting stdio, returning the exit code.
-    async fn exec(&self, name: &str, workdir: &str, argv: &[String]) -> Result<ExecResult>;
-    /// Execute `argv`, capturing combined stdout+stderr (for the agent loop).
+    async fn exec(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        argv: &[String],
+    ) -> Result<ExecResult>;
+    /// Execute `argv`, capturing combined stdout+stderr (short control commands).
     async fn exec_capture(
         &self,
         name: &str,
         workdir: &str,
+        user: &str,
         argv: &[String],
+    ) -> Result<(ExecResult, String)>;
+    /// Execute a shell command, streaming combined stdout+stderr chunks to
+    /// `chunks` as they arrive, while also accumulating the full output. The
+    /// command runs in its own process group; on `cancel` or timeout the group
+    /// is killed (no lingering children). Returns (exit, accumulated output).
+    async fn exec_stream(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        command: &str,
+        timeout_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        chunks: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<(ExecResult, String)>;
     /// Execute interactively (`-it`), inheriting the terminal.
     async fn exec_interactive(
         &self,
         name: &str,
         workdir: &str,
+        user: &str,
         argv: &[String],
     ) -> Result<ExecResult>;
 }
@@ -170,6 +194,10 @@ fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
     if !spec.workdir.is_empty() {
         args.push("-w".into());
         args.push(spec.workdir.clone());
+    }
+    if let Some(user) = &spec.user {
+        args.push("--user".into());
+        args.push(user.clone());
     }
     if let Some(net) = &spec.network {
         args.push("--network".into());
@@ -389,9 +417,17 @@ impl DockerCli for CliDocker {
         Ok(())
     }
 
-    async fn exec(&self, name: &str, workdir: &str, argv: &[String]) -> Result<ExecResult> {
+    async fn exec(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        argv: &[String],
+    ) -> Result<ExecResult> {
         let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-w", workdir, name]);
+        cmd.arg("exec");
+        push_exec_flags(&mut cmd, workdir, user);
+        cmd.arg(name);
         cmd.args(argv);
         let status = cmd.status().await.context("docker exec")?;
         Ok(ExecResult {
@@ -403,15 +439,16 @@ impl DockerCli for CliDocker {
         &self,
         name: &str,
         workdir: &str,
+        user: &str,
         argv: &[String],
     ) -> Result<(ExecResult, String)> {
         let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-w", workdir, name]);
+        cmd.arg("exec");
+        push_exec_flags(&mut cmd, workdir, user);
+        cmd.arg(name);
         cmd.args(argv);
-        // Kill the local docker-exec client if the future is dropped (timeout).
         cmd.kill_on_drop(true);
         let out = cmd.output().await.context("docker exec (capture)")?;
-        // Combine stdout + stderr in a single observation stream for the model.
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !stderr.is_empty() {
@@ -425,19 +462,121 @@ impl DockerCli for CliDocker {
         ))
     }
 
+    async fn exec_stream(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        command: &str,
+        timeout_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        chunks: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<(ExecResult, String)> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        // Run the command in its own process group, recording the leader pid so
+        // we can signal the whole group on cancel/timeout. The command is passed
+        // via env to avoid shell quoting.
+        let pidfile = "/tmp/cowboy-exec.pgid";
+        let wrapper =
+            format!("setsid sh -c 'echo $$ > {pidfile}; exec sh -c \"$COWBOY_CMD\"' 2>&1");
+        let mut cmd = Command::new("docker");
+        cmd.arg("exec");
+        push_exec_flags(&mut cmd, workdir, user);
+        cmd.args([
+            "-e",
+            &format!("COWBOY_CMD={command}"),
+            name,
+            "sh",
+            "-c",
+            &wrapper,
+        ]);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::null()); // merged into stdout by the wrapper
+        cmd.kill_on_drop(true);
+
+        let mut child = cmd.spawn().context("spawning streaming docker exec")?;
+        let stdout = child.stdout.take().context("exec stdout")?;
+        let mut reader = BufReader::new(stdout).lines();
+        let mut output = String::new();
+
+        let timeout = if timeout_secs == 0 {
+            std::time::Duration::from_secs(86_400)
+        } else {
+            std::time::Duration::from_secs(timeout_secs)
+        };
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
+        let mut interrupted: Option<&str> = None;
+        loop {
+            tokio::select! {
+                line = reader.next_line() => match line {
+                    Ok(Some(l)) => {
+                        let l = format!("{l}\n");
+                        output.push_str(&l);
+                        let _ = chunks.send(l);
+                    }
+                    _ => break, // EOF or read error
+                },
+                _ = cancel.cancelled() => { interrupted = Some("cancelled"); break; }
+                _ = &mut deadline => { interrupted = Some("timed out"); break; }
+            }
+        }
+
+        if let Some(why) = interrupted {
+            // Kill the in-container process group, then the local client.
+            let kill = format!(
+                "p=$(cat {pidfile} 2>/dev/null); [ -n \"$p\" ] && \
+                 (kill -TERM -\"$p\" 2>/dev/null; sleep 1; kill -KILL -\"$p\" 2>/dev/null) || true"
+            );
+            let _ = run_quiet(&["exec", name, "sh", "-c", &kill]).await;
+            let _ = child.start_kill();
+            let note = format!("[command {why}]");
+            output.push_str(&note);
+            let _ = chunks.send(format!("{note}\n"));
+            return Ok((
+                ExecResult {
+                    exit_code: if why == "timed out" { 124 } else { 130 },
+                },
+                output,
+            ));
+        }
+
+        let status = child.wait().await.context("waiting for docker exec")?;
+        Ok((
+            ExecResult {
+                exit_code: status.code().unwrap_or(-1),
+            },
+            output,
+        ))
+    }
+
     async fn exec_interactive(
         &self,
         name: &str,
         workdir: &str,
+        user: &str,
         argv: &[String],
     ) -> Result<ExecResult> {
         let mut cmd = Command::new("docker");
-        cmd.args(["exec", "-it", "-w", workdir, name]);
+        cmd.arg("exec");
+        cmd.arg("-it");
+        push_exec_flags(&mut cmd, workdir, user);
+        cmd.arg(name);
         cmd.args(argv);
         let status = cmd.status().await.context("docker exec -it")?;
         Ok(ExecResult {
             exit_code: status.code().unwrap_or(-1),
         })
+    }
+}
+
+/// Push `-w <workdir>` and (if non-empty) `--user <user>` onto a `docker exec`.
+fn push_exec_flags(cmd: &mut Command, workdir: &str, user: &str) {
+    cmd.args(["-w", workdir]);
+    if !user.is_empty() {
+        cmd.args(["--user", user]);
     }
 }
 

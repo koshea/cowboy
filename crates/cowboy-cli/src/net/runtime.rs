@@ -27,6 +27,9 @@ pub struct AgentRuntime {
     root: PathBuf,
     security: SecurityConfig,
     container_name: String,
+    /// The agent runs as this `uid:gid` (the host user) so it isn't root and
+    /// files it creates in the mounted workspace are owned by the user.
+    user: Option<String>,
     /// Present when network isolation is enabled (the default).
     gateway: Option<GatewayNetwork>,
 }
@@ -48,8 +51,13 @@ impl AgentRuntime {
             root,
             security,
             container_name,
+            user: Some(host_user()),
             gateway,
         }
+    }
+
+    fn user(&self) -> &str {
+        self.user.as_deref().unwrap_or("")
     }
 
     /// The stable container name for this project (also used to let a subagent
@@ -111,9 +119,12 @@ impl AgentRuntime {
             }
         }
 
+        // Run non-root as the host user; HOME=/tmp is writable for any uid
+        // (CARGO_HOME/RUSTUP_HOME are world-writable in the image).
+        let mut env: Vec<(String, String)> = vec![("HOME".into(), "/tmp".into())];
+
         // Explicit, host-configured secret env injection. Values are read from
         // the host env var named by `source_env` and never logged.
-        let mut env: Vec<(String, String)> = Vec::new();
         for secret in &self.security.secrets.env {
             match std::env::var(&secret.source_env) {
                 Ok(value) => env.push((secret.name.clone(), value)),
@@ -156,6 +167,7 @@ impl AgentRuntime {
             cap_add: Vec::new(),
             sysctls,
             dns,
+            user: self.user.clone(),
             entrypoint: None,
             keep_alive: None,
         })
@@ -235,8 +247,65 @@ impl AgentRuntime {
     pub async fn run(&self, argv: &[String]) -> Result<ExecResult> {
         self.ensure_running().await?;
         self.docker
-            .exec(&self.container_name, &self.security.container.workdir, argv)
+            .exec(
+                &self.container_name,
+                &self.security.container.workdir,
+                self.user(),
+                argv,
+            )
             .await
+    }
+
+    /// Run a shell command, streaming combined output to `chunks` as it arrives,
+    /// interruptible via `cancel` and bounded by `timeout_secs` (group-killed in
+    /// the container on either). Returns (exit, full output). For the agent loop.
+    pub async fn exec_stream(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        chunks: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Result<(ExecResult, String)> {
+        self.ensure_running().await?;
+        let workdir = cwd.unwrap_or(&self.security.container.workdir);
+        self.docker
+            .exec_stream(
+                &self.container_name,
+                workdir,
+                self.user(),
+                command,
+                timeout_secs,
+                cancel,
+                chunks,
+            )
+            .await
+    }
+
+    /// Stop all managed processes (kill their process groups) in the container,
+    /// best-effort. Called on session exit so no services linger.
+    pub async fn stop_all_processes(&self) -> Result<()> {
+        if self.docker.container_state(&self.container_name).await?
+            != crate::net::docker::ContainerState::Running
+        {
+            return Ok(());
+        }
+        let dir = format!("{}/.cowboy/proc", self.security.container.workdir);
+        let script = format!(
+            "for f in {dir}/*.pid; do [ -f \"$f\" ] && \
+             kill -TERM -\"$(cat \"$f\")\" 2>/dev/null; done; true"
+        );
+        let argv = vec!["sh".to_string(), "-c".to_string(), script];
+        let _ = self
+            .docker
+            .exec_capture(
+                &self.container_name,
+                &self.security.container.workdir,
+                self.user(),
+                &argv,
+            )
+            .await;
+        Ok(())
     }
 
     /// Run a shell command string inside the container, capturing combined
@@ -256,7 +325,7 @@ impl AgentRuntime {
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
         let fut = self
             .docker
-            .exec_capture(&self.container_name, workdir, &argv);
+            .exec_capture(&self.container_name, workdir, self.user(), &argv);
         if timeout_secs == 0 {
             return fut.await;
         }
@@ -277,10 +346,19 @@ impl AgentRuntime {
             .exec_interactive(
                 &self.container_name,
                 &self.security.container.workdir,
+                self.user(),
                 &argv,
             )
             .await
     }
+}
+
+/// The host user as `uid:gid`, so the container runs non-root and writes files
+/// owned by the user.
+fn host_user() -> String {
+    // SAFETY: getuid/getgid are always-safe libc calls.
+    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    format!("{uid}:{gid}")
 }
 
 /// A stable 32-bit hash of the project path, used to derive per-project network
@@ -515,9 +593,9 @@ mod tests {
             .returning(|_| Ok(ContainerState::Running));
         docker
             .expect_exec()
-            .withf(|_name, workdir, argv| workdir == "/workspace" && argv == ["pwd"])
+            .withf(|_name, workdir, _user, argv| workdir == "/workspace" && argv == ["pwd"])
             .times(1)
-            .returning(|_, _, _| Ok(ExecResult { exit_code: 0 }));
+            .returning(|_, _, _, _| Ok(ExecResult { exit_code: 0 }));
         let (rt, _tmp) = fixture(false, docker);
         assert!(rt.container_name().starts_with("cowboy-agent-"));
         let res = rt.run(&["pwd".to_string()]).await.unwrap();

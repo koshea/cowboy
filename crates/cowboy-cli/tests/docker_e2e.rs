@@ -100,6 +100,23 @@ fn run_pwd_reports_workspace() {
 }
 
 #[test]
+fn agent_runs_as_host_uid_not_root() {
+    if !docker_available() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let proj = Project::new();
+    // The container must run as the host uid:gid (non-root), so files the agent
+    // writes are owned by the user and it never has root inside the workspace.
+    let uid = unsafe { libc::getuid() };
+    proj.cowboy()
+        .args(["run", "id", "-u"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(uid.to_string()));
+}
+
+#[test]
 fn security_yaml_is_masked_inside_container() {
     if !docker_available() {
         eprintln!("skipping: docker not available");

@@ -19,6 +19,7 @@ async-trait.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tiktoken-rs.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

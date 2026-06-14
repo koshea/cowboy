@@ -124,13 +124,27 @@ impl OpenAiClient {
     /// by `profile.api_key_env` (never stored in config).
     pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
         let api_key = std::env::var(&profile.api_key_env).unwrap_or_default();
-        // NOTE: per-profile custom headers are accepted in config but not yet
-        // forwarded (async-openai applies auth headers itself); follow-up.
         let config = OpenAIConfig::new()
             .with_api_base(profile.base_url.clone())
             .with_api_key(api_key);
+
+        // Forward per-profile custom headers (e.g. for an internal gateway).
+        let mut headers = reqwest::header::HeaderMap::new();
+        for (k, v) in &profile.headers {
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(v),
+            ) {
+                headers.insert(name, val);
+            }
+        }
+        let http = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .map_err(oa_err)?;
+
         Ok(Self {
-            client: Client::with_config(config),
+            client: Client::with_config(config).with_http_client(http),
             model: profile.model.clone(),
             temperature: profile.temperature,
             max_tokens: profile.max_tokens,

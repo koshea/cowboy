@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{self, AskUserArgs, FinalArgs, ShellArgs, SubagentArgs};
 use super::ui::AgentUi;
+use crate::net::docker::ExecResult;
 use crate::net::runtime::AgentRuntime;
 use crate::session::SessionLogger;
 
@@ -153,6 +154,11 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
+    /// The host project root (workspace bind-mount source).
+    pub fn root(&self) -> &std::path::Path {
+        self.runtime.root()
+    }
+
     /// One-shot convenience: run a single turn then finalize (console mode/tests).
     pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
         let cancel = self.cancel.clone();
@@ -232,7 +238,13 @@ impl<'a> AgentLoop<'a> {
         for call in &response.tool_calls {
             match call.name.as_str() {
                 tools::TOOL_FINAL => {
-                    let args: FinalArgs = parse_args(&call.arguments)?;
+                    let args: FinalArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
                     if let Some(l) = &self.logger {
                         l.write_final(&args.message);
                     }
@@ -240,23 +252,22 @@ impl<'a> AgentLoop<'a> {
                     return Ok(Some(args.message));
                 }
                 tools::TOOL_SHELL => {
-                    let args: ShellArgs = parse_args(&call.arguments)?;
+                    let args: ShellArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
                     self.ui.command_start(&args.command);
                     let started = std::time::Instant::now();
-                    let (result, output) = self
-                        .runtime
-                        .run_capture(
-                            &args.command,
-                            args.cwd.as_deref(),
-                            self.behavior.command_timeout_seconds,
-                        )
-                        .await?;
+                    let (result, output) = self.run_shell_streaming(&args).await?;
                     let duration_ms = started.elapsed().as_millis();
-                    let truncated = truncate(&output, self.behavior.max_command_output_bytes);
-                    self.ui.command_end(result.exit_code, &truncated);
+                    self.ui.command_end(result.exit_code, "");
                     if let Some(l) = &mut self.logger {
                         l.log_command(&args.command, result.exit_code, duration_ms, &output);
                     }
+                    let truncated = truncate(&output, self.behavior.max_command_output_bytes);
                     let observation = format!("[exit code: {}]\n{}", result.exit_code, truncated);
                     let tool_msg = Message::tool_result(&call.id, observation);
                     if let Some(l) = &mut self.logger {
@@ -265,7 +276,13 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_ASK_USER => {
-                    let args: AskUserArgs = parse_args(&call.arguments)?;
+                    let args: AskUserArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
                     let answer = self.ui.ask_user(&args.question);
                     let tool_msg = Message::tool_result(&call.id, answer);
                     if let Some(l) = &mut self.logger {
@@ -274,7 +291,13 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_SUBAGENT => {
-                    let args: SubagentArgs = parse_args(&call.arguments)?;
+                    let args: SubagentArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
                     let result = self.run_subagent(&args).await;
                     let tool_msg = Message::tool_result(&call.id, result);
                     if let Some(l) = &mut self.logger {
@@ -291,6 +314,49 @@ impl<'a> AgentLoop<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Record a tool error as an observation so the model can self-correct.
+    fn tool_error(&mut self, id: &str, name: &str, err: &str) {
+        let msg = Message::tool_result(
+            id,
+            format!("error: invalid arguments for `{name}`: {err}; please correct and retry"),
+        );
+        if let Some(l) = &mut self.logger {
+            l.log_message(&msg);
+        }
+        self.messages.push(msg);
+    }
+
+    /// Run a shell command with live streaming to the UI (interruptible via the
+    /// turn's cancel token). Returns (exit, full output).
+    async fn run_shell_streaming(&mut self, args: &ShellArgs) -> Result<(ExecResult, String)> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let fut = self.runtime.exec_stream(
+            &args.command,
+            args.cwd.as_deref(),
+            self.behavior.command_timeout_seconds,
+            self.cancel.clone(),
+            tx,
+        );
+        tokio::pin!(fut);
+        loop {
+            tokio::select! {
+                biased;
+                Some(chunk) = rx.recv() => self.ui.command_output(&chunk),
+                res = &mut fut => {
+                    while let Ok(chunk) = rx.try_recv() {
+                        self.ui.command_output(&chunk);
+                    }
+                    return res;
+                }
+            }
+        }
+    }
+
+    /// Stop managed processes in the container (called on session end).
+    pub async fn shutdown(&self) {
+        let _ = self.runtime.stop_all_processes().await;
     }
 
     /// Run a subagent by recursively invoking the `cowboy` CLI in one-shot mode,
@@ -492,10 +558,13 @@ mod tests {
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
         docker
-            .expect_exec_capture()
-            .withf(|_n, _w, argv| argv[0] == "sh" && argv[2].contains("ls"))
+            .expect_exec_stream()
+            .withf(|_n, _w, _u, command, _t, _c, _ch| command.contains("ls"))
             .times(1)
-            .returning(|_, _, _| Ok((ExecResult { exit_code: 0 }, "file1\nfile2\n".into())));
+            .returning(|_, _, _, _, _, _, chunks| {
+                let _ = chunks.send("file1\nfile2\n".into());
+                Ok((ExecResult { exit_code: 0 }, "file1\nfile2\n".into()))
+            });
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -533,8 +602,8 @@ mod tests {
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
         docker
-            .expect_exec_capture()
-            .returning(|_, _, _| Ok((ExecResult { exit_code: 0 }, "ok".into())));
+            .expect_exec_stream()
+            .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "ok".into())));
         // Model always asks for another shell command -> never finishes.
         let looping = ScriptedModel::new(vec![]);
         // Empty queue returns default (no tool calls) -> would stop early; instead

@@ -69,6 +69,20 @@ pub async fn run() -> Result<()> {
     r.check("security.yaml", check_security(&paths.security));
     r.check("agent.yaml", check_agent(&paths.agent));
     r.check("models.yaml", check_models(&paths.models));
+    r.check(
+        "config separation",
+        check_config_separation(&paths.security),
+    );
+
+    // Container images.
+    r.check("agent image", check_image(&paths.security));
+    r.check(
+        "gateway image",
+        image_present(
+            "cowboy/gateway:local",
+            "not built; run `docker/build.sh gateway`",
+        ),
+    );
 
     // Compose detection.
     r.check("compose", check_compose(&root));
@@ -171,6 +185,40 @@ fn check_models(path: &Path) -> Status {
         }
         Err(e) => Status::Fail(e.to_string()),
     }
+}
+
+fn check_config_separation(path: &Path) -> Status {
+    match SecurityConfig::load(path) {
+        // load() runs validate(), which rejects mounting security.yaml/.cowboy.
+        Ok(_) => Status::Ok("security.yaml is host-only (masked, never mounted)".to_string()),
+        Err(cowboy_core::Error::ConfigNotFound(_)) => {
+            Status::Warn("no security.yaml yet; run `cowboy init`".to_string())
+        }
+        Err(cowboy_core::Error::SecurityInvariant(m)) => Status::Fail(m),
+        Err(e) => Status::Fail(e.to_string()),
+    }
+}
+
+/// Report whether a docker image exists locally (clean message, no JSON).
+fn image_present(image: &str, warn: &str) -> Status {
+    match std::process::Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()
+    {
+        Ok(out) if out.status.success() => Status::Ok(format!("{image} present")),
+        Ok(_) => Status::Warn(warn.to_string()),
+        Err(_) => Status::Fail("`docker` not found".to_string()),
+    }
+}
+
+fn check_image(security: &Path) -> Status {
+    let image = SecurityConfig::load(security)
+        .map(|c| c.container.image)
+        .unwrap_or_else(|_| "cowboy/agent:local".to_string());
+    image_present(
+        &image,
+        &format!("{image} not built; run `docker/build.sh agent` (or it builds on first run)"),
+    )
 }
 
 fn check_compose(root: &Path) -> Status {
