@@ -46,6 +46,8 @@ pub struct AgentLoop<'a> {
     pruned_notified: bool,
     /// Recursion depth for subagents (0 = top-level).
     subagent_depth: usize,
+    /// The most recent turn's final message (for the session summary).
+    last_final: Option<String>,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -77,6 +79,7 @@ impl<'a> AgentLoop<'a> {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            last_final: None,
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
@@ -126,17 +129,35 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
-    /// Run the loop for `task`, then finalize the session log (diff + summary)
-    /// regardless of how it ended.
-    pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
+    /// Run one conversational turn for `task`, keeping the conversation (and the
+    /// session logger) alive for subsequent turns. `turn_cancel` interrupts just
+    /// this turn. Does NOT finalize the session.
+    pub async fn run_turn(
+        &mut self,
+        task: &str,
+        turn_cancel: CancellationToken,
+    ) -> Result<Option<String>> {
+        self.cancel = turn_cancel;
         let outcome = self.run_inner(task).await;
-        if let Some(l) = &self.logger {
-            let final_msg = match &outcome {
-                Ok(Some(m)) => Some(m.as_str()),
-                _ => None,
-            };
-            l.finalize(final_msg);
+        if let Ok(Some(m)) = &outcome {
+            self.last_final = Some(m.clone());
         }
+        outcome
+    }
+
+    /// Finalize the session log (diff + summary). Call once when the
+    /// conversation ends.
+    pub fn finalize_session(&self) {
+        if let Some(l) = &self.logger {
+            l.finalize(self.last_final.as_deref());
+        }
+    }
+
+    /// One-shot convenience: run a single turn then finalize (console mode/tests).
+    pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
+        let cancel = self.cancel.clone();
+        let outcome = self.run_turn(task, cancel).await;
+        self.finalize_session();
         outcome
     }
 
@@ -548,6 +569,47 @@ mod tests {
         assert!(res.is_none());
         assert!(ui.notices.iter().any(|n| n.contains("max_iterations")));
         assert_eq!(ui.commands.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn multi_turn_retains_conversation_context() {
+        // Two turns on the same loop; the conversation must accumulate.
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("1", "final", r#"{"message":"done 1"}"#)],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done 2"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let t = CancellationToken::new();
+        let r1 = agent.run_turn("first task", t.clone()).await.unwrap();
+        let r2 = agent.run_turn("second task", t).await.unwrap();
+        assert_eq!(r1.as_deref(), Some("done 1"));
+        assert_eq!(r2.as_deref(), Some("done 2"));
+        // Both user turns are retained in the conversation (context preserved).
+        let users = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::User)
+            .count();
+        assert_eq!(users, 2);
+        assert_eq!(agent.last_final.as_deref(), Some("done 2"));
     }
 
     #[tokio::test]

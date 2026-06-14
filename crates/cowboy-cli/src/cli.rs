@@ -52,6 +52,9 @@ pub enum Command {
     /// List or show agent skills (reusable instructions under .cowboy/skills/).
     Skill(SkillArgs),
 
+    /// Stop and remove this project's agent + gateway containers and networks.
+    Down(DownArgs),
+
     /// List session logs.
     Logs,
 
@@ -97,6 +100,13 @@ pub enum PatchCommand {
 pub struct ProcArgs {
     #[command(subcommand)]
     pub command: ProcCommand,
+}
+
+#[derive(Debug, Args)]
+pub struct DownArgs {
+    /// Remove ALL cowboy-managed containers and networks (every project).
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]

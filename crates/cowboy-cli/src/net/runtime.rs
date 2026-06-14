@@ -285,14 +285,14 @@ impl AgentRuntime {
 
 /// A stable 32-bit hash of the project path, used to derive per-project network
 /// names and subnets.
-fn project_hash(root: &Path) -> u32 {
+pub fn project_hash(root: &Path) -> u32 {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     hasher.finish() as u32
 }
 
 /// Derive a stable, unique container name from the project path.
-fn container_name_for(root: &Path) -> String {
+pub fn container_name_for(root: &Path) -> String {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     let hash = hasher.finish();

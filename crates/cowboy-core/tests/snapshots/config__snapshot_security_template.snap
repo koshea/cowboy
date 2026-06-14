@@ -32,12 +32,19 @@ network_policy:
   default_private_lan: ask
   default_host: ask
   allow:
+    # Domains are suffix-matched (npmjs.org also matches registry.npmjs.org).
     domains:
       - github.com
-      - api.github.com
+      - githubusercontent.com
       - crates.io
-      - static.crates.io
-      - index.crates.io
+      - npmjs.org
+      - pypi.org
+      - pythonhosted.org
+      - golang.org
+      - go.dev
+      - rubygems.org
+      - debian.org
+      - ghcr.io
     cidrs: []
     ports:
       - 80

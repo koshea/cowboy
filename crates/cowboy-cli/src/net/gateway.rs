@@ -21,6 +21,16 @@ use super::docker::{BindMount, ContainerSpec, DockerCli, NetworkSpec};
 /// The gateway image (built from `docker/gateway.Dockerfile`).
 pub const GATEWAY_IMAGE: &str = "cowboy/gateway:local";
 
+/// Per-project docker object names derived from the project hash:
+/// `(internal_net, egress_net, gateway_container)`.
+pub fn network_names(hash: u32) -> (String, String, String) {
+    (
+        format!("cowboy-int-{hash:08x}"),
+        format!("cowboy-egr-{hash:08x}"),
+        format!("cowboy-gw-{hash:08x}"),
+    )
+}
+
 /// Per-project gateway networking parameters.
 #[derive(Debug, Clone)]
 pub struct GatewayNetwork {
@@ -67,10 +77,11 @@ impl GatewayNetwork {
         let _ = std::fs::create_dir_all(&run_dir);
         let control_sock = run_dir.join(format!("control-{hash:08x}.sock"));
 
+        let (internal_net, egress_net, gateway_name) = network_names(hash);
         Ok(Self {
-            internal_net: format!("cowboy-int-{hash:08x}"),
-            egress_net: format!("cowboy-egr-{hash:08x}"),
-            gateway_name: format!("cowboy-gw-{hash:08x}"),
+            internal_net,
+            egress_net,
+            gateway_name,
             subnet,
             gateway_ip,
             bridge_gateway,

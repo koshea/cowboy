@@ -1,6 +1,7 @@
 //! Subcommand implementations.
 
 pub mod doctor;
+pub mod down;
 pub mod init;
 pub mod logs;
 pub mod patch;

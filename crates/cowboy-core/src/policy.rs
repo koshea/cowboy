@@ -123,6 +123,27 @@ mod tests {
     }
 
     #[test]
+    fn default_policy_allows_common_dev_registries() {
+        let policy = NetworkPolicy::default();
+        for host in [
+            "registry.npmjs.org",
+            "pypi.org",
+            "files.pythonhosted.org",
+            "proxy.golang.org",
+            "static.crates.io",
+            "deb.debian.org",
+        ] {
+            let (v, _) = evaluate(&policy, &attempt(Some(host), None, 443));
+            assert_eq!(v, Verdict::Allow, "{host} should be allowed by default");
+        }
+        // An unlisted host still asks.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("evil.example"), None, 443)).0,
+            Verdict::Ask
+        );
+    }
+
+    #[test]
     fn default_policy_denies_metadata_ip() {
         let policy = NetworkPolicy::default();
         let (v, _) = evaluate(&policy, &attempt(None, Some("169.254.169.254"), 80));

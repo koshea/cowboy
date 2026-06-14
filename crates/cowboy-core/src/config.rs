@@ -302,6 +302,32 @@ fn default_deny_rules() -> RuleSet {
     }
 }
 
+/// Default allow-list: common dev package registries on 80/443. Domains are
+/// suffix-matched, so base domains cover their subdomains (e.g. `npmjs.org`
+/// matches `registry.npmjs.org`).
+fn default_allow_rules() -> RuleSet {
+    RuleSet {
+        domains: [
+            "github.com",
+            "githubusercontent.com",
+            "crates.io",
+            "npmjs.org",
+            "pypi.org",
+            "pythonhosted.org",
+            "golang.org",
+            "go.dev",
+            "rubygems.org",
+            "debian.org",
+            "ghcr.io",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+        cidrs: vec![],
+        ports: vec![80, 443],
+    }
+}
+
 impl Default for ContainerConfig {
     fn default() -> Self {
         Self {
@@ -330,7 +356,7 @@ impl Default for NetworkPolicy {
             default_external: DefaultVerdict::Ask,
             default_private_lan: DefaultVerdict::Ask,
             default_host: DefaultVerdict::Ask,
-            allow: RuleSet::default(),
+            allow: default_allow_rules(),
             deny: default_deny_rules(),
         }
     }
@@ -558,12 +584,19 @@ network_policy:
   default_private_lan: ask
   default_host: ask
   allow:
+    # Domains are suffix-matched (npmjs.org also matches registry.npmjs.org).
     domains:
       - github.com
-      - api.github.com
+      - githubusercontent.com
       - crates.io
-      - static.crates.io
-      - index.crates.io
+      - npmjs.org
+      - pypi.org
+      - pythonhosted.org
+      - golang.org
+      - go.dev
+      - rubygems.org
+      - debian.org
+      - ghcr.io
     cidrs: []
     ports:
       - 80

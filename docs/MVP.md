@@ -9,8 +9,8 @@ agent is never part of the security boundary.
 ## Commands
 
 ```
-cowboy                     # interactive session (ratatui TUI on a terminal)
-cowboy "fix the tests"     # one-shot task
+cowboy                     # interactive, conversational TUI (multi-turn)
+cowboy "fix the tests"     # seed the conversation (TTY) / one-shot (piped)
 cowboy init [--git]        # write .cowboy/{security,agent,models}.yaml
 cowboy doctor              # check Docker, Linux, nft, model config, Compose
 cowboy run <cmd>           # run a command in the agent container
@@ -18,9 +18,23 @@ cowboy shell               # interactive shell in the agent container
 cowboy patch show|save|apply|check|revert
 cowboy proc list|start|stop|restart|logs <name>
 cowboy skill list|show <name>            # agent skills (.cowboy/skills/)
+cowboy down [--all]        # stop/remove this project's (or all) containers+networks
 cowboy logs                # list past sessions
 cowboy replay <id>         # replay a past session
 ```
+
+## Interactive mode is conversational
+
+On a terminal, `cowboy` is a persistent conversational REPL (like Claude Code):
+the agent answers a turn, then returns to the prompt for your next message with
+the **full conversation and the same container** kept alive. `final` ends a
+*turn*, not the session. Ctrl-C opens an interrupt menu — `k` cancels the current
+turn (and you keep going), `e` ends the session (finalizes the log). Piped /
+non-TTY runs (`cowboy "task" | …`) stay single-shot for scripting.
+
+The default network policy allows common dev registries (npm, PyPI, Go, crates,
+RubyGems, Debian, GitHub) so `npm/pip/go/cargo/apt` installs work out of the box,
+including non-interactively.
 
 ## Skills & subagents
 

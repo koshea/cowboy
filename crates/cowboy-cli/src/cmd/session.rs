@@ -13,7 +13,7 @@ use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::tui::{run_event_loop, TuiUi, UiEvent};
+use crate::agent::tui::{run_event_loop, TuiUi, TurnCancel, UiEvent};
 use crate::agent::{AgentLoop, ConsoleUi};
 use crate::net::docker::CliDocker;
 use crate::net::runtime::AgentRuntime;
@@ -60,7 +60,6 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
             runtime,
             behavior,
             context_window,
-            cancel,
             logger,
         )
     } else {
@@ -99,22 +98,23 @@ fn resolve_task(task: Option<String>) -> Result<Option<String>> {
     Ok((!t.is_empty()).then_some(t))
 }
 
-/// Run the ratatui front-end: the agent loop + control pipeline run on a
-/// dedicated thread with their own runtime; the main thread owns the terminal.
-#[allow(clippy::too_many_arguments)]
+/// Run the conversational ratatui front-end: the agent runs a turn loop on a
+/// dedicated thread (its own runtime), the main thread owns the terminal. The
+/// conversation (and container) persist across turns until the user ends it.
 fn run_tui(
     task: String,
     model: Box<dyn cowboy_core::model::ModelClient>,
     runtime: AgentRuntime,
     behavior: cowboy_core::config::AgentBehavior,
     context_window: usize,
-    cancel: CancellationToken,
     logger: Option<crate::session::SessionLogger>,
 ) -> Result<()> {
-    let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
-    let control_tx = tx.clone();
-    let agent_cancel = cancel.clone();
-    let task_for_agent = task.clone();
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<String>();
+    let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let control_tx = ui_tx.clone();
+    let agent_turn_cancel = turn_cancel.clone();
+    let seed = (!task.is_empty()).then_some(task);
 
     let handle = std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
@@ -123,8 +123,8 @@ fn run_tui(
         {
             Ok(rt) => rt,
             Err(e) => {
-                let _ = tx.send(UiEvent::Notice(format!("runtime error: {e}")));
-                let _ = tx.send(UiEvent::Done);
+                let _ = ui_tx.send(UiEvent::Notice(format!("runtime error: {e}")));
+                let _ = ui_tx.send(UiEvent::Done);
                 return;
             }
         };
@@ -137,26 +137,34 @@ fn run_tui(
             rt.spawn(run_control_tui(sock, root, session_dir, control_tx));
         }
 
-        let mut ui = TuiUi { tx };
-        let result = {
+        // Separate sender for turn/session signals (the agent holds &mut ui).
+        let loop_tx = ui_tx.clone();
+        let mut ui = TuiUi { tx: ui_tx };
+        {
             let mut agent = AgentLoop::new(
                 model,
                 runtime,
                 behavior,
                 context_window,
-                agent_cancel,
+                CancellationToken::new(),
                 &mut ui,
             )
             .with_logger(logger);
-            rt.block_on(agent.run(&task_for_agent))
-        };
-        if let Err(e) = result {
-            let _ = ui.tx.send(UiEvent::Notice(format!("error: {e}")));
+
+            // One turn per user message; the conversation persists in `agent`.
+            while let Ok(msg) = task_rx.recv() {
+                let tc = CancellationToken::new();
+                *agent_turn_cancel.lock().unwrap() = Some(tc.clone());
+                let _ = rt.block_on(agent.run_turn(&msg, tc));
+                *agent_turn_cancel.lock().unwrap() = None;
+                let _ = loop_tx.send(UiEvent::TurnDone);
+            }
+            agent.finalize_session();
         }
-        let _ = ui.tx.send(UiEvent::Done);
+        let _ = loop_tx.send(UiEvent::Done);
     });
 
-    run_event_loop("cowboy", &task, rx, cancel)?;
+    run_event_loop("cowboy", seed, ui_rx, task_tx, turn_cancel)?;
     let _ = handle.join();
     Ok(())
 }

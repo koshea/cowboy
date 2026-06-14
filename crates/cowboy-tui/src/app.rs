@@ -33,7 +33,10 @@ pub struct TranscriptLine {
 /// Interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
+    /// Agent is working on a turn.
     Running,
+    /// Agent finished its turn; ready for the next user message.
+    Idle,
     AwaitingInput(String),
     Approval(String),
     Paused,
@@ -271,6 +274,7 @@ fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mode = match &app.mode {
         Mode::Running => "running",
+        Mode::Idle => "ready",
         Mode::AwaitingInput(_) => "awaiting input",
         Mode::Approval(_) => "approval",
         Mode::Paused => "paused",
@@ -294,6 +298,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::Done => "session finished — press q to quit",
         Mode::AwaitingInput(_) => "type your answer, Enter to submit",
+        Mode::Idle => "message cowboy · Enter send · Ctrl-C menu",
         _ => "type a message · Enter send · Ctrl-C interrupt",
     };
     let block = Block::default()
@@ -373,6 +378,16 @@ mod tests {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "do work");
         app.mode = Mode::Paused;
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_idle_ready_for_next_message() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "create a hello world");
+        app.push(LineKind::Final, "Done — created main.rs.");
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
         insta::assert_snapshot!(render(&app));
     }
 

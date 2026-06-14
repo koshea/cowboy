@@ -111,6 +111,10 @@ pub trait DockerCli: Send + Sync {
     async fn create_network(&self, spec: &NetworkSpec) -> Result<()>;
     /// Connect an existing container to an additional network.
     async fn connect_network(&self, network: &str, container: &str) -> Result<()>;
+    /// Remove a Docker network (ignores "not found").
+    async fn remove_network(&self, name: &str) -> Result<()>;
+    /// IDs of cowboy-labelled containers and networks (`(containers, networks)`).
+    async fn list_labeled(&self) -> Result<(Vec<String>, Vec<String>)>;
     /// Execute `argv` in the container, inheriting stdio, returning the exit code.
     async fn exec(&self, name: &str, workdir: &str, argv: &[String]) -> Result<ExecResult>;
     /// Execute `argv`, capturing combined stdout+stderr (for the agent loop).
@@ -344,6 +348,24 @@ impl DockerCli for CliDocker {
             );
         }
         Ok(())
+    }
+
+    async fn remove_network(&self, name: &str) -> Result<()> {
+        let _ = run_quiet(&["network", "rm", name]).await?; // ignore "not found"
+        Ok(())
+    }
+
+    async fn list_labeled(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let lines = |out: std::process::Output| -> Vec<String> {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let containers = run_quiet(&["ps", "-aq", "--filter", "label=cowboy=1"]).await?;
+        let networks = run_quiet(&["network", "ls", "-q", "--filter", "label=cowboy=1"]).await?;
+        Ok((lines(containers), lines(networks)))
     }
 
     async fn start(&self, name: &str) -> Result<()> {

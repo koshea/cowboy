@@ -38,6 +38,8 @@ pub enum UiEvent {
     ),
     /// A network decision the gateway made, for the activity log.
     NetEvent(String),
+    /// The agent finished a turn; ready for the next user message.
+    TurnDone,
     Done,
 }
 
@@ -80,18 +82,22 @@ impl AgentUi for TuiUi {
     }
 }
 
-/// Run the TUI event loop until the agent finishes and the user quits.
-///
-/// `events` receives display events from the agent thread; `cancel` is fired on
-/// Ctrl-C to interrupt the agent.
+/// Shared handle to the current turn's cancellation token (set by the agent
+/// thread, fired by the TUI's interrupt menu).
+pub type TurnCancel = std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>>;
+
+/// Run the conversational TUI event loop. `seed` is an optional first message;
+/// `task_tx` sends the user's messages to the agent thread (dropping it ends the
+/// session); `turn_cancel` interrupts the in-flight turn.
 pub fn run_event_loop(
     title: &str,
-    user_task: &str,
+    seed: Option<String>,
     events: Receiver<UiEvent>,
-    cancel: CancellationToken,
+    task_tx: Sender<String>,
+    turn_cancel: TurnCancel,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, title, user_task, events, cancel);
+    let result = event_loop(&mut terminal, title, seed, events, task_tx, turn_cancel);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -115,19 +121,33 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 fn event_loop(
     terminal: &mut Term,
     title: &str,
-    user_task: &str,
+    seed: Option<String>,
     events: Receiver<UiEvent>,
-    cancel: CancellationToken,
+    task_tx: Sender<String>,
+    turn_cancel: TurnCancel,
 ) -> Result<()> {
     let mut app = App::new(title.to_string());
-    app.push(LineKind::User, user_task);
     let mut pending_reply: Option<Sender<String>> = None;
     let mut pending_approval: Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>> = None;
-    // Mode to restore after an overlay (approval/paused) is dismissed.
-    let mut mode_before_overlay = Mode::Running;
+    let mut mode_before_overlay = Mode::Idle;
+    // Outstanding messages sent to the agent but not yet acknowledged (TurnDone).
+    let mut pending_turns: usize = 0;
+    let mut task_tx = Some(task_tx);
+
+    // Seed the first turn, or start idle awaiting the first message.
+    match seed {
+        Some(t) if !t.is_empty() => {
+            app.push(LineKind::User, t.clone());
+            if let Some(tx) = &task_tx {
+                let _ = tx.send(t);
+            }
+            pending_turns = 1;
+            app.mode = Mode::Running;
+        }
+        _ => app.mode = Mode::Idle,
+    }
 
     loop {
-        // Drain agent events.
         while let Ok(ev) = events.try_recv() {
             match ev {
                 UiEvent::Delta(t) => app.stream(&t),
@@ -145,10 +165,9 @@ fn event_loop(
                     app.status = "running".into();
                 }
                 UiEvent::Final(m) => {
+                    // `final` ends the turn, not the session.
                     app.commit_stream();
                     app.push(LineKind::Final, m);
-                    app.mode = Mode::Done;
-                    app.status = "finished".into();
                 }
                 UiEvent::Notice(m) => app.push(LineKind::Notice, m),
                 UiEvent::Ask(q, reply) => {
@@ -164,11 +183,18 @@ fn event_loop(
                     pending_approval = Some(reply);
                 }
                 UiEvent::NetEvent(line) => app.activity(line),
-                UiEvent::Done => {
-                    if app.mode != Mode::Done {
-                        app.mode = Mode::Done;
-                        app.status = "finished".into();
+                UiEvent::TurnDone => {
+                    pending_turns = pending_turns.saturating_sub(1);
+                    app.commit_stream();
+                    // Back to idle once all queued turns are processed.
+                    if pending_turns == 0 && matches!(app.mode, Mode::Running) {
+                        app.mode = Mode::Idle;
+                        app.status = "ready".into();
                     }
+                }
+                UiEvent::Done => {
+                    app.mode = Mode::Done;
+                    app.status = "session ended".into();
                 }
             }
         }
@@ -176,14 +202,15 @@ fn event_loop(
         app.tick();
         terminal.draw(|f| draw(f, &app))?;
 
-        // Handle input with a short poll so the spinner animates.
         if event::poll(Duration::from_millis(120))? {
             if let Event::Key(key) = event::read()? {
                 let ctx = KeyCtx {
                     pending_reply: &mut pending_reply,
                     pending_approval: &mut pending_approval,
                     mode_before_overlay: &mut mode_before_overlay,
-                    cancel: &cancel,
+                    turn_cancel: &turn_cancel,
+                    task_tx: &mut task_tx,
+                    pending_turns: &mut pending_turns,
                 };
                 if handle_key(Event::Key(key), key, &mut app, ctx) {
                     break;
@@ -199,15 +226,20 @@ struct KeyCtx<'a> {
     pending_reply: &'a mut Option<Sender<String>>,
     pending_approval: &'a mut Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>>,
     mode_before_overlay: &'a mut Mode,
-    cancel: &'a CancellationToken,
+    turn_cancel: &'a TurnCancel,
+    /// `None` once the session has been ended (sender dropped).
+    task_tx: &'a mut Option<Sender<String>>,
+    pending_turns: &'a mut usize,
 }
 
-/// Returns true if the loop should exit. `event` is the full crossterm event
-/// (fed to the input editor); `key` is its key form (for shortcuts).
+/// Returns true if the loop should exit.
 fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
-    // Ctrl-C opens the interrupt menu (unless one is already open / done).
+    // Ctrl-C opens the interrupt menu (during a turn or while idle).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(app.mode, Mode::Running | Mode::AwaitingInput(_)) {
+        if matches!(
+            app.mode,
+            Mode::Running | Mode::Idle | Mode::AwaitingInput(_)
+        ) {
             *ctx.mode_before_overlay = app.mode.clone();
             app.mode = Mode::Paused;
         }
@@ -233,18 +265,27 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
         return false;
     }
 
-    // Interrupt menu: resume / instruct / kill / end.
+    // Interrupt menu: resume / instruct / kill (this turn) / end (session).
     if app.mode == Mode::Paused {
         match key.code {
-            KeyCode::Char('r') | KeyCode::Esc => app.mode = ctx.mode_before_overlay.clone(),
-            KeyCode::Char('e') | KeyCode::Char('k') => {
-                ctx.cancel.cancel();
-                app.status = "interrupting…".into();
+            KeyCode::Char('r') | KeyCode::Esc | KeyCode::Char('i') => {
                 app.mode = ctx.mode_before_overlay.clone();
             }
-            KeyCode::Char('i') => {
-                app.activity("instruct: type in the input box, then resume");
+            KeyCode::Char('k') => {
+                // Cancel just the current turn; the session continues.
+                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
+                    tok.cancel();
+                }
+                app.status = "interrupting turn…".into();
                 app.mode = ctx.mode_before_overlay.clone();
+            }
+            KeyCode::Char('e') => {
+                // End the session: drop the task sender so the agent finalizes.
+                ctx.task_tx.take();
+                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
+                    tok.cancel();
+                }
+                app.status = "ending session…".into();
             }
             _ => {}
         }
@@ -252,7 +293,7 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
     }
 
     match (&app.mode, key.code) {
-        (Mode::Done, KeyCode::Char('q')) | (Mode::Done, KeyCode::Esc) => return true,
+        (Mode::Done, _) => return true,
         (Mode::AwaitingInput(_), KeyCode::Enter) => {
             let answer = app.take_input();
             app.push(LineKind::User, answer.clone());
@@ -261,6 +302,19 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
             }
             app.mode = Mode::Running;
             app.status = "running".into();
+        }
+        // Submit a message (Idle or while a turn is running -> queued).
+        (Mode::Idle | Mode::Running, KeyCode::Enter) => {
+            let msg = app.take_input();
+            if !msg.trim().is_empty() {
+                if let Some(tx) = ctx.task_tx {
+                    app.push(LineKind::User, msg.clone());
+                    let _ = tx.send(msg);
+                    *ctx.pending_turns += 1;
+                    app.mode = Mode::Running;
+                    app.status = "running".into();
+                }
+            }
         }
         // Everything else is text input for the editor.
         _ => app.input_event(event),
