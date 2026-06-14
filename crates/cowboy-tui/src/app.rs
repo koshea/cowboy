@@ -526,7 +526,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::Approval(p) => draw_modal(
             f,
             area,
-            "Network approval",
+            "Approval",
             p,
             "[o]nce [s]ession [p]roject [g]lobal [d]eny",
         ),

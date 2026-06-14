@@ -158,6 +158,7 @@ mod tests {
                     target: "/tmp/.gitconfig".into(),
                     read_only: true,
                     required: false,
+                    approval: None,
                 }],
                 allow: RuleSet {
                     domains: vec!["github.com".into()],
@@ -175,6 +176,7 @@ mod tests {
                     target: "/tmp/.config/gh".into(),
                     read_only: true,
                     required: false,
+                    approval: None,
                 }],
                 allow: RuleSet {
                     domains: vec!["api.github.com".into()],
@@ -232,6 +234,7 @@ mod tests {
                 target: "/tmp/.config/gh".into(),
                 read_only: true,
                 required: false,
+                approval: None,
             }],
             allow: RuleSet {
                 domains: vec!["api.github.com".into()],

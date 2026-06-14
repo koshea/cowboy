@@ -75,7 +75,20 @@ fn grant(source: &str, target: &str) -> SecretMount {
         target: target.into(),
         read_only: true,
         required: false,
+        approval: None,
     }
+}
+
+#[test]
+fn approval_required_recognizes_opt_in_values() {
+    assert!(approval_required(&Some("required".into())));
+    assert!(approval_required(&Some("ask".into())));
+    assert!(!approval_required(&None));
+    assert!(!approval_required(&Some("no".into())));
+    let mut m = grant("~/.config/gh", "/tmp/.config/gh");
+    assert!(!m.needs_approval());
+    m.approval = Some("required".into());
+    assert!(m.needs_approval());
 }
 
 #[test]

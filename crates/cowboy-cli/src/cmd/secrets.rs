@@ -167,6 +167,7 @@ fn add(args: SecretsAddArgs) -> Result<()> {
                 target,
                 read_only: true,
                 required: false,
+                approval: None,
             });
         }
     }

@@ -583,12 +583,14 @@ mod tests {
                 target: "/tmp/.config/gh".into(),
                 read_only: true,
                 required: false,
+                approval: None,
             },
             SecretMount {
                 source: "/no/such/optional/cred".into(),
                 target: "/tmp/.config/absent".into(),
                 read_only: true,
                 required: false,
+                approval: None,
             },
         ];
         let spec = rt.build_spec().unwrap();
@@ -615,6 +617,7 @@ mod tests {
             target: "/tmp/.config/x".into(),
             read_only: true,
             required: true,
+            approval: None,
         }];
         assert!(rt.build_spec().is_err());
     }

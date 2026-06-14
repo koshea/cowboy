@@ -164,6 +164,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         });
     }
 
+    // Gate credential grants flagged `approval: required` behind a per-session
+    // prompt to the attached client; a denied grant is dropped before the
+    // container is ever built. With no client attached, this fails closed.
+    gate_credential_grants(&mut security, &emitter).await;
+
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security);
 
     // Network approvals + gateway events flow over the control socket. Route
@@ -312,6 +317,82 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
     }
     Ok(())
+}
+
+/// Prompt the attached client to approve each credential grant marked
+/// `approval: required` (whose host source is present) before it is exposed to
+/// the container; drop denied grants from `security`. Fails closed: with no
+/// client attached the prompt is denied, so the grant is not mounted/injected.
+async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConfig, ui: &SocketUi) {
+    use cowboy_core::config::expand_path;
+    use cowboy_core::netproto::Verdict;
+
+    // Only grants whose source is actually present can be exposed; prompting for
+    // absent optional grants is pointless (they would be skipped anyway).
+    let present_file = |f: &cowboy_core::config::SecretMount| {
+        expand_path(&f.source).map(|p| p.exists()).unwrap_or(false)
+    };
+    let env_pending = security
+        .secrets
+        .env
+        .iter()
+        .any(|e| e.needs_approval() && std::env::var(&e.source_env).is_ok());
+    let file_pending = security
+        .secrets
+        .files
+        .iter()
+        .any(|f| f.needs_approval() && present_file(f));
+    if !env_pending && !file_pending {
+        return;
+    }
+
+    // Give the interactive client a moment to attach so we don't auto-deny.
+    ui.wait_for_client(std::time::Duration::from_secs(20)).await;
+
+    let mut kept_env = Vec::with_capacity(security.secrets.env.len());
+    for e in std::mem::take(&mut security.secrets.env) {
+        if e.needs_approval() && std::env::var(&e.source_env).is_ok() {
+            let prompt = format!(
+                "credential: inject env {} (from ${}) into the container?",
+                e.name, e.source_env
+            );
+            let (verdict, _scope) = ui.request_approval(prompt).await;
+            if verdict == Verdict::Allow {
+                kept_env.push(e);
+            } else {
+                ui.emit(UiEventMsg::Notice(format!(
+                    "credential denied: env {} not injected",
+                    e.name
+                )));
+            }
+        } else {
+            kept_env.push(e);
+        }
+    }
+    security.secrets.env = kept_env;
+
+    let mut kept_files = Vec::with_capacity(security.secrets.files.len());
+    for f in std::mem::take(&mut security.secrets.files) {
+        if f.needs_approval() && present_file(&f) {
+            let mode = if f.read_only { "read-only" } else { "writable" };
+            let prompt = format!(
+                "credential: mount {} → {} ({mode}) into the container?",
+                f.source, f.target
+            );
+            let (verdict, _scope) = ui.request_approval(prompt).await;
+            if verdict == Verdict::Allow {
+                kept_files.push(f);
+            } else {
+                ui.emit(UiEventMsg::Notice(format!(
+                    "credential denied: {} not mounted",
+                    f.source
+                )));
+            }
+        } else {
+            kept_files.push(f);
+        }
+    }
+    security.secrets.files = kept_files;
 }
 
 /// Drive the host-side control socket for this session's gateway. Gateway
@@ -533,6 +614,108 @@ mod tests {
                 scope: ApprovalScope::Session,
             }
         );
+    }
+
+    /// A credential grant flagged `approval: required` is prompted to the
+    /// attached client; a Deny drops it, an Allow keeps it. Grants without the
+    /// flag pass through untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn credential_approval_gates_grants() {
+        use cowboy_core::config::{SecretMount, SecurityConfig};
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let worker_sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        // A present source the grant can point at (the dir itself exists).
+        let src = tmp.path().to_string_lossy().into_owned();
+
+        let (ui, _cmd_rx) = SocketUi::bind(&worker_sock, &journal, sample_info())
+            .await
+            .unwrap();
+
+        // Attach a client and handshake.
+        let client = UnixStream::connect(&worker_sock).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut creader = BufReader::new(cr);
+        cw.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        cw.flush().await.unwrap();
+        assert!(read_line(&mut creader).await.contains("snapshot"));
+
+        let mut security = SecurityConfig::default();
+        security.secrets.files = vec![
+            SecretMount {
+                source: src.clone(),
+                target: "/tmp/.config/approved".into(),
+                read_only: true,
+                required: false,
+                approval: Some("required".into()),
+            },
+            SecretMount {
+                source: src.clone(),
+                target: "/tmp/.config/denied".into(),
+                read_only: true,
+                required: false,
+                approval: Some("required".into()),
+            },
+            SecretMount {
+                source: src.clone(),
+                target: "/tmp/.config/free".into(),
+                read_only: true,
+                required: false,
+                approval: None, // no prompt
+            },
+        ];
+
+        let gate_ui = ui.clone();
+        let gate = tokio::spawn(async move {
+            gate_credential_grants(&mut security, &gate_ui).await;
+            security
+        });
+
+        // Answer two prompts: Allow the first, Deny the second.
+        for _ in 0..2 {
+            let (id, dest) = loop {
+                let line = read_line(&mut creader).await;
+                if let Ok(ServerMsg::Approval { id, dest }) = serde_json::from_str(line.trim()) {
+                    break (id, dest);
+                }
+            };
+            let verdict = if dest.contains("approved") {
+                Verdict::Allow
+            } else {
+                Verdict::Deny
+            };
+            cw.write_all(
+                encode_line(&ClientMsg::ApprovalReply {
+                    id,
+                    verdict,
+                    scope: ApprovalScope::Session,
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            cw.flush().await.unwrap();
+        }
+
+        let security = gate.await.unwrap();
+        let targets: Vec<_> = security
+            .secrets
+            .files
+            .iter()
+            .map(|f| f.target.as_str())
+            .collect();
+        assert!(targets.contains(&"/tmp/.config/approved"), "allowed kept");
+        assert!(!targets.contains(&"/tmp/.config/denied"), "denied dropped");
+        assert!(targets.contains(&"/tmp/.config/free"), "un-gated kept");
     }
 
     /// With no client attached, the gateway's ask is denied (fail closed).

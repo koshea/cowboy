@@ -72,3 +72,4 @@ secrets:
     #   target: /tmp/.config/gh
     #   read_only: true
     #   required: false
+    #   approval: required   # prompt for per-session approval before mounting

@@ -183,6 +183,20 @@ impl SocketUi {
         });
     }
 
+    /// Wait (up to `timeout`) for at least one client to attach. Returns whether
+    /// one is attached. Used to avoid auto-denying a startup approval prompt
+    /// before the interactive client has had a chance to connect.
+    pub async fn wait_for_client(&self, timeout: Duration) -> bool {
+        let deadline = timeout;
+        let step = Duration::from_millis(100);
+        let mut waited = Duration::ZERO;
+        while self.attached() == 0 && waited < deadline {
+            tokio::time::sleep(step).await;
+            waited += step;
+        }
+        self.attached() > 0
+    }
+
     /// Ask attached clients to approve a network destination. Fails closed: with
     /// zero attached clients (or on timeout) the verdict is `Deny`/`Once` so a
     /// parked gateway connection never hangs. With clients, the first

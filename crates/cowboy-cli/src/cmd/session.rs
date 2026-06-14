@@ -141,6 +141,9 @@ pub async fn run(
         security
             .validate()
             .context("validating merged credential grants")?;
+        // Headless (piped) runs can't prompt — credential grants flagged
+        // `approval: required` fail closed and are dropped before any mount.
+        drop_approval_required_grants(&mut security);
         let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
         let context_window = resolved.context_window as usize;
         let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
@@ -208,6 +211,31 @@ pub async fn run(
         }
         result.map(|_| ())
     }
+}
+
+/// Drop credential grants that require explicit approval. Used on the headless
+/// (piped) path, which has no interactive client to prompt — so such grants
+/// fail closed rather than being exposed silently. A notice is printed for each.
+fn drop_approval_required_grants(security: &mut SecurityConfig) {
+    security.secrets.env.retain(|e| {
+        if e.needs_approval() {
+            eprintln!(
+                "credential skipped (needs approval, no TTY): env {}",
+                e.name
+            );
+            false
+        } else {
+            true
+        }
+    });
+    security.secrets.files.retain(|f| {
+        if f.needs_approval() {
+            eprintln!("credential skipped (needs approval, no TTY): {}", f.source);
+            false
+        } else {
+            true
+        }
+    });
 }
 
 /// Register a one-shot (non-interactive) session with the daemon and take its

@@ -162,6 +162,25 @@ pub struct SecretMount {
     /// Fail to start if the host source is missing (default: skip when absent).
     #[serde(default)]
     pub required: bool,
+    /// If `Some("required")` (or `"ask"`), mounting this credential needs the
+    /// user's explicit per-session approval before it is exposed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
+}
+
+impl SecretMount {
+    /// Whether mounting this credential requires explicit per-session approval.
+    pub fn needs_approval(&self) -> bool {
+        approval_required(&self.approval)
+    }
+}
+
+/// Whether an `approval` field opts a grant into a per-session approval prompt.
+pub fn approval_required(approval: &Option<String>) -> bool {
+    matches!(
+        approval.as_deref(),
+        Some("required") | Some("ask") | Some("yes") | Some("true")
+    )
 }
 
 /// A single secret env var injected into the container from a host env var.
@@ -177,6 +196,13 @@ pub struct SecretEnv {
     /// If `Some("required")`, injecting this secret needs explicit approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+}
+
+impl SecretEnv {
+    /// Whether injecting this secret requires explicit per-session approval.
+    pub fn needs_approval(&self) -> bool {
+        approval_required(&self.approval)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -961,6 +987,7 @@ secrets:
     #   target: /tmp/.config/gh
     #   read_only: true
     #   required: false
+    #   approval: required   # prompt for per-session approval before mounting
 "#;
 
 const AGENT_TEMPLATE: &str = r#"version: 1

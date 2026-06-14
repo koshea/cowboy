@@ -7,7 +7,7 @@ expression: render(&app)
 │                                               ││yet                  │
 │                                               ││                     │
 │                                               ││                     │
-│   ╭ Network approval ────────────────────────────────────────────╮   │
+│   ╭ Approval ────────────────────────────────────────────────────╮   │
 │   │github.com:443                                                │   │
 │   │                                                              │───╯
 │   │[o]nce [s]ession [p]roject [g]lobal [d]eny                    │───╮
