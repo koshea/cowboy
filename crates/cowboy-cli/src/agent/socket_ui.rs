@@ -389,4 +389,144 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("command_start"));
     }
+
+    /// Two clients that connect at different points still observe the same
+    /// ordered event stream from the moment each is live. A client joining
+    /// mid-stream replays the full journal, then both see subsequent live
+    /// events in identical order.
+    #[tokio::test]
+    async fn two_clients_see_identical_order() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+
+        let (mut ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+
+        // Client A connects first.
+        let stream_a = UnixStream::connect(&sock).await.unwrap();
+        let (ra, mut wa) = stream_a.into_split();
+        let mut reader_a = BufReader::new(ra);
+        wa.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        wa.flush().await.unwrap();
+        // A's snapshot (empty journal).
+        match read_msg(&mut reader_a).await {
+            ServerMsg::Snapshot { journal_len, .. } => assert_eq!(journal_len, 0),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // An event lands while only A is attached; give A a moment to drain it
+        // so the broadcast ordering across clients is unambiguous.
+        ui.tool_use("step one");
+        match read_msg(&mut reader_a).await {
+            ServerMsg::Event {
+                seq: 0,
+                event: UiEventMsg::ToolUse(s),
+            } => assert_eq!(s, "step one"),
+            other => panic!("A expected ToolUse, got {other:?}"),
+        }
+
+        // Client B connects mid-stream: it replays the journal (seq 0) first.
+        let stream_b = UnixStream::connect(&sock).await.unwrap();
+        let (rb, mut wb) = stream_b.into_split();
+        let mut reader_b = BufReader::new(rb);
+        wb.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        wb.flush().await.unwrap();
+        match read_msg(&mut reader_b).await {
+            ServerMsg::Snapshot { journal_len, .. } => assert_eq!(journal_len, 1),
+            other => panic!("B expected Snapshot, got {other:?}"),
+        }
+        match read_msg(&mut reader_b).await {
+            ServerMsg::Event {
+                seq: 0,
+                event: UiEventMsg::ToolUse(s),
+            } => assert_eq!(s, "step one"),
+            other => panic!("B expected replayed ToolUse, got {other:?}"),
+        }
+
+        // Subsequent live events reach both clients in the same order.
+        ui.tool_use("step two");
+        ui.tool_use("step three");
+        for expected in ["step two", "step three"] {
+            for reader in [&mut reader_a, &mut reader_b] {
+                match read_msg(reader).await {
+                    ServerMsg::Event {
+                        event: UiEventMsg::ToolUse(s),
+                        ..
+                    } => assert_eq!(s, expected),
+                    other => panic!("expected live ToolUse {expected}, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    /// `Hello{since_seq: Some(n)}` resumes: the snapshot reports the true
+    /// journal length, but only events at seq >= n are replayed.
+    #[tokio::test]
+    async fn since_seq_resumes_from_offset() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+
+        let (mut ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+
+        // Three journaled events: seq 0, 1, 2.
+        ui.tool_use("zero");
+        ui.tool_use("one");
+        ui.tool_use("two");
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        w.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: Some(2),
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+
+        // Snapshot reports the full length (3) even though we resume from 2.
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot { journal_len, .. } => assert_eq!(journal_len, 3),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        // Only seq 2 is replayed.
+        match read_msg(&mut reader).await {
+            ServerMsg::Event {
+                seq: 2,
+                event: UiEventMsg::ToolUse(s),
+            } => assert_eq!(s, "two"),
+            other => panic!("expected only seq-2 replay, got {other:?}"),
+        }
+
+        // The next thing the client sees is the new live event (seq 3), proving
+        // nothing between [0,2) leaked through.
+        ui.tool_use("three");
+        match read_msg(&mut reader).await {
+            ServerMsg::Event {
+                seq: 3,
+                event: UiEventMsg::ToolUse(s),
+            } => assert_eq!(s, "three"),
+            other => panic!("expected live seq-3, got {other:?}"),
+        }
+    }
 }
