@@ -3,7 +3,8 @@
 //! snapshot-testable with `ratatui::backend::TestBackend`.
 
 use ansi_to_tui::IntoText;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -74,6 +75,45 @@ pub struct App {
     pub scroll_top: usize,
     /// Max scroll offset, updated each frame from the rendered content/viewport.
     pub max_scroll: std::cell::Cell<usize>,
+    /// Active mouse text-selection in the transcript (absolute screen coords).
+    pub selection: Option<Selection>,
+    /// Inner text rect of the transcript, captured each frame so the event loop
+    /// can hit-test mouse coordinates against the transcript only.
+    pub transcript_area: std::cell::Cell<Rect>,
+}
+
+/// A mouse text selection, in absolute terminal coordinates (col, row).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    /// Where the drag began.
+    pub anchor: (u16, u16),
+    /// Current drag position.
+    pub cursor: (u16, u16),
+}
+
+/// Per-row selected column spans `(row, x_start, x_end)` (inclusive), in linear
+/// reading order, clamped to `rect`.
+fn selection_spans(rect: Rect, sel: &Selection) -> Vec<(u16, u16, u16)> {
+    // Order the endpoints by (row, col) so selection reads top-to-bottom.
+    let (start, end) = if (sel.anchor.1, sel.anchor.0) <= (sel.cursor.1, sel.cursor.0) {
+        (sel.anchor, sel.cursor)
+    } else {
+        (sel.cursor, sel.anchor)
+    };
+    let (sx, sy) = start;
+    let (ex, ey) = end;
+    let left = rect.x;
+    let right = rect.right().saturating_sub(1);
+    let (top, bot) = (rect.y, rect.bottom().saturating_sub(1));
+    let mut spans = Vec::new();
+    for y in sy.max(top)..=ey.min(bot) {
+        let x0 = if y == sy { sx } else { left }.clamp(left, right);
+        let x1 = if y == ey { ex } else { right }.clamp(left, right);
+        if x1 >= x0 {
+            spans.push((y, x0, x1));
+        }
+    }
+    spans
 }
 
 impl App {
@@ -94,7 +134,64 @@ impl App {
             follow: true,
             scroll_top: 0,
             max_scroll: std::cell::Cell::new(0),
+            selection: None,
+            transcript_area: std::cell::Cell::new(Rect::ZERO),
         }
+    }
+
+    /// Begin a selection at an absolute screen position, but only if it lands in
+    /// the transcript (clicks elsewhere just clear any selection).
+    pub fn begin_selection(&mut self, col: u16, row: u16) {
+        if self.transcript_area.get().contains(Position::new(col, row)) {
+            self.selection = Some(Selection {
+                anchor: (col, row),
+                cursor: (col, row),
+            });
+        } else {
+            self.selection = None;
+        }
+    }
+
+    /// Extend the active selection, clamping to the transcript rect.
+    pub fn drag_selection(&mut self, col: u16, row: u16) {
+        let r = self.transcript_area.get();
+        if let Some(sel) = &mut self.selection {
+            sel.cursor = (
+                col.clamp(r.x, r.right().saturating_sub(1)),
+                row.clamp(r.y, r.bottom().saturating_sub(1)),
+            );
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Extract the selected text from a rendered `buf`, reading only the
+    /// transcript's columns so sidebars never bleed in. Returns `None` for a
+    /// bare click (no drag) or an all-whitespace selection.
+    pub fn selected_text(&self, buf: &Buffer) -> Option<String> {
+        let sel = self.selection?;
+        if sel.anchor == sel.cursor {
+            return None; // a click, not a drag
+        }
+        let rect = self.transcript_area.get();
+        let lines: Vec<String> = selection_spans(rect, &sel)
+            .into_iter()
+            .map(|(y, x0, x1)| {
+                let mut s = String::new();
+                for x in x0..=x1 {
+                    s.push_str(buf[(x, y)].symbol());
+                }
+                s.trim_end().to_string()
+            })
+            .collect();
+        let text = lines.join("\n");
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Scroll the transcript up (toward older content) by `n` lines.
@@ -164,6 +261,33 @@ impl App {
     /// Feed a key event to the input editor.
     pub fn input_event(&mut self, event: crossterm::event::Event) {
         self.textarea.input(event);
+    }
+
+    /// Insert a newline at the cursor (multi-line input).
+    pub fn input_newline(&mut self) {
+        self.textarea.insert_newline();
+    }
+
+    /// Insert pasted text at the cursor (handles embedded newlines).
+    pub fn input_paste(&mut self, text: &str) {
+        self.textarea.insert_str(text);
+    }
+
+    /// Replace the input with `text`, cursor at the end (history recall).
+    pub fn set_input(&mut self, text: &str) {
+        let mut ta = TextArea::default();
+        ta.insert_str(text);
+        self.textarea = ta;
+    }
+
+    /// The cursor's row within the input editor (0-based).
+    pub fn input_cursor_row(&self) -> usize {
+        self.textarea.cursor().0
+    }
+
+    /// Number of lines in the input editor.
+    pub fn input_lines(&self) -> usize {
+        self.textarea.lines().len()
     }
 
     /// Clear the input editor, returning its prior content.
@@ -305,6 +429,15 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
 
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
+    // Record the inner text rect so the event loop can hit-test mouse drags
+    // against the transcript only (not the borders or sidebars).
+    let text_rect = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    app.transcript_area.set(text_rect);
     // Estimate wrapped-line count so scrollback maps to what's on screen.
     let total: usize = lines
         .iter()
@@ -335,9 +468,11 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
         .scroll((offset_top, 0));
     f.render_widget(para, area);
 
-    // Scrollbar on the right edge when content overflows.
+    // Scrollbar on the right edge when content overflows. ratatui bottoms the
+    // thumb when position == content_length - 1, so content_length is the count
+    // of scroll *positions* (0..=max_scroll), not the total line count.
     if max_scroll > 0 {
-        let mut sb_state = ratatui::widgets::ScrollbarState::new(total)
+        let mut sb_state = ratatui::widgets::ScrollbarState::new(max_scroll + 1)
             .viewport_content_length(inner_h)
             .position(offset_top as usize);
         let sb =
@@ -346,6 +481,17 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
                 .end_symbol(None)
                 .thumb_style(Style::default().fg(Color::DarkGray));
         f.render_stateful_widget(sb, area, &mut sb_state);
+    }
+
+    // Paint the selection highlight over the rendered text.
+    if let Some(sel) = &app.selection {
+        let buf = f.buffer_mut();
+        for (y, x0, x1) in selection_spans(text_rect, sel) {
+            for x in x0..=x1 {
+                let cell = &mut buf[(x, y)];
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
     }
 }
 
@@ -483,8 +629,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::Done => "session finished — press q to quit",
         Mode::AwaitingInput(_) => "type your answer · Enter submits",
-        Mode::Idle => "message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu",
-        _ => "type a message · Enter send · PgUp/wheel scroll · Ctrl-C interrupt",
+        Mode::Idle => "Enter send · Shift+Enter newline · ↑↓ history · /help · Ctrl-C menu",
+        _ => "Enter send · Shift+Enter newline · /help · Ctrl-C interrupt",
     };
     let accent = if app.mode == Mode::Idle {
         Color::Cyan
@@ -626,6 +772,46 @@ mod tests {
         app.tokens_out = 9_120;
         app.diff = "Δ 2f +30 -4".into();
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn selection_copies_transcript_text_excluding_sidebar() {
+        let mut app = App::new("t");
+        app.push(LineKind::Agent, "hello world from the transcript");
+        app.activity("ask example.com:443"); // lives in the right-hand pane
+        let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+
+        // Select the full first text row of the transcript.
+        let r = app.transcript_area.get();
+        app.selection = Some(Selection {
+            anchor: (r.x, r.y),
+            cursor: (r.right() - 1, r.y),
+        });
+        let text = app.selected_text(term.backend().buffer()).unwrap();
+        assert!(
+            text.contains("hello world from the transcript"),
+            "got {text:?}"
+        );
+        // The sidebar shares the row but lives in other columns — excluded.
+        assert!(!text.contains("example.com"), "sidebar leaked: {text:?}");
+
+        // A bare click (no drag) copies nothing.
+        app.selection = Some(Selection {
+            anchor: (r.x, r.y),
+            cursor: (r.x, r.y),
+        });
+        assert!(app.selected_text(term.backend().buffer()).is_none());
+    }
+
+    #[test]
+    fn begin_selection_only_inside_transcript() {
+        let mut app = App::new("t");
+        app.transcript_area.set(Rect::new(1, 1, 40, 10));
+        app.begin_selection(5, 5);
+        assert!(app.has_selection());
+        app.begin_selection(60, 5); // outside (sidebar) -> clears
+        assert!(!app.has_selection());
     }
 
     #[test]

@@ -15,11 +15,16 @@ use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::tui::{run_event_loop, TuiUi, TurnCancel, UiEvent};
+use crate::agent::tui::{run_event_loop, AgentCmd, SessionCtx, TuiUi, TurnCancel, UiEvent};
 use crate::agent::{AgentLoop, ConsoleUi};
 use crate::net::docker::CliDocker;
 use crate::net::runtime::AgentRuntime;
 use crate::net::{approvals, control};
+
+/// Builds a model client (and its context window) by profile name, for the
+/// `/model` command. Captures the host-owned providers + model configs.
+type ModelResolver =
+    Box<dyn Fn(&str) -> Result<(Box<dyn cowboy_core::model::ModelClient>, usize)> + Send>;
 
 pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
     let root = crate::cmd::project_root()?;
@@ -68,6 +73,37 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
 
     let behavior = agent_cfg.agent;
     if interactive {
+        // Merged model names + the active default, for the `/model` command.
+        let mut model_names: Vec<String> = Vec::new();
+        if let Some(u) = &user_models {
+            model_names.extend(u.models.keys().cloned());
+        }
+        if let Some(p) = &project_models {
+            model_names.extend(p.models.keys().cloned());
+        }
+        model_names.sort();
+        model_names.dedup();
+        let current_model = project_models
+            .as_ref()
+            .and_then(|p| p.default.clone())
+            .or_else(|| user_models.as_ref().and_then(|u| u.default.clone()))
+            .unwrap_or_default();
+
+        // Resolver the agent thread calls on `/model <name>` to rebuild the
+        // client (provider creds stay host-owned).
+        let resolve: ModelResolver = {
+            let providers = providers.clone();
+            let user = user_models.clone();
+            let project = project_models.clone();
+            Box::new(move |name: &str| {
+                let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
+                let cw = r.context_window as usize;
+                let client: Box<dyn cowboy_core::model::ModelClient> =
+                    Box::new(OpenAiClient::from_resolved(&r)?);
+                Ok((client, cw))
+            })
+        };
+
         // Load straight into the full-screen UI; the first message is entered
         // there (no pre-prompt). An empty task means "start on the welcome
         // screen and wait for input".
@@ -79,6 +115,9 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
             behavior,
             context_window,
             logger,
+            model_names,
+            current_model,
+            resolve,
         )
     } else {
         // Non-interactive: prompt on stdin if no task was given; asks fail closed.
@@ -200,6 +239,7 @@ fn resolve_task(task: Option<String>) -> Result<Option<String>> {
 /// Run the conversational ratatui front-end: the agent runs a turn loop on a
 /// dedicated thread (its own runtime), the main thread owns the terminal. The
 /// conversation (and container) persist across turns until the user ends it.
+#[allow(clippy::too_many_arguments)]
 fn run_tui(
     task: String,
     intro: Vec<String>,
@@ -208,14 +248,18 @@ fn run_tui(
     behavior: cowboy_core::config::AgentBehavior,
     context_window: usize,
     logger: Option<crate::session::SessionLogger>,
+    model_names: Vec<String>,
+    current_model: String,
+    resolve: ModelResolver,
 ) -> Result<()> {
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
-    let (task_tx, task_rx) = std::sync::mpsc::channel::<String>();
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
     let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
     let agent_turn_cancel = turn_cancel.clone();
     let seed = (!task.is_empty()).then_some(task);
+    let root = runtime.root().to_path_buf();
     // Persistent title surfaces the working directory + git branch.
-    let title = context_title(runtime.root());
+    let title = context_title(&root);
 
     // Control pipeline on its OWN always-on thread. This binds the host control
     // socket immediately — before the gateway is ever started — and keeps it
@@ -263,19 +307,33 @@ fn run_tui(
             )
             .with_logger(logger);
 
-            // One turn per user message; the conversation persists in `agent`.
-            while let Ok(msg) = task_rx.recv() {
-                let tc = CancellationToken::new();
-                *agent_turn_cancel.lock().unwrap() = Some(tc.clone());
-                let _ = rt.block_on(agent.run_turn(&msg, tc));
-                *agent_turn_cancel.lock().unwrap() = None;
-                // Post-turn indicators: working-tree diff, processes, and the
-                // title (the branch may have changed, e.g. the agent committed).
-                let (diff, procs) = post_turn_indicators(agent.root());
-                let _ = loop_tx.send(UiEvent::DiffStat(diff));
-                let _ = loop_tx.send(UiEvent::Processes(procs));
-                let _ = loop_tx.send(UiEvent::Title(context_title(agent.root())));
-                let _ = loop_tx.send(UiEvent::TurnDone);
+            // One command per loop; the conversation persists in `agent`.
+            while let Ok(cmd) = task_rx.recv() {
+                match cmd {
+                    AgentCmd::SwitchModel(name) => match resolve(&name) {
+                        Ok((client, cw)) => {
+                            agent.set_model(client, cw);
+                            let _ = loop_tx.send(UiEvent::Notice(format!("model is now {name}")));
+                        }
+                        Err(e) => {
+                            let _ =
+                                loop_tx.send(UiEvent::Notice(format!("model switch failed: {e}")));
+                        }
+                    },
+                    AgentCmd::Message(msg) => {
+                        let tc = CancellationToken::new();
+                        *agent_turn_cancel.lock().unwrap() = Some(tc.clone());
+                        let _ = rt.block_on(agent.run_turn(&msg, tc));
+                        *agent_turn_cancel.lock().unwrap() = None;
+                        // Post-turn indicators: working-tree diff, processes, and
+                        // the title (the branch may change, e.g. a commit).
+                        let (diff, procs) = post_turn_indicators(agent.root());
+                        let _ = loop_tx.send(UiEvent::DiffStat(diff));
+                        let _ = loop_tx.send(UiEvent::Processes(procs));
+                        let _ = loop_tx.send(UiEvent::Title(context_title(agent.root())));
+                        let _ = loop_tx.send(UiEvent::TurnDone);
+                    }
+                }
             }
             rt.block_on(agent.shutdown()); // stop managed processes
             agent.finalize_session();
@@ -283,7 +341,20 @@ fn run_tui(
         let _ = loop_tx.send(UiEvent::Done);
     });
 
-    run_event_loop(&title, intro, seed, ui_rx, task_tx, turn_cancel)?;
+    let session_ctx = SessionCtx {
+        root,
+        models: model_names,
+        current_model,
+    };
+    run_event_loop(
+        &title,
+        intro,
+        seed,
+        ui_rx,
+        task_tx,
+        turn_cancel,
+        session_ctx,
+    )?;
     let _ = handle.join();
     Ok(())
 }

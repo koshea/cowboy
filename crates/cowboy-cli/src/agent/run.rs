@@ -161,6 +161,13 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
+    /// Swap the model client (and its context window) mid-session, keeping the
+    /// conversation. Used by the `/model` command.
+    pub fn set_model(&mut self, model: Box<dyn ModelClient>, context_window: usize) {
+        self.model = model;
+        self.context_window = context_window;
+    }
+
     /// Run one conversational turn for `task`, keeping the conversation (and the
     /// session logger) alive for subsequent turns. `turn_cancel` interrupts just
     /// this turn. Does NOT finalize the session.

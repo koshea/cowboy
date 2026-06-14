@@ -17,6 +17,6 @@ expression: render(&app)
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    paused — ready
-╭ type a message · Enter send · PgUp/wheel scroll · Ctrl-C interrupt ──╮
+╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

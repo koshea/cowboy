@@ -17,6 +17,6 @@ expression: render(&app)
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    ready — ready
-╭ message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu ───────╮
+╭ Enter send · Shift+Enter newline · ↑↓ history · /help · Ctrl-C menu ─╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯
