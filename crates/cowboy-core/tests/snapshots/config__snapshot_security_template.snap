@@ -57,8 +57,18 @@ network_policy:
       - 100.100.100.200/32
 
 secrets:
+  # Env vars injected from the host (values read at runtime, never stored here).
   env: []
     # - name: GITHUB_TOKEN
     #   source_env: COWBOY_GITHUB_TOKEN
     #   required: false
     #   approval: required
+  # Host credential files/dirs granted (read-only by default) into the container
+  # so the agent can use CLIs like gh/gcloud/kubectl. The container HOME is /tmp,
+  # so mount under /tmp/... where the tools look. `cowboy secrets add <preset>`
+  # prints ready-to-paste entries. You must also allow the matching network host.
+  files: []
+    # - source: ~/.config/gh
+    #   target: /tmp/.config/gh
+    #   read_only: true
+    #   required: false

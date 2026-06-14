@@ -139,6 +139,28 @@ impl AgentRuntime {
             }
         }
 
+        // Host credential grants (read-only by default), mounted where the
+        // agent's CLIs look (HOME=/tmp). Missing optional grants are skipped.
+        for grant in &self.security.secrets.files {
+            let source = config::expand_path(&grant.source)
+                .with_context(|| format!("credential grant {}", grant.source))?;
+            if !source.exists() {
+                if grant.required {
+                    return Err(anyhow::anyhow!(
+                        "required credential {} is missing on the host",
+                        source.display()
+                    ));
+                }
+                continue; // optional and absent: skip
+            }
+            let src = source.to_string_lossy().into_owned();
+            mounts.push(if grant.read_only {
+                BindMount::ro(src, grant.target.clone())
+            } else {
+                BindMount::rw(src, grant.target.clone())
+            });
+        }
+
         // When isolation is enabled, attach the agent to the internal-only
         // network, point DNS at the gateway, drop NET_ADMIN/NET_RAW so the
         // agent cannot change its route, and disable IPv6.
@@ -547,6 +569,54 @@ mod tests {
         assert!(spec.env.iter().any(|(k, v)| k == "DB_URL" && v == "s3cr3t"));
         assert!(!spec.env.iter().any(|(k, _)| k == "MISSING"));
         std::env::remove_var("COWBOY_TEST_SECRET_SRC");
+    }
+
+    #[test]
+    fn build_spec_mounts_credential_grants_read_only_and_skips_absent() {
+        use cowboy_core::config::SecretMount;
+        let (mut rt, tmp) = fixture(false, MockDockerCli::new());
+        let cred = tmp.path().join("gh-config");
+        std::fs::write(&cred, "token").unwrap();
+        rt.security.secrets.files = vec![
+            SecretMount {
+                source: cred.to_string_lossy().into_owned(),
+                target: "/tmp/.config/gh".into(),
+                read_only: true,
+                required: false,
+            },
+            SecretMount {
+                source: "/no/such/optional/cred".into(),
+                target: "/tmp/.config/absent".into(),
+                read_only: true,
+                required: false,
+            },
+        ];
+        let spec = rt.build_spec().unwrap();
+        let m = spec
+            .mounts
+            .iter()
+            .find(|m| m.target == "/tmp/.config/gh")
+            .expect("granted credential should be mounted");
+        assert!(m.read_only, "credential mounts default read-only");
+        assert!(m.source.contains("gh-config"));
+        // An absent optional grant is silently skipped.
+        assert!(!spec
+            .mounts
+            .iter()
+            .any(|m| m.target == "/tmp/.config/absent"));
+    }
+
+    #[test]
+    fn build_spec_errors_on_missing_required_credential() {
+        use cowboy_core::config::SecretMount;
+        let (mut rt, _tmp) = fixture(false, MockDockerCli::new());
+        rt.security.secrets.files = vec![SecretMount {
+            source: "/no/such/required/cred".into(),
+            target: "/tmp/.config/x".into(),
+            read_only: true,
+            required: true,
+        }];
+        assert!(rt.build_spec().is_err());
     }
 
     #[tokio::test]

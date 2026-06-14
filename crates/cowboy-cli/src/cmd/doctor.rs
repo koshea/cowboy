@@ -76,6 +76,7 @@ pub async fn run() -> Result<()> {
         "config separation",
         check_config_separation(&paths.security),
     );
+    r.check("credential grants", check_credentials(&paths.security));
 
     // Container images.
     r.check("agent image", check_image(&paths.security));
@@ -165,6 +166,67 @@ fn check_security(path: &Path) -> Status {
         }
         Err(e) => Status::Fail(e.to_string()),
     }
+}
+
+/// Verify configured credential grants resolve on the host. Missing optional
+/// grants warn; missing required ones fail; world-readable cred files warn.
+fn check_credentials(path: &Path) -> Status {
+    use cowboy_core::config::expand_path;
+    let cfg = match SecurityConfig::load(path) {
+        Ok(c) => c,
+        Err(_) => return Status::Ok("none".into()),
+    };
+    let (mut count, mut warns, mut fails) = (0usize, Vec::new(), Vec::new());
+    for e in &cfg.secrets.env {
+        count += 1;
+        if std::env::var(&e.source_env).is_err() {
+            let msg = format!("env {} missing (set ${})", e.name, e.source_env);
+            if e.required {
+                fails.push(msg);
+            } else {
+                warns.push(msg);
+            }
+        }
+    }
+    for f in &cfg.secrets.files {
+        count += 1;
+        match expand_path(&f.source) {
+            Ok(p) if p.exists() => {
+                if world_readable(&p) {
+                    warns.push(format!("{} is world-readable", f.source));
+                }
+            }
+            _ => {
+                let msg = format!("{} missing on host", f.source);
+                if f.required {
+                    fails.push(msg);
+                } else {
+                    warns.push(msg);
+                }
+            }
+        }
+    }
+    if !fails.is_empty() {
+        Status::Fail(fails.join("; "))
+    } else if !warns.is_empty() {
+        Status::Warn(warns.join("; "))
+    } else if count == 0 {
+        Status::Ok("none".into())
+    } else {
+        Status::Ok(format!("{count} grant(s), all present"))
+    }
+}
+
+#[cfg(unix)]
+fn world_readable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .map(|m| m.permissions().mode() & 0o004 != 0)
+        .unwrap_or(false)
+}
+#[cfg(not(unix))]
+fn world_readable(_p: &Path) -> bool {
+    false
 }
 
 fn check_agent(path: &Path) -> Status {

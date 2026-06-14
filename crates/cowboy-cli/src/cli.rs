@@ -115,6 +115,9 @@ pub enum Command {
     /// Inspect the agent's saved memory (project + global).
     Memory(MemoryCmdArgs),
 
+    /// Grant host credentials (gh, gcloud, kubectl, …) into the container.
+    Secrets(SecretsCmdArgs),
+
     /// List session logs.
     Logs,
 
@@ -266,6 +269,33 @@ pub enum SessionCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsCmdArgs {
+    #[command(subcommand)]
+    pub command: SecretsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SecretsCommand {
+    /// Show configured credential grants and whether each host source exists.
+    List,
+    /// Print a paste-ready grant (a known preset and/or explicit env/file
+    /// grants) to add to .cowboy/security.yaml. Non-destructive.
+    Add(SecretsAddArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SecretsAddArgs {
+    /// A known tool preset: gh, gcloud, kubectl, aws, git, ssh.
+    pub preset: Option<String>,
+    /// Grant an env var into the container: `NAME` or `NAME=HOST_ENV`.
+    #[arg(long = "env", value_name = "NAME[=HOST_ENV]")]
+    pub env: Vec<String>,
+    /// Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET`.
+    #[arg(long = "file", value_name = "SRC[:TARGET]")]
+    pub file: Vec<String>,
 }
 
 #[derive(Debug, Args)]

@@ -69,6 +69,63 @@ fn security_invariant_rejects_mounting_cowboy_dir() {
     assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
 }
 
+fn grant(source: &str, target: &str) -> SecretMount {
+    SecretMount {
+        source: source.into(),
+        target: target.into(),
+        read_only: true,
+        required: false,
+    }
+}
+
+#[test]
+fn credential_grant_to_a_normal_path_validates() {
+    let mut cfg = SecurityConfig::default();
+    cfg.secrets
+        .files
+        .push(grant("~/.config/gh", "/tmp/.config/gh"));
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn credential_grant_cannot_expose_host_config() {
+    let mut cfg = SecurityConfig::default();
+    cfg.secrets
+        .files
+        .push(grant(".cowboy/security.yaml", "/tmp/x"));
+    assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
+}
+
+#[test]
+fn credential_grant_cannot_shadow_the_workspace() {
+    let mut cfg = SecurityConfig::default();
+    // Target inside the workdir would shadow the project / masked config.
+    cfg.secrets
+        .files
+        .push(grant("~/.config/gh", "/workspace/.config/gh"));
+    assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
+    // ...and a relative target is rejected too.
+    let mut cfg = SecurityConfig::default();
+    cfg.secrets.files.push(grant("~/.config/gh", "tmp/gh"));
+    assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
+}
+
+#[test]
+fn expand_path_resolves_tilde_and_vars() {
+    std::env::set_var("COWBOY_TEST_CRED_DIR", "/secrets/dir");
+    let p = expand_path("${COWBOY_TEST_CRED_DIR}/gh").unwrap();
+    assert_eq!(p, std::path::PathBuf::from("/secrets/dir/gh"));
+    let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+    assert_eq!(
+        expand_path("~/.config/gh").unwrap(),
+        home.join(".config/gh")
+    );
+    assert_eq!(
+        expand_path("/abs/path").unwrap(),
+        std::path::PathBuf::from("/abs/path")
+    );
+}
+
 #[test]
 fn warnings_flag_dangerous_options() {
     let mut cfg = SecurityConfig::default();

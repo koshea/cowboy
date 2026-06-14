@@ -141,6 +141,27 @@ pub struct RuleSet {
 pub struct SecretsConfig {
     #[serde(default)]
     pub env: Vec<SecretEnv>,
+    /// Host credential files/dirs granted (read-only by default) into the
+    /// container so the agent can use CLIs like `gh`/`gcloud`/`kubectl`.
+    #[serde(default)]
+    pub files: Vec<SecretMount>,
+}
+
+/// A host credential path granted into the container. The agent cannot edit this
+/// grant (security.yaml is host-owned and masked); only the user elects it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecretMount {
+    /// Host path (a leading `~` and `${VAR}` are expanded), e.g. `~/.config/gh`.
+    pub source: String,
+    /// Container path the credential is mounted at, e.g. `/tmp/.config/gh`
+    /// (the container `HOME` is `/tmp`, where CLIs look).
+    pub target: String,
+    /// Mount read-only (the default; protects the host credential).
+    #[serde(default = "default_true")]
+    pub read_only: bool,
+    /// Fail to start if the host source is missing (default: skip when absent).
+    #[serde(default)]
+    pub required: bool,
 }
 
 /// A single secret env var injected into the container from a host env var.
@@ -569,6 +590,31 @@ impl SecurityConfig {
                 )));
             }
         }
+        // Credential grants: never re-expose host config, and never shadow the
+        // workspace or the masked `.cowboy/` config with a mount target.
+        let workdir = self.container.workdir.trim_end_matches('/');
+        for grant in &self.secrets.files {
+            if mount_targets_security_file(&grant.source) {
+                return Err(Error::SecurityInvariant(format!(
+                    "credential grant source {:?} would expose the host-owned security config",
+                    grant.source
+                )));
+            }
+            let target = grant.target.trim_end_matches('/');
+            if !target.starts_with('/') {
+                return Err(Error::SecurityInvariant(format!(
+                    "credential grant target {:?} must be an absolute container path",
+                    grant.target
+                )));
+            }
+            if target == workdir || target.starts_with(&format!("{workdir}/")) {
+                return Err(Error::SecurityInvariant(format!(
+                    "credential grant target {:?} must be outside the workspace ({workdir}); \
+                     it must not shadow the project or the masked config",
+                    grant.target
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -797,6 +843,22 @@ pub fn expand_env(input: &str) -> Result<String> {
     Ok(out)
 }
 
+/// Expand a host path for a credential grant: a leading `~` becomes the home
+/// directory, and `${VAR}` references are expanded (erroring if unset).
+pub fn expand_path(input: &str) -> Result<PathBuf> {
+    let expanded = expand_env(input)?;
+    if expanded == "~" {
+        if let Some(b) = directories::BaseDirs::new() {
+            return Ok(b.home_dir().to_path_buf());
+        }
+    } else if let Some(rest) = expanded.strip_prefix("~/") {
+        if let Some(b) = directories::BaseDirs::new() {
+            return Ok(b.home_dir().join(rest));
+        }
+    }
+    Ok(PathBuf::from(expanded))
+}
+
 // ---------------------------------------------------------------------------
 // templates for `cowboy init`
 // ---------------------------------------------------------------------------
@@ -864,11 +926,21 @@ network_policy:
       - 100.100.100.200/32
 
 secrets:
+  # Env vars injected from the host (values read at runtime, never stored here).
   env: []
     # - name: GITHUB_TOKEN
     #   source_env: COWBOY_GITHUB_TOKEN
     #   required: false
     #   approval: required
+  # Host credential files/dirs granted (read-only by default) into the container
+  # so the agent can use CLIs like gh/gcloud/kubectl. The container HOME is /tmp,
+  # so mount under /tmp/... where the tools look. `cowboy secrets add <preset>`
+  # prints ready-to-paste entries. You must also allow the matching network host.
+  files: []
+    # - source: ~/.config/gh
+    #   target: /tmp/.config/gh
+    #   read_only: true
+    #   required: false
 "#;
 
 const AGENT_TEMPLATE: &str = r#"version: 1
