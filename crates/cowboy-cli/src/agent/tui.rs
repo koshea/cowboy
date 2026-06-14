@@ -32,6 +32,7 @@ pub enum AgentCmd {
 }
 
 /// Events the agent loop / control server send to the TUI event loop.
+#[derive(Debug)]
 pub enum UiEvent {
     Delta(String),
     ModelDone,

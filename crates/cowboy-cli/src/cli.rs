@@ -58,6 +58,12 @@ pub enum Command {
     /// Stop and remove this project's agent + gateway containers and networks.
     Down(DownArgs),
 
+    /// Attach the TUI to a running session (by id, or a worker socket path).
+    Attach {
+        #[arg(value_name = "SESSION")]
+        target: String,
+    },
+
     /// List session logs.
     Logs,
 

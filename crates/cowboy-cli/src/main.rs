@@ -25,6 +25,7 @@ async fn main() -> Result<()> {
         Some(Command::Models(args)) => cmd::models::run(args),
         Some(Command::Skill(args)) => cmd::skill::run(args),
         Some(Command::Down(args)) => cmd::down::run(args).await,
+        Some(Command::Attach { target }) => cmd::attach::run(target).await,
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
