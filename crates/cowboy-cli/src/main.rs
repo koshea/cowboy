@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
             cowboy_cli::cli::WorktreeCommand::List => cmd::worktree::list().await,
             cowboy_cli::cli::WorktreeCommand::Create { name } => cmd::worktree::create(name).await,
         },
+        Some(Command::Memory(args)) => cmd::memory::run(args),
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),

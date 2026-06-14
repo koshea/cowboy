@@ -14,6 +14,7 @@ pub const TOOL_SUBAGENT: &str = "subagent";
 pub const TOOL_READ: &str = "read";
 pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_WRITE: &str = "write";
+pub const TOOL_MEMORY: &str = "memory";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -86,6 +87,28 @@ pub struct WriteArgs {
     pub content: String,
 }
 
+/// Arguments for the `memory` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct MemoryArgs {
+    /// What to do: "save", "recall", "list", or "delete".
+    pub action: String,
+    /// For `save`: a one-line title (becomes the index description and slug).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// For `save`: the full memory body to store.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// For `recall`/`delete`: the memory name (slug) shown in the index.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// For `save`: "project" (default) or "global".
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// For `save`: a free-form category, e.g. "preference" or "fact".
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+}
+
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -125,6 +148,18 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<WriteArgs>(),
         },
         ToolDef {
+            name: TOOL_MEMORY.into(),
+            description: "Your durable cross-session memory (stored on the host, not in the \
+                          repo). `save` a concise fact or user preference worth remembering next \
+                          time (scope \"project\" by default, or \"global\" across projects); \
+                          `recall` a full entry by name; `list` the index; `delete` one. The \
+                          index of saved memories is shown to you at the start of each session. \
+                          Do NOT use this for project conventions that belong in the repo — put \
+                          those in AGENTS.md."
+                .into(),
+            parameters: schema_for::<MemoryArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -158,7 +193,7 @@ mod tests {
         let names: Vec<_> = definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(
             names,
-            vec!["shell", "read", "edit", "write", "final", "ask_user", "subagent"]
+            vec!["shell", "read", "edit", "write", "memory", "final", "ask_user", "subagent"]
         );
     }
 

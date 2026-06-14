@@ -128,6 +128,65 @@ expression: defs
     }
   },
   {
+    "description": "Your durable cross-session memory (stored on the host, not in the repo). `save` a concise fact or user preference worth remembering next time (scope \"project\" by default, or \"global\" across projects); `recall` a full entry by name; `list` the index; `delete` one. The index of saved memories is shown to you at the start of each session. Do NOT use this for project conventions that belong in the repo — put those in AGENTS.md.",
+    "name": "memory",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `memory` tool.",
+      "properties": {
+        "action": {
+          "description": "What to do: \"save\", \"recall\", \"list\", or \"delete\".",
+          "type": "string"
+        },
+        "content": {
+          "default": null,
+          "description": "For `save`: the full memory body to store.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "For `recall`/`delete`: the memory name (slug) shown in the index.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "scope": {
+          "default": null,
+          "description": "For `save`: \"project\" (default) or \"global\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "default": null,
+          "description": "For `save`: a one-line title (becomes the index description and slug).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "type": {
+          "default": null,
+          "description": "For `save`: a free-form category, e.g. \"preference\" or \"fact\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "MemoryArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

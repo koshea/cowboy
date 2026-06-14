@@ -8,7 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, AskUserArgs, EditArgs, FinalArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+    self, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, ReadArgs, ShellArgs, SubagentArgs,
+    WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -32,6 +33,20 @@ development actions inside the container.
 Reusable skills may be available: run `cowboy skill list` to see them and \
 `cowboy skill show <name>` to read a skill's instructions, then follow them. \
 For a large, independent sub-task, use the `subagent` tool to delegate it.
+
+Project conventions may live in AGENTS.md (or CLAUDE.md) files, which are \
+authoritative. Before working in an area, `read` the repo-root AGENTS.md and the \
+nearest AGENTS.md on the path to the files you're touching (the nearest one \
+wins). When you establish — or the user tells you — a durable project convention \
+(build/test commands, style rules, layout), record it in the appropriate \
+AGENTS.md with `edit`/`write` so it persists for everyone.
+
+You also have a private cross-session `memory` (stored on the host, not the \
+repo). The index of what you've saved is shown below when present; `recall` a \
+full entry by name when it's relevant, and `save` concise facts or user \
+preferences worth remembering next time (default scope \"project\"; use \
+\"global\" for things true across projects). Keep project conventions in \
+AGENTS.md, not memory.
 
 The runtime enforces network, host, and secret permissions outside your control. \
 Outbound network access goes through a gateway that allows, denies, or prompts \
@@ -158,6 +173,18 @@ impl<'a> AgentLoop<'a> {
     /// Attach a session logger (records transcript, commands, final summary).
     pub fn with_logger(mut self, logger: Option<SessionLogger>) -> Self {
         self.logger = logger;
+        self
+    }
+
+    /// Append host-provided context (e.g. the memory index) to the system
+    /// message so it's always present and never pruned by `fit_context`.
+    pub fn with_memory_context(mut self, ctx: String) -> Self {
+        if !ctx.trim().is_empty() {
+            if let Some(sys) = self.messages.first_mut() {
+                sys.content.push_str("\n\n");
+                sys.content.push_str(&ctx);
+            }
+        }
         self
     }
 
@@ -366,6 +393,22 @@ impl<'a> AgentLoop<'a> {
                     self.ui
                         .tool_use(&fileop_summary("write", &args.path, exit, &out));
                 }
+                tools::TOOL_MEMORY => {
+                    let args: MemoryArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    self.ui.tool_use(&format!("memory {}", args.action));
+                    let observation = self.run_memory(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -405,6 +448,63 @@ impl<'a> AgentLoop<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// Handle a `memory` tool call host-side (the agent can't reach the home
+    /// dir; the loop runs on the host, so it reads/writes it directly). Returns
+    /// the observation text.
+    fn run_memory(&self, args: &MemoryArgs) -> String {
+        use cowboy_core::memory::{self, Scope};
+        let key = format!(
+            "{:08x}",
+            crate::net::runtime::project_hash(self.runtime.root())
+        );
+        match args.action.as_str() {
+            "save" => {
+                let (Some(title), Some(content)) = (&args.title, &args.content) else {
+                    return "error: `save` requires `title` and `content`".into();
+                };
+                let scope = match args.scope.as_deref() {
+                    Some("global") => Scope::Global,
+                    _ => Scope::Project,
+                };
+                match memory::save(&key, title, content, scope, args.kind.as_deref()) {
+                    Ok(name) => format!("saved memory `{name}` [{}]", scope.as_str()),
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            "recall" => {
+                let Some(name) = &args.name else {
+                    return "error: `recall` requires `name`".into();
+                };
+                match memory::recall(&key, name) {
+                    Ok(Some(body)) => body,
+                    Ok(None) => format!("no memory named `{name}`"),
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            "list" => {
+                let idx = memory::index(&key);
+                if idx.is_empty() {
+                    "no memories stored".into()
+                } else {
+                    idx
+                }
+            }
+            "delete" => {
+                let Some(name) = &args.name else {
+                    return "error: `delete` requires `name`".into();
+                };
+                match memory::delete(&key, name) {
+                    Ok(true) => format!("deleted memory `{name}`"),
+                    Ok(false) => format!("no memory named `{name}`"),
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            other => {
+                format!("error: unknown memory action `{other}` (save|recall|list|delete)")
+            }
+        }
     }
 
     /// Record a tool error as an observation so the model can self-correct.
@@ -745,6 +845,36 @@ mod tests {
         assert_eq!(final_msg.as_deref(), Some("done; tests pass"));
         assert_eq!(ui.commands, vec!["ls"]);
         assert_eq!(ui.finals, vec!["done; tests pass"]);
+    }
+
+    #[test]
+    fn with_memory_context_appends_to_system_message() {
+        let model = ScriptedModel::new(vec![]);
+        let mut ui = RecordingUi::default();
+        let agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_memory_context("INDEX: build-uses-just".into());
+        // Injected into the always-kept system message (never pruned).
+        assert!(agent.messages[0].content.starts_with("You are Cowboy"));
+        assert!(agent.messages[0].content.contains("INDEX: build-uses-just"));
+        // Empty context is a no-op.
+        let mut ui2 = RecordingUi::default();
+        let agent2 = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui2,
+        )
+        .with_memory_context("   ".into());
+        assert_eq!(agent2.messages.len(), 1);
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ use crate::cmd::session::{
     context_title, git_branch, log_approval, log_network, post_turn_indicators, verdict_str,
 };
 use crate::net::docker::CliDocker;
-use crate::net::runtime::{container_name_for, AgentRuntime};
+use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
 use crate::net::{approvals, control};
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 
@@ -170,6 +170,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         ));
     }
 
+    let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
@@ -178,7 +179,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         CancellationToken::new(),
         &mut ui,
     )
-    .with_logger(logger);
+    .with_logger(logger)
+    .with_memory_context(memory_ctx);
 
     // Rebuilds the model client for `/model <name>` (provider creds stay
     // host-owned; the agent only ever sees a built client).

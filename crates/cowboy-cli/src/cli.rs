@@ -112,6 +112,9 @@ pub enum Command {
     /// List or create git worktrees for parallel sessions.
     Worktree(WorktreeArgs),
 
+    /// Inspect the agent's saved memory (project + global).
+    Memory(MemoryCmdArgs),
+
     /// List session logs.
     Logs,
 
@@ -263,6 +266,22 @@ pub enum SessionCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct MemoryCmdArgs {
+    #[command(subcommand)]
+    pub command: MemoryCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MemoryCommand {
+    /// List saved memories (project + global) for the current worktree.
+    List,
+    /// Print a memory's full body by name.
+    Show { name: String },
+    /// Delete a memory by name.
+    Delete { name: String },
 }
 
 #[derive(Debug, Args)]

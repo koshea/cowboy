@@ -7,6 +7,7 @@ pub mod down;
 pub mod fileop;
 pub mod init;
 pub mod logs;
+pub mod memory;
 pub mod models;
 pub mod patch;
 pub mod proc;

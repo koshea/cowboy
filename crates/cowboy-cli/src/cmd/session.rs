@@ -23,7 +23,7 @@ use crate::cli::StartFlags;
 use crate::cmd::daemon;
 use crate::net::control;
 use crate::net::docker::CliDocker;
-use crate::net::runtime::{container_name_for, AgentRuntime};
+use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
 
 pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
     let root = crate::cmd::project_root()?;
@@ -113,6 +113,9 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
             println!("nothing to do.");
             return Ok(());
         };
+        // Canonicalize so the runtime, lease key, and memory key all agree with
+        // the worker/CLI (which canonicalize too).
+        let root = std::fs::canonicalize(&root).unwrap_or(root);
         let security = SecurityConfig::load(&paths.security)
             .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
         let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
@@ -131,6 +134,7 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
         // if the daemon is unreachable we run uncoordinated rather than block.
         let coordinated = coordinate_oneshot(&root, &id, &task).await?;
 
+        let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
         let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -153,7 +157,8 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
             cancel,
             &mut ui,
         )
-        .with_logger(logger);
+        .with_logger(logger)
+        .with_memory_context(memory_ctx);
         let result = agent.run(&task).await;
         agent.shutdown().await; // stop managed processes
 
