@@ -2,16 +2,11 @@
 //! container while the host enforces security at the container and network
 //! layer.
 
-mod agent;
-mod cli;
-mod cmd;
-mod net;
-mod session;
-
 use anyhow::Result;
 use clap::Parser;
 
-use cli::{Cli, Command};
+use cowboy_cli::cli::{Cli, Command};
+use cowboy_cli::cmd;
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -2,6 +2,7 @@
 //! network policy, and error types.
 
 pub mod config;
+pub mod daemonproto;
 pub mod error;
 pub mod model;
 pub mod netproto;

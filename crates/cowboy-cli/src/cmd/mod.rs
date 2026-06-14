@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod daemon;
 pub mod doctor;
 pub mod down;
 pub mod fileop;

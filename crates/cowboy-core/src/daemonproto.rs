@@ -1,0 +1,464 @@
+//! Wire types for the `cowboyd` daemon architecture, shared by the `cowboy`
+//! client, the `cowboyd` daemon, and the headless session worker.
+//!
+//! Three protocols, all framed with [`crate::netproto::encode_line`]
+//! (newline-delimited JSON):
+//!
+//! * **Daemon control API** — [`DaemonRequest`] / [`DaemonResponse`]: the
+//!   client and the worker talk to the daemon (registry, leases, worktrees,
+//!   supervision). Request/response, `id`-correlated so a connection can
+//!   pipeline.
+//! * **Worker → client** — [`ServerMsg`]: the live event stream (the
+//!   serializable image of the in-process `UiEvent`), plus id-tagged `Ask` /
+//!   `Approval` prompts whose replies travel back as [`ClientMsg`].
+//! * **Client → worker** — [`ClientMsg`].
+//!
+//! The session event journal (`events.jsonl`) is a sequence of [`UiEventMsg`]
+//! lines; the 0-based line number is the event's `seq`.
+
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+
+use crate::netproto::{ApprovalScope, Verdict};
+
+/// A session identifier: `{now_ms}-{worker_pid}` (the pid is the worker's, which
+/// is what the daemon needs for liveness checks).
+pub type SessionId = String;
+
+/// How a session holds its worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseMode {
+    /// One writable session per worktree (the default).
+    Exclusive,
+    /// A read-only follower; never conflicts with anything.
+    ReadOnly,
+}
+
+/// Lifecycle state of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStatus {
+    Starting,
+    Running,
+    Idle,
+    AwaitingApproval,
+    AwaitingInput,
+    Completed,
+    Failed,
+    Stale,
+}
+
+impl SessionStatus {
+    /// True once the session can no longer be attached live.
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stale
+        )
+    }
+}
+
+/// Registry record for a session, as reported by the daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub id: SessionId,
+    pub root: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub status: SessionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_sock: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_path: Option<PathBuf>,
+    #[serde(default)]
+    pub lease_mode: Option<LeaseMode>,
+    #[serde(default)]
+    pub started_ms: u64,
+    #[serde(default)]
+    pub last_heartbeat_ms: u64,
+    #[serde(default)]
+    pub turn: u64,
+    #[serde(default)]
+    pub tokens: (u64, u64),
+    #[serde(default)]
+    pub attached_clients: u32,
+    #[serde(default)]
+    pub diffstat: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_command: Option<String>,
+}
+
+/// A cowboy-created git worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    pub branch: String,
+    pub path: PathBuf,
+    pub status: SessionStatus,
+}
+
+/// Where a client should attach for a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AttachTarget {
+    /// The worker is alive — connect to this per-session socket.
+    Live { worker_sock: PathBuf },
+    /// The worker is gone — render the journal read-only from disk.
+    Replay {
+        journal_path: PathBuf,
+        status: SessionStatus,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Daemon control API
+// ---------------------------------------------------------------------------
+
+/// An `id`-correlated request to the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonRequest {
+    pub id: u64,
+    pub req: DaemonReq,
+}
+
+/// An `id`-correlated response from the daemon (echoes the request `id`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DaemonResponse {
+    pub id: u64,
+    pub resp: DaemonResp,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonReq {
+    Ping,
+    StartSession {
+        root: PathBuf,
+        #[serde(default)]
+        task: Option<String>,
+        mode: LeaseMode,
+    },
+    ListSessions {
+        #[serde(default)]
+        root: Option<PathBuf>,
+    },
+    GetSession {
+        id: SessionId,
+    },
+    AttachSession {
+        id: SessionId,
+    },
+    DetachSession {
+        id: SessionId,
+    },
+    // worker -> daemon
+    RegisterWorker {
+        info: SessionInfo,
+    },
+    UpdateSession {
+        id: SessionId,
+        status: SessionStatus,
+        #[serde(default)]
+        turn: u64,
+        #[serde(default)]
+        tokens: (u64, u64),
+        #[serde(default)]
+        diffstat: String,
+        #[serde(default)]
+        attached_clients: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
+    },
+    Heartbeat {
+        id: SessionId,
+        seq: u64,
+    },
+    CompleteSession {
+        id: SessionId,
+    },
+    FailSession {
+        id: SessionId,
+        error: String,
+    },
+    // leases + worktrees
+    AcquireLease {
+        key: PathBuf,
+        session: SessionId,
+        mode: LeaseMode,
+    },
+    ReleaseLease {
+        key: PathBuf,
+        session: SessionId,
+    },
+    ListWorktrees {
+        repo: PathBuf,
+    },
+    CreateWorktree {
+        repo: PathBuf,
+        branch: String,
+        #[serde(default)]
+        path: Option<PathBuf>,
+    },
+    CleanupStale {
+        #[serde(default)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DaemonResp {
+    Pong {
+        version: String,
+        pid: u32,
+        sessions: usize,
+    },
+    Started {
+        id: SessionId,
+        worker_sock: PathBuf,
+    },
+    Sessions {
+        sessions: Vec<SessionInfo>,
+    },
+    Session {
+        info: SessionInfo,
+    },
+    Attach {
+        target: AttachTarget,
+    },
+    Detached,
+    Registered,
+    Updated,
+    Completed,
+    Failed,
+    LeaseGranted {
+        key: PathBuf,
+    },
+    LeaseDenied {
+        key: PathBuf,
+        held_by: SessionInfo,
+    },
+    Worktrees {
+        list: Vec<WorktreeInfo>,
+    },
+    WorktreeCreated {
+        path: PathBuf,
+        branch: String,
+    },
+    CleanedUp {
+        reclaimed: Vec<SessionId>,
+        leases_released: Vec<PathBuf>,
+    },
+    Err {
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Worker <-> client
+// ---------------------------------------------------------------------------
+
+/// The serializable image of the in-process display events (everything the
+/// agent emits to a UI except the channel-carrying `Ask`/`Approval`). One of
+/// these per line is the `events.jsonl` journal format.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UiEventMsg {
+    Delta(String),
+    ModelDone,
+    CommandStart(String),
+    CommandOutput(String),
+    CommandEnd { code: i32, output: String },
+    ToolUse(String),
+    Final(String),
+    Notice(String),
+    NetEvent(String),
+    DiffStat(String),
+    Tokens { input: u64, output: u64 },
+    Title(String),
+    Processes(Vec<(String, String)>),
+    TurnDone,
+}
+
+/// Worker → client messages over the per-session socket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[allow(clippy::large_enum_variant)] // `Snapshot` is sent once per attach; a wire enum, size is moot
+pub enum ServerMsg {
+    /// Sent once per attach (not journaled): session metadata + journal length
+    /// at the moment of subscription.
+    Snapshot { info: SessionInfo, journal_len: u64 },
+    /// A journaled display event with its sequence number (= journal line).
+    Event { seq: u64, event: UiEventMsg },
+    /// A pending question for the user; reply with [`ClientMsg::AskReply`].
+    Ask { id: u64, question: String },
+    /// A pending network approval; reply with [`ClientMsg::ApprovalReply`].
+    Approval { id: u64, dest: String },
+    /// The session changed lifecycle state.
+    Status(SessionStatus),
+    /// Terminal: the worker is shutting down; the connection will close.
+    Ended { reason: String },
+}
+
+/// What an interrupt from the client should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterruptKind {
+    /// Cancel the current turn; the session continues.
+    Turn,
+    /// Cancel the turn and return to idle for a new instruction.
+    Instruct,
+    /// End the whole session.
+    End,
+}
+
+/// Client → worker messages over the per-session socket.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientMsg {
+    /// First line after connecting: replay from `since_seq` (None = all).
+    Hello {
+        #[serde(default)]
+        since_seq: Option<u64>,
+        #[serde(default)]
+        read_only: bool,
+    },
+    Message(String),
+    AskReply {
+        id: u64,
+        answer: String,
+    },
+    ApprovalReply {
+        id: u64,
+        verdict: Verdict,
+        scope: ApprovalScope,
+    },
+    SwitchModel(String),
+    Interrupt {
+        kind: InterruptKind,
+    },
+    /// Disconnect but leave the session running.
+    Detach,
+    /// End the session.
+    End,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::netproto::encode_line;
+
+    fn roundtrip<T>(v: &T)
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let line = encode_line(v);
+        assert!(line.ends_with('\n'));
+        let back: T = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v, &back);
+    }
+
+    #[test]
+    fn daemon_request_response_roundtrip() {
+        roundtrip(&DaemonRequest {
+            id: 1,
+            req: DaemonReq::StartSession {
+                root: "/home/me/app".into(),
+                task: Some("fix tests".into()),
+                mode: LeaseMode::Exclusive,
+            },
+        });
+        roundtrip(&DaemonRequest {
+            id: 2,
+            req: DaemonReq::Ping,
+        });
+        roundtrip(&DaemonResponse {
+            id: 2,
+            resp: DaemonResp::Pong {
+                version: "0.1.0".into(),
+                pid: 42,
+                sessions: 3,
+            },
+        });
+        roundtrip(&DaemonResponse {
+            id: 3,
+            resp: DaemonResp::LeaseDenied {
+                key: "/home/me/app".into(),
+                held_by: sample_info(),
+            },
+        });
+    }
+
+    #[test]
+    fn server_and_client_messages_roundtrip() {
+        roundtrip(&ServerMsg::Event {
+            seq: 5,
+            event: UiEventMsg::CommandEnd {
+                code: 0,
+                output: "ok".into(),
+            },
+        });
+        roundtrip(&ServerMsg::Ask {
+            id: 1,
+            question: "continue?".into(),
+        });
+        roundtrip(&ServerMsg::Snapshot {
+            info: sample_info(),
+            journal_len: 12,
+        });
+        roundtrip(&ClientMsg::Hello {
+            since_seq: Some(3),
+            read_only: false,
+        });
+        roundtrip(&ClientMsg::ApprovalReply {
+            id: 1,
+            verdict: Verdict::Allow,
+            scope: ApprovalScope::Session,
+        });
+    }
+
+    #[test]
+    fn journal_event_roundtrip() {
+        roundtrip(&UiEventMsg::Tokens {
+            input: 1200,
+            output: 340,
+        });
+        roundtrip(&UiEventMsg::Processes(vec![(
+            "web".into(),
+            "running".into(),
+        )]));
+    }
+
+    fn sample_info() -> SessionInfo {
+        SessionInfo {
+            id: "123-456".into(),
+            root: "/home/me/app".into(),
+            task: Some("fix tests".into()),
+            status: SessionStatus::Running,
+            pid: Some(456),
+            branch: Some("main".into()),
+            container_name: Some("cowboy-agent-app-deadbeef".into()),
+            worker_sock: Some("/run/cowboy/s-123.sock".into()),
+            journal_path: Some("/home/me/app/.cowboy/sessions/123-456/events.jsonl".into()),
+            lease_mode: Some(LeaseMode::Exclusive),
+            started_ms: 1,
+            last_heartbeat_ms: 2,
+            turn: 1,
+            tokens: (10, 20),
+            attached_clients: 1,
+            diffstat: "Δ 1f +2 -0".into(),
+            running_command: None,
+        }
+    }
+}
