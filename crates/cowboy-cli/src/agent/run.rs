@@ -83,6 +83,17 @@ pub struct AgentLoop<'a> {
     logger: Option<SessionLogger>,
 }
 
+/// Instruction for the context-compaction summary call.
+const SUMMARY_SYSTEM: &str = "\
+You are compacting an AI coding agent's conversation so it fits the context \
+window. Summarize the messages below into a concise but information-dense brief \
+that PRESERVES everything needed to continue the task: the user's goals and \
+instructions, decisions and their rationale, files created/edited and how, \
+commands run and their key results, important facts learned about the codebase, \
+and any unresolved problems or next steps. Use terse bullet points; drop \
+pleasantries. This summary REPLACES the original messages, so omit nothing load-\
+bearing. Output only the summary.";
+
 /// Tokens reserved for the model's response + tool schemas when budgeting.
 const RESPONSE_HEADROOM: usize = 4096;
 /// Maximum subagent nesting depth (prevents runaway recursion).
@@ -144,20 +155,88 @@ impl<'a> AgentLoop<'a> {
         n
     }
 
-    /// Prune the oldest history to keep the conversation within the context
-    /// window (minus response headroom). The system message is always kept, and
-    /// we never leave an orphan tool-result at the front.
-    fn fit_context(&mut self) {
+    /// Total estimated tokens of the current conversation.
+    fn total_tokens(&self) -> usize {
+        self.messages.iter().map(Self::message_tokens).sum()
+    }
+
+    /// Keep the conversation within the context window. When it overflows, fold
+    /// the oldest whole turns into a single model-generated summary message
+    /// rather than dropping them, so earlier decisions, edits, and facts survive.
+    /// Compaction happens at user-turn boundaries (turn starts) so a tool result
+    /// is never orphaned. Falls back to dropping if a summary can't be made.
+    async fn fit_context(&mut self) {
         let budget = self.context_window.saturating_sub(RESPONSE_HEADROOM);
-        if budget == 0 {
+        if budget == 0 || self.total_tokens() <= budget {
             return;
         }
-        let mut pruned = false;
-        while self.messages.len() > 2 {
-            let total: usize = self.messages.iter().map(Self::message_tokens).sum();
-            if total <= budget {
+
+        // User messages mark turn starts. Keep the most recent whole turns that
+        // fit in part of the budget; summarize everything before them.
+        let user_idxs: Vec<usize> = (1..self.messages.len())
+            .filter(|&i| self.messages[i].role == Role::User)
+            .collect();
+        let tail_budget = (budget * 6 / 10).max(1);
+        let mut keep_from = match user_idxs.last() {
+            Some(&i) => i,
+            None => {
+                self.drop_oldest(budget);
+                return;
+            }
+        };
+        for &idx in user_idxs.iter().rev() {
+            let tail: usize = self.messages[idx..].iter().map(Self::message_tokens).sum();
+            if tail <= tail_budget {
+                keep_from = idx;
+            } else {
                 break;
             }
+        }
+        // Nothing before the kept tail to summarize (e.g. one huge turn): drop.
+        if keep_from <= 1 {
+            self.drop_oldest(budget);
+            return;
+        }
+
+        let old: Vec<Message> = self.messages[1..keep_from].to_vec();
+        let folded = old.len();
+        let summary = match self.summarize(&old).await {
+            Ok(s) if !s.trim().is_empty() => s,
+            _ => {
+                self.drop_oldest(budget);
+                return;
+            }
+        };
+        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 1);
+        rebuilt.push(self.messages[0].clone());
+        rebuilt.push(Message::system(format!(
+            "[Summary of earlier conversation, compacted to save context]\n{summary}"
+        )));
+        rebuilt.extend_from_slice(&self.messages[keep_from..]);
+        self.messages = rebuilt;
+        self.ui.notice(&format!(
+            "compacted {folded} earlier messages into a summary"
+        ));
+    }
+
+    /// Ask the model to summarize a span of prior messages into a dense brief.
+    async fn summarize(&self, old: &[Message]) -> Result<String> {
+        let msgs = vec![
+            Message::system(SUMMARY_SYSTEM),
+            Message::user(format!(
+                "{}\n\n---\nWrite the summary now.",
+                render_transcript(old)
+            )),
+        ];
+        let resp = self.model.chat(&msgs, &[], None).await?;
+        Ok(resp.content.unwrap_or_default())
+    }
+
+    /// Last-resort pruning: drop the oldest messages (never the system message),
+    /// skipping orphaned tool results, until within budget.
+    fn drop_oldest(&mut self, budget: usize) {
+        let mut pruned = false;
+        while self.messages.len() > 2 && self.total_tokens() > budget {
             self.messages.remove(1);
             while self.messages.len() > 1 && self.messages[1].role == Role::Tool {
                 self.messages.remove(1);
@@ -248,7 +327,7 @@ impl<'a> AgentLoop<'a> {
             }
 
             // Keep history within the model's context window.
-            self.fit_context();
+            self.fit_context().await;
 
             // Estimate the prompt tokens actually sent (post-pruning).
             let prompt_est: u64 = self
@@ -666,6 +745,29 @@ fn emit_delta(ui: &mut dyn AgentUi, piece: Delta) {
     }
 }
 
+/// Render a span of messages as plain text for the compaction summarizer.
+fn render_transcript(messages: &[Message]) -> String {
+    let mut s = String::new();
+    for m in messages {
+        let role = match m.role {
+            Role::System => "system",
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::Tool => "tool",
+        };
+        s.push_str(&format!("[{role}]\n"));
+        if !m.content.is_empty() {
+            s.push_str(&m.content);
+            s.push('\n');
+        }
+        for tc in &m.tool_calls {
+            s.push_str(&format!("(tool call {}: {})\n", tc.name, tc.arguments));
+        }
+        s.push('\n');
+    }
+    s
+}
+
 fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
     let args = if arguments.trim().is_empty() {
         "{}"
@@ -1054,10 +1156,52 @@ mod tests {
             )));
         }
         let before = agent.messages.len();
-        agent.fit_context();
+        // No scripted summary -> summarization yields empty -> drop fallback.
+        agent.fit_context().await;
         assert!(agent.messages.len() < before, "should have pruned");
         assert_eq!(agent.messages[0].role, Role::System, "system kept");
         assert!(ui.notices.iter().any(|n| n.contains("pruned")));
+    }
+
+    #[tokio::test]
+    async fn fit_context_compacts_old_turns_into_a_summary() {
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        // The model serves the compaction summary.
+        let model = ScriptedModel::new(vec![ChatResponse {
+            content: Some("SUMMARY: earlier turns did X and Y".into()),
+            tool_calls: vec![],
+        }]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            RESPONSE_HEADROOM + 60,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // Several whole turns (user -> assistant) so there are turn boundaries.
+        for i in 0..12 {
+            agent
+                .messages
+                .push(Message::user(format!("please do task {i} with detail")));
+            agent
+                .messages
+                .push(Message::new(Role::Assistant, format!("did task {i} ok")));
+        }
+        agent.fit_context().await;
+
+        // Folded into: [system, summary(system), recent turns…].
+        assert_eq!(agent.messages[0].role, Role::System);
+        assert_eq!(agent.messages[1].role, Role::System);
+        assert!(agent.messages[1].content.contains("SUMMARY: earlier turns"));
+        assert!(agent.messages[1]
+            .content
+            .contains("Summary of earlier conversation"));
+        // The most recent turn is kept verbatim.
+        let last = agent.messages.last().unwrap();
+        assert!(last.content.contains("did task 11"));
+        assert!(ui.notices.iter().any(|n| n.contains("compacted")));
     }
 
     #[test]
