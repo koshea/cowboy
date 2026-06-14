@@ -13,9 +13,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
+    let start_flags = cli.start_flags();
     match cli.command {
         // Bare `cowboy` or `cowboy "<task>"` -> session engine (Slice D).
-        None => cmd::session::run(cli.task, /* one_shot */ false).await,
+        None => cmd::session::run(cli.task, start_flags).await,
         Some(Command::Init(args)) => cmd::init::run(args),
         Some(Command::Doctor) => cmd::doctor::run().await,
         Some(Command::Shell) => cmd::run::shell().await,

@@ -2,14 +2,14 @@
 //! runtime, the network control pipeline, and a UI (ratatui TUI on a terminal,
 //! console otherwise) into the agent loop.
 
-use std::io::IsTerminal;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
-use cowboy_core::daemonproto::{DaemonReq, DaemonResp, LeaseMode};
+use cowboy_core::daemonproto::{AttachTarget, DaemonReq, DaemonResp, LeaseMode, SessionInfo};
 use cowboy_core::model::OpenAiClient;
 use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
@@ -17,12 +17,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::tui::SessionCtx;
 use crate::agent::{AgentLoop, ConsoleUi};
+use crate::cli::StartFlags;
 use crate::cmd::daemon;
 use crate::net::control;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::AgentRuntime;
 
-pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
+pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
     let root = crate::cmd::project_root()?;
     let paths = ConfigPaths::for_root(&root);
 
@@ -47,29 +48,61 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
 
     if interactive {
         // Interactive sessions run in a daemon-managed worker; this process is a
-        // thin client that starts (or, later, reuses) the session and attaches.
+        // thin client that starts (or reuses) the session and attaches.
         let (model_names, current_model) = models_and_default(&user_models, &project_models);
         daemon::ensure_running().await?;
-        let resp = daemon::request(DaemonReq::StartSession {
-            root: root.clone(),
-            task: task.clone(),
-            mode: LeaseMode::Exclusive,
-        })
-        .await
-        .context("starting session via cowboyd")?;
-        let (id, sock) = match resp {
-            DaemonResp::Started { id, worker_sock } => (id, worker_sock),
-            DaemonResp::Err { message } => anyhow::bail!(message),
-            other => anyhow::bail!("unexpected daemon response: {other:?}"),
-        };
-        let intro = welcome_lines(&root, &resolved, Some(&id));
-        let title = context_title(&root);
-        let ctx = SessionCtx {
+        let ctx_for = |root: PathBuf| SessionCtx {
             root,
-            models: model_names,
-            current_model,
+            models: model_names.clone(),
+            current_model: current_model.clone(),
         };
-        crate::cmd::attach::attach_socket(&sock, &title, intro, ctx)
+        let mut root = root;
+        let mut force = flags.force;
+        loop {
+            let resp = daemon::request(DaemonReq::StartSession {
+                root: root.clone(),
+                task: task.clone(),
+                mode: LeaseMode::Exclusive,
+                force,
+            })
+            .await
+            .context("starting session via cowboyd")?;
+            match resp {
+                DaemonResp::Started { id, worker_sock } => {
+                    let intro = welcome_lines(&root, &resolved, Some(&id));
+                    let title = context_title(&root);
+                    return crate::cmd::attach::attach_socket(
+                        &worker_sock,
+                        &title,
+                        intro,
+                        ctx_for(root),
+                    );
+                }
+                DaemonResp::LeaseDenied { held_by, .. } => {
+                    match decide_collision(&held_by, &flags)? {
+                        Collision::Attach => {
+                            return attach_existing(&held_by.id, ctx_for(held_by.root), false)
+                                .await;
+                        }
+                        Collision::ReadOnly => {
+                            return attach_existing(&held_by.id, ctx_for(held_by.root), true).await;
+                        }
+                        Collision::NewWorktree => {
+                            root = create_worktree_for(&root, task.as_deref()).await?;
+                            force = false;
+                            continue;
+                        }
+                        Collision::Force => {
+                            force = true;
+                            continue;
+                        }
+                        Collision::Quit => return Ok(()),
+                    }
+                }
+                DaemonResp::Err { message } => anyhow::bail!(message),
+                other => anyhow::bail!("unexpected daemon response: {other:?}"),
+            }
+        }
     } else {
         // Non-interactive: prompt on stdin if no task was given; run in-process
         // (the daemon still tracks a lease in a later milestone). Asks fail closed.
@@ -112,6 +145,165 @@ pub async fn run(task: Option<String>, _one_shot: bool) -> Result<()> {
         agent.run(&task).await?;
         agent.shutdown().await; // stop managed processes
         Ok(())
+    }
+}
+
+/// How a same-worktree collision was resolved.
+enum Collision {
+    /// Attach read-write to the active session.
+    Attach,
+    /// Attach read-only (watch without driving).
+    ReadOnly,
+    /// Create a fresh git worktree and run there.
+    NewWorktree,
+    /// Take over a stale lease (retry the start with `force`).
+    Force,
+    /// Do nothing.
+    Quit,
+}
+
+/// Resolve a collision: honor an explicit flag, else prompt (interactive), else
+/// fail safe with guidance. `--force` is rejected against a *live* holder.
+fn decide_collision(held_by: &SessionInfo, flags: &StartFlags) -> Result<Collision> {
+    // A terminal holder would have been reclaimed by the daemon; this is either
+    // a live session or a stale one.
+    let live = !matches!(
+        held_by.status,
+        cowboy_core::daemonproto::SessionStatus::Stale
+    );
+
+    if flags.attach_if_active {
+        return Ok(Collision::Attach);
+    }
+    if flags.read_only {
+        return Ok(Collision::ReadOnly);
+    }
+    if flags.new_worktree {
+        return Ok(Collision::NewWorktree);
+    }
+    if flags.force {
+        if live {
+            anyhow::bail!(
+                "session {} is live in this worktree; --force-same-worktree only takes over a \
+                 *stale* lease. Use --new-worktree or --attach-if-active.",
+                held_by.id
+            );
+        }
+        return Ok(Collision::Force);
+    }
+
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "worktree already has an active session ({}, {:?}); rerun with --attach-if-active, \
+             --read-only, --new-worktree{}",
+            held_by.id,
+            held_by.status,
+            if live {
+                ""
+            } else {
+                ", or --force-same-worktree"
+            }
+        );
+    }
+    prompt_collision(held_by, live)
+}
+
+/// Interactive collision menu (the session has not entered the TUI yet, so this
+/// is plain stdin/stdout).
+fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
+    loop {
+        println!("\nThis worktree already has an active session:");
+        println!("  id      {}", held_by.id);
+        println!("  status  {:?}", held_by.status);
+        if let Some(b) = &held_by.branch {
+            println!("  branch  {b}");
+        }
+        print!(
+            "[a]ttach  [r]ead-only  [w] new worktree{}  [q]uit > ",
+            if live { "" } else { "  [f]orce-takeover" }
+        );
+        io::stdout().flush().ok();
+
+        let mut line = String::new();
+        if io::stdin().read_line(&mut line)? == 0 {
+            return Ok(Collision::Quit);
+        }
+        match line.trim() {
+            "a" | "attach" => return Ok(Collision::Attach),
+            "r" | "ro" | "read-only" => return Ok(Collision::ReadOnly),
+            "w" | "new" | "worktree" => return Ok(Collision::NewWorktree),
+            "f" | "force" if !live => return Ok(Collision::Force),
+            "q" | "quit" | "" => return Ok(Collision::Quit),
+            other => println!("unrecognized choice: {other:?}"),
+        }
+    }
+}
+
+/// Attach to an existing session by id (live or, if it has since ended, replay).
+async fn attach_existing(id: &str, ctx: SessionCtx, read_only: bool) -> Result<()> {
+    let resp = daemon::request(DaemonReq::AttachSession { id: id.to_string() })
+        .await
+        .context("attaching via cowboyd")?;
+    let title = context_title(&ctx.root);
+    match resp {
+        DaemonResp::Attach {
+            target: AttachTarget::Live { worker_sock },
+        } => {
+            let intro = vec![format!(
+                "attached to {id}{}",
+                if read_only { " (read-only)" } else { "" }
+            )];
+            crate::cmd::attach::attach_socket_ro(&worker_sock, &title, intro, ctx, read_only)
+        }
+        DaemonResp::Attach {
+            target:
+                AttachTarget::Replay {
+                    journal_path,
+                    status,
+                },
+        } => crate::cmd::attach::replay_journal(&journal_path, &title, &format!("{status:?}"), ctx),
+        DaemonResp::Err { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Ask the daemon to create a new worktree off `root` for `task` and return its
+/// path (worktree creation itself lands with the worktree commands).
+async fn create_worktree_for(root: &std::path::Path, task: Option<&str>) -> Result<PathBuf> {
+    let branch = format!("cowboy/{}", branch_slug(task));
+    let resp = daemon::request(DaemonReq::CreateWorktree {
+        repo: root.to_path_buf(),
+        branch,
+        path: None,
+    })
+    .await
+    .context("creating worktree via cowboyd")?;
+    match resp {
+        DaemonResp::WorktreeCreated { path, branch } => {
+            println!("created worktree {} on {branch}", path.display());
+            Ok(path)
+        }
+        DaemonResp::Err { message } => anyhow::bail!(message),
+        other => anyhow::bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// A short branch slug from a task description (fallback `work`).
+fn branch_slug(task: Option<&str>) -> String {
+    let raw = task.unwrap_or("work").to_lowercase();
+    let mut slug: String = raw
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-');
+    let slug: String = slug.chars().take(40).collect();
+    if slug.is_empty() {
+        "work".into()
+    } else {
+        slug
     }
 }
 

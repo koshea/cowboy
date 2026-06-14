@@ -133,6 +133,18 @@ pub fn attach_socket(
     intro: Vec<String>,
     ctx: SessionCtx,
 ) -> Result<()> {
+    attach_socket_ro(sock, title, intro, ctx, false)
+}
+
+/// As [`attach_socket`], but `read_only` watches the session without driving it:
+/// the client announces itself read-only and never forwards input.
+pub fn attach_socket_ro(
+    sock: &std::path::Path,
+    title: &str,
+    intro: Vec<String>,
+    ctx: SessionCtx,
+    read_only: bool,
+) -> Result<()> {
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
     let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
     let turn_cancel: TurnCancel =
@@ -151,7 +163,7 @@ pub fn attach_socket(
         rt.block_on(async move {
             match UnixStream::connect(&sock).await {
                 Ok(stream) => {
-                    let _ = bridge(stream, ui_tx.clone(), task_rx, bridge_cancel).await;
+                    let _ = bridge(stream, ui_tx.clone(), task_rx, bridge_cancel, read_only).await;
                 }
                 Err(e) => {
                     let _ = ui_tx.send(UiEvent::Notice(format!("attach failed: {e}")));
@@ -167,12 +179,14 @@ pub fn attach_socket(
 }
 
 /// Bridge a connected worker `stream` to the UI channels. Returns when the
-/// worker ends or the UI hangs up.
+/// worker ends or the UI hangs up. A `read_only` client never forwards input
+/// (no `Message`/`SwitchModel`), so it can watch without driving the session.
 pub async fn bridge(
     stream: UnixStream,
     ui_tx: Sender<UiEvent>,
     task_rx: Receiver<AgentCmd>,
     turn_cancel: TurnCancel,
+    read_only: bool,
 ) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let (out_tx, mut out_rx) = unbounded_channel::<ClientMsg>();
@@ -181,7 +195,7 @@ pub async fn bridge(
     out_tx
         .send(ClientMsg::Hello {
             since_seq: None,
-            read_only: false,
+            read_only,
         })
         .ok();
 
@@ -196,9 +210,15 @@ pub async fn bridge(
     });
 
     // UI commands (blocking std recv) -> ClientMsg. On hangup, end the session.
+    // A read-only client drops input but still drains the channel and ends on
+    // hangup; it must never send `End` (that would stop a session it's only
+    // watching).
     let cmd_out = out_tx.clone();
     let cmd_pump = tokio::task::spawn_blocking(move || {
         while let Ok(cmd) = task_rx.recv() {
+            if read_only {
+                continue;
+            }
             let msg = match cmd {
                 AgentCmd::Message(m) => ClientMsg::Message(m),
                 AgentCmd::SwitchModel(n) => ClientMsg::SwitchModel(n),
@@ -207,11 +227,16 @@ pub async fn bridge(
                 return;
             }
         }
-        let _ = cmd_out.send(ClientMsg::End);
+        let _ = cmd_out.send(if read_only {
+            ClientMsg::Detach
+        } else {
+            ClientMsg::End
+        });
     });
 
     // Interrupt watcher: when the UI fires the turn-cancel token, send an
-    // Interrupt and re-arm a fresh token for the next turn.
+    // Interrupt and re-arm a fresh token for the next turn. Read-only clients
+    // don't interrupt the session they're watching.
     let int_out = out_tx.clone();
     let int_cancel = turn_cancel.clone();
     let interrupts = tokio::spawn(async move {
@@ -219,11 +244,12 @@ pub async fn bridge(
             let token = int_cancel.lock().unwrap().clone();
             let Some(token) = token else { break };
             token.cancelled().await;
-            if int_out
-                .send(ClientMsg::Interrupt {
-                    kind: InterruptKind::Turn,
-                })
-                .is_err()
+            if !read_only
+                && int_out
+                    .send(ClientMsg::Interrupt {
+                        kind: InterruptKind::Turn,
+                    })
+                    .is_err()
             {
                 break;
             }
@@ -424,7 +450,7 @@ mod tests {
         let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
         let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
         let cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let bridge = tokio::spawn(bridge(stream, ui_tx, task_rx, cancel));
+        let bridge = tokio::spawn(bridge(stream, ui_tx, task_rx, cancel, false));
 
         let title = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(title, UiEvent::Title(t) if t.contains("main")));

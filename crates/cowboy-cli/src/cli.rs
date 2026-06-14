@@ -21,8 +21,47 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub verbose: bool,
 
+    /// On a same-worktree collision, attach to the active session instead of
+    /// prompting.
+    #[arg(long)]
+    pub attach_if_active: bool,
+
+    /// On a same-worktree collision, attach read-only (watch without driving).
+    #[arg(long)]
+    pub read_only: bool,
+
+    /// On a same-worktree collision, create a new git worktree and run there.
+    #[arg(long)]
+    pub new_worktree: bool,
+
+    /// Take over a *stale* lease on this worktree (never a live one).
+    #[arg(long)]
+    pub force_same_worktree: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+impl Cli {
+    /// The same-worktree collision flags, bundled for the session engine.
+    pub fn start_flags(&self) -> StartFlags {
+        StartFlags {
+            attach_if_active: self.attach_if_active,
+            read_only: self.read_only,
+            new_worktree: self.new_worktree,
+            force: self.force_same_worktree,
+        }
+    }
+}
+
+/// How to resolve a same-worktree collision, set from CLI flags (otherwise the
+/// user is prompted interactively).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StartFlags {
+    pub attach_if_active: bool,
+    pub read_only: bool,
+    pub new_worktree: bool,
+    pub force: bool,
 }
 
 #[derive(Debug, Subcommand)]

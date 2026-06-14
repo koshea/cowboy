@@ -167,6 +167,72 @@ fn registry_register_attach_complete() {
     assert!(state_file.exists(), "state.json should be written");
 }
 
+/// AcquireLease/ReleaseLease over the wire: a live holder blocks a second
+/// acquirer (LeaseDenied), and a release frees the worktree again.
+#[test]
+fn lease_acquire_denies_live_holder_then_release_frees_it() {
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+
+    // A live session s1 holds the lease on /home/me/app.
+    let info = sample_info("s1");
+    assert!(matches!(
+        request(&sock, DaemonReq::RegisterWorker { info: info.clone() }),
+        Some(DaemonResp::Registered)
+    ));
+    let key = std::path::PathBuf::from("/home/me/app");
+    assert!(matches!(
+        request(
+            &sock,
+            DaemonReq::AcquireLease {
+                key: key.clone(),
+                session: "s1".into(),
+                mode: LeaseMode::Exclusive,
+            },
+        ),
+        Some(DaemonResp::LeaseGranted { .. })
+    ));
+
+    // s2 is refused while s1 is live, and learns who holds it.
+    match request(
+        &sock,
+        DaemonReq::AcquireLease {
+            key: key.clone(),
+            session: "s2".into(),
+            mode: LeaseMode::Exclusive,
+        },
+    ) {
+        Some(DaemonResp::LeaseDenied { held_by, .. }) => assert_eq!(held_by.id, "s1"),
+        other => panic!("expected LeaseDenied, got {other:?}"),
+    }
+
+    // After s1 releases, s2 can take the worktree.
+    assert!(matches!(
+        request(
+            &sock,
+            DaemonReq::ReleaseLease {
+                key: key.clone(),
+                session: "s1".into(),
+            },
+        ),
+        Some(DaemonResp::Updated)
+    ));
+    assert!(matches!(
+        request(
+            &sock,
+            DaemonReq::AcquireLease {
+                key,
+                session: "s2".into(),
+                mode: LeaseMode::Exclusive,
+            },
+        ),
+        Some(DaemonResp::LeaseGranted { .. })
+    ));
+}
+
 #[test]
 fn start_session_spawns_and_registers_a_worker() {
     use assert_fs::prelude::*;
@@ -208,6 +274,7 @@ fn start_session_spawns_and_registers_a_worker() {
             root: proj.path().to_path_buf(),
             task: None,
             mode: LeaseMode::Exclusive,
+            force: false,
         },
     ) {
         Some(DaemonResp::Started { id, worker_sock }) => (id, worker_sock),

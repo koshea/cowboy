@@ -146,6 +146,9 @@ pub enum DaemonReq {
         #[serde(default)]
         task: Option<String>,
         mode: LeaseMode,
+        /// Steal a *stale* lease on this worktree (never a live one).
+        #[serde(default)]
+        force: bool,
     },
     ListSessions {
         #[serde(default)]
@@ -380,6 +383,7 @@ mod tests {
                 root: "/home/me/app".into(),
                 task: Some("fix tests".into()),
                 mode: LeaseMode::Exclusive,
+                force: false,
             },
         });
         roundtrip(&DaemonRequest {

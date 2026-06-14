@@ -68,6 +68,18 @@ pub struct Lease {
     pub updated_ms: u64,
 }
 
+/// Liveness of a lease holder, deciding whether its lease can be reclaimed.
+enum HolderState {
+    /// No such session in the registry.
+    Gone,
+    /// Completed or Failed.
+    Terminal,
+    /// Marked `Stale` (worker died / heartbeat lapsed) — reclaim needs `--force`.
+    Stale,
+    /// Still running — never displaced.
+    Live,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct State {
     #[serde(default)]
@@ -102,6 +114,88 @@ impl Daemon {
             state_path,
             next_seq: 0,
         }
+    }
+
+    /// Canonical lease key for a worktree root (matches the container/network
+    /// path hashing). Falls back to the given path if it can't be canonicalized.
+    fn lease_key(root: &Path) -> String {
+        std::fs::canonicalize(root)
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// Liveness of the session currently holding a lease. `Stale` is checked
+    /// before the general terminal test (which also matches `Stale`) so a
+    /// crashed-but-uncleaned session keeps requiring `--force` to displace.
+    fn holder_state(&self, session: &SessionId) -> HolderState {
+        match self.state.sessions.get(session) {
+            None => HolderState::Gone,
+            Some(s) if s.status == SessionStatus::Stale => HolderState::Stale,
+            Some(s) if s.status.is_terminal() => HolderState::Terminal,
+            Some(_) => HolderState::Live,
+        }
+    }
+
+    /// Try to grant an exclusive lease on `key` to `session`. A lease held by a
+    /// gone/terminal session is reclaimed automatically; a `Stale` one only with
+    /// `force`; a live one is **never** displaced (rule 5). Returns the
+    /// conflicting session id if denied.
+    fn acquire(
+        &mut self,
+        key: &str,
+        session: &str,
+        mode: LeaseMode,
+        force: bool,
+    ) -> Result<(), SessionId> {
+        if let Some(existing) = self.state.leases.get(key) {
+            if existing.session != session {
+                let reclaimable = match self.holder_state(&existing.session) {
+                    HolderState::Gone | HolderState::Terminal => true,
+                    HolderState::Stale => force,
+                    HolderState::Live => false,
+                };
+                if !reclaimable {
+                    return Err(existing.session.clone());
+                }
+            }
+        }
+        let now = now_ms();
+        let created = self
+            .state
+            .leases
+            .get(key)
+            .filter(|l| l.session == session)
+            .map(|l| l.created_ms)
+            .unwrap_or(now);
+        self.state.leases.insert(
+            key.to_string(),
+            Lease {
+                session: session.to_string(),
+                mode,
+                created_ms: created,
+                updated_ms: now,
+            },
+        );
+        Ok(())
+    }
+
+    /// Release a lease iff it is held by `session` (a no-op otherwise, so a
+    /// stale session can't release a stolen lease out from under its new owner).
+    fn release(&mut self, key: &str, session: &str) {
+        if self
+            .state
+            .leases
+            .get(key)
+            .is_some_and(|l| l.session == session)
+        {
+            self.state.leases.remove(key);
+        }
+    }
+
+    /// Release any leases held by a session (called when it ends).
+    fn release_all_for(&mut self, session: &str) {
+        self.state.leases.retain(|_, l| l.session != session);
     }
 
     /// Persist the registry atomically (temp file + rename).
@@ -239,8 +333,34 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                 },
             }
         }
-        DaemonReq::StartSession { root, task, mode } => {
-            start_session(daemon, root, task, mode).await
+        DaemonReq::StartSession {
+            root,
+            task,
+            mode,
+            force,
+        } => start_session(daemon, root, task, mode, force).await,
+        DaemonReq::AcquireLease { key, session, mode } => {
+            let mut d = daemon.lock().await;
+            let k = Daemon::lease_key(&key);
+            match d.acquire(&k, &session, mode, false) {
+                Ok(()) => {
+                    d.save();
+                    DaemonResp::LeaseGranted { key }
+                }
+                Err(holder) => match d.state.sessions.get(&holder).cloned() {
+                    Some(held_by) => DaemonResp::LeaseDenied { key, held_by },
+                    None => DaemonResp::Err {
+                        message: format!("worktree held by unknown session {holder}"),
+                    },
+                },
+            }
+        }
+        DaemonReq::ReleaseLease { key, session } => {
+            let mut d = daemon.lock().await;
+            let k = Daemon::lease_key(&key);
+            d.release(&k, &session);
+            d.save();
+            DaemonResp::Updated
         }
         DaemonReq::AttachSession { id } => {
             let d = daemon.lock().await;
@@ -317,6 +437,8 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                 s.status = SessionStatus::Completed;
                 s.worker_sock = None;
             }
+            // A cleanly finished session frees its worktree immediately.
+            d.release_all_for(&id);
             d.save();
             DaemonResp::Completed
         }
@@ -327,6 +449,7 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                 s.worker_sock = None;
                 s.running_command = Some(format!("error: {error}"));
             }
+            d.release_all_for(&id);
             d.save();
             DaemonResp::Failed
         }
@@ -343,11 +466,31 @@ async fn start_session(
     root: PathBuf,
     task: Option<String>,
     mode: LeaseMode,
+    force: bool,
 ) -> DaemonResp {
+    let key = Daemon::lease_key(&root);
+    // Acquire the worktree lease up front (exclusive sessions only). On conflict
+    // bail before spawning so two writable workers never share a worktree.
     let id = {
         let mut d = daemon.lock().await;
         d.next_seq += 1;
-        format!("{}-{}", now_ms(), d.next_seq)
+        let id = format!("{}-{}", now_ms(), d.next_seq);
+        if mode == LeaseMode::Exclusive {
+            if let Err(holder) = d.acquire(&key, &id, mode, force) {
+                let held_by = d.state.sessions.get(&holder).cloned();
+                return match held_by {
+                    Some(held_by) => DaemonResp::LeaseDenied {
+                        key: PathBuf::from(key),
+                        held_by,
+                    },
+                    None => DaemonResp::Err {
+                        message: format!("worktree held by unknown session {holder}"),
+                    },
+                };
+            }
+            d.save();
+        }
+        id
     };
     let sock = runtime_dir().join(format!("s-{id}.sock"));
     let journal = root.join(".cowboy/sessions").join(&id).join("events.jsonl");
@@ -370,9 +513,13 @@ async fn start_session(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            // Don't leave an orphan lease behind a worker that never ran.
+            let mut d = daemon.lock().await;
+            d.release(&key, &id);
+            d.save();
             return DaemonResp::Err {
                 message: format!("spawning worker: {e}"),
-            }
+            };
         }
     };
     let pid = child.id();
@@ -479,4 +626,131 @@ pub async fn ensure_running() -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     anyhow::bail!("cowboyd did not become ready")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn daemon() -> Daemon {
+        Daemon {
+            state: State::default(),
+            state_path: PathBuf::from("/dev/null"),
+            next_seq: 0,
+        }
+    }
+
+    /// Register a session with a given status so its lease holder has known
+    /// liveness.
+    fn put_session(d: &mut Daemon, id: &str, status: SessionStatus) {
+        d.state.sessions.insert(
+            id.to_string(),
+            SessionInfo {
+                id: id.to_string(),
+                root: PathBuf::from("/w"),
+                task: None,
+                status,
+                pid: None,
+                branch: None,
+                container_name: None,
+                worker_sock: None,
+                journal_path: None,
+                lease_mode: Some(LeaseMode::Exclusive),
+                started_ms: 0,
+                last_heartbeat_ms: 0,
+                turn: 0,
+                tokens: (0, 0),
+                attached_clients: 0,
+                diffstat: String::new(),
+                running_command: None,
+            },
+        );
+    }
+
+    #[test]
+    fn free_worktree_is_granted_and_reentrant() {
+        let mut d = daemon();
+        assert!(d.acquire("/w", "s1", LeaseMode::Exclusive, false).is_ok());
+        // The same session re-acquiring is fine.
+        assert!(d.acquire("/w", "s1", LeaseMode::Exclusive, false).is_ok());
+    }
+
+    #[test]
+    fn live_holder_is_never_displaced_even_with_force() {
+        let mut d = daemon();
+        put_session(&mut d, "s1", SessionStatus::Running);
+        d.acquire("/w", "s1", LeaseMode::Exclusive, false).unwrap();
+
+        assert_eq!(
+            d.acquire("/w", "s2", LeaseMode::Exclusive, false),
+            Err("s1".to_string())
+        );
+        // Force does NOT steal a live lease (rule 5).
+        assert_eq!(
+            d.acquire("/w", "s2", LeaseMode::Exclusive, true),
+            Err("s1".to_string())
+        );
+    }
+
+    #[test]
+    fn stale_holder_needs_force_to_steal() {
+        let mut d = daemon();
+        put_session(&mut d, "s1", SessionStatus::Stale);
+        d.acquire("/w", "s1", LeaseMode::Exclusive, false).unwrap();
+
+        // Without force a stale lease is reported as a conflict...
+        assert_eq!(
+            d.acquire("/w", "s2", LeaseMode::Exclusive, false),
+            Err("s1".to_string())
+        );
+        // ...with force it is stolen.
+        assert!(d.acquire("/w", "s2", LeaseMode::Exclusive, true).is_ok());
+        assert_eq!(d.state.leases["/w"].session, "s2");
+    }
+
+    #[test]
+    fn terminal_or_gone_holder_is_reclaimed_without_force() {
+        // Completed holder: auto-reclaim.
+        let mut d = daemon();
+        put_session(&mut d, "s1", SessionStatus::Completed);
+        d.acquire("/w", "s1", LeaseMode::Exclusive, false).unwrap();
+        assert!(d.acquire("/w", "s2", LeaseMode::Exclusive, false).is_ok());
+
+        // Gone holder (no session record): auto-reclaim too.
+        let mut d2 = daemon();
+        d2.state.leases.insert(
+            "/w".into(),
+            Lease {
+                session: "ghost".into(),
+                mode: LeaseMode::Exclusive,
+                created_ms: 0,
+                updated_ms: 0,
+            },
+        );
+        assert!(d2.acquire("/w", "s9", LeaseMode::Exclusive, false).is_ok());
+    }
+
+    #[test]
+    fn release_only_by_holder() {
+        let mut d = daemon();
+        d.acquire("/w", "s1", LeaseMode::Exclusive, false).unwrap();
+        // A different session can't release someone else's lease.
+        d.release("/w", "s2");
+        assert!(d.state.leases.contains_key("/w"));
+        // The holder can.
+        d.release("/w", "s1");
+        assert!(!d.state.leases.contains_key("/w"));
+    }
+
+    #[test]
+    fn release_all_for_drops_every_lease_of_a_session() {
+        let mut d = daemon();
+        d.acquire("/a", "s1", LeaseMode::Exclusive, false).unwrap();
+        d.acquire("/b", "s1", LeaseMode::Exclusive, false).unwrap();
+        d.acquire("/c", "s2", LeaseMode::Exclusive, false).unwrap();
+        d.release_all_for("s1");
+        assert!(!d.state.leases.contains_key("/a"));
+        assert!(!d.state.leases.contains_key("/b"));
+        assert!(d.state.leases.contains_key("/c"));
+    }
 }
