@@ -12,6 +12,12 @@ gateway — never by prompting the model.
   file inside the container, so the agent cannot read them even though they live
   under `.cowboy/`. (Enforced in `AgentRuntime::build_spec`; proven by the
   `security_yaml_is_masked_inside_container` E2E test.)
+- **Provider credentials live only in the home dir.** Endpoint URLs and API keys
+  are stored in `~/.config/cowboy/providers.yaml` (`0600`), consumed host-side
+  when building the model client, and never written into a project or mounted —
+  so the agent cannot reach them by construction. Project `models.yaml` files
+  reference a provider by name and are forbidden (by `deny_unknown_fields`) from
+  carrying credentials.
 - **Config validation refuses to expose security config.** `SecurityConfig::validate`
   rejects any mount whose source is `security.yaml` or the `.cowboy` directory.
 - **Network egress is route-enforced, not prompt-enforced.** The agent runs on

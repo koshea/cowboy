@@ -2,21 +2,21 @@
 source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
-╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
-│› start the dev server                         ││no network activity  │
+╭ ~/dev/cowboy  ⎇ main ─────────────────────────╮╭ network ────────────╮
+│› refactor the parser                          ││no network activity  │
 │                                               ││yet                  │
-│✓ Server running on :3000.                     ││                     │
+│✓ Done.                                        ││                     │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
 │                                               │╰─────────────────────╯
 │                                               │╭ processes ──────────╮
-│                                               ││web            runnin│
+│                                               ││no managed processes │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   ready — ready                                            Δ 2f +30 -4
+   ready — ready                             ~128k↑ 9.1k↓   Δ 2f +30 -4
 ╭ message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu ───────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

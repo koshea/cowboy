@@ -19,7 +19,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::ModelProfile;
+use crate::config::ResolvedModel;
 use crate::error::{Error, Result};
 
 /// Role of a conversation message.
@@ -120,17 +120,16 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// Build from a model profile. The API key is read from the env var named
-    /// by `profile.api_key_env` (never stored in config).
-    pub fn from_profile(profile: &ModelProfile) -> Result<Self> {
-        let api_key = std::env::var(&profile.api_key_env).unwrap_or_default();
+    /// Build from a fully-resolved model (provider credentials joined with the
+    /// model definition by [`crate::config::resolve_model`]).
+    pub fn from_resolved(model: &ResolvedModel) -> Result<Self> {
         let config = OpenAIConfig::new()
-            .with_api_base(profile.base_url.clone())
-            .with_api_key(api_key);
+            .with_api_base(model.base_url.clone())
+            .with_api_key(model.api_key.clone());
 
-        // Forward per-profile custom headers (e.g. for an internal gateway).
+        // Forward custom headers (provider defaults + per-model overrides).
         let mut headers = reqwest::header::HeaderMap::new();
-        for (k, v) in &profile.headers {
+        for (k, v) in &model.headers {
             if let (Ok(name), Ok(val)) = (
                 reqwest::header::HeaderName::from_bytes(k.as_bytes()),
                 reqwest::header::HeaderValue::from_str(v),
@@ -145,9 +144,9 @@ impl OpenAiClient {
 
         Ok(Self {
             client: Client::with_config(config).with_http_client(http),
-            model: profile.model.clone(),
-            temperature: profile.temperature,
-            max_tokens: profile.max_tokens,
+            model: model.model.clone(),
+            temperature: model.temperature,
+            max_tokens: model.max_tokens,
         })
     }
 }

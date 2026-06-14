@@ -13,13 +13,22 @@ never by prompting the model.
 ## Quick start
 
 ```sh
-cargo build --release
-export COWBOY_OPENAI_API_KEY=...        # key for your OpenAI-compatible endpoint
+cargo install --path crates/cowboy-cli   # installs `cowboy` to ~/.cargo/bin
+docker/build.sh                          # build the agent + gateway images
+cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
 cd your-project
-cowboy init                              # writes .cowboy/{security,agent,models}.yaml
+cowboy init                              # writes .cowboy/{security,agent}.yaml
 cowboy doctor                            # check Docker, Linux, nft, model, Compose
 cowboy "run the tests and fix one simple failure"
 ```
+
+**Providers vs. models.** Provider credentials (endpoint URL + API key) are
+host-owned: `cowboy models setup` saves them to `~/.config/cowboy/providers.yaml`
+(`0600`), never in a project, so the agent can't reach them. Models (which
+provider + model id + params) can be defined at the user level
+(`~/.config/cowboy/models.yaml`) or per project (`.cowboy/models.yaml`, no
+credentials); set the default with `cowboy models use [-g] <name>` and review with
+`cowboy models list`.
 
 ## Docs
 

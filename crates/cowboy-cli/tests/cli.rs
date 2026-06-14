@@ -22,19 +22,24 @@ fn help_lists_commands() {
 #[test]
 fn init_creates_config_files() {
     let tmp = assert_fs::TempDir::new().unwrap();
+    let home = assert_fs::TempDir::new().unwrap(); // isolated home config
     cowboy()
         .current_dir(tmp.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .arg("init")
         .assert()
         .success()
-        .stdout(predicate::str::contains("Initialized cowboy config"));
+        .stdout(predicate::str::contains("Initialized cowboy config"))
+        // With no provider configured yet, init points at setup.
+        .stdout(predicate::str::contains("cowboy models setup"));
 
     tmp.child(".cowboy/security.yaml")
         .assert(predicate::path::is_file());
     tmp.child(".cowboy/agent.yaml")
         .assert(predicate::path::is_file());
+    // Provider credentials are host-owned; no models.yaml in the project.
     tmp.child(".cowboy/models.yaml")
-        .assert(predicate::path::is_file());
+        .assert(predicate::path::missing());
     tmp.child(".gitignore")
         .assert(predicate::str::contains(".cowboy/sessions/"));
 }
@@ -64,10 +69,11 @@ fn doctor_runs_after_init() {
         .assert()
         .success();
     // Doctor should succeed on this host (Linux + docker + nft present), though
-    // it may warn about the missing API key.
+    // it may warn about a missing provider.
+    let home = assert_fs::TempDir::new().unwrap();
     cowboy()
         .current_dir(tmp.path())
-        .env_remove("COWBOY_OPENAI_API_KEY")
+        .env("XDG_CONFIG_HOME", home.path())
         .arg("doctor")
         .assert()
         .success()

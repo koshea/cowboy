@@ -27,8 +27,10 @@ pub const COWBOY_DIR: &str = ".cowboy";
 pub const SECURITY_FILE: &str = "security.yaml";
 /// Agent-visible config filename. Mounted into the container.
 pub const AGENT_FILE: &str = "agent.yaml";
-/// Model profiles filename.
+/// Model definitions filename (home + project).
 pub const MODELS_FILE: &str = "models.yaml";
+/// Home-only providers filename (endpoint + key). Never in a project.
+pub const PROVIDERS_FILE: &str = "providers.yaml";
 
 // ---------------------------------------------------------------------------
 // security.yaml
@@ -204,29 +206,79 @@ pub struct ProcessDef {
 }
 
 // ---------------------------------------------------------------------------
-// models.yaml
+// providers.yaml (home-only) + models.yaml (home + project)
 // ---------------------------------------------------------------------------
 
-/// Model profiles for the OpenAI-compatible client.
+/// Model providers: endpoint + API key pairs. **Host-owned and home-only** —
+/// this file lives at `~/.config/cowboy/providers.yaml` (mode `0600`) and is
+/// never placed in a project or mounted into the agent container, so the agent
+/// cannot reach the credentials by construction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProvidersConfig {
+    #[serde(default = "default_version")]
+    pub version: u32,
+    #[serde(default)]
+    pub providers: BTreeMap<String, Provider>,
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+/// A single OpenAI-compatible provider: where to send requests and the key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    /// Endpoint base URL (supports `${VAR}` expansion from the host env).
+    pub base_url: String,
+    /// The API key, stored literally (the file is `0600`, home-owned).
+    pub api_key: String,
+    /// Optional default headers (e.g. for an internal gateway).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// Model definitions. Lives at both the user level
+/// (`~/.config/cowboy/models.yaml`) and the project level
+/// (`.cowboy/models.yaml`); project entries override user entries by name and a
+/// project may override the default. **Never contains provider credentials** —
+/// `deny_unknown_fields` makes a stray `api_key`/`base_url`/`providers` a hard
+/// parse error.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelsConfig {
     #[serde(default = "default_version")]
     pub version: u32,
-    pub models: ModelSet,
+    /// Name of the default model (optional at the project level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelDef>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelSet {
-    /// Name of the default profile.
-    pub default: String,
-    pub profiles: BTreeMap<String, ModelProfile>,
+impl Default for ModelsConfig {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            default: None,
+            models: BTreeMap::new(),
+        }
+    }
 }
 
+/// A named model: which provider to use plus model id and sampling params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ModelProfile {
-    pub base_url: String,
-    /// Name of the env var holding the API key (never the key itself).
-    pub api_key_env: String,
+#[serde(deny_unknown_fields)]
+pub struct ModelDef {
+    /// Name of the provider (looked up in `providers.yaml`).
+    pub provider: String,
+    /// The provider-side model id, e.g. `anthropic/claude-sonnet-4-6`.
     pub model: String,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
@@ -234,7 +286,22 @@ pub struct ModelProfile {
     pub max_tokens: u32,
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    /// Per-model header overrides (merged over the provider's headers).
     #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+/// A fully-resolved model ready to build a client from: provider credentials
+/// merged with the model definition. Decouples the client from the on-disk
+/// layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedModel {
+    pub base_url: String,
+    pub api_key: String,
+    pub model: String,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub context_window: u32,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -510,31 +577,181 @@ impl AgentConfig {
     }
 }
 
+/// The home config directory (`~/.config/cowboy`), if resolvable. Mirrors the
+/// skills crate's use of `directories::BaseDirs`.
+pub fn global_config_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.config_dir().join("cowboy"))
+}
+
+fn write_yaml<T: Serialize>(value: &T, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::ConfigRead {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let yaml = serde_yaml_ng::to_string(value).map_err(|e| Error::Invalid(e.to_string()))?;
+    std::fs::write(path, yaml).map_err(|source| Error::ConfigRead {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+impl ProvidersConfig {
+    /// Load a providers file from a specific path.
+    pub fn load(path: &Path) -> Result<Self> {
+        read_yaml(path)
+    }
+
+    /// The home-only providers file (`~/.config/cowboy/providers.yaml`).
+    pub fn global_path() -> Option<PathBuf> {
+        global_config_dir().map(|d| d.join(PROVIDERS_FILE))
+    }
+
+    /// Load the home providers file, or an empty config if it doesn't exist.
+    pub fn load_global() -> Result<Self> {
+        match Self::global_path() {
+            Some(p) if p.exists() => read_yaml(&p),
+            _ => Ok(Self::default()),
+        }
+    }
+
+    /// Write to `path` with owner-only (`0600`) permissions — this file holds
+    /// API keys.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        write_yaml(self, path)?;
+        set_owner_only(path)
+    }
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
+        Error::ConfigRead {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 impl ModelsConfig {
     pub fn load(path: &Path) -> Result<Self> {
-        let cfg: Self = read_yaml(path)?;
-        cfg.validate()?;
-        Ok(cfg)
+        read_yaml(path)
     }
 
-    pub fn validate(&self) -> Result<()> {
-        if !self.models.profiles.contains_key(&self.models.default) {
+    /// The user-level models file (`~/.config/cowboy/models.yaml`).
+    pub fn user_path() -> Option<PathBuf> {
+        global_config_dir().map(|d| d.join(MODELS_FILE))
+    }
+
+    /// Load a models file if it exists, else `None` (a missing file is not an
+    /// error — user/project model lists are both optional).
+    pub fn load_opt(path: &Path) -> Result<Option<Self>> {
+        if path.exists() {
+            Ok(Some(read_yaml(path)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        write_yaml(self, path)
+    }
+}
+
+/// Resolve the active model into a [`ResolvedModel`] by merging user and project
+/// model lists (project overrides by name) and joining with the named provider's
+/// credentials.
+///
+/// Default precedence: explicit `name` → project `default` → user `default`.
+pub fn resolve_model(
+    providers: &ProvidersConfig,
+    user: Option<&ModelsConfig>,
+    project: Option<&ModelsConfig>,
+    name: Option<&str>,
+) -> Result<ResolvedModel> {
+    // Merge model definitions: user first, then project overrides by name.
+    let mut models: BTreeMap<String, ModelDef> = BTreeMap::new();
+    if let Some(u) = user {
+        models.extend(u.models.clone());
+    }
+    if let Some(p) = project {
+        models.extend(p.models.clone());
+    }
+    if models.is_empty() {
+        return Err(Error::Invalid(
+            "no models configured; run `cowboy models setup`".to_string(),
+        ));
+    }
+
+    // Default precedence: explicit name, then project default, then user default.
+    let chosen = name
+        .map(str::to_string)
+        .or_else(|| project.and_then(|p| p.default.clone()))
+        .or_else(|| user.and_then(|u| u.default.clone()))
+        .ok_or_else(|| {
+            Error::Invalid(
+                "no default model set; pick one with `cowboy models use <name>`".to_string(),
+            )
+        })?;
+
+    let def = models
+        .get(&chosen)
+        .ok_or_else(|| Error::Invalid(format!("unknown model: {chosen}")))?;
+
+    let provider = providers.providers.get(&def.provider).ok_or_else(|| {
+        Error::Invalid(format!(
+            "model {chosen:?} references provider {:?}, which is not configured; \
+             run `cowboy models setup`",
+            def.provider
+        ))
+    })?;
+
+    // Provider headers first, then per-model overrides win.
+    let mut headers = provider.headers.clone();
+    headers.extend(def.headers.clone());
+
+    Ok(ResolvedModel {
+        base_url: expand_env(&provider.base_url)?,
+        api_key: provider.api_key.clone(),
+        model: def.model.clone(),
+        temperature: def.temperature,
+        max_tokens: def.max_tokens,
+        context_window: def.context_window,
+        headers,
+    })
+}
+
+/// Expand `${VAR}` references in `input` from the host environment. Errors if a
+/// referenced variable is unset or empty (so a misconfigured endpoint fails
+/// loudly rather than silently pointing at an empty URL). Literal text and `$`
+/// not followed by `{` are passed through unchanged.
+pub fn expand_env(input: &str) -> Result<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let end = after.find('}').ok_or_else(|| {
+            Error::Invalid(format!("unterminated `${{` in config value: {input:?}"))
+        })?;
+        let var = &after[..end];
+        let value = std::env::var(var).unwrap_or_default();
+        if value.is_empty() {
             return Err(Error::Invalid(format!(
-                "default model profile {:?} is not defined in profiles",
-                self.models.default
+                "config references ${{{var}}} but ${var} is unset or empty"
             )));
         }
-        Ok(())
+        out.push_str(&value);
+        rest = &after[end + 1..];
     }
-
-    /// Resolve the active profile (`name` or the configured default).
-    pub fn resolve(&self, name: Option<&str>) -> Result<&ModelProfile> {
-        let key = name.unwrap_or(&self.models.default);
-        self.models
-            .profiles
-            .get(key)
-            .ok_or_else(|| Error::Invalid(format!("unknown model profile: {key}")))
-    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -549,11 +766,6 @@ pub fn security_template() -> String {
 pub fn agent_template() -> String {
     AGENT_TEMPLATE.to_string()
 }
-/// Default `models.yaml` rendered by `cowboy init`, with comments.
-pub fn models_template() -> String {
-    MODELS_TEMPLATE.to_string()
-}
-
 const SECURITY_TEMPLATE: &str = r#"version: 1
 
 # HOST-OWNED security config. The cowboy host process reads this; it is NEVER
@@ -639,30 +851,4 @@ processes: {}
 commands: {}
   # test: cargo test
   # lint: cargo clippy
-"#;
-
-const MODELS_TEMPLATE: &str = r#"version: 1
-
-# Model profiles for the OpenAI-compatible client. The API key is read from the
-# env var named by `api_key_env` — never store the key in this file.
-
-models:
-  default: dev
-  profiles:
-    dev:
-      base_url: https://litellm-test.follow-chinstrap.ts.net/v1
-      api_key_env: COWBOY_OPENAI_API_KEY
-      model: anthropic/claude-sonnet-4-6
-      temperature: 0.2
-      max_tokens: 8192
-      context_window: 200000
-      headers: {}
-    cheap:
-      base_url: https://litellm-test.follow-chinstrap.ts.net/v1
-      api_key_env: COWBOY_OPENAI_API_KEY
-      model: openai/gpt-5.4-mini
-      temperature: 0.1
-      max_tokens: 4096
-      context_window: 128000
-      headers: {}
 "#;

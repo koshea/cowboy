@@ -47,24 +47,44 @@ commands:
   test: cargo test
 ```
 
-## `models.yaml` (host-owned)
+## Providers & models
 
-OpenAI-compatible model profiles. **The API key is read from the env var named
-by `api_key_env` — never store the key in this file.**
+Provider credentials and model definitions are split so that **credentials are
+host-owned and the agent can never reach them.**
+
+### `~/.config/cowboy/providers.yaml` (home-only, `0600`)
+
+Endpoint + key pairs. This file lives only in your home dir — never in a project,
+never mounted into the container. Manage it with `cowboy models setup`.
 
 ```yaml
 version: 1
-models:
-  default: dev
-  profiles:
-    dev:
-      base_url: https://your-openai-compatible-endpoint/v1
-      api_key_env: COWBOY_OPENAI_API_KEY
-      model: anthropic/claude-sonnet-4-6
-      temperature: 0.2
-      max_tokens: 8192
-      context_window: 200000
+providers:
+  litellm:
+    base_url: https://your-openai-compatible-endpoint/v1   # supports ${VAR}
+    api_key: sk-...                                         # stored literally; file is 0600
+    headers: {}                                             # optional
 ```
 
-Works with any OpenAI-compatible backend (LiteLLM, OpenRouter, Ollama, vLLM, an
-internal gateway, …). Cowboy does not manage or endorse a gateway.
+### `models.yaml` — user (`~/.config/cowboy/`) and/or project (`.cowboy/`)
+
+A model names a provider plus the model id and sampling params. **Never contains
+credentials** (a stray `api_key`/`base_url` is a hard parse error). User and
+project lists merge by name (project wins); the default is `project.default` ??
+`user.default`.
+
+```yaml
+version: 1
+default: sonnet
+models:
+  sonnet:
+    provider: litellm
+    model: anthropic/claude-sonnet-4-6
+    temperature: 0.2
+    max_tokens: 8192
+    context_window: 200000
+```
+
+Manage with `cowboy models setup` / `list` / `use [-g] <name>`. Works with any
+OpenAI-compatible backend (LiteLLM, OpenRouter, Ollama, vLLM, an internal
+gateway, …). Cowboy does not manage or endorse a gateway.

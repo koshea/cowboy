@@ -46,6 +46,43 @@ impl ControlClient {
         }
     }
 
+    /// Connect to the host socket, retrying briefly to absorb startup races
+    /// (the host may bind the socket slightly after the gateway comes up).
+    async fn connect(path: &std::path::Path) -> Result<UnixStream> {
+        let mut last = None;
+        for attempt in 0..20 {
+            match UnixStream::connect(path).await {
+                Ok(s) => {
+                    if attempt > 0 {
+                        tracing::info!(sock = %path.display(), attempt, "control socket connected");
+                    }
+                    return Ok(s);
+                }
+                Err(e) => {
+                    last = Some(e);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            }
+        }
+        Err(last.unwrap()).with_context(|| format!("connecting control socket {}", path.display()))
+    }
+
+    /// Ensure `guard` holds a live connection, (re)connecting if absent.
+    async fn ensure_conn<'a>(
+        guard: &'a mut Option<Conn>,
+        path: &std::path::Path,
+    ) -> Result<&'a mut Conn> {
+        if guard.is_none() {
+            let stream = Self::connect(path).await?;
+            let (r, w) = stream.into_split();
+            *guard = Some(Conn {
+                reader: BufReader::new(r),
+                writer: w,
+            });
+        }
+        Ok(guard.as_mut().unwrap())
+    }
+
     async fn ask_inner(&self, attempt: &NetworkAttempt) -> Result<Verdict> {
         let Some(path) = self.path.clone() else {
             anyhow::bail!("no control socket configured");
@@ -55,17 +92,21 @@ impl ControlClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let mut guard = self.inner.lock().await;
-        if guard.is_none() {
-            let stream = UnixStream::connect(&path)
-                .await
-                .with_context(|| format!("connecting control socket {}", path.display()))?;
-            let (r, w) = stream.into_split();
-            *guard = Some(Conn {
-                reader: BufReader::new(r),
-                writer: w,
-            });
+        let result = Self::ask_on_conn(&mut guard, &path, id, attempt).await;
+        if result.is_err() {
+            // Drop a poisoned connection so the next call reconnects.
+            *guard = None;
         }
-        let conn = guard.as_mut().unwrap();
+        result
+    }
+
+    async fn ask_on_conn(
+        guard: &mut Option<Conn>,
+        path: &std::path::Path,
+        id: u64,
+        attempt: &NetworkAttempt,
+    ) -> Result<Verdict> {
+        let conn = Self::ensure_conn(guard, path).await?;
 
         let msg = GatewayMessage::Ask {
             id,
@@ -100,20 +141,35 @@ impl ControlClient {
         Ok(verdict)
     }
 
-    /// Best-effort: notify the host of a decision for the activity log.
+    /// Best-effort: notify the host of a decision for the activity log. Opens
+    /// the connection if needed (so allow/deny verdicts — which never `ask` —
+    /// still reach the host's activity pane).
     pub async fn event(&self, attempt: &NetworkAttempt, verdict: Verdict, reason: String) {
-        if self.path.is_none() {
+        let Some(path) = self.path.clone() else {
             return;
-        }
+        };
         let mut guard = self.inner.lock().await;
-        if let Some(conn) = guard.as_mut() {
-            let msg = GatewayMessage::Event {
-                attempt: attempt.clone(),
-                verdict,
-                reason,
-            };
-            let _ = conn.writer.write_all(encode_line(&msg).as_bytes()).await;
-            let _ = conn.writer.flush().await;
+        if let Err(e) = Self::event_on_conn(&mut guard, &path, attempt, verdict, reason).await {
+            tracing::debug!(error = %e, "control event send failed");
+            *guard = None; // reconnect next time
         }
+    }
+
+    async fn event_on_conn(
+        guard: &mut Option<Conn>,
+        path: &std::path::Path,
+        attempt: &NetworkAttempt,
+        verdict: Verdict,
+        reason: String,
+    ) -> Result<()> {
+        let conn = Self::ensure_conn(guard, path).await?;
+        let msg = GatewayMessage::Event {
+            attempt: attempt.clone(),
+            verdict,
+            reason,
+        };
+        conn.writer.write_all(encode_line(&msg).as_bytes()).await?;
+        conn.writer.flush().await?;
+        Ok(())
     }
 }

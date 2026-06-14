@@ -2,21 +2,21 @@
 source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
-┌ cowboy ───────────────────────────────────────┐┌ network ────────────┐
-│you fix the failing test                       ││ask example.com:443  │
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│› fix the failing test                         ││ask example.com:443  │
+│                                               ││                     │
 │$ cargo test                                   ││                     │
-│test result: FAILED                            ││                     │
+│  test result: FAILED                          ││                     │
+│                                               ││                     │
 │Looking at the failure...                      ││                     │
-│                                               ││                     │
-│                                               ││                     │
-│                                               │└─────────────────────┘
-│                                               │┌ processes ──────────┐
+│                                               │╰─────────────────────╯
+│                                               │╭ processes ──────────╮
 │                                               ││no managed processes │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
-└───────────────────────────────────────────────┘└─────────────────────┘
+╰───────────────────────────────────────────────╯╰─────────────────────╯
 ⠷  running — exec: cargo test
-┌ type a message · Enter send · Ctrl-C interrupt ──────────────────────┐
+╭ type a message · Enter send · PgUp/wheel scroll · Ctrl-C interrupt ──╮
 │                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+╰──────────────────────────────────────────────────────────────────────╯

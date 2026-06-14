@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use cowboy_core::config::{self, ConfigPaths};
+use cowboy_core::config::{self, ConfigPaths, ProvidersConfig};
 
 use crate::cli::InitArgs;
 
@@ -17,7 +17,8 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     write_file(&paths.security, &config::security_template(), args.force)?;
     write_file(&paths.agent, &config::agent_template(), args.force)?;
-    write_file(&paths.models, &config::models_template(), args.force)?;
+    // Note: models/providers are NOT scaffolded into the project. Provider
+    // credentials are host-owned (home dir); see `cowboy models setup`.
 
     ensure_gitignore(&root)?;
 
@@ -31,8 +32,16 @@ pub fn run(args: InitArgs) -> Result<()> {
     println!("\nInitialized cowboy config in {}", paths.dir.display());
     println!("  - {} (host-owned, never mounted)", config::SECURITY_FILE);
     println!("  - {} (mounted into the container)", config::AGENT_FILE);
-    println!("  - {} (model profiles)", config::MODELS_FILE);
-    println!("\nNext: set COWBOY_OPENAI_API_KEY, then run `cowboy doctor`.");
+
+    // Point the user at provider setup if no home provider is configured yet.
+    let has_provider = ProvidersConfig::load_global()
+        .map(|p| !p.providers.is_empty())
+        .unwrap_or(false);
+    if has_provider {
+        println!("\nNext: run `cowboy doctor`.");
+    } else {
+        println!("\nNext: run `cowboy models setup` to configure a model provider, then `cowboy doctor`.");
+    }
     Ok(())
 }
 

@@ -133,10 +133,21 @@ pub trait DockerCli: Send + Sync {
         user: &str,
         argv: &[String],
     ) -> Result<(ExecResult, String)>;
+    /// Execute `argv` with `stdin` piped in (so multi-line payloads avoid shell
+    /// quoting), capturing stdout. Used by the structured file tools.
+    async fn exec_stdin(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        argv: &[String],
+        stdin: &str,
+    ) -> Result<(ExecResult, String)>;
     /// Execute a shell command, streaming combined stdout+stderr chunks to
     /// `chunks` as they arrive, while also accumulating the full output. The
     /// command runs in its own process group; on `cancel` or timeout the group
     /// is killed (no lingering children). Returns (exit, accumulated output).
+    #[allow(clippy::too_many_arguments)]
     async fn exec_stream(
         &self,
         name: &str,
@@ -462,6 +473,50 @@ impl DockerCli for CliDocker {
         ))
     }
 
+    async fn exec_stdin(
+        &self,
+        name: &str,
+        workdir: &str,
+        user: &str,
+        argv: &[String],
+        stdin: &str,
+    ) -> Result<(ExecResult, String)> {
+        use tokio::io::AsyncWriteExt;
+        let mut cmd = Command::new("docker");
+        cmd.arg("exec").arg("-i");
+        push_exec_flags(&mut cmd, workdir, user);
+        cmd.arg(name);
+        cmd.args(argv);
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        cmd.kill_on_drop(true);
+        let mut child = cmd.spawn().context("docker exec (stdin)")?;
+        // The in-container helper reads all of stdin before emitting output, so
+        // writing fully then awaiting completion does not deadlock.
+        if let Some(mut si) = child.stdin.take() {
+            si.write_all(stdin.as_bytes()).await?;
+            si.shutdown().await.ok();
+            drop(si);
+        }
+        let out = child
+            .wait_with_output()
+            .await
+            .context("docker exec (stdin)")?;
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.is_empty() {
+            combined.push_str(&stderr);
+        }
+        Ok((
+            ExecResult {
+                exit_code: out.status.code().unwrap_or(-1),
+            },
+            combined,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn exec_stream(
         &self,
         name: &str,

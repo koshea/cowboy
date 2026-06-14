@@ -16,6 +16,12 @@ pub trait AgentUi {
     fn command_output(&mut self, _chunk: &str) {}
     /// The command finished with this exit code (output already streamed).
     fn command_end(&mut self, exit_code: i32, output: &str);
+    /// A structured file action (read/edit/write) was performed.
+    fn tool_use(&mut self, summary: &str) {
+        self.notice(summary);
+    }
+    /// Running session token estimate (input/output). Default: ignored.
+    fn tokens(&mut self, _input: u64, _output: u64) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question; return their answer.
@@ -87,6 +93,13 @@ impl AgentUi for ConsoleUi {
         if exit_code != 0 {
             println!("\x1b[31m[exit {exit_code}]\x1b[0m");
         }
+    }
+
+    fn tool_use(&mut self, summary: &str) {
+        if self.final_only {
+            return;
+        }
+        println!("\x1b[35m✎ {summary}\x1b[0m");
     }
 
     fn final_message(&mut self, message: &str) {

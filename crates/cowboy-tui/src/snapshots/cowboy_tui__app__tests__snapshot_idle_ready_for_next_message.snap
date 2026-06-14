@@ -2,21 +2,21 @@
 source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
-┌ cowboy ───────────────────────────────────────┐┌ network ────────────┐
-│you create a hello world                       ││                     │
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│› create a hello world                         ││no network activity  │
+│                                               ││yet                  │
 │✓ Done — created main.rs.                      ││                     │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
-│                                               ││                     │
-│                                               │└─────────────────────┘
-│                                               │┌ processes ──────────┐
+│                                               │╰─────────────────────╯
+│                                               │╭ processes ──────────╮
 │                                               ││no managed processes │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
-└───────────────────────────────────────────────┘└─────────────────────┘
+╰───────────────────────────────────────────────╯╰─────────────────────╯
    ready — ready
-┌ message cowboy · Enter send · Ctrl-C menu ───────────────────────────┐
+╭ message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu ───────╮
 │                                                                      │
-└──────────────────────────────────────────────────────────────────────┘
+╰──────────────────────────────────────────────────────────────────────╯

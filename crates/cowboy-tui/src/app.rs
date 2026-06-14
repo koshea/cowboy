@@ -14,9 +14,13 @@ use tui_textarea::TextArea;
 /// Kind of a transcript line (drives color/prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LineKind {
+    /// Welcome / project-info banner shown at startup.
+    Banner,
     User,
     Agent,
     Command,
+    /// A structured tool action (read/edit/write).
+    Tool,
     Output,
     Final,
     Notice,
@@ -49,6 +53,9 @@ pub struct App {
     pub status: String,
     /// Working-tree diff summary for the status bar (e.g. `Δ 2 files +30 -4`).
     pub diff: String,
+    /// Running session token estimate (input/prompt, output/completion).
+    pub tokens_in: u64,
+    pub tokens_out: u64,
     pub transcript: Vec<TranscriptLine>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
@@ -60,6 +67,13 @@ pub struct App {
     pub textarea: TextArea<'static>,
     pub mode: Mode,
     pub throbber: ThrobberState,
+    /// When true, the transcript follows the tail (newest output). When false,
+    /// it stays anchored at `scroll_top` so new output doesn't move the view.
+    pub follow: bool,
+    /// Absolute wrapped-line offset from the top, used while not following.
+    pub scroll_top: usize,
+    /// Max scroll offset, updated each frame from the rendered content/viewport.
+    pub max_scroll: std::cell::Cell<usize>,
 }
 
 impl App {
@@ -68,6 +82,8 @@ impl App {
             title: title.into(),
             status: "ready".into(),
             diff: String::new(),
+            tokens_in: 0,
+            tokens_out: 0,
             transcript: Vec::new(),
             streaming: String::new(),
             activity: Vec::new(),
@@ -75,7 +91,41 @@ impl App {
             textarea: TextArea::default(),
             mode: Mode::Running,
             throbber: ThrobberState::default(),
+            follow: true,
+            scroll_top: 0,
+            max_scroll: std::cell::Cell::new(0),
         }
+    }
+
+    /// Scroll the transcript up (toward older content) by `n` lines.
+    pub fn scroll_up(&mut self, n: usize) {
+        if self.follow {
+            // Detach from the tail at the current bottom position.
+            self.follow = false;
+            self.scroll_top = self.max_scroll.get();
+        }
+        self.scroll_top = self.scroll_top.saturating_sub(n);
+    }
+
+    /// Scroll the transcript down (toward the tail) by `n` lines.
+    pub fn scroll_down(&mut self, n: usize) {
+        if self.follow {
+            return;
+        }
+        self.scroll_top += n;
+        if self.scroll_top >= self.max_scroll.get() {
+            self.follow = true;
+        }
+    }
+
+    /// Jump back to following the tail.
+    pub fn scroll_to_bottom(&mut self) {
+        self.follow = true;
+    }
+
+    /// True when the view is pinned to the latest output.
+    pub fn at_bottom(&self) -> bool {
+        self.follow
     }
 
     pub fn push(&mut self, kind: LineKind, text: impl Into<String>) {
@@ -126,8 +176,9 @@ impl App {
 
 fn style_for(kind: LineKind) -> (&'static str, Style) {
     match kind {
+        LineKind::Banner => ("", Style::default().fg(Color::DarkGray)),
         LineKind::User => (
-            "you ",
+            "› ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -139,7 +190,8 @@ fn style_for(kind: LineKind) -> (&'static str, Style) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
-        LineKind::Output => ("", Style::default().fg(Color::Gray)),
+        LineKind::Tool => ("✎ ", Style::default().fg(Color::Magenta)),
+        LineKind::Output => ("  ", Style::default().fg(Color::Gray)),
         LineKind::Final => (
             "✓ ",
             Style::default()
@@ -147,8 +199,21 @@ fn style_for(kind: LineKind) -> (&'static str, Style) {
                 .add_modifier(Modifier::BOLD),
         ),
         LineKind::Notice => ("", Style::default().fg(Color::DarkGray)),
-        LineKind::Error => ("! ", Style::default().fg(Color::Red)),
+        LineKind::Error => ("✗ ", Style::default().fg(Color::Red)),
     }
+}
+
+/// Insert a blank spacer before this entry when it starts a new "block" so the
+/// transcript breathes (e.g. before a user turn or the final summary).
+fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
+    let Some(prev) = prev else { return false };
+    if prev == cur && matches!(cur, LineKind::Output | LineKind::Command | LineKind::Tool) {
+        return false;
+    }
+    matches!(
+        cur,
+        LineKind::User | LineKind::Final | LineKind::Command | LineKind::Tool | LineKind::Agent
+    ) && prev != LineKind::Banner
 }
 
 /// Draw the whole UI.
@@ -202,12 +267,20 @@ pub fn draw(f: &mut Frame, app: &App) {
 
 fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+    let mut prev: Option<LineKind> = None;
     for entry in &app.transcript {
+        if spacer_before(prev, entry.kind) {
+            lines.push(Line::from(""));
+        }
+        prev = Some(entry.kind);
         let (prefix, style) = style_for(entry.kind);
         // Render command output through the ANSI parser (preserves colors).
         if entry.kind == LineKind::Output {
             if let Ok(text) = entry.text.clone().into_text() {
-                lines.extend(text.lines);
+                for mut l in text.lines {
+                    l.spans.insert(0, Span::raw("  "));
+                    lines.push(l);
+                }
                 continue;
             }
         }
@@ -215,44 +288,110 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
             let text = if i == 0 {
                 format!("{prefix}{raw}")
             } else {
-                raw.to_string()
+                format!("{}{raw}", " ".repeat(prefix.chars().count()))
             };
             lines.push(Line::from(Span::styled(text, style)));
         }
     }
     if !app.streaming.is_empty() {
+        if spacer_before(prev, LineKind::Agent) {
+            lines.push(Line::from(""));
+        }
         let style = style_for(LineKind::Agent).1;
         for raw in app.streaming.lines() {
             lines.push(Line::from(Span::styled(raw.to_string(), style)));
         }
     }
 
+    let inner_w = area.width.saturating_sub(2).max(1) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    // Estimate wrapped-line count so scrollback maps to what's on screen.
+    let total: usize = lines
+        .iter()
+        .map(|l| l.width().div_ceil(inner_w).max(1))
+        .sum();
+    let max_scroll = total.saturating_sub(inner_h);
+    app.max_scroll.set(max_scroll);
+    let offset_top = if app.follow {
+        max_scroll
+    } else {
+        app.scroll_top.min(max_scroll)
+    }
+    .min(u16::MAX as usize) as u16;
+
+    let title = if !app.follow && (offset_top as usize) < max_scroll {
+        format!(" {}  ▲ scrollback · End to follow ", app.title)
+    } else {
+        format!(" {} ", app.title)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {} ", app.title));
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let start = lines.len().saturating_sub(inner_height);
-    let visible: Vec<Line> = lines.into_iter().skip(start).collect();
-    let para = Paragraph::new(visible)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+    let para = Paragraph::new(lines)
         .block(block)
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((offset_top, 0));
     f.render_widget(para, area);
+
+    // Scrollbar on the right edge when content overflows.
+    if max_scroll > 0 {
+        let mut sb_state = ratatui::widgets::ScrollbarState::new(total)
+            .viewport_content_length(inner_h)
+            .position(offset_top as usize);
+        let sb =
+            ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(Style::default().fg(Color::DarkGray));
+        f.render_stateful_widget(sb, area, &mut sb_state);
+    }
+}
+
+/// A consistent rounded side/utility panel.
+fn panel(title: &str) -> Block<'_> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default().fg(Color::Gray),
+        ))
+}
+
+/// Color a `verdict label (reason)` activity line by its leading verdict word.
+fn activity_line(raw: &str) -> Line<'static> {
+    let (verdict, rest) = raw.split_once(' ').unwrap_or((raw, ""));
+    let vstyle = match verdict {
+        "allow" => Style::default().fg(Color::Green),
+        "deny" => Style::default().fg(Color::Red),
+        "ask" => Style::default().fg(Color::Yellow),
+        _ => Style::default().fg(Color::DarkGray),
+    };
+    Line::from(vec![
+        Span::styled(format!("{verdict} "), vstyle),
+        Span::styled(rest.to_string(), Style::default().fg(Color::Gray)),
+    ])
 }
 
 fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
     let inner = area.height.saturating_sub(2) as usize;
-    let start = app.activity.len().saturating_sub(inner);
-    let lines: Vec<Line> = app.activity[start..]
-        .iter()
-        .map(|l| {
-            Line::from(Span::styled(
-                l.clone(),
-                Style::default().fg(Color::DarkGray),
-            ))
-        })
-        .collect();
+    let lines: Vec<Line> = if app.activity.is_empty() {
+        vec![Line::from(Span::styled(
+            "no network activity yet",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        let start = app.activity.len().saturating_sub(inner);
+        app.activity[start..]
+            .iter()
+            .map(|l| activity_line(l))
+            .collect()
+    };
     let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" network "))
+        .block(panel("network"))
         .wrap(Wrap { trim: true });
     f.render_widget(para, area);
 }
@@ -266,11 +405,15 @@ fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
     } else {
         app.processes
             .iter()
-            .map(|(n, s)| Line::from(format!("{n}  {s}")))
+            .map(|(n, s)| {
+                Line::from(vec![
+                    Span::styled(format!("{n:<14} "), Style::default().fg(Color::White)),
+                    Span::styled(s.clone(), Style::default().fg(Color::Green)),
+                ])
+            })
             .collect()
     };
-    let para =
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" processes "));
+    let para = Paragraph::new(lines).block(panel("processes"));
     f.render_widget(para, area);
 }
 
@@ -293,11 +436,23 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
     }
     let bar = Style::default().bg(Color::Blue).fg(Color::White);
-    // Split the status area: left mode/status, right-aligned diff summary.
-    let (left, right) = if app.diff.is_empty() {
+    // Right side: running token estimate, then the working-tree diff summary.
+    let mut segs: Vec<String> = Vec::new();
+    if app.tokens_in > 0 || app.tokens_out > 0 {
+        segs.push(format!(
+            "~{}↑ {}↓",
+            fmt_count(app.tokens_in),
+            fmt_count(app.tokens_out)
+        ));
+    }
+    if !app.diff.is_empty() {
+        segs.push(app.diff.clone());
+    }
+    let right_text = segs.join("   ");
+    let (left, right) = if right_text.is_empty() {
         (cols[1], None)
     } else {
-        let w = app.diff.chars().count() as u16 + 1;
+        let w = right_text.chars().count() as u16 + 1;
         let s = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(w)])
@@ -307,20 +462,43 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let text = format!(" {mode} — {}", app.status);
     f.render_widget(Paragraph::new(text).style(bar), left);
     if let Some(right) = right {
-        f.render_widget(Paragraph::new(format!("{} ", app.diff)).style(bar), right);
+        f.render_widget(Paragraph::new(format!("{right_text} ")).style(bar), right);
+    }
+}
+
+/// Compact human count: `980`, `12.3k`, `45k`, `1.2M`.
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", n / 1000)
+    } else if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
     }
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::Done => "session finished — press q to quit",
-        Mode::AwaitingInput(_) => "type your answer, Enter to submit",
-        Mode::Idle => "message cowboy · Enter send · Ctrl-C menu",
-        _ => "type a message · Enter send · Ctrl-C interrupt",
+        Mode::AwaitingInput(_) => "type your answer · Enter submits",
+        Mode::Idle => "message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu",
+        _ => "type a message · Enter send · PgUp/wheel scroll · Ctrl-C interrupt",
+    };
+    let accent = if app.mode == Mode::Idle {
+        Color::Cyan
+    } else {
+        Color::DarkGray
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {hint} "));
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .title(Span::styled(
+            format!(" {hint} "),
+            Style::default().fg(Color::DarkGray),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(&app.textarea, inner);
@@ -335,7 +513,13 @@ fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) 
     f.render_widget(Clear, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} "))
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
         .style(Style::default().fg(Color::Magenta));
     let text = vec![
         Line::from(body.to_string()),
@@ -383,6 +567,39 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_welcome_screen() {
+        let mut app = App::new("cowboy · 20260614-abcd");
+        for l in [
+            "Welcome to cowboy — the agent runs sandboxed in Docker.",
+            "workspace  /home/dev/myproject",
+            "model      anthropic/claude-sonnet-4-6  (gw.local)",
+            "branch     main",
+            "",
+            "Type a message to begin · Enter sends · Ctrl-C menu",
+        ] {
+            app.push(LineKind::Banner, l);
+        }
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn scrolling_detaches_from_and_returns_to_tail() {
+        let mut app = App::new("cowboy");
+        for i in 0..100 {
+            app.push(LineKind::Output, format!("line {i}"));
+        }
+        // Force max_scroll to be computed.
+        let _ = render(&app);
+        assert!(app.at_bottom());
+        app.scroll_up(5);
+        assert!(!app.at_bottom());
+        app.scroll_to_bottom();
+        assert!(app.at_bottom());
+    }
+
+    #[test]
     fn snapshot_approval_modal() {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "build the project");
@@ -396,6 +613,27 @@ mod tests {
         app.push(LineKind::User, "do work");
         app.mode = Mode::Paused;
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_token_total_in_status_bar() {
+        let mut app = App::new("~/dev/cowboy  ⎇ main");
+        app.push(LineKind::User, "refactor the parser");
+        app.push(LineKind::Final, "Done.");
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
+        app.tokens_in = 128_300;
+        app.tokens_out = 9_120;
+        app.diff = "Δ 2f +30 -4".into();
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn fmt_count_is_compact() {
+        assert_eq!(fmt_count(980), "980");
+        assert_eq!(fmt_count(1200), "1.2k");
+        assert_eq!(fmt_count(45_000), "45k");
+        assert_eq!(fmt_count(1_250_000), "1.2M");
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub enum Command {
     /// Managed long-running process commands.
     Proc(ProcArgs),
 
+    /// Configure model providers (home-owned) and models.
+    Models(ModelsArgs),
+
     /// List or show agent skills (reusable instructions under .cowboy/skills/).
     Skill(SkillArgs),
 
@@ -63,6 +66,11 @@ pub enum Command {
         #[arg(value_name = "SESSION_ID")]
         session_id: String,
     },
+
+    /// Internal: in-container worker for the structured file tools (reads a JSON
+    /// request on stdin). Not for direct use.
+    #[command(name = "x-fileop", hide = true)]
+    XFileop,
 }
 
 #[derive(Debug, Args)]
@@ -107,6 +115,29 @@ pub struct DownArgs {
     /// Remove ALL cowboy-managed containers and networks (every project).
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ModelsArgs {
+    #[command(subcommand)]
+    pub command: ModelsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelsCommand {
+    /// Interactively add a provider (endpoint + key, saved to your home dir)
+    /// and a model that uses it.
+    Setup,
+    /// List configured providers and models, and the effective default.
+    List,
+    /// Set the default model. Writes to the project unless `--global`.
+    Use {
+        /// The model name to make default.
+        name: String,
+        /// Set the user-level (home) default instead of the project default.
+        #[arg(short, long)]
+        global: bool,
+    },
 }
 
 #[derive(Debug, Args)]

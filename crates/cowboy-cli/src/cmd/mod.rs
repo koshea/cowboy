@@ -2,8 +2,10 @@
 
 pub mod doctor;
 pub mod down;
+pub mod fileop;
 pub mod init;
 pub mod logs;
+pub mod models;
 pub mod patch;
 pub mod proc;
 pub mod run;

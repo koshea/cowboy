@@ -7,7 +7,9 @@ use cowboy_core::config::AgentBehavior;
 use cowboy_core::model::{ChatResponse, Message, ModelClient, Role, ToolDef};
 use tokio_util::sync::CancellationToken;
 
-use super::tools::{self, AskUserArgs, FinalArgs, ShellArgs, SubagentArgs};
+use super::tools::{
+    self, AskUserArgs, EditArgs, FinalArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+};
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
 use crate::net::runtime::AgentRuntime;
@@ -18,7 +20,10 @@ pub const SYSTEM_PROMPT: &str = "\
 You are Cowboy, an autonomous coding agent running inside a Docker container.
 
 The project is mounted at /workspace. You may freely inspect, edit, build, test, \
-and run code inside the container. Use the `shell` tool for almost all work.
+and run code inside the container. Use `shell` for builds, tests, git, and other \
+commands. For files, prefer the structured tools: `read` (with line numbers), \
+`edit` (exact unique-string replacement), and `write` (create/overwrite) — they \
+are more reliable and cheaper than `cat`/`sed`/heredocs.
 
 Cowboy-specific helpers are CLIs you invoke through `shell`, e.g. `cowboy patch \
 show` and `cowboy proc start <name>`. You do not need to ask before ordinary \
@@ -29,7 +34,13 @@ Reusable skills may be available: run `cowboy skill list` to see them and \
 For a large, independent sub-task, use the `subagent` tool to delegate it.
 
 The runtime enforces network, host, and secret permissions outside your control. \
-If a command cannot access something, observe the failure and continue.
+Outbound network access goes through a gateway that allows, denies, or prompts \
+the user per destination. A blocked request surfaces as a connection/TLS error \
+(e.g. \"connection reset\", \"TLS closed\", curl exit 35/35) — this means the \
+host has not approved that destination, NOT that the destination is down. Do not \
+retry the same blocked host with different tools or flags; instead state plainly \
+which host:port you need and why, and let the user approve it (or proceed without \
+network). If a command cannot access something, observe the failure and continue.
 
 Before large edits, inspect the repository and form a brief plan. After edits, run \
 relevant checks. When finished, call `final` summarizing what changed, what was \
@@ -49,6 +60,9 @@ pub struct AgentLoop<'a> {
     subagent_depth: usize,
     /// The most recent turn's final message (for the session summary).
     last_final: Option<String>,
+    /// Running session token estimates (tiktoken-based; provider-independent).
+    tokens_in: u64,
+    tokens_out: u64,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -81,10 +95,27 @@ impl<'a> AgentLoop<'a> {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             last_final: None,
+            tokens_in: 0,
+            tokens_out: 0,
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
         }
+    }
+
+    /// Accumulate per-call token estimates (prompt sent + completion received)
+    /// and report the running session total to the UI. Estimates use the local
+    /// tokenizer, so they are provider-independent and roughly track billing.
+    fn account_tokens(&mut self, prompt_est: u64, response: &ChatResponse) {
+        self.tokens_in += prompt_est;
+        let mut out =
+            cowboy_core::tokens::count(response.content.as_deref().unwrap_or_default()) as u64;
+        for tc in &response.tool_calls {
+            out += (cowboy_core::tokens::count(&tc.arguments)
+                + cowboy_core::tokens::count(&tc.name)) as u64;
+        }
+        self.tokens_out += out;
+        self.ui.tokens(self.tokens_in, self.tokens_out);
     }
 
     /// Approximate token count of a message (content + tool-call arguments).
@@ -185,6 +216,12 @@ impl<'a> AgentLoop<'a> {
             // Keep history within the model's context window.
             self.fit_context();
 
+            // Estimate the prompt tokens actually sent (post-pruning).
+            let prompt_est: u64 = self
+                .messages
+                .iter()
+                .map(Self::message_tokens)
+                .sum::<usize>() as u64;
             let response = match self.call_model().await {
                 Ok(r) => r,
                 Err(_) if self.cancel.is_cancelled() => {
@@ -196,6 +233,7 @@ impl<'a> AgentLoop<'a> {
                     return Err(e);
                 }
             };
+            self.account_tokens(prompt_est, &response);
 
             // Record the assistant turn (content + any tool calls).
             let assistant = Message {
@@ -275,6 +313,52 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_READ => {
+                    let args: ReadArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    self.ui.tool_use(&format!("read {}", args.path));
+                    let payload = serde_json::json!({
+                        "op": "read", "path": args.path,
+                        "offset": args.offset, "limit": args.limit,
+                    });
+                    self.run_fileop(&call.id, &payload).await?;
+                }
+                tools::TOOL_EDIT => {
+                    let args: EditArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    let payload = serde_json::json!({
+                        "op": "edit", "path": args.path,
+                        "old": args.old, "new": args.new, "replace_all": args.replace_all,
+                    });
+                    let (exit, out) = self.run_fileop(&call.id, &payload).await?;
+                    self.ui
+                        .tool_use(&fileop_summary("edit", &args.path, exit, &out));
+                }
+                tools::TOOL_WRITE => {
+                    let args: WriteArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    let payload = serde_json::json!({
+                        "op": "write", "path": args.path, "content": args.content,
+                    });
+                    let (exit, out) = self.run_fileop(&call.id, &payload).await?;
+                    self.ui
+                        .tool_use(&fileop_summary("write", &args.path, exit, &out));
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -326,6 +410,38 @@ impl<'a> AgentLoop<'a> {
             l.log_message(&msg);
         }
         self.messages.push(msg);
+    }
+
+    /// Run a structured file operation in the container, record the observation
+    /// for the model, and log it. Returns (exit_code, helper output).
+    async fn run_fileop(
+        &mut self,
+        call_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(i32, String)> {
+        let (result, output) = match self.runtime.fileop(&payload.to_string()).await {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = Message::tool_result(call_id, format!("error: {e}"));
+                if let Some(l) = &mut self.logger {
+                    l.log_message(&msg);
+                }
+                self.messages.push(msg);
+                return Ok((-1, String::new()));
+            }
+        };
+        let observation = if result.exit_code == 0 {
+            output.clone()
+        } else {
+            format!("error: {}", output.trim())
+        };
+        let observation = truncate(&observation, self.behavior.max_command_output_bytes);
+        let tool_msg = Message::tool_result(call_id, observation);
+        if let Some(l) = &mut self.logger {
+            l.log_message(&tool_msg);
+        }
+        self.messages.push(tool_msg);
+        Ok((result.exit_code, output))
     }
 
     /// Run a shell command with live streaming to the UI (interruptible via the
@@ -442,6 +558,21 @@ fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid tool arguments: {e}"))
 }
 
+/// A concise one-line summary of a file op for the UI: the helper's status line
+/// on success, or `"<action> <path> — failed"` otherwise.
+fn fileop_summary(action: &str, path: &str, exit: i32, output: &str) -> String {
+    if exit == 0 {
+        let line = output.trim();
+        if line.is_empty() {
+            format!("{action} {path}")
+        } else {
+            line.to_string()
+        }
+    } else {
+        format!("{action} {path} — failed")
+    }
+}
+
 /// Truncate `output` to at most `max_bytes`, on a char boundary, with a marker.
 fn truncate(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
@@ -504,6 +635,7 @@ mod tests {
         commands: Vec<String>,
         finals: Vec<String>,
         notices: Vec<String>,
+        tool_uses: Vec<String>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
@@ -511,6 +643,9 @@ mod tests {
             self.commands.push(command.to_string());
         }
         fn command_end(&mut self, _exit_code: i32, _output: &str) {}
+        fn tool_use(&mut self, summary: &str) {
+            self.tool_uses.push(summary.to_string());
+        }
         fn final_message(&mut self, message: &str) {
             self.finals.push(message.to_string());
         }
@@ -593,6 +728,56 @@ mod tests {
         assert_eq!(final_msg.as_deref(), Some("done; tests pass"));
         assert_eq!(ui.commands, vec!["ls"]);
         assert_eq!(ui.finals, vec!["done; tests pass"]);
+    }
+
+    #[tokio::test]
+    async fn runs_edit_via_fileop_then_final() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_exec_stdin()
+            .withf(|_n, _w, _u, argv, stdin| {
+                argv == ["cowboy", "x-fileop"]
+                    && stdin.contains("\"op\":\"edit\"")
+                    && stdin.contains("main.rs")
+            })
+            .times(1)
+            .returning(|_, _, _, _, _| {
+                Ok((
+                    ExecResult { exit_code: 0 },
+                    "edited main.rs: 1 replacement\n".into(),
+                ))
+            });
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "edit",
+                    r#"{"path":"main.rs","old":"foo","new":"bar"}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let final_msg = agent.run("edit then finish").await.unwrap();
+        assert_eq!(final_msg.as_deref(), Some("done"));
+        // The UI showed the helper's status line for the edit.
+        assert_eq!(ui.tool_uses, vec!["edited main.rs: 1 replacement"]);
     }
 
     #[tokio::test]

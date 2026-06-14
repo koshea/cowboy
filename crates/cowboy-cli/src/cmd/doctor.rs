@@ -4,7 +4,9 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::Result;
-use cowboy_core::config::{AgentConfig, ConfigPaths, ModelsConfig, SecurityConfig};
+use cowboy_core::config::{
+    resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
+};
 
 use crate::net::compose;
 
@@ -68,7 +70,8 @@ pub async fn run() -> Result<()> {
     // Config files.
     r.check("security.yaml", check_security(&paths.security));
     r.check("agent.yaml", check_agent(&paths.agent));
-    r.check("models.yaml", check_models(&paths.models));
+    r.check("providers", check_providers());
+    r.check("models", check_models(&paths.models));
     r.check(
         "config separation",
         check_config_separation(&paths.security),
@@ -162,28 +165,46 @@ fn check_agent(path: &Path) -> Status {
     }
 }
 
-fn check_models(path: &Path) -> Status {
-    match ModelsConfig::load(path) {
-        Ok(cfg) => match cfg.resolve(None) {
-            Ok(profile) => {
-                if std::env::var(&profile.api_key_env).is_ok() {
-                    Status::Ok(format!(
-                        "default={}, model={}",
-                        cfg.models.default, profile.model
-                    ))
-                } else {
-                    Status::Warn(format!(
-                        "default={}, but ${} is not set",
-                        cfg.models.default, profile.api_key_env
-                    ))
-                }
-            }
-            Err(e) => Status::Fail(e.to_string()),
-        },
-        Err(cowboy_core::Error::ConfigNotFound(_)) => {
-            Status::Fail("missing; run `cowboy init`".to_string())
+/// Providers are home-owned (`~/.config/cowboy/providers.yaml`, 0600).
+fn check_providers() -> Status {
+    let path = match ProvidersConfig::global_path() {
+        Some(p) => p,
+        None => return Status::Warn("cannot resolve home config dir".to_string()),
+    };
+    match ProvidersConfig::load_global() {
+        Ok(cfg) if cfg.providers.is_empty() => {
+            Status::Warn("none configured; run `cowboy models setup`".to_string())
         }
+        Ok(cfg) => Status::Ok(format!(
+            "{} configured ({})",
+            cfg.providers.len(),
+            path.display()
+        )),
         Err(e) => Status::Fail(e.to_string()),
+    }
+}
+
+/// Models resolve against the home providers + user/project model lists.
+fn check_models(project_path: &Path) -> Status {
+    let providers = match ProvidersConfig::load_global() {
+        Ok(p) => p,
+        Err(e) => return Status::Fail(e.to_string()),
+    };
+    if providers.providers.is_empty() {
+        return Status::Warn("no provider; run `cowboy models setup`".to_string());
+    }
+    let user = match ModelsConfig::user_path().map(|p| ModelsConfig::load_opt(&p)) {
+        Some(Ok(m)) => m,
+        Some(Err(e)) => return Status::Fail(e.to_string()),
+        None => None,
+    };
+    let project = match ModelsConfig::load_opt(project_path) {
+        Ok(m) => m,
+        Err(e) => return Status::Fail(e.to_string()),
+    };
+    match resolve_model(&providers, user.as_ref(), project.as_ref(), None) {
+        Ok(m) => Status::Ok(format!("default resolves to {} @ {}", m.model, m.base_url)),
+        Err(e) => Status::Warn(e.to_string()),
     }
 }
 

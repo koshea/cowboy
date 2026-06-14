@@ -29,6 +29,7 @@ pub enum UiEvent {
     CommandStart(String),
     CommandOutput(String),
     CommandEnd(i32, String),
+    ToolUse(String),
     Final(String),
     Notice(String),
     Ask(String, Sender<String>),
@@ -41,6 +42,10 @@ pub enum UiEvent {
     NetEvent(String),
     /// Working-tree diff summary for the status bar.
     DiffStat(String),
+    /// Running session token estimate (input, output).
+    Tokens(u64, u64),
+    /// Update the transcript title (cwd + branch context).
+    Title(String),
     /// Managed processes (name, status) for the process pane.
     Processes(Vec<(String, String)>),
     /// The agent finished a turn; ready for the next user message.
@@ -71,6 +76,12 @@ impl AgentUi for TuiUi {
             .tx
             .send(UiEvent::CommandEnd(exit_code, output.to_string()));
     }
+    fn tool_use(&mut self, summary: &str) {
+        let _ = self.tx.send(UiEvent::ToolUse(summary.to_string()));
+    }
+    fn tokens(&mut self, input: u64, output: u64) {
+        let _ = self.tx.send(UiEvent::Tokens(input, output));
+    }
     fn final_message(&mut self, message: &str) {
         let _ = self.tx.send(UiEvent::Final(message.to_string()));
     }
@@ -94,18 +105,30 @@ impl AgentUi for TuiUi {
 /// thread, fired by the TUI's interrupt menu).
 pub type TurnCancel = std::sync::Arc<std::sync::Mutex<Option<CancellationToken>>>;
 
-/// Run the conversational TUI event loop. `seed` is an optional first message;
-/// `task_tx` sends the user's messages to the agent thread (dropping it ends the
-/// session); `turn_cancel` interrupts the in-flight turn.
+/// Run the conversational TUI event loop. `intro` lines are shown as a welcome
+/// banner; `seed` is an optional first message; `task_tx` sends the user's
+/// messages to the agent thread (dropping it ends the session); `turn_cancel`
+/// interrupts the in-flight turn.
 pub fn run_event_loop(
     title: &str,
+    intro: Vec<String>,
     seed: Option<String>,
     events: Receiver<UiEvent>,
     task_tx: Sender<String>,
     turn_cancel: TurnCancel,
 ) -> Result<()> {
+    // Keep stray host logs (tracing on stderr) off the alternate screen.
+    let _stderr = redirect_stderr_to_log();
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, title, seed, events, task_tx, turn_cancel);
+    let result = event_loop(
+        &mut terminal,
+        title,
+        intro,
+        seed,
+        events,
+        task_tx,
+        turn_cancel,
+    );
     restore_terminal(&mut terminal)?;
     result
 }
@@ -115,20 +138,67 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn setup_terminal() -> Result<Term> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen)?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal(terminal: &mut Term) -> Result<()> {
     terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture,
+        terminal::LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Redirect the process's stderr to a per-run log file for the lifetime of the
+/// TUI, restoring it on drop. Host `tracing` output goes to stderr; without this
+/// it would scribble over the alternate-screen UI.
+struct StderrGuard {
+    _file: std::fs::File,
+    saved: i32,
+}
+
+impl Drop for StderrGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+fn redirect_stderr_to_log() -> Option<StderrGuard> {
+    use std::os::fd::AsRawFd;
+    let path = std::env::temp_dir().join(format!("cowboy-{}.log", std::process::id()));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        if saved < 0 {
+            return None;
+        }
+        if libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) < 0 {
+            libc::close(saved);
+            return None;
+        }
+        Some(StderrGuard { _file: file, saved })
+    }
 }
 
 fn event_loop(
     terminal: &mut Term,
     title: &str,
+    intro: Vec<String>,
     seed: Option<String>,
     events: Receiver<UiEvent>,
     task_tx: Sender<String>,
@@ -141,6 +211,11 @@ fn event_loop(
     // Outstanding messages sent to the agent but not yet acknowledged (TurnDone).
     let mut pending_turns: usize = 0;
     let mut task_tx = Some(task_tx);
+
+    // Welcome banner (project info) at the top of the transcript.
+    for line in intro {
+        app.push(LineKind::Banner, line);
+    }
 
     // Seed the first turn, or start idle awaiting the first message.
     match seed {
@@ -175,6 +250,10 @@ fn event_loop(
                     }
                     app.status = "running".into();
                 }
+                UiEvent::ToolUse(s) => {
+                    app.commit_stream();
+                    app.push(LineKind::Tool, s);
+                }
                 UiEvent::Final(m) => {
                     // `final` ends the turn, not the session.
                     app.commit_stream();
@@ -195,6 +274,11 @@ fn event_loop(
                 }
                 UiEvent::NetEvent(line) => app.activity(line),
                 UiEvent::DiffStat(s) => app.diff = s,
+                UiEvent::Tokens(i, o) => {
+                    app.tokens_in = i;
+                    app.tokens_out = o;
+                }
+                UiEvent::Title(t) => app.title = t,
                 UiEvent::Processes(procs) => app.processes = procs,
                 UiEvent::TurnDone => {
                     pending_turns = pending_turns.saturating_sub(1);
@@ -216,18 +300,26 @@ fn event_loop(
         terminal.draw(|f| draw(f, &app))?;
 
         if event::poll(Duration::from_millis(120))? {
-            if let Event::Key(key) = event::read()? {
-                let ctx = KeyCtx {
-                    pending_reply: &mut pending_reply,
-                    pending_approval: &mut pending_approval,
-                    mode_before_overlay: &mut mode_before_overlay,
-                    turn_cancel: &turn_cancel,
-                    task_tx: &mut task_tx,
-                    pending_turns: &mut pending_turns,
-                };
-                if handle_key(Event::Key(key), key, &mut app, ctx) {
-                    break;
+            match event::read()? {
+                Event::Key(key) => {
+                    let ctx = KeyCtx {
+                        pending_reply: &mut pending_reply,
+                        pending_approval: &mut pending_approval,
+                        mode_before_overlay: &mut mode_before_overlay,
+                        turn_cancel: &turn_cancel,
+                        task_tx: &mut task_tx,
+                        pending_turns: &mut pending_turns,
+                    };
+                    if handle_key(Event::Key(key), key, &mut app, ctx) {
+                        break;
+                    }
                 }
+                Event::Mouse(me) => match me.kind {
+                    crossterm::event::MouseEventKind::ScrollUp => app.scroll_up(3),
+                    crossterm::event::MouseEventKind::ScrollDown => app.scroll_down(3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
@@ -247,6 +339,33 @@ struct KeyCtx<'a> {
 
 /// Returns true if the loop should exit.
 fn handle_key(event: Event, key: KeyEvent, app: &mut App, ctx: KeyCtx) -> bool {
+    // Transcript scrollback — works in any mode so you can read while the agent
+    // runs or while typing. Uses keys the text editor doesn't claim.
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::PageUp => {
+            app.scroll_up(10);
+            return false;
+        }
+        KeyCode::PageDown => {
+            app.scroll_down(10);
+            return false;
+        }
+        KeyCode::Up if shift => {
+            app.scroll_up(1);
+            return false;
+        }
+        KeyCode::Down if shift => {
+            app.scroll_down(1);
+            return false;
+        }
+        KeyCode::End if shift => {
+            app.scroll_to_bottom();
+            return false;
+        }
+        _ => {}
+    }
+
     // Ctrl-C opens the interrupt menu (during a turn or while idle).
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if matches!(

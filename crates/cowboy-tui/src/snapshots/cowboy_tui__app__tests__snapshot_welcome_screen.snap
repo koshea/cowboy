@@ -3,20 +3,20 @@ source: crates/cowboy-tui/src/app.rs
 expression: render(&app)
 ---
 ╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
-│› start the dev server                         ││no network activity  │
-│                                               ││yet                  │
-│✓ Server running on :3000.                     ││                     │
-│                                               ││                     │
-│                                               ││                     │
-│                                               ││                     │
-│                                               │╰─────────────────────╯
-│                                               │╭ processes ──────────╮
-│                                               ││web            runnin│
+│Welcome to cowboy — the agent runs sandboxed in││no network activity  │
+│Docker.                                        ││yet                  │
+│workspace  /home/dev/myproject                 ││                     │
+│model      anthropic/claude-sonnet-4-6         ││                     │
+│(gw.local)                                     ││                     │
+│branch     main                                ││                     │
+│Type a message to begin · Enter sends · Ctrl-C │╰─────────────────────╯
+│menu                                           │╭ processes ──────────╮
+│                                               ││no managed processes │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   ready — ready                                            Δ 2f +30 -4
+   ready — ready
 ╭ message cowboy · Enter send · PgUp/wheel scroll · Ctrl-C menu ───────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

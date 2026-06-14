@@ -282,6 +282,24 @@ impl AgentRuntime {
             .await
     }
 
+    /// Run a structured file operation inside the container via the in-container
+    /// `cowboy x-fileop` helper, passing the JSON `payload` on stdin (so
+    /// multi-line content needs no shell quoting). Returns (exit, output). The
+    /// op runs confined by Docker — file edits never touch the host directly.
+    pub async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)> {
+        self.ensure_running().await?;
+        let argv = vec!["cowboy".to_string(), "x-fileop".to_string()];
+        self.docker
+            .exec_stdin(
+                &self.container_name,
+                &self.security.container.workdir,
+                self.user(),
+                &argv,
+                payload,
+            )
+            .await
+    }
+
     /// Stop all managed processes (kill their process groups) in the container,
     /// best-effort. Called on session exit so no services linger.
     pub async fn stop_all_processes(&self) -> Result<()> {

@@ -6,15 +6,15 @@
 
 use std::collections::BTreeMap;
 
-use cowboy_core::config::ModelProfile;
+use cowboy_core::config::ResolvedModel;
 use cowboy_core::model::{Message, ModelClient, OpenAiClient, ToolDef};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn profile(base_url: String) -> ModelProfile {
-    ModelProfile {
+fn profile(base_url: String) -> ResolvedModel {
+    ResolvedModel {
         base_url,
-        api_key_env: "COWBOY_TEST_KEY_UNSET".into(),
+        api_key: "test-key".into(),
         model: "test-model".into(),
         temperature: 0.0,
         max_tokens: 256,
@@ -52,7 +52,7 @@ async fn streams_and_assembles_text() {
         .mount(&server)
         .await;
 
-    let client = OpenAiClient::from_profile(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let resp = client
         .chat(&[Message::user("hi")], &[], Some(tx))
@@ -86,7 +86,7 @@ async fn forwards_custom_headers() {
 
     let mut p = profile(format!("{}/v1", server.uri()));
     p.headers.insert("x-cowboy-test".into(), "abc123".into());
-    let client = OpenAiClient::from_profile(&p).unwrap();
+    let client = OpenAiClient::from_resolved(&p).unwrap();
     let resp = client
         .chat(&[Message::user("hi")], &[], None)
         .await
@@ -108,7 +108,7 @@ async fn chat_is_cancelled_by_dropping_the_future() {
         .mount(&server)
         .await;
 
-    let client = OpenAiClient::from_profile(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
     let msgs = [Message::user("hi")];
     let fut = client.chat(&msgs, &[], None);
     // Dropping the future on timeout cancels the in-flight request.
@@ -150,7 +150,7 @@ async fn assembles_streamed_tool_call() {
             "required": ["command"]
         }),
     }];
-    let client = OpenAiClient::from_profile(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
     let resp = client
         .chat(&[Message::user("list files")], &tools, None)
         .await

@@ -4,7 +4,7 @@ expression: defs
 ---
 [
   {
-    "description": "Run a shell command inside the container and observe its output. Use this for all work, including cowboy CLIs like `cowboy patch`.",
+    "description": "Run a shell command inside the container and observe its output. Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. For reading or editing files, prefer the `read`/`edit`/`write` tools.",
     "name": "shell",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
@@ -27,6 +27,103 @@ expression: defs
         "command"
       ],
       "title": "ShellArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Read a file from the workspace with line numbers. Prefer this over `cat`/`sed` — the line numbers help you make precise edits.",
+    "name": "read",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `read` tool.",
+      "properties": {
+        "limit": {
+          "default": null,
+          "description": "Maximum number of lines to return.",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "offset": {
+          "default": null,
+          "description": "1-based line to start at (default 1).",
+          "format": "uint",
+          "minimum": 0.0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Path to the file (workspace-relative, e.g. `src/main.rs`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "title": "ReadArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Replace an exact span of text in a file. `old` must match exactly and be unique unless `replace_all` is set. Prefer this over `sed`/heredocs for edits — it is precise and fails loudly if `old` is missing or ambiguous.",
+    "name": "edit",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `edit` tool.",
+      "properties": {
+        "new": {
+          "description": "Replacement text.",
+          "type": "string"
+        },
+        "old": {
+          "description": "Exact text to replace. Must match a unique span unless `replace_all`.",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to the file to edit (workspace-relative).",
+          "type": "string"
+        },
+        "replace_all": {
+          "default": false,
+          "description": "Replace every occurrence instead of requiring a unique match.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "new",
+        "old",
+        "path"
+      ],
+      "title": "EditArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Create a new file or overwrite an existing one with the given content. Parent directories are created. Prefer this over `echo >`/heredocs.",
+    "name": "write",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `write` tool.",
+      "properties": {
+        "content": {
+          "description": "Full file contents (overwrites any existing file).",
+          "type": "string"
+        },
+        "path": {
+          "description": "Path to write (workspace-relative). Parent directories are created.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "content",
+        "path"
+      ],
+      "title": "WriteArgs",
       "type": "object"
     }
   },
