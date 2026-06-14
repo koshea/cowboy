@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
-use cowboy_core::daemonproto::{AttachTarget, DaemonReq, DaemonResp, LeaseMode, SessionInfo};
+use cowboy_core::daemonproto::{
+    AttachTarget, DaemonReq, DaemonResp, LeaseMode, SessionInfo, SessionStatus,
+};
 use cowboy_core::model::OpenAiClient;
 use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
@@ -21,7 +23,7 @@ use crate::cli::StartFlags;
 use crate::cmd::daemon;
 use crate::net::control;
 use crate::net::docker::CliDocker;
-use crate::net::runtime::AgentRuntime;
+use crate::net::runtime::{container_name_for, AgentRuntime};
 
 pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
     let root = crate::cmd::project_root()?;
@@ -104,8 +106,9 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
             }
         }
     } else {
-        // Non-interactive: prompt on stdin if no task was given; run in-process
-        // (the daemon still tracks a lease in a later milestone). Asks fail closed.
+        // Non-interactive (piped) one-shot: run in-process with a console UI, but
+        // coordinate through the daemon so it can't collide with another session
+        // in the same worktree. Asks fail closed.
         let Some(task) = resolve_task(task)? else {
             println!("nothing to do.");
             return Ok(());
@@ -116,9 +119,18 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
         let context_window = resolved.context_window as usize;
         let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
         let logger = crate::session::SessionLogger::create(&root).ok();
+        let id = logger
+            .as_ref()
+            .map(|l| l.id().to_string())
+            .unwrap_or_else(|| format!("{}-{}", now_ms(), std::process::id()));
         if let Some(l) = &logger {
             eprintln!("session: {}", l.id());
         }
+
+        // Take the worktree lease (bails if another session holds it). Best-effort:
+        // if the daemon is unreachable we run uncoordinated rather than block.
+        let coordinated = coordinate_oneshot(&root, &id, &task).await?;
+
         let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -142,9 +154,78 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
             &mut ui,
         )
         .with_logger(logger);
-        agent.run(&task).await?;
+        let result = agent.run(&task).await;
         agent.shutdown().await; // stop managed processes
-        Ok(())
+
+        // Release the lease and record the outcome.
+        if coordinated {
+            let req = match &result {
+                Ok(_) => DaemonReq::CompleteSession { id },
+                Err(e) => DaemonReq::FailSession {
+                    id,
+                    error: e.to_string(),
+                },
+            };
+            let _ = daemon::request(req).await;
+        }
+        result.map(|_| ())
+    }
+}
+
+/// Register a one-shot (non-interactive) session with the daemon and take its
+/// worktree lease, so a piped run can't collide with another session in the same
+/// worktree. Returns `Ok(true)` when coordinated, `Ok(false)` when the daemon is
+/// unavailable (proceed uncoordinated rather than block scripts), or `Err` when
+/// the worktree is already in use.
+async fn coordinate_oneshot(root: &std::path::Path, id: &str, task: &str) -> Result<bool> {
+    if daemon::ensure_running().await.is_err() {
+        return Ok(false);
+    }
+    let now = now_ms() as u64;
+    let info = SessionInfo {
+        id: id.to_string(),
+        root: root.to_path_buf(),
+        task: Some(task.to_string()),
+        status: SessionStatus::Running,
+        pid: Some(std::process::id()),
+        branch: git_branch(root),
+        container_name: Some(container_name_for(root)),
+        worker_sock: None, // in-process: no socket to attach to
+        journal_path: None,
+        lease_mode: Some(LeaseMode::Exclusive),
+        started_ms: now,
+        last_heartbeat_ms: now,
+        turn: 0,
+        tokens: (0, 0),
+        attached_clients: 0,
+        diffstat: String::new(),
+        running_command: None,
+    };
+    let _ = daemon::request(DaemonReq::RegisterWorker { info }).await;
+    match daemon::request(DaemonReq::AcquireLease {
+        key: root.to_path_buf(),
+        session: id.to_string(),
+        mode: LeaseMode::Exclusive,
+    })
+    .await
+    {
+        Ok(DaemonResp::LeaseGranted { .. }) => Ok(true),
+        Ok(DaemonResp::LeaseDenied { held_by, .. }) => {
+            let _ = daemon::request(DaemonReq::FailSession {
+                id: id.to_string(),
+                error: "worktree busy".into(),
+            })
+            .await;
+            anyhow::bail!(
+                "worktree already has an active session ({}, {:?}); a non-interactive run \
+                 can't share a worktree — run it from a separate git worktree \
+                 (`cowboy worktree create`).",
+                held_by.id,
+                held_by.status
+            );
+        }
+        // Daemon hiccup: don't block the run.
+        _ => Ok(false),
     }
 }
 

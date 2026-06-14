@@ -3,8 +3,10 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+use assert_fs::prelude::*;
 
 use cowboy_core::daemonproto::{
     AttachTarget, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode, SessionInfo,
@@ -391,9 +393,84 @@ fn lease_acquire_denies_live_holder_then_release_frees_it() {
     ));
 }
 
+/// A piped, non-interactive `cowboy "task"` refuses to run in a worktree that a
+/// live session already holds (it fails before any model call). No Docker/model
+/// needed — coordination bails at lease acquisition.
+#[test]
+fn piped_run_is_denied_in_a_busy_worktree() {
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let cfg = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    // A model provider so the piped run gets as far as lease acquisition.
+    cfg.child("cowboy/providers.yaml")
+        .write_str("version: 1\nproviders:\n  p:\n    base_url: https://x/v1\n    api_key: k\n")
+        .unwrap();
+    cfg.child("cowboy/models.yaml")
+        .write_str("version: 1\ndefault: m\nmodels:\n  m:\n    provider: p\n    model: x\n")
+        .unwrap();
+    proj.child(".cowboy/security.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+    proj.child(".cowboy/agent.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let daemon = Command::new(env!("CARGO_BIN_EXE_cowboyd"))
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .spawn()
+        .expect("spawn cowboyd");
+    let _d = Daemon(daemon);
+    assert!(wait_for_pong(&sock));
+
+    // A live session (pid = this test process) holds the worktree lease.
+    let mut holder = sample_info("holder");
+    holder.root = proj.path().to_path_buf();
+    holder.pid = Some(std::process::id());
+    assert!(matches!(
+        request(&sock, DaemonReq::RegisterWorker { info: holder }),
+        Some(DaemonResp::Registered)
+    ));
+    assert!(matches!(
+        request(
+            &sock,
+            DaemonReq::AcquireLease {
+                key: proj.path().to_path_buf(),
+                session: "holder".into(),
+                mode: LeaseMode::Exclusive,
+            },
+        ),
+        Some(DaemonResp::LeaseGranted { .. })
+    ));
+
+    // A piped `cowboy "task"` in the same worktree must fail safe (non-zero exit,
+    // explanatory message) without running a turn.
+    let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", state.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .arg("do something")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run piped cowboy");
+    assert!(
+        !out.status.success(),
+        "piped run should fail in a busy worktree"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("active session") || stderr.contains("share a worktree"),
+        "expected a busy-worktree message, got: {stderr}"
+    );
+}
+
 #[test]
 fn start_session_spawns_and_registers_a_worker() {
-    use assert_fs::prelude::*;
     let runtime = assert_fs::TempDir::new().unwrap();
     let state = assert_fs::TempDir::new().unwrap();
     let cfg = assert_fs::TempDir::new().unwrap(); // XDG_CONFIG_HOME (providers/models)

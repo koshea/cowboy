@@ -221,11 +221,16 @@ impl Daemon {
             if s.status.is_terminal() {
                 continue; // already terminal/stale
             }
-            let pid_dead = s.pid.is_some_and(|p| !pid_alive(p));
-            let root_gone = !s.root.exists();
-            let hb_stale =
-                check_heartbeat && now.saturating_sub(s.last_heartbeat_ms) > STALE_AFTER_MS;
-            if pid_dead || root_gone || hb_stale {
+            // The daemon and every worker share a host, so a live pid is the
+            // authoritative liveness signal; heartbeat age is only a fallback for
+            // sessions with no pid to check (e.g. records restored from disk).
+            let dead = match s.pid {
+                Some(p) if pid_alive(p) => false,
+                Some(_) => true,
+                None => check_heartbeat && now.saturating_sub(s.last_heartbeat_ms) > STALE_AFTER_MS,
+            };
+            // A vanished worktree also means the session can't continue.
+            if dead || !s.root.exists() {
                 s.status = SessionStatus::Stale;
                 s.worker_sock = None;
                 newly.push(id.clone());
@@ -912,8 +917,10 @@ mod tests {
     fn sweep_without_heartbeat_ignores_age() {
         let live_root = assert_fs::TempDir::new().unwrap();
         let mut d = daemon();
+        // A pid-less record (e.g. restored from disk) with an ancient heartbeat:
+        // only the heartbeat-aware sweep can judge it stale.
         put_session(&mut d, "old", SessionStatus::Running);
-        d.state.sessions.get_mut("old").unwrap().pid = Some(std::process::id());
+        d.state.sessions.get_mut("old").unwrap().pid = None;
         d.state.sessions.get_mut("old").unwrap().root = live_root.path().into();
         d.state.sessions.get_mut("old").unwrap().last_heartbeat_ms = 0; // ancient
 
@@ -921,6 +928,18 @@ mod tests {
         assert!(d.sweep_stale(false).is_empty());
         // The periodic sweep (heartbeat-aware) would.
         assert_eq!(d.sweep_stale(true), vec!["old".to_string()]);
+    }
+
+    #[test]
+    fn sweep_spares_a_live_pid_despite_stale_heartbeat() {
+        let live_root = assert_fs::TempDir::new().unwrap();
+        let mut d = daemon();
+        // Our own pid is alive; an ancient heartbeat must NOT mark it stale.
+        put_session(&mut d, "busy", SessionStatus::Running);
+        d.state.sessions.get_mut("busy").unwrap().pid = Some(std::process::id());
+        d.state.sessions.get_mut("busy").unwrap().root = live_root.path().into();
+        d.state.sessions.get_mut("busy").unwrap().last_heartbeat_ms = 0;
+        assert!(d.sweep_stale(true).is_empty());
     }
 
     #[test]
