@@ -28,6 +28,14 @@ async fn main() -> Result<()> {
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
+        Some(Command::XSessionWorker(a)) => {
+            cmd::worker::run(cmd::worker::WorkerArgs {
+                root: a.root,
+                task: a.task,
+                sock: a.sock,
+            })
+            .await
+        }
     }
 }
 

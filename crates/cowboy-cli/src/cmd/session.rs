@@ -184,7 +184,7 @@ fn welcome_lines(
 
 /// Persistent transcript title: the working directory (home-relative) plus the
 /// git branch, e.g. `~/dev/cowboy  ⎇ main`.
-fn context_title(root: &std::path::Path) -> String {
+pub(crate) fn context_title(root: &std::path::Path) -> String {
     let cwd = short_path(root);
     match git_branch(root) {
         Some(b) => format!("{cwd}  ⎇ {b}"),
@@ -208,7 +208,7 @@ fn short_path(p: &std::path::Path) -> String {
 }
 
 /// Current git branch of `root`, if it is a repository.
-fn git_branch(root: &std::path::Path) -> Option<String> {
+pub(crate) fn git_branch(root: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -362,7 +362,7 @@ fn run_tui(
 /// Compute the post-turn TUI indicators from the host side: a `git diff
 /// --shortstat` summary (empty if not a repo / no changes) and the list of
 /// managed processes (one `<name>.pid` file each under `.cowboy/proc/`).
-fn post_turn_indicators(root: &std::path::Path) -> (String, Vec<(String, String)>) {
+pub(crate) fn post_turn_indicators(root: &std::path::Path) -> (String, Vec<(String, String)>) {
     let diff = std::process::Command::new("git")
         .args(["-C"])
         .arg(root)

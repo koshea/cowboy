@@ -12,6 +12,7 @@ pub mod proc;
 pub mod run;
 pub mod session;
 pub mod skill;
+pub mod worker;
 
 /// Locate the project root. For the MVP this is the current working directory;
 /// later this may walk up to find an existing `.cowboy/` directory.

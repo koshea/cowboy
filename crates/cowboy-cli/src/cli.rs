@@ -71,6 +71,24 @@ pub enum Command {
     /// request on stdin). Not for direct use.
     #[command(name = "x-fileop", hide = true)]
     XFileop,
+
+    /// Internal: headless session worker spawned by the daemon. Not for direct
+    /// use.
+    #[command(name = "x-session-worker", hide = true)]
+    XSessionWorker(SessionWorkerArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SessionWorkerArgs {
+    /// Worktree root the session runs in.
+    #[arg(long)]
+    pub root: std::path::PathBuf,
+    /// Optional initial task.
+    #[arg(long)]
+    pub task: Option<String>,
+    /// Override the per-session socket path.
+    #[arg(long)]
+    pub sock: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
