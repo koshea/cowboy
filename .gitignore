@@ -1,0 +1,14 @@
+# Rust build artifacts
+/target
+
+# Secrets and local env
+.env
+
+# cowboy session logs (per-project, not source)
+.cowboy/sessions/
+
+# insta pending snapshots
+**/*.snap.new
+
+# OS / editor cruft
+.DS_Store

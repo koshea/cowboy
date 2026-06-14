@@ -1,0 +1,5 @@
+target/
+.git/
+.cowboy/sessions/
+**/*.snap.new
+.env

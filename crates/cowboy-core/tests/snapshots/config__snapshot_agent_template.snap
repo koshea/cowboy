@@ -1,0 +1,27 @@
+---
+source: crates/cowboy-core/tests/config.rs
+expression: agent_template()
+---
+version: 1
+
+# Agent-visible config. This IS mounted into the container and the agent may
+# edit it. It contains no security controls.
+
+agent:
+  command_timeout_seconds: 600
+  model_timeout_seconds: 120
+  max_iterations: 100
+  max_command_output_bytes: 60000
+
+session:
+  scratchpad: .cowboy/sessions/current/scratchpad.md
+
+processes: {}
+  # web:
+  #   command: npm run dev
+  #   cwd: /workspace
+  #   auto_start: false
+
+commands: {}
+  # test: cargo test
+  # lint: cargo clippy

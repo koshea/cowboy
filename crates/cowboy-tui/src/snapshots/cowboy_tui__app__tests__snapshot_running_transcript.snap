@@ -1,0 +1,20 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+┌ cowboy ──────────────────────────────────────────────────┐
+│you fix the failing test                                  │
+│$ cargo test                                              │
+│test result: FAILED                                       │
+│Looking at the failure...                                 │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+ | running — exec: cargo test
+┌ type a message · Enter send · Ctrl-C interrupt ──────────┐
+│>                                                         │
+└──────────────────────────────────────────────────────────┘

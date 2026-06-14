@@ -1,0 +1,431 @@
+//! Docker control.
+//!
+//! For the MVP we shell out to the `docker` CLI, behind the [`DockerCli`] trait
+//! so the implementation can be swapped for `bollard` later without touching
+//! callers. The trait is mockable (`mockall`) for unit tests.
+
+use std::path::Path;
+use std::process::Stdio;
+
+use anyhow::{bail, Context, Result};
+use async_trait::async_trait;
+use tokio::process::Command;
+
+/// A bind mount applied to the agent container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+impl BindMount {
+    pub fn rw(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+            read_only: false,
+        }
+    }
+    pub fn ro(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+            read_only: true,
+        }
+    }
+    /// Render as a `docker run -v` value.
+    pub fn to_arg(&self) -> String {
+        if self.read_only {
+            format!("{}:{}:ro", self.source, self.target)
+        } else {
+            format!("{}:{}", self.source, self.target)
+        }
+    }
+}
+
+/// Specification for a container (agent, gateway, or one-shot helper).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContainerSpec {
+    pub name: String,
+    pub image: String,
+    pub workdir: String,
+    pub mounts: Vec<BindMount>,
+    /// Non-secret environment variables (name, value).
+    pub env: Vec<(String, String)>,
+    /// Optional Docker network to attach at creation.
+    pub network: Option<String>,
+    /// Optional static IP within `network`.
+    pub ip: Option<String>,
+    pub memory: Option<String>,
+    pub cpus: Option<f64>,
+    /// Capabilities to drop (e.g. NET_ADMIN, NET_RAW). Applied as `--cap-drop`.
+    pub cap_drop: Vec<String>,
+    /// Capabilities to add (e.g. NET_ADMIN for the gateway). `--cap-add`.
+    pub cap_add: Vec<String>,
+    /// Kernel sysctls to set (`--sysctl`).
+    pub sysctls: Vec<(String, String)>,
+    /// DNS servers for the container (`--dns`).
+    pub dns: Vec<String>,
+    /// Override the image `ENTRYPOINT` (`--entrypoint`).
+    pub entrypoint: Option<String>,
+    /// Command to run; defaults to `tail -f /dev/null` for keep-alive.
+    pub keep_alive: Option<Vec<String>>,
+}
+
+/// Parameters for `docker network create`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkSpec {
+    pub name: String,
+    /// `--internal`: no route to the outside world.
+    pub internal: bool,
+    pub subnet: Option<String>,
+    pub gateway: Option<String>,
+}
+
+/// Result of a streamed command execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecResult {
+    pub exit_code: i32,
+}
+
+/// Docker operations cowboy needs. Shell-out today, `bollard` tomorrow.
+#[cfg_attr(test, mockall::automock)]
+#[async_trait]
+pub trait DockerCli: Send + Sync {
+    async fn image_exists(&self, image: &str) -> Result<bool>;
+    async fn build_image(&self, dockerfile: &Path, context: &Path, tag: &str) -> Result<()>;
+    async fn pull_image(&self, image: &str) -> Result<()>;
+    async fn container_state(&self, name: &str) -> Result<ContainerState>;
+    async fn run_detached(&self, spec: &ContainerSpec) -> Result<()>;
+    /// Run a one-shot container to completion (`docker run --rm`), returning its
+    /// exit code. Used for the route-setup helper.
+    async fn run_oneshot(&self, spec: &ContainerSpec) -> Result<ExecResult>;
+    async fn start(&self, name: &str) -> Result<()>;
+    /// Remove a container. Used by teardown paths (Slice C/G).
+    #[allow(dead_code)]
+    async fn remove(&self, name: &str, force: bool) -> Result<()>;
+    /// True if a Docker network with this name exists.
+    async fn network_exists(&self, name: &str) -> Result<bool>;
+    /// Create a Docker network (idempotent callers check existence first).
+    async fn create_network(&self, spec: &NetworkSpec) -> Result<()>;
+    /// Connect an existing container to an additional network.
+    async fn connect_network(&self, network: &str, container: &str) -> Result<()>;
+    /// Execute `argv` in the container, inheriting stdio, returning the exit code.
+    async fn exec(&self, name: &str, workdir: &str, argv: &[String]) -> Result<ExecResult>;
+    /// Execute `argv`, capturing combined stdout+stderr (for the agent loop).
+    async fn exec_capture(
+        &self,
+        name: &str,
+        workdir: &str,
+        argv: &[String],
+    ) -> Result<(ExecResult, String)>;
+    /// Execute interactively (`-it`), inheriting the terminal.
+    async fn exec_interactive(
+        &self,
+        name: &str,
+        workdir: &str,
+        argv: &[String],
+    ) -> Result<ExecResult>;
+}
+
+/// Existence/run state of a container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Absent,
+    Running,
+    Stopped,
+}
+
+/// The default implementation that shells out to the `docker` binary.
+#[derive(Debug, Default, Clone)]
+pub struct CliDocker;
+
+impl CliDocker {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+async fn run_quiet(args: &[&str]) -> Result<std::process::Output> {
+    Command::new("docker")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .context("failed to invoke `docker` (is it installed and running?)")
+}
+
+/// Append the common `docker run` flags for a [`ContainerSpec`] to `args`
+/// (everything after `run [-d|--rm]`). Shared by detached and one-shot runs.
+fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
+    if !spec.name.is_empty() {
+        args.push("--name".into());
+        args.push(spec.name.clone());
+    }
+    if !spec.workdir.is_empty() {
+        args.push("-w".into());
+        args.push(spec.workdir.clone());
+    }
+    if let Some(net) = &spec.network {
+        args.push("--network".into());
+        args.push(net.clone());
+    }
+    if let Some(ip) = &spec.ip {
+        args.push("--ip".into());
+        args.push(ip.clone());
+    }
+    if let Some(mem) = &spec.memory {
+        args.push("--memory".into());
+        args.push(mem.clone());
+    }
+    if let Some(cpus) = spec.cpus {
+        args.push("--cpus".into());
+        args.push(cpus.to_string());
+    }
+    for cap in &spec.cap_drop {
+        args.push("--cap-drop".into());
+        args.push(cap.clone());
+    }
+    for cap in &spec.cap_add {
+        args.push("--cap-add".into());
+        args.push(cap.clone());
+    }
+    for (k, v) in &spec.sysctls {
+        args.push("--sysctl".into());
+        args.push(format!("{k}={v}"));
+    }
+    for d in &spec.dns {
+        args.push("--dns".into());
+        args.push(d.clone());
+    }
+    if let Some(ep) = &spec.entrypoint {
+        args.push("--entrypoint".into());
+        args.push(ep.clone());
+    }
+    for m in &spec.mounts {
+        args.push("-v".into());
+        args.push(m.to_arg());
+    }
+    for (k, v) in &spec.env {
+        args.push("-e".into());
+        args.push(format!("{k}={v}"));
+    }
+    // Label so cowboy-managed containers are discoverable for teardown.
+    args.push("--label".into());
+    args.push("cowboy=1".into());
+    args.push(spec.image.clone());
+    match &spec.keep_alive {
+        Some(cmd) => args.extend(cmd.iter().cloned()),
+        // `tail -f /dev/null` keeps a container alive portably (works on both
+        // the debian default image and minimal busybox/alpine images).
+        None => args.extend([
+            "tail".to_string(),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ]),
+    }
+}
+
+#[async_trait]
+impl DockerCli for CliDocker {
+    async fn image_exists(&self, image: &str) -> Result<bool> {
+        let out = run_quiet(&["image", "inspect", image]).await?;
+        Ok(out.status.success())
+    }
+
+    async fn build_image(&self, dockerfile: &Path, context: &Path, tag: &str) -> Result<()> {
+        let status = Command::new("docker")
+            .args(["build", "-t", tag, "-f"])
+            .arg(dockerfile)
+            .arg(context)
+            .status()
+            .await
+            .context("docker build")?;
+        if !status.success() {
+            bail!("docker build failed for {tag} ({status})");
+        }
+        Ok(())
+    }
+
+    async fn pull_image(&self, image: &str) -> Result<()> {
+        let status = Command::new("docker")
+            .args(["pull", image])
+            .status()
+            .await
+            .context("docker pull")?;
+        if !status.success() {
+            bail!("docker pull failed for {image} ({status})");
+        }
+        Ok(())
+    }
+
+    async fn container_state(&self, name: &str) -> Result<ContainerState> {
+        let out = run_quiet(&["inspect", "-f", "{{.State.Running}}", name]).await?;
+        if !out.status.success() {
+            return Ok(ContainerState::Absent);
+        }
+        let running = String::from_utf8_lossy(&out.stdout).trim() == "true";
+        Ok(if running {
+            ContainerState::Running
+        } else {
+            ContainerState::Stopped
+        })
+    }
+
+    async fn run_detached(&self, spec: &ContainerSpec) -> Result<()> {
+        let mut args = vec!["run".to_string(), "-d".to_string()];
+        render_run_args(&mut args, spec);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_quiet(&argv).await?;
+        if !out.status.success() {
+            bail!(
+                "docker run failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn run_oneshot(&self, spec: &ContainerSpec) -> Result<ExecResult> {
+        let mut args = vec!["run".to_string(), "--rm".to_string()];
+        render_run_args(&mut args, spec);
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_quiet(&argv).await?;
+        if !out.status.success() {
+            bail!(
+                "docker run (oneshot) failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(ExecResult {
+            exit_code: out.status.code().unwrap_or(-1),
+        })
+    }
+
+    async fn network_exists(&self, name: &str) -> Result<bool> {
+        let out = run_quiet(&["network", "inspect", name]).await?;
+        Ok(out.status.success())
+    }
+
+    async fn create_network(&self, spec: &NetworkSpec) -> Result<()> {
+        let mut args = vec!["network".to_string(), "create".to_string()];
+        if spec.internal {
+            args.push("--internal".into());
+        }
+        if let Some(subnet) = &spec.subnet {
+            args.push("--subnet".into());
+            args.push(subnet.clone());
+        }
+        if let Some(gw) = &spec.gateway {
+            args.push("--gateway".into());
+            args.push(gw.clone());
+        }
+        args.push("--label".into());
+        args.push("cowboy=1".into());
+        args.push(spec.name.clone());
+        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = run_quiet(&argv).await?;
+        if !out.status.success() {
+            bail!(
+                "docker network create failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn connect_network(&self, network: &str, container: &str) -> Result<()> {
+        let out = run_quiet(&["network", "connect", network, container]).await?;
+        if !out.status.success() {
+            bail!(
+                "docker network connect failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn start(&self, name: &str) -> Result<()> {
+        let out = run_quiet(&["start", name]).await?;
+        if !out.status.success() {
+            bail!(
+                "docker start failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
+    async fn remove(&self, name: &str, force: bool) -> Result<()> {
+        let mut args = vec!["rm"];
+        if force {
+            args.push("-f");
+        }
+        args.push(name);
+        let _ = run_quiet(&args).await?;
+        Ok(())
+    }
+
+    async fn exec(&self, name: &str, workdir: &str, argv: &[String]) -> Result<ExecResult> {
+        let mut cmd = Command::new("docker");
+        cmd.args(["exec", "-w", workdir, name]);
+        cmd.args(argv);
+        let status = cmd.status().await.context("docker exec")?;
+        Ok(ExecResult {
+            exit_code: status.code().unwrap_or(-1),
+        })
+    }
+
+    async fn exec_capture(
+        &self,
+        name: &str,
+        workdir: &str,
+        argv: &[String],
+    ) -> Result<(ExecResult, String)> {
+        let mut cmd = Command::new("docker");
+        cmd.args(["exec", "-w", workdir, name]);
+        cmd.args(argv);
+        // Kill the local docker-exec client if the future is dropped (timeout).
+        cmd.kill_on_drop(true);
+        let out = cmd.output().await.context("docker exec (capture)")?;
+        // Combine stdout + stderr in a single observation stream for the model.
+        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.is_empty() {
+            combined.push_str(&stderr);
+        }
+        Ok((
+            ExecResult {
+                exit_code: out.status.code().unwrap_or(-1),
+            },
+            combined,
+        ))
+    }
+
+    async fn exec_interactive(
+        &self,
+        name: &str,
+        workdir: &str,
+        argv: &[String],
+    ) -> Result<ExecResult> {
+        let mut cmd = Command::new("docker");
+        cmd.args(["exec", "-it", "-w", workdir, name]);
+        cmd.args(argv);
+        let status = cmd.status().await.context("docker exec -it")?;
+        Ok(ExecResult {
+            exit_code: status.code().unwrap_or(-1),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_mount_args() {
+        assert_eq!(BindMount::rw("/a", "/b").to_arg(), "/a:/b");
+        assert_eq!(BindMount::ro("/a", "/b").to_arg(), "/a:/b:ro");
+    }
+}

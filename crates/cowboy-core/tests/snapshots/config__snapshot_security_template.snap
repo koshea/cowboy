@@ -1,0 +1,57 @@
+---
+source: crates/cowboy-core/tests/config.rs
+expression: security_template()
+---
+version: 1
+
+# HOST-OWNED security config. The cowboy host process reads this; it is NEVER
+# mounted into the agent container. The agent cannot see or edit this file.
+
+container:
+  image: cowboy/agent:local
+  # dockerfile: ./Dockerfile.cowboy
+  build: false
+  workdir: /workspace
+  mounts:
+    - source: .
+      target: /workspace
+      mode: rw
+  privileged: false
+  docker_socket: false
+  memory: 8g
+  cpus: 4
+
+networks:
+  isolated:
+    enabled: true
+  compose:
+    approved: []
+
+network_policy:
+  default_external: ask
+  default_private_lan: ask
+  default_host: ask
+  allow:
+    domains:
+      - github.com
+      - api.github.com
+      - crates.io
+      - static.crates.io
+      - index.crates.io
+    cidrs: []
+    ports:
+      - 80
+      - 443
+  deny:
+    domains:
+      - metadata.google.internal
+    cidrs:
+      - 169.254.169.254/32
+      - 100.100.100.200/32
+
+secrets:
+  env: []
+    # - name: GITHUB_TOKEN
+    #   source_env: COWBOY_GITHUB_TOKEN
+    #   required: false
+    #   approval: required

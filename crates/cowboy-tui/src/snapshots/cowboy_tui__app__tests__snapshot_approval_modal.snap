@@ -1,0 +1,20 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+┌ cowboy ──────────────────────────────────────────────────┐
+│you build the project                                     │
+│                                                          │
+│                                                          │
+│   ┌ Network approval ────────────────────────────────┐   │
+│   │github.com:443 (HTTPS)                            │   │
+│   │                                                  │   │
+│   │[o]nce [s]ession [p]roject [g]lobal [d]eny        │   │
+│   │                                                  │   │
+│   │                                                  │   │
+│   └──────────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────────────┘
+   approval — ready
+┌ type a message · Enter send · Ctrl-C interrupt ──────────┐
+│>                                                         │
+└──────────────────────────────────────────────────────────┘

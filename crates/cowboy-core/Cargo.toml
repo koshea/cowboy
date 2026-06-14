@@ -1,0 +1,28 @@
+[package]
+name = "cowboy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+schemars.workspace = true
+thiserror.workspace = true
+directories.workspace = true
+tracing.workspace = true
+jiff.workspace = true
+ipnet.workspace = true
+async-openai.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+futures.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
+rstest.workspace = true
+pretty_assertions.workspace = true
+wiremock.workspace = true
+tokio.workspace = true
