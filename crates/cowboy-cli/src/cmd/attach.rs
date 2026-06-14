@@ -58,21 +58,71 @@ pub async fn run(target: String) -> Result<()> {
     };
     let title = title_for(&info);
     match target {
-        AttachTarget::Live { worker_sock } => attach_socket(
-            &worker_sock,
-            &title,
-            vec![format!("attached to {}", info.id)],
-            ctx,
-        ),
-        AttachTarget::Replay { status, .. } => {
-            // Read-only journal replay lands in a later milestone.
-            println!(
-                "session {} is {status:?}; read-only replay is not yet available",
-                info.id
-            );
-            Ok(())
+        AttachTarget::Live { worker_sock } => {
+            // A worker can exit between GetSession and our connect. Probe the
+            // socket first; if it's dead, fall back to a read-only journal
+            // replay rather than dropping the user into a broken live view.
+            if std::os::unix::net::UnixStream::connect(&worker_sock).is_ok() {
+                attach_socket(
+                    &worker_sock,
+                    &title,
+                    vec![format!("attached to {}", info.id)],
+                    ctx,
+                )
+            } else {
+                match info.journal_path.clone() {
+                    Some(j) => replay_journal(&j, &title, &format!("{:?}", info.status), ctx),
+                    None => anyhow::bail!("session {} is gone and has no journal", info.id),
+                }
+            }
         }
+        AttachTarget::Replay {
+            journal_path,
+            status,
+        } => replay_journal(&journal_path, &title, &format!("{status:?}"), ctx),
     }
+}
+
+/// Render a terminal session read-only by replaying its `events.jsonl` from
+/// disk. There is no worker socket: we feed every journaled event into the UI,
+/// then `Done` so the loop drops into review-only mode.
+pub fn replay_journal(
+    journal_path: &std::path::Path,
+    title: &str,
+    status: &str,
+    ctx: SessionCtx,
+) -> Result<()> {
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+    // The agent side is dead; nothing consumes commands, so the receiver is
+    // dropped immediately and any input the user types is silently ignored.
+    let (task_tx, _task_rx) = std::sync::mpsc::channel::<AgentCmd>();
+    let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    let events = read_journal(journal_path);
+    let feeder = std::thread::spawn(move || {
+        for event in events {
+            if ui_tx.send(to_ui_event(event)).is_err() {
+                return;
+            }
+        }
+        let _ = ui_tx.send(UiEvent::Done);
+    });
+
+    let intro = vec![format!("replay of {status} session (read-only)")];
+    run_event_loop(title, intro, None, ui_rx, task_tx, turn_cancel, ctx)?;
+    let _ = feeder.join();
+    Ok(())
+}
+
+/// Read every journaled [`UiEventMsg`] from an `events.jsonl` (one per line),
+/// skipping any unparseable lines.
+fn read_journal(path: &std::path::Path) -> Vec<UiEventMsg> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<UiEventMsg>(l.trim()).ok())
+        .collect()
 }
 
 /// Run the TUI attached to `sock`. The terminal event loop runs on this thread;
@@ -391,5 +441,27 @@ mod tests {
 
         worker.await.unwrap();
         let _ = bridge.await;
+    }
+
+    #[test]
+    fn read_journal_parses_events_and_skips_garbage() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let journal = tmp.path().join("events.jsonl");
+        let lines = [
+            serde_json::to_string(&UiEventMsg::ToolUse("read foo".into())).unwrap(),
+            "{ not json".to_string(),
+            serde_json::to_string(&UiEventMsg::Final("done".into())).unwrap(),
+        ];
+        std::fs::write(&journal, lines.join("\n")).unwrap();
+
+        let events = read_journal(&journal);
+        assert_eq!(events.len(), 2, "garbage line must be skipped");
+        assert!(matches!(&events[0], UiEventMsg::ToolUse(s) if s == "read foo"));
+        assert!(matches!(&events[1], UiEventMsg::Final(s) if s == "done"));
+    }
+
+    #[test]
+    fn read_journal_missing_file_is_empty() {
+        assert!(read_journal(std::path::Path::new("/nope/missing.jsonl")).is_empty());
     }
 }

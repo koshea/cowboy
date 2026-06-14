@@ -147,6 +147,7 @@ pub fn run_event_loop(
 }
 
 /// Static session context the slash commands need.
+#[derive(Clone)]
 pub struct SessionCtx {
     /// Project root (for `/diff`).
     pub root: PathBuf,
