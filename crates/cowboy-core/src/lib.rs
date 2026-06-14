@@ -11,5 +11,6 @@ pub mod netproto;
 pub mod policy;
 pub mod skills;
 pub mod tokens;
+pub mod usersecrets;
 
 pub use error::{Error, Result};

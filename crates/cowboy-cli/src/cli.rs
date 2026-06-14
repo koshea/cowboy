@@ -296,6 +296,13 @@ pub struct SecretsAddArgs {
     /// Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET`.
     #[arg(long = "file", value_name = "SRC[:TARGET]")]
     pub file: Vec<String>,
+    /// Write to the cross-project user overlay instead of this worktree's.
+    #[arg(long)]
+    pub global: bool,
+    /// Print a snippet to paste into the repo's .cowboy/security.yaml instead of
+    /// writing your personal (home-dir) overlay.
+    #[arg(long)]
+    pub repo: bool,
 }
 
 #[derive(Debug, Args)]

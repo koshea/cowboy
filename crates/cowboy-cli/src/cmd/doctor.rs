@@ -76,7 +76,10 @@ pub async fn run() -> Result<()> {
         "config separation",
         check_config_separation(&paths.security),
     );
-    r.check("credential grants", check_credentials(&paths.security));
+    r.check(
+        "credential grants",
+        check_credentials(&paths.security, &root),
+    );
 
     // Container images.
     r.check("agent image", check_image(&paths.security));
@@ -170,12 +173,18 @@ fn check_security(path: &Path) -> Status {
 
 /// Verify configured credential grants resolve on the host. Missing optional
 /// grants warn; missing required ones fail; world-readable cred files warn.
-fn check_credentials(path: &Path) -> Status {
+fn check_credentials(path: &Path, root: &Path) -> Status {
     use cowboy_core::config::expand_path;
-    let cfg = match SecurityConfig::load(path) {
+    let mut cfg = match SecurityConfig::load(path) {
         Ok(c) => c,
         Err(_) => return Status::Ok("none".into()),
     };
+    // Include the user's personal overlay (global + per-worktree).
+    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    cowboy_core::usersecrets::merge_into(
+        &mut cfg,
+        &format!("{:08x}", crate::net::runtime::project_hash(&canon)),
+    );
     let (mut count, mut warns, mut fails) = (0usize, Vec::new(), Vec::new());
     for e in &cfg.secrets.env {
         count += 1;

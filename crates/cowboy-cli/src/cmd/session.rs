@@ -116,8 +116,15 @@ pub async fn run(task: Option<String>, flags: StartFlags) -> Result<()> {
         // Canonicalize so the runtime, lease key, and memory key all agree with
         // the worker/CLI (which canonicalize too).
         let root = std::fs::canonicalize(&root).unwrap_or(root);
-        let security = SecurityConfig::load(&paths.security)
+        let mut security = SecurityConfig::load(&paths.security)
             .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
+        cowboy_core::usersecrets::merge_into(
+            &mut security,
+            &format!("{:08x}", project_hash(&root)),
+        );
+        security
+            .validate()
+            .context("validating merged credential grants")?;
         let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
         let context_window = resolved.context_window as usize;
         let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;

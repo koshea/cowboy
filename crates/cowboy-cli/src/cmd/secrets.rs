@@ -1,14 +1,18 @@
 //! `cowboy secrets` — grant host credentials into the container.
 //!
-//! Grants live only in the host-owned, container-masked `.cowboy/security.yaml`
-//! (the agent can't grant itself anything). `add` is non-destructive: it prints
-//! a paste-ready block (the `secrets` grant plus the `network_policy.allow`
-//! domains the tool needs) for the user to merge into security.yaml.
+//! Grants come from three host-owned sources, merged at session start:
+//! the repo's `.cowboy/security.yaml` (committed, opinionated), and your personal
+//! overlay under `~/.config/cowboy/secrets/` — `global.yaml` (all projects) and
+//! `projects/<key>.yaml` (this worktree, keyed like memory). The agent can write
+//! none of these. `add` writes your personal overlay by default (so personal
+//! paths don't end up in the repo); `--repo` instead prints a snippet to paste.
 
 use anyhow::{Context, Result};
-use cowboy_core::config::{expand_path, ConfigPaths, SecurityConfig};
+use cowboy_core::config::{expand_path, ConfigPaths, SecretEnv, SecretMount, SecurityConfig};
+use cowboy_core::usersecrets;
 
 use crate::cli::{SecretsAddArgs, SecretsCommand};
+use crate::net::runtime::project_hash;
 
 pub fn run(command: SecretsCommand) -> Result<()> {
     match command {
@@ -17,13 +21,17 @@ pub fn run(command: SecretsCommand) -> Result<()> {
     }
 }
 
+/// The merge key for the current worktree (matches the agent's).
+fn project_key() -> Result<String> {
+    let root = crate::cmd::project_root()?;
+    let canon = std::fs::canonicalize(&root).unwrap_or(root);
+    Ok(format!("{:08x}", project_hash(&canon)))
+}
+
 /// A known-tool preset: read-only file grants + the network it needs.
 struct Preset {
-    /// (host source, container target) pairs.
     files: &'static [(&'static str, &'static str)],
-    /// Domains the tool talks to (suggested network_policy.allow additions).
     domains: &'static [&'static str],
-    /// What the grant exposes / extra notes.
     note: &'static str,
 }
 
@@ -42,13 +50,12 @@ fn preset(name: &str) -> Option<Preset> {
                 "*.googleapis.com",
             ],
             note: "your gcloud config + application-default credentials (read-only). \
-                   Token refresh needs write access — add read_only: false if it fails.",
+                   Token refresh needs write access — set read_only: false if it fails.",
         },
         "kubectl" => Preset {
             files: &[("~/.kube", "/tmp/.kube")],
             domains: &[],
-            note: "your kubeconfig (read-only). Also allow your cluster's API server \
-                   host:port in network_policy.allow.",
+            note: "your kubeconfig (read-only). Also allow your cluster's API server host.",
         },
         "aws" => Preset {
             files: &[("~/.aws", "/tmp/.aws")],
@@ -66,8 +73,7 @@ fn preset(name: &str) -> Option<Preset> {
         "ssh" => Preset {
             files: &[("~/.ssh", "/tmp/.ssh")],
             domains: &[],
-            note: "WARNING: this exposes your SSH PRIVATE KEYS to the agent (read-only). \
-                   Only grant this if you trust the task.",
+            note: "WARNING: exposes your SSH PRIVATE KEYS to the agent (read-only).",
         },
         _ => return None,
     })
@@ -75,70 +81,29 @@ fn preset(name: &str) -> Option<Preset> {
 
 const PRESETS: &[&str] = &["gh", "gcloud", "kubectl", "aws", "git", "ssh"];
 
-fn list() -> Result<()> {
-    let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
-    let cfg = match SecurityConfig::load(&paths.security) {
-        Ok(c) => c,
-        Err(_) => {
-            println!("no .cowboy/security.yaml (run `cowboy init`)");
-            return Ok(());
-        }
-    };
-    if cfg.secrets.env.is_empty() && cfg.secrets.files.is_empty() {
-        println!("no credential grants configured. Add one with `cowboy secrets add <preset>`.");
-        println!("presets: {}", PRESETS.join(", "));
-        return Ok(());
-    }
-    if !cfg.secrets.env.is_empty() {
-        println!("env grants:");
-        for e in &cfg.secrets.env {
-            let present = std::env::var(&e.source_env).is_ok();
-            let mark = if present { "set" } else { "MISSING on host" };
-            println!("  {} ← ${}  [{mark}]", e.name, e.source_env);
-        }
-    }
-    if !cfg.secrets.files.is_empty() {
-        println!("file grants:");
-        for f in &cfg.secrets.files {
-            let present = expand_path(&f.source).map(|p| p.exists()).unwrap_or(false);
-            let mode = if f.read_only { "ro" } else { "rw" };
-            let mark = if present {
-                "present"
-            } else {
-                "MISSING on host"
-            };
-            println!("  {} → {}  [{mode}] [{mark}]", f.source, f.target);
-        }
-    }
-    Ok(())
+/// Grants gathered from a preset and/or explicit flags.
+#[derive(Default)]
+struct Collected {
+    env: Vec<(String, String)>,   // (name, source_env)
+    files: Vec<(String, String)>, // (source, target)
+    domains: Vec<String>,
+    notes: Vec<String>,
 }
 
-fn add(args: SecretsAddArgs) -> Result<()> {
-    // Collect file + env grants and suggested domains from a preset and/or flags.
-    let mut files: Vec<(String, String)> = Vec::new();
-    let mut domains: Vec<String> = Vec::new();
-    let mut env: Vec<(String, String)> = Vec::new();
-    let mut notes: Vec<String> = Vec::new();
-
+fn collect(args: &SecretsAddArgs) -> Result<Collected> {
+    let mut c = Collected::default();
     if let Some(name) = &args.preset {
-        let p = preset(name).with_context(|| {
-            format!(
-                "unknown preset {name:?}; try one of: {}",
-                PRESETS.join(", ")
-            )
-        })?;
-        for (s, t) in p.files {
-            files.push((s.to_string(), t.to_string()));
-        }
-        domains.extend(p.domains.iter().map(|d| d.to_string()));
-        notes.push(format!("{name}: {}", p.note));
+        let p = preset(name)
+            .with_context(|| format!("unknown preset {name:?}; try: {}", PRESETS.join(", ")))?;
+        c.files
+            .extend(p.files.iter().map(|(s, t)| (s.to_string(), t.to_string())));
+        c.domains.extend(p.domains.iter().map(|d| d.to_string()));
+        c.notes.push(format!("{name}: {}", p.note));
     }
     for f in &args.file {
-        // SRC or SRC:TARGET
         let (src, target) = match f.split_once(':') {
             Some((s, t)) => (s.to_string(), t.to_string()),
             None => {
-                // Default target: /tmp/<basename> so it lands under HOME=/tmp.
                 let base = std::path::Path::new(f)
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -146,57 +111,169 @@ fn add(args: SecretsAddArgs) -> Result<()> {
                 (f.clone(), format!("/tmp/{base}"))
             }
         };
-        files.push((src, target));
+        c.files.push((src, target));
     }
     for e in &args.env {
-        // NAME or NAME=HOST_ENV
         let (name, src) = match e.split_once('=') {
             Some((n, s)) => (n.to_string(), s.to_string()),
             None => (e.clone(), e.clone()),
         };
-        env.push((name, src));
+        c.env.push((name, src));
     }
-
-    if files.is_empty() && env.is_empty() {
+    if c.env.is_empty() && c.files.is_empty() {
         anyhow::bail!(
             "nothing to add; give a preset ({}) or --env/--file",
             PRESETS.join(", ")
         );
     }
+    Ok(c)
+}
 
+fn add(args: SecretsAddArgs) -> Result<()> {
+    let c = collect(&args)?;
+
+    if args.repo {
+        print_repo_snippet(&c);
+        return Ok(());
+    }
+
+    // Write the personal overlay (per-worktree by default, or --global).
+    let path = if args.global {
+        usersecrets::global_file()
+    } else {
+        usersecrets::project_file(&project_key()?)
+    }
+    .context("cannot resolve home config directory")?;
+
+    let mut us = usersecrets::read(&path);
+    for (name, source_env) in c.env {
+        if !us.env.iter().any(|e| e.name == name) {
+            us.env.push(SecretEnv {
+                name,
+                source_env,
+                required: false,
+                approval: None,
+            });
+        }
+    }
+    for (source, target) in c.files {
+        if !us
+            .files
+            .iter()
+            .any(|f| f.source == source && f.target == target)
+        {
+            us.files.push(SecretMount {
+                source,
+                target,
+                read_only: true,
+                required: false,
+            });
+        }
+    }
+    for d in c.domains {
+        if !us.allow.domains.contains(&d) {
+            us.allow.domains.push(d);
+        }
+    }
+    usersecrets::write(&path, &us)?;
+
+    let scope = if args.global {
+        "all projects"
+    } else {
+        "this worktree"
+    };
+    println!("✓ wrote credential grant to {}", path.display());
+    println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
+    for n in &c.notes {
+        println!("  {n}");
+    }
+    Ok(())
+}
+
+/// Print a paste-ready block for the repo's committed security.yaml.
+fn print_repo_snippet(c: &Collected) {
     println!("# Add the following to .cowboy/security.yaml (host-owned, never mounted).\n");
     println!("# Under `secrets:` —");
-    if !env.is_empty() {
+    if !c.env.is_empty() {
         println!("  env:");
-        for (name, src) in &env {
+        for (name, src) in &c.env {
             println!("    - name: {name}");
             println!("      source_env: {src}");
         }
     }
-    if !files.is_empty() {
+    if !c.files.is_empty() {
         println!("  files:");
-        for (src, target) in &files {
+        for (src, target) in &c.files {
             println!("    - source: {src}");
             println!("      target: {target}");
             println!("      read_only: true");
         }
     }
-    if !domains.is_empty() {
+    if !c.domains.is_empty() {
         println!("\n# Under `network_policy.allow.domains:` —");
-        for d in &domains {
+        for d in &c.domains {
             println!("    - {d}");
         }
     }
-    if !notes.is_empty() {
-        println!("\n# Grants:");
-        for n in &notes {
-            println!("#   {n}");
+    for n in &c.notes {
+        println!("\n# {n}");
+    }
+}
+
+fn list() -> Result<()> {
+    let key = project_key()?;
+    let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
+    let repo = SecurityConfig::load(&paths.security).ok();
+    let global = usersecrets::global_file()
+        .map(|p| usersecrets::read(&p))
+        .unwrap_or_default();
+    let proj = usersecrets::project_file(&key)
+        .map(|p| usersecrets::read(&p))
+        .unwrap_or_default();
+
+    let repo_env = repo
+        .as_ref()
+        .map(|s| s.secrets.env.clone())
+        .unwrap_or_default();
+    let repo_files = repo
+        .as_ref()
+        .map(|s| s.secrets.files.clone())
+        .unwrap_or_default();
+
+    let sources: [(&str, &[SecretEnv], &[SecretMount]); 3] = [
+        ("repo", &repo_env, &repo_files),
+        ("user-global", &global.env, &global.files),
+        ("user-project", &proj.env, &proj.files),
+    ];
+    let mut any = false;
+    for (label, envs, files) in sources {
+        for e in envs {
+            any = true;
+            let mark = if std::env::var(&e.source_env).is_ok() {
+                "set"
+            } else {
+                "MISSING on host"
+            };
+            println!("  env   {} ← ${}  [{label}] [{mark}]", e.name, e.source_env);
+        }
+        for f in files {
+            any = true;
+            let present = expand_path(&f.source).map(|p| p.exists()).unwrap_or(false);
+            let mode = if f.read_only { "ro" } else { "rw" };
+            let mark = if present {
+                "present"
+            } else {
+                "MISSING on host"
+            };
+            println!(
+                "  file  {} → {}  [{label}] [{mode}] [{mark}]",
+                f.source, f.target
+            );
         }
     }
-    println!(
-        "\n# (env values are read from the host at runtime; file grants mount read-only.\n\
-         #  The network domains are a separate, explicit decision — approve them here or\n\
-         #  when the agent first connects.)"
-    );
+    if !any {
+        println!("no credential grants. Add one with `cowboy secrets add <preset>`.");
+        println!("presets: {}", PRESETS.join(", "));
+    }
     Ok(())
 }

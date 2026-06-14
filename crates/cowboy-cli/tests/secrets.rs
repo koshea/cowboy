@@ -1,5 +1,6 @@
-//! CLI tests for `cowboy secrets` (list + add presets). `add` is non-destructive
-//! (prints a paste-ready snippet), so these assert on stdout.
+//! CLI tests for `cowboy secrets`. `add` writes the personal home-dir overlay by
+//! default (so XDG_CONFIG_HOME is isolated), or prints a repo snippet with
+//! `--repo`. `list` shows the merged view (repo + user global + user per-project).
 
 use assert_cmd::Command;
 use assert_fs::prelude::*;
@@ -10,11 +11,13 @@ fn cowboy() -> Command {
 }
 
 #[test]
-fn add_gh_prints_grant_and_network_domains() {
+fn add_repo_prints_grant_and_network_domains() {
+    let home = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     cowboy()
         .current_dir(proj.path())
-        .args(["secrets", "add", "gh"])
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["secrets", "add", "gh", "--repo"])
         .assert()
         .success()
         .stdout(predicate::str::contains("source: ~/.config/gh"))
@@ -24,10 +27,54 @@ fn add_gh_prints_grant_and_network_domains() {
 }
 
 #[test]
+fn add_writes_personal_per_project_overlay() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["secrets", "add", "gh"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("this worktree"));
+
+    // It shows up as a user-project grant in the merged listing.
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["secrets", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("~/.config/gh → /tmp/.config/gh"))
+        .stdout(predicate::str::contains("[user-project]"));
+}
+
+#[test]
+fn add_global_writes_the_global_overlay() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["secrets", "add", "gh", "--global"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("all projects"));
+
+    home.child("cowboy/secrets/global.yaml")
+        .assert(predicate::str::contains("source: ~/.config/gh"))
+        .assert(predicate::str::contains("api.github.com"));
+}
+
+#[test]
 fn add_unknown_preset_fails() {
+    let home = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     cowboy()
         .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .args(["secrets", "add", "nope"])
         .assert()
         .failure()
@@ -35,28 +82,8 @@ fn add_unknown_preset_fails() {
 }
 
 #[test]
-fn add_explicit_env_and_file() {
-    let proj = assert_fs::TempDir::new().unwrap();
-    cowboy()
-        .current_dir(proj.path())
-        .args([
-            "secrets",
-            "add",
-            "--env",
-            "GH_TOKEN=MY_GH_TOKEN",
-            "--file",
-            "/home/me/.netrc:/tmp/.netrc",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("name: GH_TOKEN"))
-        .stdout(predicate::str::contains("source_env: MY_GH_TOKEN"))
-        .stdout(predicate::str::contains("source: /home/me/.netrc"))
-        .stdout(predicate::str::contains("target: /tmp/.netrc"));
-}
-
-#[test]
-fn list_shows_a_configured_grant() {
+fn list_labels_repo_grants() {
+    let home = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();
     proj.child(".cowboy/security.yaml")
         .write_str(
@@ -65,9 +92,11 @@ fn list_shows_a_configured_grant() {
         .unwrap();
     cowboy()
         .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
         .args(["secrets", "list"])
         .assert()
         .success()
         .stdout(predicate::str::contains("/no/such/cred → /tmp/.config/gh"))
+        .stdout(predicate::str::contains("[repo]"))
         .stdout(predicate::str::contains("MISSING on host"));
 }

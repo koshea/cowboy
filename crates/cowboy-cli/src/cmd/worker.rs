@@ -53,8 +53,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root).unwrap_or(args.root.clone());
     let paths = ConfigPaths::for_root(&root);
 
-    let security = SecurityConfig::load(&paths.security)
+    let mut security = SecurityConfig::load(&paths.security)
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
+    // Merge the user's personal credential overlay (global + per-worktree) and
+    // re-validate the combined config.
+    cowboy_core::usersecrets::merge_into(&mut security, &format!("{:08x}", project_hash(&root)));
+    security
+        .validate()
+        .context("validating merged credential grants")?;
     let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
 
     let providers = ProvidersConfig::load_global().context("loading providers.yaml")?;
