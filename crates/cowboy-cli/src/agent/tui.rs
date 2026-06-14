@@ -65,6 +65,8 @@ pub enum UiEvent {
     Tokens(u64, u64),
     /// Running estimated session spend in USD.
     Cost(f64),
+    /// The agent's working plan: ordered (step, status) pairs.
+    Plan(Vec<(String, String)>),
     /// Update the transcript title (cwd + branch context).
     Title(String),
     /// Managed processes (name, status) for the process pane.
@@ -108,6 +110,9 @@ impl AgentUi for TuiUi {
     }
     fn cost(&mut self, usd: f64) {
         let _ = self.tx.send(UiEvent::Cost(usd));
+    }
+    fn plan(&mut self, steps: &[(String, String)]) {
+        let _ = self.tx.send(UiEvent::Plan(steps.to_vec()));
     }
     fn final_message(&mut self, message: &str) {
         let _ = self.tx.send(UiEvent::Final(message.to_string()));
@@ -413,6 +418,7 @@ fn event_loop(
                     app.tokens_out = o;
                 }
                 UiEvent::Cost(usd) => app.cost_usd = usd,
+                UiEvent::Plan(steps) => app.plan = steps,
                 UiEvent::Title(t) => app.title = t,
                 UiEvent::Processes(procs) => app.processes = procs,
                 UiEvent::TurnDone => {

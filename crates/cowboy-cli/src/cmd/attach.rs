@@ -379,6 +379,7 @@ fn to_ui_event(e: UiEventMsg) -> UiEvent {
         UiEventMsg::DiffStat(s) => UiEvent::DiffStat(s),
         UiEventMsg::Tokens { input, output } => UiEvent::Tokens(input, output),
         UiEventMsg::Cost(usd) => UiEvent::Cost(usd),
+        UiEventMsg::Plan(steps) => UiEvent::Plan(steps),
         UiEventMsg::Title(t) => UiEvent::Title(t),
         UiEventMsg::Processes(p) => UiEvent::Processes(p),
         UiEventMsg::TurnDone => UiEvent::TurnDone,

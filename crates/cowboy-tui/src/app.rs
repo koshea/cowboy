@@ -181,6 +181,9 @@ pub struct App {
     pub activity: Vec<String>,
     /// Managed processes: (name, status).
     pub processes: Vec<(String, String)>,
+    /// The agent's working plan: ordered (step, status) pairs. When non-empty a
+    /// dedicated pane is shown on the right.
+    pub plan: Vec<(String, String)>,
     /// Input editor (multi-line, cursor) via tui-textarea.
     pub textarea: TextArea<'static>,
     pub mode: Mode,
@@ -251,6 +254,7 @@ impl App {
             reasoning: String::new(),
             activity: Vec::new(),
             processes: Vec::new(),
+            plan: Vec::new(),
             textarea: TextArea::default(),
             mode: Mode::Running,
             throbber: ThrobberState::default(),
@@ -492,12 +496,27 @@ pub fn draw(f: &mut Frame, app: &App) {
         .split(rows[0]);
     draw_transcript(f, app, main[0]);
 
-    let side = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(main[1]);
-    draw_activity(f, app, side[0]);
-    draw_processes(f, app, side[1]);
+    if app.plan.is_empty() {
+        let side = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(main[1]);
+        draw_activity(f, app, side[0]);
+        draw_processes(f, app, side[1]);
+    } else {
+        // With a plan, give it the top third and split the rest as before.
+        let side = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(40),
+                Constraint::Percentage(26),
+            ])
+            .split(main[1]);
+        draw_plan(f, app, side[0]);
+        draw_activity(f, app, side[1]);
+        draw_processes(f, app, side[2]);
+    }
 
     draw_status(f, app, rows[1]);
     draw_input(f, app, rows[2]);
@@ -861,6 +880,37 @@ fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
     let para = Paragraph::new(lines)
         .block(panel("network"))
         .wrap(Wrap { trim: true });
+    f.render_widget(para, area);
+}
+
+fn draw_plan(f: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line> = app
+        .plan
+        .iter()
+        .map(|(step, status)| {
+            let (mark, color) = match status.as_str() {
+                "done" => ("✓", Color::Green),
+                "in_progress" => ("▸", Color::Yellow),
+                _ => ("·", Color::DarkGray),
+            };
+            let step_style = match status.as_str() {
+                "done" => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::CROSSED_OUT),
+                "in_progress" => Style::default().fg(Color::White),
+                _ => Style::default().fg(Color::Gray),
+            };
+            Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(color)),
+                Span::styled(step.clone(), step_style),
+            ])
+        })
+        .collect();
+    let done = app.plan.iter().filter(|(_, s)| s == "done").count();
+    let title = format!("plan {done}/{}", app.plan.len());
+    let para = Paragraph::new(lines)
+        .block(panel(&title))
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
@@ -1228,6 +1278,29 @@ mod tests {
         app.diff = "Δ 2f +30 -4".into();
         app.processes = vec![("web".into(), "running".into())];
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_plan_pane() {
+        let mut app = App::new("cowboy · 20260614-abcd");
+        app.push(LineKind::User, "refactor the parser");
+        app.mode = Mode::Running;
+        app.status = "working".into();
+        app.plan = vec![
+            ("read the existing parser".into(), "done".into()),
+            ("extract the tokenizer".into(), "in_progress".into()),
+            ("add tests".into(), "pending".into()),
+        ];
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn plan_pane_only_shown_when_plan_is_nonempty() {
+        let mut app = App::new("cowboy");
+        // No plan: the rendered frame must not carry the plan panel title.
+        assert!(!render(&app).contains("plan "));
+        app.plan = vec![("do the thing".into(), "pending".into())];
+        assert!(render(&app).contains("plan 0/1"));
     }
 
     #[test]

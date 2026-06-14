@@ -26,6 +26,9 @@ pub trait AgentUi {
     fn tokens(&mut self, _input: u64, _output: u64) {}
     /// Running estimated session spend in USD. Default: ignored.
     fn cost(&mut self, _usd: f64) {}
+    /// The agent's working plan changed: ordered (step, status) pairs where
+    /// status is "pending" | "in_progress" | "done". Default: ignored.
+    fn plan(&mut self, _steps: &[(String, String)]) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question; return their answer.
@@ -122,6 +125,22 @@ impl AgentUi for ConsoleUi {
             return;
         }
         println!("\x1b[35m✎ {summary}\x1b[0m");
+    }
+
+    fn plan(&mut self, steps: &[(String, String)]) {
+        if self.final_only || steps.is_empty() {
+            return;
+        }
+        println!("\x1b[36m▣ plan\x1b[0m");
+        for (step, status) in steps {
+            let (mark, color) = match status.as_str() {
+                "done" => ("✓", "\x1b[32m"),
+                "in_progress" => ("▸", "\x1b[33m"),
+                _ => ("·", "\x1b[2m"),
+            };
+            println!("{color}  {mark} {step}\x1b[0m");
+        }
+        let _ = std::io::stdout().flush();
     }
 
     fn final_message(&mut self, message: &str) {

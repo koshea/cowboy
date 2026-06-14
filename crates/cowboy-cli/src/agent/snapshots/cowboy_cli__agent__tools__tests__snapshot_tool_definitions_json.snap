@@ -187,6 +187,51 @@ expression: defs
     }
   },
   {
+    "description": "Maintain a short, visible checklist for a multi-step task. Pass the full ordered list of `steps` (each with a `status` of \"pending\", \"in_progress\", or \"done\"); the list REPLACES the previous plan. Create a plan before starting non-trivial work, mark exactly one step \"in_progress\" at a time, and update statuses as you go. Skip it for trivial one-step tasks.",
+    "name": "plan",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "definitions": {
+        "PlanStep": {
+          "description": "One step in the agent's working plan.",
+          "properties": {
+            "status": {
+              "default": null,
+              "description": "Status: \"pending\" (default), \"in_progress\", or \"done\".",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "step": {
+              "description": "A short description of the step.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "step"
+          ],
+          "type": "object"
+        }
+      },
+      "description": "Arguments for the `plan` tool. The whole list is replaced on each call.",
+      "properties": {
+        "steps": {
+          "description": "The full, ordered list of steps; replaces the current plan.",
+          "items": {
+            "$ref": "#/definitions/PlanStep"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "steps"
+      ],
+      "title": "PlanArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

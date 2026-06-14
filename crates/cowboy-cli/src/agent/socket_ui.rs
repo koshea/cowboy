@@ -243,6 +243,9 @@ impl AgentUi for SocketUi {
     fn cost(&mut self, usd: f64) {
         self.emit(UiEventMsg::Cost(usd));
     }
+    fn plan(&mut self, steps: &[(String, String)]) {
+        self.emit(UiEventMsg::Plan(steps.to_vec()));
+    }
     fn final_message(&mut self, message: &str) {
         self.emit(UiEventMsg::Final(message.to_string()));
     }

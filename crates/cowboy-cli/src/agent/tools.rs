@@ -15,6 +15,7 @@ pub const TOOL_READ: &str = "read";
 pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_WRITE: &str = "write";
 pub const TOOL_MEMORY: &str = "memory";
+pub const TOOL_PLAN: &str = "plan";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -109,6 +110,23 @@ pub struct MemoryArgs {
     pub kind: Option<String>,
 }
 
+/// One step in the agent's working plan.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlanStep {
+    /// A short description of the step.
+    pub step: String,
+    /// Status: "pending" (default), "in_progress", or "done".
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
+/// Arguments for the `plan` tool. The whole list is replaced on each call.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct PlanArgs {
+    /// The full, ordered list of steps; replaces the current plan.
+    pub steps: Vec<PlanStep>,
+}
+
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -160,6 +178,17 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<MemoryArgs>(),
         },
         ToolDef {
+            name: TOOL_PLAN.into(),
+            description: "Maintain a short, visible checklist for a multi-step task. Pass the \
+                          full ordered list of `steps` (each with a `status` of \"pending\", \
+                          \"in_progress\", or \"done\"); the list REPLACES the previous plan. \
+                          Create a plan before starting non-trivial work, mark exactly one step \
+                          \"in_progress\" at a time, and update statuses as you go. Skip it for \
+                          trivial one-step tasks."
+                .into(),
+            parameters: schema_for::<PlanArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -193,7 +222,9 @@ mod tests {
         let names: Vec<_> = definitions().into_iter().map(|d| d.name).collect();
         assert_eq!(
             names,
-            vec!["shell", "read", "edit", "write", "memory", "final", "ask_user", "subagent"]
+            vec![
+                "shell", "read", "edit", "write", "memory", "plan", "final", "ask_user", "subagent"
+            ]
         );
     }
 

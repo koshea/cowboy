@@ -8,8 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, ReadArgs, ShellArgs, SubagentArgs,
-    WriteArgs,
+    self, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, PlanArgs, ReadArgs, ShellArgs,
+    SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -57,6 +57,11 @@ retry the same blocked host with different tools or flags; instead state plainly
 which host:port you need and why, and let the user approve it (or proceed without \
 network). If a command cannot access something, observe the failure and continue.
 
+For a multi-step task, use the `plan` tool to keep a short, visible checklist: \
+lay out the steps up front, keep exactly one step \"in_progress\" at a time, and \
+mark steps \"done\" as you complete them (re-send the whole list to update it). \
+Skip it for trivial one-step work.
+
 Before large edits, inspect the repository and form a brief plan. After edits, run \
 relevant checks. When finished, call `final` summarizing what changed, what was \
 validated, and remaining risks or follow-up work.";
@@ -85,6 +90,8 @@ pub struct AgentLoop<'a> {
     cost_usd: f64,
     /// One-shot latch so the 80%-of-budget warning fires only once.
     budget_warned: bool,
+    /// The agent's current working plan: (step, status) in order.
+    plan: Vec<(String, String)>,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -134,6 +141,7 @@ impl<'a> AgentLoop<'a> {
             price_out: None,
             cost_usd: 0.0,
             budget_warned: false,
+            plan: Vec::new(),
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
@@ -158,6 +166,30 @@ impl<'a> AgentLoop<'a> {
                 (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po;
             self.ui.cost(self.cost_usd);
         }
+    }
+
+    /// Replace the working plan, surface it to the UI, and echo it back to the
+    /// model as the tool observation. Statuses are normalized to a known set.
+    fn run_plan(&mut self, args: PlanArgs) -> String {
+        self.plan = args
+            .steps
+            .into_iter()
+            .map(|s| {
+                let status = match s.status.as_deref().map(str::trim).unwrap_or("pending") {
+                    "in_progress" | "in progress" | "doing" | "active" => "in_progress",
+                    "done" | "complete" | "completed" | "finished" => "done",
+                    _ => "pending",
+                };
+                (s.step, status.to_string())
+            })
+            .collect();
+        self.ui.plan(&self.plan);
+        let done = self.plan.iter().filter(|(_, s)| s == "done").count();
+        let rendered = render_plan(&self.plan);
+        format!(
+            "Plan updated ({done}/{} done):\n{rendered}",
+            self.plan.len()
+        )
     }
 
     /// Hard stop reason if a configured budget has been reached, else `None`.
@@ -576,6 +608,21 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_PLAN => {
+                    let args: PlanArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    let observation = self.run_plan(args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -865,6 +912,21 @@ fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid tool arguments: {e}"))
 }
 
+/// Render a plan as check-boxed lines (for the model observation / console).
+fn render_plan(plan: &[(String, String)]) -> String {
+    plan.iter()
+        .map(|(step, status)| {
+            let mark = match status.as_str() {
+                "done" => "[x]",
+                "in_progress" => "[~]",
+                _ => "[ ]",
+            };
+            format!("{mark} {step}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A concise one-line summary of a file op for the UI: the helper's status line
 /// on success, or `"<action> <path> — failed"` otherwise.
 fn fileop_summary(action: &str, path: &str, exit: i32, output: &str) -> String {
@@ -944,11 +1006,15 @@ mod tests {
         notices: Vec<String>,
         tool_uses: Vec<String>,
         costs: Vec<f64>,
+        plans: Vec<Vec<(String, String)>>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
         fn cost(&mut self, usd: f64) {
             self.costs.push(usd);
+        }
+        fn plan(&mut self, steps: &[(String, String)]) {
+            self.plans.push(steps.to_vec());
         }
         fn command_start(&mut self, command: &str) {
             self.commands.push(command.to_string());
@@ -1095,6 +1161,52 @@ mod tests {
         assert!(
             ui.costs.last().copied().unwrap_or(0.0) > 0.0,
             "a priced model should report a running cost"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_tool_records_steps_and_normalizes_status() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "plan",
+                    r#"{"steps":[{"step":"scope","status":"done"},
+                                {"step":"build","status":"doing"},
+                                {"step":"test"}]}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("go").await.unwrap();
+
+        let plan = ui.plans.last().expect("a plan should have been emitted");
+        assert_eq!(
+            plan,
+            &vec![
+                ("scope".to_string(), "done".to_string()),
+                ("build".to_string(), "in_progress".to_string()), // "doing" normalized
+                ("test".to_string(), "pending".to_string()),      // missing status defaults
+            ]
         );
     }
 

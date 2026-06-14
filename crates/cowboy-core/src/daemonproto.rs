@@ -300,6 +300,8 @@ pub enum UiEventMsg {
     },
     /// Running estimated session spend in USD.
     Cost(f64),
+    /// The agent's working plan: ordered (step, status) pairs.
+    Plan(Vec<(String, String)>),
     Title(String),
     Processes(Vec<(String, String)>),
     TurnDone,
@@ -458,6 +460,10 @@ mod tests {
             output: 340,
         });
         roundtrip(&UiEventMsg::Cost(0.42));
+        roundtrip(&UiEventMsg::Plan(vec![
+            ("scope the work".into(), "done".into()),
+            ("implement".into(), "in_progress".into()),
+        ]));
         roundtrip(&UiEventMsg::Processes(vec![(
             "web".into(),
             "running".into(),
