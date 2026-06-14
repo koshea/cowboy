@@ -85,6 +85,60 @@ fn use_writes_project_default() {
 }
 
 #[test]
+fn add_registers_a_model_with_shipped_defaults() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    seed_home(&home);
+
+    // A known model id: name + reasoning + context come from the shipped table.
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["models", "add", "cerebras/zai-glm-4.7"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Cerebras: GLM 4.7"));
+
+    home.child("cowboy/models.yaml")
+        .assert(predicate::str::contains("Cerebras: GLM 4.7"))
+        .assert(predicate::str::contains("model: cerebras/zai-glm-4.7"))
+        .assert(predicate::str::contains("reasoning_effort: high"))
+        .assert(predicate::str::contains("context_window: 131072"));
+}
+
+#[test]
+fn add_honors_overrides() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    seed_home(&home);
+
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args([
+            "models",
+            "add",
+            "cerebras/zai-glm-4.7",
+            "--name",
+            "glm",
+            "--temp",
+            "0.3",
+            "--reasoning",
+            "none",
+            "--default",
+        ])
+        .assert()
+        .success();
+
+    home.child("cowboy/models.yaml")
+        .assert(predicate::str::contains("  glm:"))
+        .assert(predicate::str::contains("temperature: 0.3"))
+        .assert(predicate::str::contains("default: glm"))
+        // reasoning explicitly disabled -> field omitted
+        .assert(predicate::str::contains("reasoning_effort").not());
+}
+
+#[test]
 fn use_unknown_model_errors() {
     let home = assert_fs::TempDir::new().unwrap();
     let proj = assert_fs::TempDir::new().unwrap();

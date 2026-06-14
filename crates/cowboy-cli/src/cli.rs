@@ -216,6 +216,36 @@ pub enum ModelsCommand {
         #[arg(short, long)]
         global: bool,
     },
+    /// List models offered by the configured provider endpoints (chat models
+    /// only unless `--all`), with recommended names and config status.
+    Available {
+        /// Include non-chat models (image/audio/embedding/etc).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Register a model by its provider id, prefilled from shipped defaults.
+    Add {
+        /// The provider-side model id, e.g. `cerebras/zai-glm-4.7`.
+        id: String,
+        /// Friendly name (config key). Defaults to the recommended name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Provider to use (defaults to the only configured one).
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        temp: Option<f32>,
+        #[arg(long)]
+        context: Option<u32>,
+        #[arg(long = "max-output")]
+        max_output: Option<u32>,
+        /// Reasoning effort: none|minimal|low|medium|high.
+        #[arg(long)]
+        reasoning: Option<String>,
+        /// Make this the default model.
+        #[arg(long)]
+        default: bool,
+    },
 }
 
 #[derive(Debug, Args)]

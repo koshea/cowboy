@@ -93,6 +93,10 @@ fn model_def(provider: &str, model: &str) -> ModelDef {
         temperature: 0.2,
         max_tokens: 8192,
         context_window: 200_000,
+        reasoning_effort: None,
+        top_p: None,
+        stop: Vec::new(),
+        extra: std::collections::BTreeMap::new(),
         headers: BTreeMap::new(),
     }
 }

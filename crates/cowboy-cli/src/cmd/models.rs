@@ -11,16 +11,39 @@ use std::io::{IsTerminal, Write};
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{
-    resolve_model, ConfigPaths, ModelDef, ModelsConfig, Provider, ProvidersConfig,
+    expand_env, resolve_model, ConfigPaths, ModelDef, ModelsConfig, Provider, ProvidersConfig,
+    ReasoningEffort,
 };
+use cowboy_core::model::list_models;
+use cowboy_core::model_defaults;
 
 use crate::cli::{ModelsArgs, ModelsCommand};
 
-pub fn run(args: ModelsArgs) -> Result<()> {
+pub async fn run(args: ModelsArgs) -> Result<()> {
     match args.command {
         ModelsCommand::Setup => setup(),
         ModelsCommand::List => list(),
         ModelsCommand::Use { name, global } => use_default(&name, global),
+        ModelsCommand::Available { all } => available(all).await,
+        ModelsCommand::Add {
+            id,
+            name,
+            provider,
+            temp,
+            context,
+            max_output,
+            reasoning,
+            default,
+        } => add(AddArgs {
+            id,
+            name,
+            provider,
+            temp,
+            context,
+            max_output,
+            reasoning,
+            default,
+        }),
     }
 }
 
@@ -78,6 +101,10 @@ fn setup() -> Result<()> {
                 temperature,
                 max_tokens,
                 context_window,
+                reasoning_effort: None,
+                top_p: None,
+                stop: Vec::new(),
+                extra: BTreeMap::new(),
                 headers: BTreeMap::new(),
             },
         );
@@ -206,6 +233,139 @@ fn use_default(name: &str, global: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+// --- available (list the provider catalogue) ---
+
+async fn available(all: bool) -> Result<()> {
+    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    if providers.providers.is_empty() {
+        bail!("no providers configured; run `cowboy models setup`");
+    }
+    // Provider-side ids already registered (for the [configured] marker).
+    let user = ModelsConfig::user_path()
+        .map(|p| ModelsConfig::load_opt(&p))
+        .transpose()?
+        .flatten();
+    let project = project_models()?;
+    let configured: std::collections::BTreeSet<String> = user
+        .iter()
+        .chain(project.iter())
+        .flat_map(|c| c.models.values().map(|d| d.model.clone()))
+        .collect();
+
+    for (pname, p) in &providers.providers {
+        let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
+        println!("provider {pname} ({base}):");
+        match list_models(&base, &p.api_key, &p.headers).await {
+            Ok(mut entries) => {
+                entries.sort_by(|a, b| a.id.cmp(&b.id));
+                let mut shown = 0;
+                for e in &entries {
+                    if !all && !model_defaults::is_chat(&e.id) {
+                        continue;
+                    }
+                    let suggested = model_defaults::lookup(&e.id).name;
+                    let mark = if configured.contains(&e.id) {
+                        "  [configured]"
+                    } else {
+                        ""
+                    };
+                    println!("  {:<50} {suggested}{mark}", e.id);
+                    shown += 1;
+                }
+                if shown == 0 {
+                    println!("  (no chat models; pass --all to see everything)");
+                }
+            }
+            Err(err) => println!("  error: {err}"),
+        }
+    }
+    println!("\nRegister one with: cowboy models add <id>");
+    Ok(())
+}
+
+// --- add (register a model by id, prefilled from defaults) ---
+
+struct AddArgs {
+    id: String,
+    name: Option<String>,
+    provider: Option<String>,
+    temp: Option<f32>,
+    context: Option<u32>,
+    max_output: Option<u32>,
+    reasoning: Option<String>,
+    default: bool,
+}
+
+fn add(a: AddArgs) -> Result<()> {
+    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    if providers.providers.is_empty() {
+        bail!("no providers configured; run `cowboy models setup`");
+    }
+    let provider = match a.provider {
+        Some(p) => p,
+        None if providers.providers.len() == 1 => {
+            providers.providers.keys().next().unwrap().clone()
+        }
+        None if providers.providers.contains_key("default") => "default".to_string(),
+        None => bail!(
+            "multiple providers configured; pass --provider <name> ({})",
+            providers
+                .providers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    if !providers.providers.contains_key(&provider) {
+        bail!("unknown provider {provider:?}; see `cowboy models list`");
+    }
+
+    let d = model_defaults::lookup(&a.id);
+    let name = a.name.unwrap_or(d.name);
+    let reasoning_effort = match a.reasoning {
+        Some(s) => parse_reasoning(&s)?,
+        None => d.reasoning_effort,
+    };
+    let def = ModelDef {
+        provider,
+        model: a.id.clone(),
+        temperature: a.temp.unwrap_or(d.temperature),
+        max_tokens: a.max_output.unwrap_or(d.max_tokens),
+        context_window: a.context.unwrap_or(d.context_window),
+        reasoning_effort,
+        top_p: None,
+        stop: Vec::new(),
+        extra: BTreeMap::new(),
+        headers: BTreeMap::new(),
+    };
+
+    let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
+    let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
+    let first = cfg.models.is_empty();
+    cfg.models.insert(name.clone(), def);
+    if a.default || first || cfg.default.is_none() {
+        cfg.default = Some(name.clone());
+    }
+    cfg.save(&path)?;
+    println!("✓ saved model `{name}` ({}) to {}", a.id, path.display());
+    if cfg.default.as_deref() == Some(name.as_str()) {
+        println!("  (default model)");
+    }
+    Ok(())
+}
+
+fn parse_reasoning(s: &str) -> Result<Option<ReasoningEffort>> {
+    Ok(match s.to_lowercase().as_str() {
+        "none" | "off" | "" => None,
+        "minimal" => Some(ReasoningEffort::Minimal),
+        "low" => Some(ReasoningEffort::Low),
+        "medium" => Some(ReasoningEffort::Medium),
+        "high" => Some(ReasoningEffort::High),
+        other => bail!("invalid reasoning effort {other:?} (none|minimal|low|medium|high)"),
+    })
 }
 
 // --- helpers ---

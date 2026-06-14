@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use cowboy_core::config::ResolvedModel;
-use cowboy_core::model::{Delta, Message, ModelClient, OpenAiClient, ToolDef};
-use wiremock::matchers::{header, method, path};
+use cowboy_core::config::{ReasoningEffort, ResolvedModel};
+use cowboy_core::model::{list_models, Delta, Message, ModelClient, OpenAiClient, ToolDef};
+use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn profile(base_url: String) -> ResolvedModel {
@@ -19,6 +19,10 @@ fn profile(base_url: String) -> ResolvedModel {
         temperature: 0.0,
         max_tokens: 256,
         context_window: 8192,
+        reasoning_effort: None,
+        top_p: None,
+        stop: Vec::new(),
+        extra: BTreeMap::new(),
         headers: BTreeMap::new(),
     }
 }
@@ -112,6 +116,67 @@ async fn streams_reasoning_separately_from_content() {
     }
     assert_eq!(reasoning, "let me think… ok.");
     assert_eq!(content, "the answer");
+}
+
+#[tokio::test]
+async fn sends_reasoning_effort_top_p_and_extra() {
+    let server = MockServer::start().await;
+    // The mock matches only if these params are present in the request body, so a
+    // successful response proves they were sent.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "reasoning_effort": "high",
+            "top_p": 0.5,
+            "provider_specific": "x",
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut p = profile(format!("{}/v1", server.uri()));
+    p.reasoning_effort = Some(ReasoningEffort::High);
+    p.top_p = Some(0.5);
+    p.extra
+        .insert("provider_specific".into(), serde_json::json!("x"));
+    let client = OpenAiClient::from_resolved(&p).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(resp.content.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn list_models_parses_the_catalogue() {
+    let server = MockServer::start().await;
+    let body = serde_json::json!({
+        "object": "list",
+        "data": [
+            {"id": "anthropic/claude-opus-4-8", "owned_by": "anthropic"},
+            {"id": "cerebras/zai-glm-4.7", "owned_by": "Cerebras"},
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body))
+        .mount(&server)
+        .await;
+
+    let entries = list_models(
+        &format!("{}/v1", server.uri()),
+        "test-key",
+        &BTreeMap::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].id, "anthropic/claude-opus-4-8");
+    assert_eq!(entries[1].owned_by, "Cerebras");
 }
 
 #[tokio::test]

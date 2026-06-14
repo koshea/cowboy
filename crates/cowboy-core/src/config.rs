@@ -272,6 +272,29 @@ impl Default for ModelsConfig {
     }
 }
 
+/// How hard a reasoning model should think. Sent as `reasoning_effort` in the
+/// chat request; absent means the parameter is omitted entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// The wire value (also the user-facing label).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Minimal => "minimal",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
 /// A named model: which provider to use plus model id and sampling params.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -286,6 +309,18 @@ pub struct ModelDef {
     pub max_tokens: u32,
     #[serde(default = "default_context_window")]
     pub context_window: u32,
+    /// Reasoning effort for reasoning models (omitted when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Nucleus sampling (config-file only; omitted when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f32>,
+    /// Stop sequences (config-file only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stop: Vec<String>,
+    /// Arbitrary extra request-body params merged in (config-file escape hatch).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, serde_json::Value>,
     /// Per-model header overrides (merged over the provider's headers).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
@@ -302,6 +337,10 @@ pub struct ResolvedModel {
     pub temperature: f32,
     pub max_tokens: u32,
     pub context_window: u32,
+    pub reasoning_effort: Option<ReasoningEffort>,
+    pub top_p: Option<f32>,
+    pub stop: Vec<String>,
+    pub extra: BTreeMap<String, serde_json::Value>,
     pub headers: BTreeMap<String, String>,
 }
 
@@ -723,6 +762,10 @@ pub fn resolve_model(
         temperature: def.temperature,
         max_tokens: def.max_tokens,
         context_window: def.context_window,
+        reasoning_effort: def.reasoning_effort,
+        top_p: def.top_p,
+        stop: def.stop.clone(),
+        extra: def.extra.clone(),
         headers,
     })
 }

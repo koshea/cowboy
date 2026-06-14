@@ -1,0 +1,152 @@
+# Recommended defaults for known models, shipped with cowboy.
+#
+# Override or extend without a code release via ~/.config/cowboy/model-defaults.yaml
+# (same schema; entries there win). Match by exact `id` or by `prefix`
+# (longest match wins). Fields: name, context_window, max_tokens, temperature,
+# reasoning_effort (minimal|low|medium|high), chat (default true).
+#
+# Values are best-effort baselines you can tweak per-model when adding one; the
+# point is sensible prefills, not perfection.
+version: 1
+models:
+  # --- Anthropic (200K context, extended thinking) ------------------------
+  - prefix: anthropic/claude-opus
+    name: "Claude Opus"
+    context_window: 200000
+    max_tokens: 32000
+    temperature: 1.0
+    reasoning_effort: high
+  - prefix: anthropic/claude-sonnet
+    name: "Claude Sonnet"
+    context_window: 200000
+    max_tokens: 32000
+    temperature: 1.0
+    reasoning_effort: medium
+  - prefix: anthropic/claude-haiku
+    name: "Claude Haiku"
+    context_window: 200000
+    max_tokens: 16000
+    temperature: 1.0
+  - prefix: anthropic/claude-fable
+    name: "Claude Fable"
+    context_window: 200000
+    max_tokens: 32000
+    temperature: 1.0
+    reasoning_effort: medium
+  - id: anthropic/claude-opus-4-8
+    name: "Claude Opus 4.8"
+    context_window: 200000
+    max_tokens: 32000
+    temperature: 1.0
+    reasoning_effort: high
+  - id: anthropic/claude-sonnet-4-6
+    name: "Claude Sonnet 4.6"
+    context_window: 200000
+    max_tokens: 32000
+    temperature: 1.0
+    reasoning_effort: medium
+
+  # --- Cerebras -----------------------------------------------------------
+  - id: cerebras/zai-glm-4.7
+    name: "Cerebras: GLM 4.7"
+    context_window: 131072
+    max_tokens: 16384
+    temperature: 0.6
+    reasoning_effort: high
+  - id: cerebras/gpt-oss-120b
+    name: "Cerebras: GPT-OSS 120B"
+    context_window: 131072
+    max_tokens: 32768
+    temperature: 1.0
+    reasoning_effort: medium
+
+  # --- Fireworks ----------------------------------------------------------
+  - id: fireworks/accounts/fireworks/models/glm-5p1
+    name: "Fireworks: GLM 5.1"
+    context_window: 200000
+    max_tokens: 32768
+    temperature: 0.6
+    reasoning_effort: high
+  - id: fireworks/accounts/fireworks/models/kimi-k2p5
+    name: "Fireworks: Kimi K2.5"
+    context_window: 262144
+    max_tokens: 32768
+    temperature: 0.6
+  - id: fireworks/accounts/fireworks/models/kimi-k2p6
+    name: "Fireworks: Kimi K2.6"
+    context_window: 262144
+    max_tokens: 32768
+    temperature: 0.6
+  - id: fireworks/accounts/fireworks/models/deepseek-v4-pro
+    name: "Fireworks: DeepSeek V4 Pro"
+    context_window: 163840
+    max_tokens: 32768
+    temperature: 0.6
+    reasoning_effort: high
+  - prefix: fireworks/accounts/fireworks/models/gpt-oss
+    name: "Fireworks: GPT-OSS"
+    context_window: 131072
+    max_tokens: 32768
+    temperature: 1.0
+    reasoning_effort: medium
+
+  # --- OpenAI -------------------------------------------------------------
+  # gpt-5.x family (reasoning); codex/mini/nano inherit via prefix.
+  - prefix: openai/gpt-5
+    name: "GPT-5"
+    context_window: 400000
+    max_tokens: 65536
+    temperature: 1.0
+    reasoning_effort: medium
+  - prefix: openai/gpt-4.1
+    name: "GPT-4.1"
+    context_window: 1000000
+    max_tokens: 32768
+    temperature: 0.2
+  - prefix: openai/gpt-4o
+    name: "GPT-4o"
+    context_window: 128000
+    max_tokens: 16384
+    temperature: 0.2
+  - prefix: openai/o3
+    name: "OpenAI o3"
+    context_window: 200000
+    max_tokens: 100000
+    temperature: 1.0
+    reasoning_effort: high
+  - prefix: openai/o4-mini
+    name: "OpenAI o4-mini"
+    context_window: 200000
+    max_tokens: 100000
+    temperature: 1.0
+    reasoning_effort: high
+
+  # --- Gemini -------------------------------------------------------------
+  - prefix: gemini/gemini-3
+    name: "Gemini 3"
+    context_window: 1048576
+    max_tokens: 65536
+    temperature: 1.0
+    reasoning_effort: medium
+  - prefix: gemini/gemini-2.5-pro
+    name: "Gemini 2.5 Pro"
+    context_window: 1048576
+    max_tokens: 65536
+    temperature: 1.0
+    reasoning_effort: medium
+  - prefix: gemini/gemini-2.5-flash
+    name: "Gemini 2.5 Flash"
+    context_window: 1048576
+    max_tokens: 65536
+    temperature: 1.0
+  - prefix: gemini/gemini-pro
+    name: "Gemini Pro"
+    context_window: 1048576
+    max_tokens: 65536
+    temperature: 1.0
+    reasoning_effort: medium
+  - prefix: gemini/gemini-flash
+    name: "Gemini Flash"
+    context_window: 1048576
+    max_tokens: 65536
+    temperature: 1.0

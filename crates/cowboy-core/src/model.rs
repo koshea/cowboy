@@ -17,7 +17,9 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::config::ResolvedModel;
+use std::collections::BTreeMap;
+
+use crate::config::{ReasoningEffort, ResolvedModel};
 use crate::error::{Error, Result};
 
 /// Role of a conversation message.
@@ -128,6 +130,10 @@ pub struct OpenAiClient {
     model: String,
     temperature: f32,
     max_tokens: u32,
+    reasoning_effort: Option<ReasoningEffort>,
+    top_p: Option<f32>,
+    stop: Vec<String>,
+    extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl OpenAiClient {
@@ -156,8 +162,76 @@ impl OpenAiClient {
             model: model.model.clone(),
             temperature: model.temperature,
             max_tokens: model.max_tokens,
+            reasoning_effort: model.reasoning_effort,
+            top_p: model.top_p,
+            stop: model.stop.clone(),
+            extra: model.extra.clone(),
         })
     }
+}
+
+/// One model from a provider's `GET /models` catalogue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub id: String,
+    pub owned_by: String,
+}
+
+#[derive(Deserialize)]
+struct ModelsList {
+    #[serde(default)]
+    data: Vec<ModelEntryWire>,
+}
+#[derive(Deserialize)]
+struct ModelEntryWire {
+    id: String,
+    #[serde(default)]
+    owned_by: String,
+}
+
+/// List a provider's available models via `GET {base_url}/models`. Reused by the
+/// `/models` picker and `cowboy models available`.
+pub async fn list_models(
+    base_url: &str,
+    api_key: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Vec<ModelEntry>> {
+    let mut hmap = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            hmap.insert(name, val);
+        }
+    }
+    let http = reqwest::Client::builder()
+        .default_headers(hmap)
+        .build()
+        .map_err(oa_err)?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(oa_err)?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::Model(format!(
+            "listing models failed ({code}): {text}"
+        )));
+    }
+    let list: ModelsList = resp.json().await.map_err(oa_err)?;
+    Ok(list
+        .data
+        .into_iter()
+        .map(|e| ModelEntry {
+            id: e.id,
+            owned_by: e.owned_by,
+        })
+        .collect())
 }
 
 fn to_openai_messages(messages: &[Message]) -> Result<Vec<ChatCompletionRequestMessage>> {
@@ -338,6 +412,21 @@ impl ModelClient for OpenAiClient {
         let request = builder.build().map_err(oa_err)?;
         let mut body = serde_json::to_value(&request).map_err(|e| Error::Model(e.to_string()))?;
         body["stream"] = serde_json::Value::Bool(true);
+        if let Some(effort) = self.reasoning_effort {
+            body["reasoning_effort"] = serde_json::Value::String(effort.as_str().into());
+        }
+        if let Some(top_p) = self.top_p {
+            body["top_p"] = serde_json::json!(top_p);
+        }
+        if !self.stop.is_empty() {
+            body["stop"] = serde_json::json!(self.stop);
+        }
+        // Config escape hatch: merge arbitrary top-level params last.
+        if let Some(obj) = body.as_object_mut() {
+            for (k, v) in &self.extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
 
         let resp = self
             .http
