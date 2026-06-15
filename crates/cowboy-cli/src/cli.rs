@@ -177,6 +177,16 @@ pub enum Command {
         session: Option<String>,
     },
 
+    /// Read-only review of a session's output (or a branch): prints a bundle
+    /// and records a Review artifact. Never edits anything.
+    Review {
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+        /// Review a branch's changes instead of a session.
+        #[arg(long)]
+        branch: Option<String>,
+    },
+
     /// List session logs.
     Logs,
 
