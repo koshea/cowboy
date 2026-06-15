@@ -3,6 +3,7 @@
 
 pub mod artifact;
 pub mod config;
+pub mod crew;
 pub mod daemonproto;
 pub mod decision;
 pub mod error;
