@@ -191,6 +191,18 @@ pub struct CompletionState {
     pub selected: usize,
 }
 
+/// The shell command currently running, for the live status indicator.
+#[derive(Debug, Clone)]
+pub struct RunningCmd {
+    pub cmd: String,
+    /// Wall-clock start (ms since epoch), set by the event loop.
+    pub started_ms: u64,
+    /// Seconds elapsed, refreshed by the event loop each tick.
+    pub elapsed_secs: u64,
+    /// Most recent output line (the live tail).
+    pub last: String,
+}
+
 pub struct App {
     pub title: String,
     pub status: String,
@@ -216,6 +228,11 @@ pub struct App {
     pub plan: Vec<(String, String)>,
     /// Set while the session has declared itself blocked (shown in the status bar).
     pub blocked: Option<String>,
+    /// The shell command currently executing, for the live "running" indicator.
+    pub running: Option<RunningCmd>,
+    /// True when the last transcript line is a transient (carriage-return)
+    /// progress update, so the next output chunk overwrites it in place.
+    pub last_output_transient: bool,
     /// Input editor (multi-line, cursor) via ratatui-textarea.
     pub textarea: TextArea<'static>,
     pub mode: Mode,
@@ -310,6 +327,8 @@ impl App {
             processes: Vec::new(),
             plan: Vec::new(),
             blocked: None,
+            running: None,
+            last_output_transient: false,
             textarea: TextArea::default(),
             mode: Mode::Running,
             throbber: ThrobberState::default(),
@@ -533,10 +552,61 @@ impl App {
     }
 
     pub fn push(&mut self, kind: LineKind, text: impl Into<String>) {
+        // Any non-output line ends a transient progress run (the next output
+        // chunk must append, not overwrite this line).
+        if kind != LineKind::Output {
+            self.last_output_transient = false;
+        }
         self.transcript.push(TranscriptLine {
             kind,
             text: text.into(),
         });
+    }
+
+    /// Mark the start of a streamed shell command (for the live indicator).
+    pub fn start_command(&mut self, cmd: impl Into<String>, now_ms: u64) {
+        self.last_output_transient = false;
+        self.running = Some(RunningCmd {
+            cmd: cmd.into(),
+            started_ms: now_ms,
+            elapsed_secs: 0,
+            last: String::new(),
+        });
+    }
+
+    /// Refresh the running command's elapsed time (called each event-loop tick).
+    pub fn tick_command(&mut self, now_ms: u64) {
+        if let Some(r) = &mut self.running {
+            r.elapsed_secs = now_ms.saturating_sub(r.started_ms) / 1000;
+        }
+    }
+
+    /// Clear the running-command indicator (command finished).
+    pub fn end_command(&mut self) {
+        self.running = None;
+        self.last_output_transient = false;
+    }
+
+    /// Append (or, for a transient carriage-return update, overwrite-in-place) a
+    /// line of streamed command output, and update the live tail.
+    pub fn command_output_line(&mut self, text: impl Into<String>, committed: bool) {
+        let text = text.into();
+        let replace = self.last_output_transient
+            && self
+                .transcript
+                .last()
+                .is_some_and(|l| l.kind == LineKind::Output);
+        if replace {
+            if let Some(last) = self.transcript.last_mut() {
+                last.text = text.clone();
+            }
+        } else {
+            self.push(LineKind::Output, text.clone());
+        }
+        self.last_output_transient = !committed;
+        if let Some(r) = &mut self.running {
+            r.last = text;
+        }
     }
 
     /// Append a network activity line.
@@ -1272,7 +1342,16 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             .split(cols[1]);
         (s[0], Some(s[1]))
     };
-    let text = format!(" {mode} — {}", app.status);
+    // While a shell command runs, the left segment becomes a live tail:
+    // elapsed time + the latest output line (the spinner is in cols[0]).
+    let text = match &app.running {
+        Some(r) => {
+            let tail = r.last.trim();
+            let body = if tail.is_empty() { &r.cmd } else { tail };
+            format!(" exec {}s › {body}", r.elapsed_secs)
+        }
+        None => format!(" {mode} — {}", app.status),
+    };
     f.render_widget(Paragraph::new(text).style(bar), left);
     if let Some(right) = right {
         f.render_widget(Paragraph::new(format!("{right_text} ")).style(bar), right);
@@ -1795,6 +1874,29 @@ mod tests {
         assert!(text.contains("transcript line 2"), "got {text:?}");
         assert!(text.contains("transcript line 5"), "got {text:?}");
         assert_eq!(text.lines().count(), 4, "four wrapped lines: {text:?}");
+    }
+
+    #[test]
+    fn transient_command_output_overwrites_in_place() {
+        let mut app = App::new("t");
+        app.start_command("build", 1000);
+        app.command_output_line("compiling", true); // committed line
+        app.command_output_line("[ 10%]", false); // transient progress
+        app.command_output_line("[ 50%]", false); // overwrites the progress line
+        app.command_output_line("[100%]", true); // overwrites, then commits
+        app.command_output_line("done", true); // new committed line
+        let out: Vec<&str> = app
+            .transcript
+            .iter()
+            .filter(|l| l.kind == LineKind::Output)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(out, vec!["compiling", "[100%]", "done"]);
+        assert_eq!(app.running.as_ref().unwrap().last, "done");
+        app.tick_command(4000);
+        assert_eq!(app.running.as_ref().unwrap().elapsed_secs, 3);
+        app.end_command();
+        assert!(app.running.is_none());
     }
 
     #[test]

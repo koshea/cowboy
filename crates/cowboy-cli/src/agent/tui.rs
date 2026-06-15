@@ -391,16 +391,20 @@ fn event_loop(
                 UiEvent::CommandStart(c) => {
                     app.commit_stream();
                     app.push(LineKind::Command, c.clone());
-                    app.status = format!("exec: {c}");
+                    app.start_command(c, now_ms());
                 }
                 UiEvent::CommandOutput(chunk) => {
-                    // Streamed live, one line at a time.
-                    app.push(LineKind::Output, chunk.trim_end_matches('\n'));
+                    // A committed line carries a trailing newline; a transient
+                    // (carriage-return progress) update doesn't — it overwrites
+                    // the previous line in place.
+                    let committed = chunk.ends_with('\n');
+                    app.command_output_line(chunk.trim_end_matches('\n'), committed);
                 }
                 UiEvent::CommandEnd(code, _out) => {
                     if code != 0 {
                         app.push(LineKind::Error, format!("[exit {code}]"));
                     }
+                    app.end_command();
                     app.status = "running".into();
                 }
                 UiEvent::ToolUse(s) => {
@@ -479,6 +483,7 @@ fn event_loop(
         }
 
         app.tick();
+        app.tick_command(now_ms());
         terminal.draw(|f| draw(f, &app))?;
 
         // Flush any queued clipboard copy. Prefer the direct OS clipboard
@@ -662,6 +667,14 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
         MouseEventKind::ScrollDown => app.scroll_down(3),
         _ => {}
     }
+}
+
+/// Milliseconds since the Unix epoch (for the running-command elapsed timer).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Mutable context handed to the key handler.

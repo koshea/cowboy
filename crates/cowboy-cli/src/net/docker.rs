@@ -527,7 +527,7 @@ impl DockerCli for CliDocker {
         cancel: tokio_util::sync::CancellationToken,
         chunks: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<(ExecResult, String)> {
-        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::io::AsyncReadExt;
 
         // Run the command in its own process group, recording the leader pid so
         // we can signal the whole group on cancel/timeout. The command is passed
@@ -537,6 +537,9 @@ impl DockerCli for CliDocker {
             format!("setsid sh -c 'echo $$ > {pidfile}; exec sh -c \"$COWBOY_CMD\"' 2>&1");
         let mut cmd = Command::new("docker");
         cmd.arg("exec");
+        // `-t` allocates a PTY so the command sees a terminal and flushes output
+        // line-by-line; a plain pipe block-buffers, hiding output until exit.
+        cmd.arg("-t");
         push_exec_flags(&mut cmd, workdir, user);
         cmd.args([
             "-e",
@@ -547,13 +550,21 @@ impl DockerCli for CliDocker {
             &wrapper,
         ]);
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null()); // merged into stdout by the wrapper
+        cmd.stderr(Stdio::null()); // merged into stdout by the PTY
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().context("spawning streaming docker exec")?;
-        let stdout = child.stdout.take().context("exec stdout")?;
-        let mut reader = BufReader::new(stdout).lines();
+        let mut stdout = child.stdout.take().context("exec stdout")?;
         let mut output = String::new();
+        // Split the PTY byte stream ourselves: `\n` (and `\r\n`) commits a line;
+        // a bare `\r` is a progress overwrite (transient). `line_start` marks
+        // where the current line begins in `output` so transient updates replace
+        // it in place. (UTF-8 multibyte never contains 0x0A/0x0D, so splitting on
+        // those bytes is safe.)
+        let mut line: Vec<u8> = Vec::new();
+        let mut line_start = 0usize;
+        let mut pending_cr = false;
+        let mut rbuf = [0u8; 8192];
 
         let timeout = if timeout_secs == 0 {
             std::time::Duration::from_secs(86_400)
@@ -566,18 +577,36 @@ impl DockerCli for CliDocker {
         let mut interrupted: Option<&str> = None;
         loop {
             tokio::select! {
-                line = reader.next_line() => match line {
-                    Ok(Some(l)) => {
-                        let l = format!("{l}\n");
-                        output.push_str(&l);
-                        let _ = chunks.send(l);
+                read = stdout.read(&mut rbuf) => match read {
+                    Ok(0) | Err(_) => break, // EOF or read error
+                    Ok(n) => {
+                        for &b in &rbuf[..n] {
+                            if pending_cr {
+                                pending_cr = false;
+                                if b == b'\n' {
+                                    commit_line(&mut output, &mut line_start, &mut line, &chunks);
+                                    continue;
+                                }
+                                // bare `\r`: overwrite the line so far, then this
+                                // byte starts fresh content on the same line.
+                                transient_line(&mut output, line_start, &mut line, &chunks);
+                            }
+                            match b {
+                                b'\n' => {
+                                    commit_line(&mut output, &mut line_start, &mut line, &chunks)
+                                }
+                                b'\r' => pending_cr = true,
+                                _ => line.push(b),
+                            }
+                        }
                     }
-                    _ => break, // EOF or read error
                 },
                 _ = cancel.cancelled() => { interrupted = Some("cancelled"); break; }
                 _ = &mut deadline => { interrupted = Some("timed out"); break; }
             }
         }
+        // Flush any trailing partial line (no final newline) as transient.
+        transient_line(&mut output, line_start, &mut line, &chunks);
 
         if let Some(why) = interrupted {
             // Kill the in-container process group, then the local client.
@@ -633,6 +662,43 @@ fn push_exec_flags(cmd: &mut Command, workdir: &str, user: &str) {
     if !user.is_empty() {
         cmd.args(["--user", user]);
     }
+}
+
+/// Commit the current line (`\n` reached): record it in `output` with a
+/// newline and send it as a *committed* chunk (trailing newline — the UI
+/// appends it). `line_start` advances past it.
+fn commit_line(
+    output: &mut String,
+    line_start: &mut usize,
+    buf: &mut Vec<u8>,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let text = String::from_utf8_lossy(buf);
+    output.truncate(*line_start);
+    output.push_str(&text);
+    output.push('\n');
+    let _ = tx.send(format!("{text}\n"));
+    *line_start = output.len();
+    buf.clear();
+}
+
+/// Flush the current line as *transient* (a bare `\r` overwrite, e.g. a progress
+/// bar): replace it in `output` (no newline) and send it without a trailing
+/// newline so the UI overwrites the last line in place instead of appending.
+fn transient_line(
+    output: &mut String,
+    line_start: usize,
+    buf: &mut Vec<u8>,
+    tx: &tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    if buf.is_empty() {
+        return;
+    }
+    let text = String::from_utf8_lossy(buf);
+    output.truncate(line_start);
+    output.push_str(&text);
+    let _ = tx.send(text.into_owned());
+    buf.clear();
 }
 
 #[cfg(test)]
