@@ -44,6 +44,10 @@ pub struct FinalArgs {
 pub struct AskUserArgs {
     /// A question for the user when the agent is genuinely blocked.
     pub question: String,
+    /// Optional suggested answers to present as a pick-list. The user may still
+    /// type a free-form answer ("other").
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
 }
 
 /// Arguments for the `subagent` tool.
@@ -320,7 +324,9 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: TOOL_ASK_USER.into(),
             description: "Ask the user a question when you are genuinely blocked and cannot \
-                          proceed without their input."
+                          proceed without their input. Provide `options` (2–4 short choices) when \
+                          the answer is a clear pick — the user gets a selectable list and can \
+                          still type their own answer."
                 .into(),
             parameters: schema_for::<AskUserArgs>(),
         },

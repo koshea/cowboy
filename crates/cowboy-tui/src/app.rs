@@ -43,6 +43,8 @@ pub enum Mode {
     /// Agent finished its turn; ready for the next user message.
     Idle,
     AwaitingInput(String),
+    /// Answering a multiple-choice question (state in `App::choice`).
+    AwaitingChoice,
     Approval(String),
     Paused,
     /// Choosing a model from the provider catalogue (state in `App::model_picker`).
@@ -160,6 +162,15 @@ impl ModelForm {
     }
 }
 
+/// A pending multiple-choice question (the `ask_user` pick-list).
+#[derive(Debug, Clone, Default)]
+pub struct Choice {
+    pub question: String,
+    pub options: Vec<String>,
+    /// Highlighted option index.
+    pub selected: usize,
+}
+
 /// Full renderable TUI state.
 pub struct App {
     pub title: String,
@@ -206,6 +217,8 @@ pub struct App {
     pub model_picker: Option<ModelPicker>,
     /// New-model config form state (set while `mode == ModelForm`).
     pub model_form: Option<ModelForm>,
+    /// Pending multiple-choice question (set while `mode == AwaitingChoice`).
+    pub choice: Option<Choice>,
 }
 
 /// A mouse text selection, in absolute terminal coordinates (col, row).
@@ -268,6 +281,7 @@ impl App {
             transcript_area: std::cell::Cell::new(Rect::ZERO),
             model_picker: None,
             model_form: None,
+            choice: None,
         }
     }
 
@@ -445,6 +459,58 @@ impl App {
         self.textarea = TextArea::default();
         text
     }
+
+    /// True when the input editor has no (non-whitespace) text.
+    pub fn input_is_empty(&self) -> bool {
+        self.input_text().trim().is_empty()
+    }
+
+    // --- multiple-choice question (ask_user pick-list) ---
+
+    /// Enter choice mode for a question + its options.
+    pub fn begin_choice(&mut self, question: String, options: Vec<String>) {
+        self.textarea = TextArea::default();
+        self.choice = Some(Choice {
+            question,
+            options,
+            selected: 0,
+        });
+        self.mode = Mode::AwaitingChoice;
+    }
+
+    /// Move the highlighted option by `delta` (wrapping).
+    pub fn choice_move(&mut self, delta: isize) {
+        if let Some(c) = &mut self.choice {
+            let n = c.options.len();
+            if n == 0 {
+                return;
+            }
+            c.selected = ((c.selected as isize + delta).rem_euclid(n as isize)) as usize;
+        }
+    }
+
+    /// The option at `idx`, if any (for digit shortcuts).
+    pub fn choice_option(&self, idx: usize) -> Option<String> {
+        self.choice
+            .as_ref()
+            .and_then(|c| c.options.get(idx).cloned())
+    }
+
+    /// The answer to submit: a typed custom answer if present, else the
+    /// highlighted option. Clears choice + input state.
+    pub fn choice_answer(&mut self) -> String {
+        let typed = self.take_input();
+        let answer = if !typed.trim().is_empty() {
+            typed.trim().to_string()
+        } else {
+            self.choice
+                .as_ref()
+                .and_then(|c| c.options.get(c.selected).cloned())
+                .unwrap_or_default()
+        };
+        self.choice = None;
+        answer
+    }
 }
 
 fn style_for(kind: LineKind) -> (&'static str, Style) {
@@ -535,6 +601,11 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     match &app.mode {
         Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, "type your answer · Enter"),
+        Mode::AwaitingChoice => {
+            if let Some(c) = &app.choice {
+                draw_choice(f, area, c, &app.input_text());
+            }
+        }
         Mode::Approval(p) => draw_modal(
             f,
             area,
@@ -959,6 +1030,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Running => "running",
         Mode::Idle => "ready",
         Mode::AwaitingInput(_) => "awaiting input",
+        Mode::AwaitingChoice => "awaiting choice",
         Mode::Approval(_) => "approval",
         Mode::Paused => "paused",
         Mode::ModelPicker => "models",
@@ -1059,6 +1131,65 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(&app.textarea, inner);
 }
 
+/// A multiple-choice question: the prompt, a selectable option list, and a
+/// free-text "other" line reflecting what's been typed.
+fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
+    let w = area.width.saturating_sub(8).min(70);
+    let h = (c.options.len() as u16 + 6).min(area.height).max(7);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            " Question ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().fg(Color::Magenta));
+
+    let typing = !typed.trim().is_empty();
+    let mut lines = vec![Line::from(c.question.clone()), Line::from("")];
+    for (i, opt) in c.options.iter().enumerate() {
+        let selected = !typing && i == c.selected;
+        let marker = if selected { "▸" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(Span::styled(
+            format!("{marker} {}. {opt}", i + 1),
+            style,
+        )));
+    }
+    let other = if typing {
+        Line::from(vec![
+            Span::styled("▸ other: ", Style::default().fg(Color::White)),
+            Span::styled(typed.to_string(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(Span::styled(
+            "  (or type a custom answer)",
+            Style::default().add_modifier(Modifier::DIM),
+        ))
+    };
+    lines.push(other);
+    lines.push(Line::from(Span::styled(
+        "↑↓ select · 1-9 pick · Enter choose · type for other",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, rect);
+}
+
 fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) {
     let w = area.width.saturating_sub(8).min(70);
     let h = 7u16.min(area.height);
@@ -1107,6 +1238,45 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn choice_selection_and_custom_answer() {
+        let mut app = App::new("cowboy");
+        app.begin_choice(
+            "Which DB?".into(),
+            vec!["postgres".into(), "sqlite".into(), "mysql".into()],
+        );
+        assert_eq!(app.mode, Mode::AwaitingChoice);
+        // Move selection: down twice, up once -> index 1.
+        app.choice_move(1);
+        app.choice_move(1);
+        app.choice_move(-1);
+        assert_eq!(app.choice.as_ref().unwrap().selected, 1);
+        // With no typed text, the answer is the highlighted option.
+        assert_eq!(app.choice_answer(), "sqlite");
+        assert!(app.choice.is_none());
+
+        // A typed custom answer wins over the selection.
+        app.begin_choice("Which DB?".into(), vec!["postgres".into()]);
+        app.textarea.insert_str("duckdb");
+        assert_eq!(app.choice_answer(), "duckdb");
+
+        // Digit shortcut maps 1-based to the option.
+        app.begin_choice("x".into(), vec!["a".into(), "b".into()]);
+        assert_eq!(app.choice_option(1).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn snapshot_choice_modal() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::Agent, "I need a decision.");
+        app.begin_choice(
+            "Which database should we use?".into(),
+            vec!["PostgreSQL".into(), "SQLite".into(), "MySQL".into()],
+        );
+        app.choice_move(1); // highlight SQLite
+        insta::assert_snapshot!(render(&app));
     }
 
     #[test]

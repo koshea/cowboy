@@ -34,8 +34,9 @@ pub trait AgentUi {
     fn blocked(&mut self, _reason: Option<&str>) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
-    /// Ask the user a question; return their answer.
-    fn ask_user(&mut self, question: &str) -> String;
+    /// Ask the user a question and return their answer. `options` (possibly
+    /// empty) are suggested choices; the user may still answer freely.
+    fn ask_user(&mut self, question: &str, options: &[String]) -> String;
     /// A general notice (errors, status).
     fn notice(&mut self, msg: &str);
 }
@@ -165,18 +166,32 @@ impl AgentUi for ConsoleUi {
         }
     }
 
-    fn ask_user(&mut self, question: &str) -> String {
+    fn ask_user(&mut self, question: &str, options: &[String]) -> String {
         // A subagent is non-interactive; don't block on input.
         if self.final_only {
             return String::new();
         }
         use std::io::BufRead;
         println!("\x1b[1;35m? {question}\x1b[0m");
-        print!("> ");
+        for (i, opt) in options.iter().enumerate() {
+            println!("  \x1b[36m{}\x1b[0m {opt}", i + 1);
+        }
+        if options.is_empty() {
+            print!("> ");
+        } else {
+            print!("pick 1-{} or type an answer > ", options.len());
+        }
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         let _ = std::io::stdin().lock().read_line(&mut line);
-        line.trim().to_string()
+        let answer = line.trim().to_string();
+        // A bare number selects the matching option.
+        if let Ok(n) = answer.parse::<usize>() {
+            if n >= 1 && n <= options.len() {
+                return options[n - 1].clone();
+            }
+        }
+        answer
     }
 
     fn notice(&mut self, msg: &str) {

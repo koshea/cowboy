@@ -272,7 +272,7 @@ impl AgentUi for SocketUi {
     fn notice(&mut self, msg: &str) {
         self.emit(UiEventMsg::Notice(msg.to_string()));
     }
-    fn ask_user(&mut self, question: &str) -> String {
+    fn ask_user(&mut self, question: &str, options: &[String]) -> String {
         // No attached client can answer -> empty (matches the non-interactive
         // / subagent contract).
         if self.attached() == 0 {
@@ -284,6 +284,7 @@ impl AgentUi for SocketUi {
         let _ = self.inner.live.send(ServerMsg::Ask {
             id,
             question: question.to_string(),
+            options: options.to_vec(),
         });
         // The agent loop blocks here for the answer; the reply arrives on a
         // socket-server task (separate runtime thread), so this does not
@@ -722,7 +723,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(ui.ask_user("proceed?"), "");
+        assert_eq!(ui.ask_user("proceed?", &[]), "");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -737,10 +738,10 @@ mod tests {
 
         // ask_user blocks, so run it on a blocking thread.
         let mut ask_ui = ui.clone();
-        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("continue?"));
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("continue?", &[]));
 
         let id = match read_msg(&mut reader).await {
-            ServerMsg::Ask { id, question } => {
+            ServerMsg::Ask { id, question, .. } => {
                 assert_eq!(question, "continue?");
                 id
             }

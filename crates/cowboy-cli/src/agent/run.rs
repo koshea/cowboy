@@ -60,7 +60,9 @@ network). If a command cannot access something, observe the failure and continue
 For a multi-step task, use the `plan` tool to keep a short, visible checklist: \
 lay out the steps up front, keep exactly one step \"in_progress\" at a time, and \
 mark steps \"done\" as you complete them (re-send the whole list to update it). \
-Skip it for trivial one-step work.
+Before you finish, send the plan one last time with EVERY step marked \"done\" \
+(or dropped if abandoned) — never leave a step \"in_progress\"/\"pending\" when \
+you call `final`. Skip the plan tool entirely for trivial one-step work.
 
 Before large edits, inspect the repository and form a brief plan. After edits, run \
 relevant checks. Publish durable outputs others may need with `artifact` (e.g. an \
@@ -765,7 +767,9 @@ impl<'a> AgentLoop<'a> {
                             continue;
                         }
                     };
-                    let answer = self.ui.ask_user(&args.question);
+                    let answer = self
+                        .ui
+                        .ask_user(&args.question, &args.options.clone().unwrap_or_default());
                     let tool_msg = Message::tool_result(&call.id, answer);
                     if let Some(l) = &mut self.logger {
                         l.log_message(&tool_msg);
@@ -977,12 +981,7 @@ impl<'a> AgentLoop<'a> {
         self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRequested {
             question: args.question.clone(),
         });
-        let prompt = if options.is_empty() {
-            args.question.clone()
-        } else {
-            format!("{}\nOptions: {}", args.question, options.join(" | "))
-        };
-        let answer = self.ui.ask_user(&prompt);
+        let answer = self.ui.ask_user(&args.question, &options);
 
         let Some(logger) = &self.logger else {
             return format!("decision (unrecorded — no session log): {answer}");
@@ -1358,7 +1357,7 @@ mod tests {
         fn final_message(&mut self, message: &str) {
             self.finals.push(message.to_string());
         }
-        fn ask_user(&mut self, _question: &str) -> String {
+        fn ask_user(&mut self, _question: &str, _options: &[String]) -> String {
             "yes".to_string()
         }
         fn notice(&mut self, msg: &str) {

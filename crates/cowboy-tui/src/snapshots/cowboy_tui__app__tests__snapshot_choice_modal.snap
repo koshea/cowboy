@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│I need a decision.                             ││no network activity  │
+│                                               ││yet                  │
+│                                               ││                     │
+│   ╭ Question ────────────────────────────────────────────────────╮   │
+│   │Which database should we use?                                 │   │
+│   │                                                              │   │
+│   │  1. PostgreSQL                                               │───╯
+│   │▸ 2. SQLite                                                   │───╮
+│   │  3. MySQL                                                    │es │
+│   │  (or type a custom answer)                                   │   │
+│   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
+│   ╰──────────────────────────────────────────────────────────────╯   │
+╰───────────────────────────────────────────────╯╰─────────────────────╯
+   awaiting choice — ready
+╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯
