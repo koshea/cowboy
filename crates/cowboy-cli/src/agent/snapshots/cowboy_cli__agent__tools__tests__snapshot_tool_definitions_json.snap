@@ -363,6 +363,44 @@ expression: defs
     }
   },
   {
+    "description": "Ask the user to make a decision and record it durably (question, options, chosen answer, rationale) so the rationale survives and downstream work can depend on it. Use for choices that shape the work (data model, protocol, API shape), not routine questions.",
+    "name": "decision",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `decision` tool — ask the user to decide and record it.",
+      "properties": {
+        "options": {
+          "default": null,
+          "description": "Optional choices to present.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "question": {
+          "description": "The decision to make (asked to the user).",
+          "type": "string"
+        },
+        "rationale": {
+          "default": null,
+          "description": "Optional rationale/context to record alongside the decision.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "title": "DecisionArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Declare that you cannot proceed and need an external input (a decision, a dependency's artifact, access). Give a clear `reason` and optionally `waiting_on`. Use `unblock` once you can continue. This surfaces the session as blocked to the user / Ranch coordinator.",
     "name": "blocked",
     "parameters": {

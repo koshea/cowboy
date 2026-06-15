@@ -156,6 +156,9 @@ pub enum Command {
         session: Option<String>,
     },
 
+    /// List or show decisions recorded in a session.
+    Decisions(DecisionsCmdArgs),
+
     /// List session logs.
     Logs,
 
@@ -378,6 +381,27 @@ pub enum ArtifactCommand {
         /// One-line summary.
         #[arg(long)]
         summary: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct DecisionsCmdArgs {
+    #[command(subcommand)]
+    pub command: DecisionsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum DecisionsCommand {
+    /// List recorded decisions (defaults to the most recent session).
+    List {
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Show one decision by id.
+    Show {
+        id: String,
         #[arg(long)]
         session: Option<String>,
     },

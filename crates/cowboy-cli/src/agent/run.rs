@@ -8,8 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, ArtifactArgs, AskUserArgs, BlockedArgs, EditArgs, FinalArgs, HandoffArgs, MemoryArgs,
-    PlanArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+    self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
+    MemoryArgs, PlanArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -733,6 +733,21 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_DECISION => {
+                    let args: DecisionArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    let observation = self.run_decision(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_UNBLOCK => {
                     self.ui.blocked(None);
                     self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::Unblocked);
@@ -953,6 +968,57 @@ impl<'a> AgentLoop<'a> {
             }
             Err(e) => format!("handoff written to handoff.md, but indexing failed: {e}"),
         }
+    }
+
+    /// Host-side `decision` tool: ask the user, then record the decision durably
+    /// (decisions.jsonl + a DecisionRecord artifact) with lifecycle events.
+    fn run_decision(&mut self, args: &DecisionArgs) -> String {
+        let options = args.options.clone().unwrap_or_default();
+        self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRequested {
+            question: args.question.clone(),
+        });
+        let prompt = if options.is_empty() {
+            args.question.clone()
+        } else {
+            format!("{}\nOptions: {}", args.question, options.join(" | "))
+        };
+        let answer = self.ui.ask_user(&prompt);
+
+        let Some(logger) = &self.logger else {
+            return format!("decision (unrecorded — no session log): {answer}");
+        };
+        let dir = logger.dir();
+        let selected = (!answer.trim().is_empty()).then(|| answer.clone());
+        let d = cowboy_core::decision::record_in(
+            dir,
+            logger.id(),
+            &args.question,
+            options.clone(),
+            selected,
+            args.rationale.clone(),
+            now_ms(),
+        );
+        // Also surface it as a DecisionRecord artifact.
+        let body = format!(
+            "# Decision\n\n## Question\n{}\n\n## Options\n{}\n\n## Selected\n{}\n\n## Rationale\n{}\n",
+            args.question,
+            if options.is_empty() { "(free-form)".into() } else { options.join(", ") },
+            if answer.trim().is_empty() { "(no answer)" } else { answer.trim() },
+            args.rationale.as_deref().unwrap_or("(none)"),
+        );
+        let _ = cowboy_core::artifact::add_in(
+            dir,
+            logger.id(),
+            cowboy_core::artifact::ArtifactKind::DecisionRecord,
+            &format!("Decision {}", d.id),
+            &body,
+            None,
+            now_ms(),
+        );
+        self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRecorded {
+            decision_id: d.id.clone(),
+        });
+        format!("decision {} recorded: {}", d.id, answer)
     }
 
     /// Record a tool error as an observation so the model can self-correct.
@@ -1552,6 +1618,61 @@ mod tests {
         assert_eq!(arts[0].kind, cowboy_core::artifact::ArtifactKind::Contract);
         let (_, body) = cowboy_core::artifact::get_in(&session_dir, &arts[0].id).unwrap();
         assert!(body.contains("GET /things"));
+    }
+
+    #[tokio::test]
+    async fn decision_tool_records_the_answer() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "decision",
+                    r#"{"question":"UUIDs or sequential?","options":["uuid","sequential"]}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let runtime = runtime_with(docker);
+        let root = runtime.root().to_path_buf();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let session_dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default(); // ask_user returns "yes"
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+
+        let decisions = cowboy_core::decision::list_in(&session_dir);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].question, "UUIDs or sequential?");
+        assert_eq!(decisions[0].selected.as_deref(), Some("yes"));
+        // Recorded as a DecisionRecord artifact + lifecycle event.
+        assert!(cowboy_core::artifact::list_in(&session_dir)
+            .iter()
+            .any(|a| a.kind == cowboy_core::artifact::ArtifactKind::DecisionRecord));
+        assert!(cowboy_core::lifecycle::read_in(&session_dir)
+            .iter()
+            .any(|r| matches!(
+                r.event,
+                cowboy_core::lifecycle::LifecycleEvent::DecisionRecorded { .. }
+            )));
     }
 
     #[tokio::test]

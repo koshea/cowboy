@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod attach;
 pub mod daemon;
+pub mod decisions;
 pub mod doctor;
 pub mod down;
 pub mod fileop;

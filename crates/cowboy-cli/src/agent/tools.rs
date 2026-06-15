@@ -20,6 +20,7 @@ pub const TOOL_ARTIFACT: &str = "artifact";
 pub const TOOL_HANDOFF: &str = "handoff";
 pub const TOOL_BLOCKED: &str = "blocked";
 pub const TOOL_UNBLOCK: &str = "unblock";
+pub const TOOL_DECISION: &str = "decision";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -159,6 +160,19 @@ pub struct HandoffArgs {
     pub next_steps: Option<String>,
 }
 
+/// Arguments for the `decision` tool — ask the user to decide and record it.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct DecisionArgs {
+    /// The decision to make (asked to the user).
+    pub question: String,
+    /// Optional choices to present.
+    #[serde(default)]
+    pub options: Option<Vec<String>>,
+    /// Optional rationale/context to record alongside the decision.
+    #[serde(default)]
+    pub rationale: Option<String>,
+}
+
 /// Arguments for the `blocked` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct BlockedArgs {
@@ -273,6 +287,15 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<HandoffArgs>(),
         },
         ToolDef {
+            name: TOOL_DECISION.into(),
+            description: "Ask the user to make a decision and record it durably (question, \
+                          options, chosen answer, rationale) so the rationale survives and \
+                          downstream work can depend on it. Use for choices that shape the work \
+                          (data model, protocol, API shape), not routine questions."
+                .into(),
+            parameters: schema_for::<DecisionArgs>(),
+        },
+        ToolDef {
             name: TOOL_BLOCKED.into(),
             description: "Declare that you cannot proceed and need an external input \
                           (a decision, a dependency's artifact, access). Give a clear `reason` \
@@ -323,7 +346,7 @@ mod tests {
             names,
             vec![
                 "shell", "read", "edit", "write", "memory", "plan", "artifact", "handoff",
-                "blocked", "unblock", "final", "ask_user", "subagent"
+                "decision", "blocked", "unblock", "final", "ask_user", "subagent"
             ]
         );
     }
