@@ -443,6 +443,91 @@ fn e2e_daemon_restart_readopts_worker() {
     std::thread::sleep(Duration::from_millis(500));
 }
 
+/// Foundations against a real model: a single turn must drive the coordination
+/// tools (artifact, blocked/unblock, handoff) and leave the right on-disk
+/// effects — the regression check for prompt/model compatibility. Asserts the
+/// file effects (robust to wording), not the transcript. Needs a model provider
+/// but not Docker (these tools run host-side; the task does no shell/network).
+#[test]
+#[ignore = "real model: needs a provider in ~/.config/cowboy"]
+fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    let task = "Do exactly these steps using your tools, with NO shell commands: \
+        (1) artifact tool: publish kind=contract, title=\"API Contract\", \
+        content=\"# API\\nGET /things\"; \
+        (2) blocked tool with reason \"need a design review\", then the unblock tool; \
+        (3) handoff tool: goal=\"demo\", status=\"complete\", next_steps=\"wire the API\"; \
+        (4) final with a one-line summary.";
+    let (id, ws) = match start(&sock, proj.path(), Some(task)) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    // Drive the turn to completion.
+    let mut a = Client::connect(&ws);
+    a.hello(None);
+    loop {
+        match a.recv() {
+            Some(ServerMsg::Event {
+                event: UiEventMsg::TurnDone,
+                ..
+            }) => break,
+            Some(ServerMsg::Ended { .. }) | None => break,
+            Some(_) => {}
+        }
+    }
+
+    let sd = proj.path().join(".cowboy/sessions").join(&id);
+    let lifecycle = std::fs::read_to_string(sd.join("lifecycle.jsonl")).unwrap_or_default();
+    let artifacts = std::fs::read_to_string(sd.join("artifacts.jsonl")).unwrap_or_default();
+    let handoff = std::fs::read_to_string(sd.join("handoff.md")).unwrap_or_default();
+
+    // End the session so finalize runs (emits session_completed), then re-read.
+    a.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(800));
+    let lifecycle_final = std::fs::read_to_string(sd.join("lifecycle.jsonl")).unwrap_or_default();
+
+    let _ = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .arg("down")
+        .output();
+
+    // Each coordination tool left its mark.
+    for needle in [
+        "artifact_published",
+        "\"blocked\"",
+        "unblocked",
+        "handoff_created",
+    ] {
+        assert!(
+            lifecycle.contains(needle),
+            "lifecycle.jsonl should record {needle}; got:\n{lifecycle}"
+        );
+    }
+    assert!(
+        artifacts.contains("\"contract\"") && artifacts.contains("\"handoff\""),
+        "a contract + handoff artifact should be indexed; got:\n{artifacts}"
+    );
+    assert!(
+        handoff.to_lowercase().contains("demo"),
+        "handoff.md should capture the goal; got:\n{handoff}"
+    );
+    assert!(
+        lifecycle_final.contains("session_completed"),
+        "ending the session should emit session_completed"
+    );
+}
+
 /// The flagship real-Docker turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.
