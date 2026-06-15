@@ -1,13 +1,25 @@
 # The crew (model routing)
 
 Cowboy can route delegated work to **different models by the kind of work**. The
-main session model is the **foreman**: it plans, delegates, reviews, and
-integrates. When it delegates a sub-task, it describes the work by *category* and
-*effort*; Cowboy resolves that to a model from your **crew roster**.
+**foreman** is simply the model you select with `/model` (or `cowboy models use`):
+it plans, delegates, reviews, and integrates. When it delegates a sub-task, it
+describes the work by *category* and *effort*; Cowboy resolves that to a model
+from your **crew roster**.
 
-> The planner requests a *kind* of worker — never a model. Model assignment is
+> The foreman requests a *kind* of worker — never a model. Model assignment is
 > your routing policy. Quotas, rate limits, and spend belong to the
 > [LLM gateway](../security/network.md), not to Cowboy.
+
+## Solo or crew
+
+Crew is opt-in. The `/model` picker has a **Solo / Crew** toggle (Tab):
+
+- **Solo** — the selected model does everything itself; no delegation.
+- **Crew** — the selected model is the foreman and delegates per your roster.
+
+There's no separate "planner" setting: the foreman is always whatever `/model`
+points at, so the picker can never disagree with what's actually running.
+Switching the foreman is just selecting a different model.
 
 ## The roster — `~/.config/cowboy/crew.yaml`
 
@@ -16,26 +28,30 @@ is an **effort ramp**: a model is assigned a *floor* effort and handles that lev
 and everything above it, until a higher floor takes over. So a category can be one
 model for all efforts, a couple of breakpoints, or all five spelled out.
 
+There is no `planner:` field — the foreman is the selected `/model`. A roster
+slot can name the special value `<default>` to mean "use the foreman," so you can
+pin some efforts to specific models and inherit the foreman for the rest.
+Swapping `/model` then re-points every `<default>` slot automatically.
+
 ```yaml
 version: 1
-planner:
-  model: opus            # the foreman / main session model
 crew:
   docs: cheap            # one model for every effort
   tests:
     tiny: cheap          # tiny..medium → cheap
     large: opus          # large, deep  → opus
-  backend:
-    small: sonnet        # ≤ medium → sonnet (tiny falls to the lowest floor)
-    large: opus          # large, deep → opus
+  review:
+    small: cheap         # ≤ medium → cheap
+    large: <default>     # large, deep → the foreman (whatever /model selects)
   general: sonnet        # required: the cross-category fallback
 temperature:             # optional: override temperature per task type
   tests: 0.0             #   cooler for precise work…
   exploration: 0.6       #   …warmer for ideation (falls back to general's, else
                          #   the model's own default)
 delegation:
+  enabled: true          # crew mode on (toggle Solo/Crew from the /model picker)
   max_parallel: 4        # local fan-out hint (not a quota)
-  max_depth: 1           # planner delegates; workers don't, by default
+  max_depth: 1           # foreman delegates; workers don't, by default
   allow_recursive_delegation: false
 ```
 
@@ -56,9 +72,10 @@ request:
 1. the category's ramp picks the **highest floor ≤ effort** (or, below all
    floors, the **lowest** floor);
 2. unknown category → the `general` ramp;
-3. no match → the planner model.
+3. no match → the foreman.
 
-So routing is total — every request gets a model, worst case the planner's.
+A `<default>` slot at any step resolves to the foreman. So routing is total —
+every request gets a model, worst case the foreman.
 
 ## Managing it
 

@@ -1,9 +1,10 @@
 //! Crew Roster: route delegated work to model profiles by *category* + *effort*.
 //!
-//! The planner (foreman) delegates work by **kind** — a category (the sort of
-//! work) and an effort level (how hard) — and Cowboy resolves that to a model
-//! from the user's roster. The planner never names a model directly; routing is
-//! user-owned policy.
+//! The foreman — the currently selected `/model` — delegates work by **kind**:
+//! a category (the sort of work) and an effort level (how hard), which Cowboy
+//! resolves to a model from the user's roster. The foreman never names a model
+//! directly; routing is user-owned policy. A roster slot of `<default>` inherits
+//! the foreman, so swapping `/model` re-points those slots automatically.
 //!
 //! The roster is an **effort ramp** per category: a model is assigned a *floor*
 //! effort and handles that level and everything above it, until a higher floor
@@ -111,23 +112,26 @@ impl Ramp {
     }
 }
 
-/// The foreman: the main session model and whether it may delegate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Planner {
-    pub model: String,
-    #[serde(default = "default_true")]
-    pub may_delegate: bool,
-}
+/// Reserved model name in a ramp slot meaning "use the foreman (the currently
+/// selected `/model`)". Lets a roster pin some efforts to specific models while
+/// inheriting the foreman for the rest — so swapping the foreman via `/model`
+/// re-points every `<default>` slot without editing the roster.
+pub const DEFAULT_MODEL: &str = "<default>";
 
-/// Delegation limits. These are *throughput / safety* knobs, not quota or
-/// budget controls (the gateway owns those).
+/// Delegation limits + the crew on/off switch. These are *throughput / safety*
+/// knobs, not quota or budget controls (the gateway owns those).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Delegation {
+    /// Crew mode: when true the foreman delegates per the roster; when false the
+    /// foreman (the selected model) does everything itself (solo). Toggled from
+    /// the `/model` picker.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     /// Local fan-out hint: how many workers to run at once (the gateway is the
     /// real backpressure). Not a quota.
     #[serde(default = "default_max_parallel")]
     pub max_parallel: u32,
-    /// How deep delegation may nest (planner = depth 0).
+    /// How deep delegation may nest (foreman = depth 0).
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
     /// Whether a worker may itself delegate (off by default).
@@ -138,6 +142,7 @@ pub struct Delegation {
 impl Default for Delegation {
     fn default() -> Self {
         Self {
+            enabled: true,
             max_parallel: default_max_parallel(),
             max_depth: default_max_depth(),
             allow_recursive_delegation: false,
@@ -150,7 +155,6 @@ impl Default for Delegation {
 pub struct CrewConfig {
     #[serde(default = "default_version")]
     pub version: u32,
-    pub planner: Planner,
     #[serde(default)]
     pub crew: BTreeMap<String, Ramp>,
     /// Optional per-category temperature override (by task type). A delegated
@@ -169,8 +173,9 @@ pub enum ResolveVia {
     Category,
     /// The `general` fallback ramp.
     General,
-    /// The planner model (no category/general matched).
-    Planner,
+    /// The foreman model — either an explicit `<default>` slot or the final
+    /// fallback when no category/general ramp matched.
+    Foreman,
 }
 
 /// The outcome of resolving a (category, effort) request.
@@ -183,15 +188,34 @@ pub struct Resolved {
 }
 
 impl CrewConfig {
+    /// True when crew delegation is on. When false, the foreman (selected model)
+    /// works solo.
+    pub fn enabled(&self) -> bool {
+        self.delegation.enabled
+    }
+
     /// Resolve a delegation request to a model name. Total: always returns a
-    /// model (worst case the planner model). Unknown categories fall to
-    /// `general`, then to the planner.
-    pub fn resolve(&self, category: &str, effort: Effort) -> Resolved {
+    /// model (worst case the foreman). Unknown categories fall to `general`,
+    /// then to the foreman. A `<default>` slot resolves to `foreman`.
+    pub fn resolve(&self, category: &str, effort: Effort, foreman: &str) -> Resolved {
+        // A ramp slot of `<default>` means "the foreman" — substitute it but
+        // keep the layer it resolved through for display.
+        let sub = |model: &str| -> String {
+            if model == DEFAULT_MODEL {
+                foreman.to_string()
+            } else {
+                model.to_string()
+            }
+        };
         if let Some(ramp) = self.crew.get(category) {
             if let Some(model) = ramp.pick(effort) {
                 return Resolved {
-                    model: model.to_string(),
-                    via: ResolveVia::Category,
+                    via: if model == DEFAULT_MODEL {
+                        ResolveVia::Foreman
+                    } else {
+                        ResolveVia::Category
+                    },
+                    model: sub(model),
                     fell_back: false,
                 };
             }
@@ -199,15 +223,19 @@ impl CrewConfig {
         if let Some(ramp) = self.crew.get(GENERAL) {
             if let Some(model) = ramp.pick(effort) {
                 return Resolved {
-                    model: model.to_string(),
-                    via: ResolveVia::General,
+                    via: if model == DEFAULT_MODEL {
+                        ResolveVia::Foreman
+                    } else {
+                        ResolveVia::General
+                    },
+                    model: sub(model),
                     fell_back: true,
                 };
             }
         }
         Resolved {
-            model: self.planner.model.clone(),
-            via: ResolveVia::Planner,
+            model: foreman.to_string(),
+            via: ResolveVia::Foreman,
             fell_back: true,
         }
     }
@@ -222,18 +250,20 @@ impl CrewConfig {
     }
 
     /// The effective model for each effort level of a category (ramps expanded),
-    /// for display (`crew list`) and the TUI grid.
-    pub fn expanded(&self, category: &str) -> Vec<(Effort, String)> {
+    /// for display (`crew list`) and the TUI grid. `foreman` fills `<default>`
+    /// slots and the fallback.
+    pub fn expanded(&self, category: &str, foreman: &str) -> Vec<(Effort, String)> {
         Effort::all()
             .into_iter()
-            .map(|e| (e, self.resolve(category, e).model))
+            .map(|e| (e, self.resolve(category, e, foreman).model))
             .collect()
     }
 
     /// Validate the roster against the set of known model names.
     pub fn validate(&self, available: &BTreeSet<String>) -> Result<()> {
         let known = |m: &str| -> Result<()> {
-            if available.contains(m) {
+            // `<default>` is the foreman sentinel, not a models.yaml entry.
+            if m == DEFAULT_MODEL || available.contains(m) {
                 Ok(())
             } else {
                 Err(Error::Invalid(format!(
@@ -241,7 +271,6 @@ impl CrewConfig {
                 )))
             }
         };
-        known(&self.planner.model)?;
         if !self.crew.contains_key(GENERAL) {
             return Err(Error::Invalid(
                 "crew must define a `general` category (the cross-category fallback)".into(),
@@ -323,8 +352,12 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
         (Effort::Small, standard),
         (Effort::Large, premium),
     ]);
-    // review/e2e: bias to stronger models.
-    let strong = ramp(&[(Effort::Tiny, standard), (Effort::Medium, premium)]);
+    // review/e2e: bias to stronger models, then the foreman for the hardest.
+    let strong = ramp(&[
+        (Effort::Tiny, standard),
+        (Effort::Medium, premium),
+        (Effort::Deep, DEFAULT_MODEL),
+    ]);
 
     crew.insert("exploration".into(), economy.clone());
     crew.insert("docs".into(), economy.clone());
@@ -339,10 +372,6 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
 
     CrewConfig {
         version: 1,
-        planner: Planner {
-            model: premium.to_string(),
-            may_delegate: true,
-        },
         crew,
         temperature: BTreeMap::new(),
         delegation: Delegation::default(),
@@ -550,10 +579,6 @@ mod tests {
     fn cfg(crew: BTreeMap<String, Ramp>) -> CrewConfig {
         CrewConfig {
             version: 1,
-            planner: Planner {
-                model: "opus".into(),
-                may_delegate: true,
-            },
             crew,
             temperature: BTreeMap::new(),
             delegation: Delegation::default(),
@@ -605,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_falls_back_category_then_general_then_planner() {
+    fn resolve_falls_back_category_then_general_then_foreman() {
         let mut crew = BTreeMap::new();
         crew.insert(
             "tests".into(),
@@ -615,33 +640,51 @@ mod tests {
         let c = cfg(crew);
 
         // category hit
-        let r = c.resolve("tests", Effort::Small);
+        let r = c.resolve("tests", Effort::Small, "foreman-model");
         assert_eq!(r.model, "cheap");
         assert_eq!(r.via, ResolveVia::Category);
         assert!(!r.fell_back);
 
         // unknown category -> general
-        let r = c.resolve("frontend", Effort::Medium);
+        let r = c.resolve("frontend", Effort::Medium, "foreman-model");
         assert_eq!(r.model, "sonnet");
         assert_eq!(r.via, ResolveVia::General);
         assert!(r.fell_back);
 
-        // no general -> planner
+        // no general -> foreman (the selected model)
         let mut crew2 = BTreeMap::new();
         crew2.insert("tests".into(), Ramp::Single("cheap".into()));
         let c2 = cfg(crew2);
-        let r = c2.resolve("frontend", Effort::Medium);
-        assert_eq!(r.model, "opus");
-        assert_eq!(r.via, ResolveVia::Planner);
+        let r = c2.resolve("frontend", Effort::Medium, "foreman-model");
+        assert_eq!(r.model, "foreman-model");
+        assert_eq!(r.via, ResolveVia::Foreman);
         assert!(r.fell_back);
+    }
+
+    #[test]
+    fn default_slot_resolves_to_the_foreman() {
+        let mut crew = BTreeMap::new();
+        crew.insert(
+            "review".into(),
+            steps(&[(Effort::Small, "cheap"), (Effort::Large, DEFAULT_MODEL)]),
+        );
+        crew.insert(GENERAL.into(), Ramp::Single("cheap".into()));
+        let c = cfg(crew);
+        // small -> explicit model; large -> <default> substitutes the foreman.
+        let r = c.resolve("review", Effort::Large, "opus-4-8");
+        assert_eq!(r.model, "opus-4-8");
+        assert_eq!(r.via, ResolveVia::Foreman);
+        assert!(!r.fell_back); // matched the category ramp, just inherits foreman
+        assert_eq!(
+            c.resolve("review", Effort::Small, "opus-4-8").model,
+            "cheap"
+        );
     }
 
     #[test]
     fn yaml_accepts_scalar_and_map_shapes() {
         let yaml = "\
 version: 1
-planner:
-  model: opus
 crew:
   docs: cheap
   tests:
@@ -649,10 +692,27 @@ crew:
     large: opus
 ";
         let c: CrewConfig = serde_yaml_ng::from_str(yaml).unwrap();
-        assert_eq!(c.resolve("docs", Effort::Deep).model, "cheap");
-        assert_eq!(c.resolve("tests", Effort::Tiny).model, "cheap");
-        assert_eq!(c.resolve("tests", Effort::Large).model, "opus");
+        assert_eq!(c.resolve("docs", Effort::Deep, "f").model, "cheap");
+        assert_eq!(c.resolve("tests", Effort::Tiny, "f").model, "cheap");
+        assert_eq!(c.resolve("tests", Effort::Large, "f").model, "opus");
         assert_eq!(c.delegation.max_parallel, 4); // default applied
+        assert!(c.enabled()); // delegation on by default
+    }
+
+    #[test]
+    fn legacy_planner_field_is_ignored() {
+        // Old crew.yaml files carried a `planner:` block; it must still parse
+        // (serde ignores it) now that the foreman is the selected model.
+        let yaml = "\
+version: 1
+planner:
+  model: opus
+  may_delegate: true
+crew:
+  general: cheap
+";
+        let c: CrewConfig = serde_yaml_ng::from_str(yaml).unwrap();
+        assert_eq!(c.resolve("anything", Effort::Deep, "f").model, "cheap");
     }
 
     #[test]
@@ -754,9 +814,11 @@ crew:
             .collect();
         c.validate(&available).unwrap();
         // exploration ramps from cheap up to premium at deep.
-        assert_eq!(c.resolve("exploration", Effort::Tiny).model, "cheap");
-        assert_eq!(c.resolve("exploration", Effort::Deep).model, "opus");
+        assert_eq!(c.resolve("exploration", Effort::Tiny, "f").model, "cheap");
+        assert_eq!(c.resolve("exploration", Effort::Deep, "f").model, "opus");
+        // review's deep slot is <default> → inherits the foreman.
+        assert_eq!(c.resolve("review", Effort::Deep, "f").model, "f");
         // every category expands to 5 concrete levels.
-        assert_eq!(c.expanded("backend").len(), 5);
+        assert_eq!(c.expanded("backend", "f").len(), 5);
     }
 }

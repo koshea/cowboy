@@ -446,6 +446,7 @@ fn event_loop(
                             entries,
                             filter: String::new(),
                             selected: 0,
+                            crew_mode: crate::cmd::crew::crew_enabled(),
                         });
                         app.mode = Mode::ModelPicker;
                     }
@@ -969,20 +970,26 @@ fn crew_command(arg: Option<&str>, app: &mut App) {
         Ok(Some(cfg)) => {
             // Shorten ids to their last path segment so the grid stays readable.
             let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
+            let foreman =
+                crate::cmd::crew::foreman_model().unwrap_or_else(|| "<default>".to_string());
             let mut col_w = crew::Effort::all()
                 .iter()
                 .map(|e| e.as_str().len())
                 .max()
                 .unwrap_or(6);
             for cat in cfg.crew.keys() {
-                for (_, model) in cfg.expanded(cat) {
+                for (_, model) in cfg.expanded(cat, &foreman) {
                     col_w = col_w.max(short(&model).len());
                 }
             }
             col_w += 2;
             app.push(
                 LineKind::Notice,
-                format!("crew planner: {}", cfg.planner.model),
+                format!(
+                    "crew foreman: {}   delegation: {}",
+                    foreman,
+                    if cfg.enabled() { "on" } else { "off (solo)" }
+                ),
             );
             let mut header = format!("{:<14}", "CATEGORY");
             for e in crew::Effort::all() {
@@ -991,7 +998,7 @@ fn crew_command(arg: Option<&str>, app: &mut App) {
             app.push(LineKind::Notice, header);
             for cat in cfg.crew.keys() {
                 let mut row = format!("{cat:<14}");
-                for (_, model) in cfg.expanded(cat) {
+                for (_, model) in cfg.expanded(cat, &foreman) {
                     row.push_str(&format!("{:<col_w$}", short(&model)));
                 }
                 app.push(LineKind::Notice, row);
@@ -1242,6 +1249,8 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
         }
         KeyCode::Up => p.move_sel(-1),
         KeyCode::Down => p.move_sel(1),
+        // Tab toggles Solo ⇄ Crew for the selection.
+        KeyCode::Tab => p.crew_mode = !p.crew_mode,
         KeyCode::Backspace => {
             p.filter.pop();
             p.clamp();
@@ -1250,13 +1259,22 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
             let Some(choice) = p.selected_choice() else {
                 return;
             };
+            // Apply the Solo/Crew choice now (independent of which model).
+            let crew_mode = p.crew_mode;
+            if let Err(e) = crate::cmd::crew::set_crew_enabled(crew_mode) {
+                app.push(LineKind::Error, format!("crew mode: {e}"));
+            }
+            let mode_word = if crew_mode { "crew" } else { "solo" };
             if let Some(name) = choice.configured_name.clone() {
-                // Already configured: just switch to it.
+                // Already configured: persist it as the foreman + switch live.
+                if let Err(e) = crate::cmd::models::set_user_default(&name) {
+                    app.push(LineKind::Error, format!("set default: {e}"));
+                }
                 if let Some(tx) = ctx.task_tx.as_ref() {
                     let _ = tx.send(AgentCmd::SwitchModel(name.clone()));
                 }
                 ctx.session.current_model = name.clone();
-                app.push(LineKind::Notice, format!("model → {name}"));
+                app.push(LineKind::Notice, format!("model → {name} ({mode_word})"));
                 app.model_picker = None;
                 app.mode = ctx.mode_before_overlay.clone();
             } else {

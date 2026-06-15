@@ -199,6 +199,17 @@ fn list() -> Result<()> {
 
 // --- use ---
 
+/// Persist the user-level default model (no stdout output) — used by the TUI
+/// `/model` picker so the selection survives restarts and the crew foreman
+/// reflects it. Assumes `name` is a known model.
+pub fn set_user_default(name: &str) -> Result<()> {
+    let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
+    let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
+    cfg.default = Some(name.to_string());
+    cfg.save(&path)?;
+    Ok(())
+}
+
 fn use_default(name: &str, global: bool) -> Result<()> {
     let user = ModelsConfig::user_path()
         .map(|p| ModelsConfig::load_opt(&p))

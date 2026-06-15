@@ -1,8 +1,9 @@
 //! `cowboy crew` — manage the Crew Roster (capability → model routing).
 //!
 //! The roster lives at `~/.config/cowboy/crew.yaml` (host-owned, like
-//! `models.yaml`). The planner delegates work by category + effort; Cowboy
-//! resolves that to a model here. Quotas/rate-limits/spend belong to the gateway.
+//! `models.yaml`). The foreman (the selected `/model`) delegates work by
+//! category + effort; Cowboy resolves that to a model here. A `<default>` slot
+//! inherits the foreman. Quotas/rate-limits/spend belong to the gateway.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -46,18 +47,80 @@ fn model_names(models: &BTreeMap<String, ModelDef>) -> BTreeSet<String> {
 }
 
 /// Effective per-session model name override, consulted at model resolution:
-/// `COWBOY_MODEL` (set by subagent routing) wins; otherwise the crew planner
-/// model, if a roster is configured. `None` → use the models.yaml default.
+/// `COWBOY_MODEL` (set by subagent routing) wins. Otherwise `None` → use the
+/// models.yaml default, which IS the foreman (what `/model` selects). The crew
+/// roster no longer overrides this — the foreman is always the selected model.
 pub fn session_model_override() -> Option<String> {
+    match std::env::var("COWBOY_MODEL") {
+        Ok(m) if !m.is_empty() => Some(m),
+        _ => None,
+    }
+}
+
+/// The foreman model name for delegation routing: a routed `COWBOY_MODEL` if
+/// this process is itself a worker, else the configured default model (what
+/// `/model` selects). Used to fill `<default>` roster slots.
+pub fn foreman_model() -> Option<String> {
     if let Ok(m) = std::env::var("COWBOY_MODEL") {
         if !m.is_empty() {
             return Some(m);
         }
     }
-    match crew::load() {
-        Ok(Some(c)) => Some(c.planner.model),
-        _ => None,
+    default_model_name()
+}
+
+/// True when crew delegation is on (a roster exists and `delegation.enabled`).
+pub fn crew_enabled() -> bool {
+    matches!(crew::load(), Ok(Some(c)) if c.enabled())
+}
+
+/// Turn crew mode on/off (toggled from the `/model` picker). Enabling with no
+/// roster yet bootstraps a default one from the model price tiers; disabling
+/// just flips the flag and preserves the roster.
+pub fn set_crew_enabled(enabled: bool) -> Result<()> {
+    match crew::load()? {
+        Some(mut cfg) => {
+            cfg.delegation.enabled = enabled;
+            crew::save(&cfg)
+        }
+        None if enabled => {
+            // Bootstrap a default roster so "Crew" has something to route to.
+            let models = merged_models()?;
+            if models.is_empty() {
+                bail!("no models configured; run `cowboy models setup` first");
+            }
+            let ranked = price_sorted(&models);
+            let cheap = ranked.first().cloned().unwrap();
+            let premium = ranked.last().cloned().unwrap();
+            let standard = ranked
+                .get(ranked.len() / 2)
+                .cloned()
+                .unwrap_or_else(|| cheap.clone());
+            let mut cfg = crew::default_with_tiers(&cheap, &standard, &premium);
+            cfg.delegation.enabled = true;
+            crew::save(&cfg)
+        }
+        None => Ok(()), // already solo
     }
+    .map_err(Into::into)
+}
+
+/// The configured default model name (project default, else user default) —
+/// this is the foreman when no `COWBOY_MODEL` route is set.
+fn default_model_name() -> Option<String> {
+    if let Ok(root) = crate::cmd::project_root() {
+        let proj = root.join(".cowboy").join("models.yaml");
+        if let Some(d) = ModelsConfig::load_opt(&proj)
+            .ok()
+            .flatten()
+            .and_then(|p| p.default)
+        {
+            return Some(d);
+        }
+    }
+    ModelsConfig::user_path()
+        .and_then(|p| ModelsConfig::load_opt(&p).ok().flatten())
+        .and_then(|u| u.default)
 }
 
 /// Per-task-type temperature override for this session, set by the crew router
@@ -112,7 +175,10 @@ fn init(force: bool) -> Result<()> {
     crew::save(&cfg)?;
     println!("✓ wrote crew roster to {}", path.display());
     println!("  tiers: cheap={cheap}  standard={standard}  premium={premium}");
-    println!("  planner: {premium}");
+    println!(
+        "  foreman: your selected model ({}) — change it with `cowboy models use` or /model",
+        foreman_model().as_deref().unwrap_or("none set")
+    );
     println!("  edit it, or review with `cowboy crew list`.");
     Ok(())
 }
@@ -132,7 +198,13 @@ fn short_model(name: &str) -> &str {
 
 fn list() -> Result<()> {
     let cfg = load_or_explain()?;
-    println!("planner: {}", cfg.planner.model);
+    let foreman = foreman_model().unwrap_or_else(|| "<default>".to_string());
+    println!(
+        "foreman: {}   crew: {}",
+        foreman,
+        if cfg.enabled() { "on" } else { "off (solo)" }
+    );
+    println!("(<default> slots inherit the foreman)");
     println!();
     // Size columns to the widest shortened model name so long ids stay readable.
     let cat_w = cfg
@@ -149,7 +221,7 @@ fn list() -> Result<()> {
         .max()
         .unwrap_or(6);
     for cat in cfg.crew.keys() {
-        for (_, model) in cfg.expanded(cat) {
+        for (_, model) in cfg.expanded(cat, &foreman) {
             col_w = col_w.max(short_model(&model).len());
         }
     }
@@ -162,7 +234,7 @@ fn list() -> Result<()> {
     println!();
     for cat in cfg.crew.keys() {
         print!("{cat:<cat_w$}");
-        for (_, model) in cfg.expanded(cat) {
+        for (_, model) in cfg.expanded(cat, &foreman) {
             print!("{:<col_w$}", short_model(&model));
         }
         println!();

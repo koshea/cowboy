@@ -17,6 +17,6 @@ expression: render(&app)
 ││                                                                    ││
 ╰│                                                                    │╯
  │                                                                    │
-╭│↑/↓ move · Enter select · Esc cancel · type to filter               │╮
+╭│↑/↓ move · Enter select · Esc cancel · Tab mode: crew (delegates)   │╮
 │╰────────────────────────────────────────────────────────────────────╯│
 ╰──────────────────────────────────────────────────────────────────────╯

@@ -34,20 +34,6 @@ Reusable skills may be available: run `cowboy skill list` to see them and \
 `cowboy skill show <name>` to read a skill's instructions, then follow them \
 (skills are discovered from `.cowboy/skills/` and `.claude/skills/`).
 
-You are the foreman of a crew. For focused, separable work, delegate it with the \
-`subagent` tool instead of doing everything yourself: describe the work by \
-`category` (the kind — exploration, tests, frontend, backend, review, docs, \
-debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
-deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
-routes each request to the right crew model. To run work in parallel, emit \
-several `subagent` calls in one message. Named specialist agents may be defined \
-under `.claude/agents/`/`.cowboy/agents/` (`cowboy agents list`); adopt one by \
-passing `agent: <name>` to `subagent`. Delegate when work is scoped and separable \
-(exploration, test-writing, an independent component, a review pass); do it \
-yourself when the task is tiny, the hand-off costs more than the work, or it \
-needs continuous coordination with your current state. Prefer small, well-scoped \
-subagent tasks that return a concrete artifact.
-
 Project conventions may live in AGENTS.md (or CLAUDE.md) files, which are \
 authoritative. Before working in an area, `read` the repo-root AGENTS.md and the \
 nearest AGENTS.md on the path to the files you're touching (the nearest one \
@@ -84,6 +70,25 @@ API/schema contract). At the end of a substantial task, write a `handoff` (goal,
 status, changed files, decisions, contracts, validation, risks, next steps) so the \
 next worker can continue, then call `final` summarizing what changed, what was \
 validated, and remaining risks or follow-up work.";
+
+/// The crew-foreman delegation guidance, appended to the system prompt only in
+/// crew mode (a roster exists and delegation is enabled). In solo mode the
+/// selected model does all the work itself, so this isn't shown and the
+/// `subagent` tool isn't offered.
+pub const FOREMAN_PROMPT: &str =
+    "\n\nYou are the foreman of a crew. For focused, separable work, delegate it with the \
+`subagent` tool instead of doing everything yourself: describe the work by \
+`category` (the kind — exploration, tests, frontend, backend, review, docs, \
+debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
+deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
+routes each request to the right crew model. To run work in parallel, emit \
+several `subagent` calls in one message. Named specialist agents may be defined \
+under `.claude/agents/`/`.cowboy/agents/` (`cowboy agents list`); adopt one by \
+passing `agent: <name>` to `subagent`. Delegate when work is scoped and separable \
+(exploration, test-writing, an independent component, a review pass); do it \
+yourself when the task is tiny, the hand-off costs more than the work, or it \
+needs continuous coordination with your current state. Prefer small, well-scoped \
+subagent tasks that return a concrete artifact.";
 
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
@@ -213,10 +218,26 @@ impl<'a> AgentLoop<'a> {
         cancel: CancellationToken,
         ui: &'a mut dyn AgentUi,
     ) -> Self {
+        // Crew mode (roster + delegation enabled) gates the foreman guidance and
+        // the `subagent` tool; in solo mode the selected model works alone.
+        let crew_on = crate::cmd::crew::crew_enabled();
+        let system = if crew_on {
+            format!("{SYSTEM_PROMPT}{FOREMAN_PROMPT}")
+        } else {
+            SYSTEM_PROMPT.to_string()
+        };
+        let tools = if crew_on {
+            tools::definitions()
+        } else {
+            tools::definitions()
+                .into_iter()
+                .filter(|t| t.name != tools::TOOL_SUBAGENT)
+                .collect()
+        };
         Self {
             model,
             runtime,
-            tools: tools::definitions(),
+            tools,
             behavior,
             cancel,
             context_window,
@@ -234,7 +255,7 @@ impl<'a> AgentLoop<'a> {
             budget_warned: false,
             plan: Vec::new(),
             lifecycle_started: false,
-            messages: vec![Message::system(SYSTEM_PROMPT)],
+            messages: vec![Message::system(system)],
             ui,
             logger: None,
         }
@@ -1411,7 +1432,12 @@ impl<'a> AgentLoop<'a> {
             .as_deref()
             .and_then(crew::Effort::parse)
             .unwrap_or(crew::DEFAULT_EFFORT);
-        let routed = crew_cfg.as_ref().map(|c| c.resolve(&category, effort));
+        // `<default>` roster slots (and the fallback) resolve to the foreman —
+        // this process's own model (a routed COWBOY_MODEL, else the selection).
+        let foreman = crate::cmd::crew::foreman_model().unwrap_or_default();
+        let routed = crew_cfg
+            .as_ref()
+            .map(|c| c.resolve(&category, effort, &foreman));
         let temperature = crew_cfg.as_ref().and_then(|c| c.temperature_for(&category));
 
         // Worker brief: an optional adopted agent persona, then context, the task,

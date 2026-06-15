@@ -24,7 +24,7 @@ docs (or the code).
   prompts for network access.
 - **Sessions & a daemon** (`cowboyd`) that supervise worker processes, track
   worktree leases, and let you attach/detach/replay.
-- **A configurable crew** — a powerful planner delegates work by *kind* (category
+- **A configurable crew** — your selected model (the foreman) delegates work by *kind* (category
   + effort) and Cowboy routes each sub-task to the right model from your roster,
   running independent work in parallel. See [The crew](using/crew.md).
 - **Ranch Plans** — the headline feature: split a large task into coordinated,

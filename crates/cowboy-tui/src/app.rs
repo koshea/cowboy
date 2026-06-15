@@ -84,6 +84,9 @@ pub struct ModelPicker {
     pub entries: Vec<ModelChoice>,
     pub filter: String,
     pub selected: usize,
+    /// Whether the chosen model runs as a crew foreman (delegates) or solo.
+    /// Toggled with Tab; applied on selection.
+    pub crew_mode: bool,
 }
 
 impl ModelPicker {
@@ -875,14 +878,25 @@ fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
     }
     f.render_widget(Paragraph::new(lines), rows[1]);
 
-    let footer = "↑/↓ move · Enter select · Esc cancel · type to filter";
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            footer,
+    // Footer: navigation hints + the Solo/Crew mode toggle (Tab).
+    let (mode_label, mode_color) = if p.crew_mode {
+        ("crew (delegates)", Color::Magenta)
+    } else {
+        ("solo", Color::Cyan)
+    };
+    let footer = Line::from(vec![
+        Span::styled(
+            "↑/↓ move · Enter select · Esc cancel · ",
             Style::default().fg(Color::DarkGray),
-        ))),
-        rows[2],
-    );
+        ),
+        Span::styled("Tab", Style::default().fg(Color::White)),
+        Span::styled(" mode: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            mode_label,
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(footer), rows[2]);
 }
 
 fn draw_model_form(f: &mut Frame, area: Rect, form: &ModelForm) {
@@ -1695,6 +1709,7 @@ mod tests {
             ],
             filter: String::new(),
             selected: 1,
+            crew_mode: true,
         });
         app.mode = Mode::ModelPicker;
         insta::assert_snapshot!(render(&app));
