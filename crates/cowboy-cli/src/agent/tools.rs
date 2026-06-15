@@ -17,6 +17,7 @@ pub const TOOL_WRITE: &str = "write";
 pub const TOOL_MEMORY: &str = "memory";
 pub const TOOL_PLAN: &str = "plan";
 pub const TOOL_ARTIFACT: &str = "artifact";
+pub const TOOL_HANDOFF: &str = "handoff";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -128,6 +129,34 @@ pub struct PlanArgs {
     pub steps: Vec<PlanStep>,
 }
 
+/// Arguments for the `handoff` tool — a structured end-of-session summary that
+/// the next worker (or a Ranch coordinator) can rely on.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct HandoffArgs {
+    /// What this session set out to do.
+    pub goal: String,
+    /// Outcome: complete | partial | blocked | failed.
+    pub status: String,
+    /// Files created/changed (and how), if any.
+    #[serde(default)]
+    pub changed_files: Option<String>,
+    /// Important decisions made and why.
+    #[serde(default)]
+    pub decisions: Option<String>,
+    /// Interfaces/contracts introduced or changed (point at published artifacts).
+    #[serde(default)]
+    pub contracts: Option<String>,
+    /// How the work was validated (tests/builds run and their result).
+    #[serde(default)]
+    pub validation: Option<String>,
+    /// Known risks or gaps.
+    #[serde(default)]
+    pub risks: Option<String>,
+    /// Recommended next steps for whoever picks this up.
+    #[serde(default)]
+    pub next_steps: Option<String>,
+}
+
 /// Arguments for the `artifact` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ArtifactArgs {
@@ -223,6 +252,15 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<ArtifactArgs>(),
         },
         ToolDef {
+            name: TOOL_HANDOFF.into(),
+            description: "Write a structured handoff summary for whoever continues this work \
+                          (a teammate, a later session, or a Ranch coordinator): goal, status, \
+                          changed files, decisions, contracts, validation, risks, next steps. \
+                          Call this at the end of a substantial task, just before `final`."
+                .into(),
+            parameters: schema_for::<HandoffArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -257,7 +295,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "shell", "read", "edit", "write", "memory", "plan", "artifact", "final",
+                "shell", "read", "edit", "write", "memory", "plan", "artifact", "handoff", "final",
                 "ask_user", "subagent"
             ]
         );

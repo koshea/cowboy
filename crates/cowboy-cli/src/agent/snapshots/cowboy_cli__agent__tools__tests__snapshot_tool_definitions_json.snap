@@ -291,6 +291,78 @@ expression: defs
     }
   },
   {
+    "description": "Write a structured handoff summary for whoever continues this work (a teammate, a later session, or a Ranch coordinator): goal, status, changed files, decisions, contracts, validation, risks, next steps. Call this at the end of a substantial task, just before `final`.",
+    "name": "handoff",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `handoff` tool — a structured end-of-session summary that the next worker (or a Ranch coordinator) can rely on.",
+      "properties": {
+        "changed_files": {
+          "default": null,
+          "description": "Files created/changed (and how), if any.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "contracts": {
+          "default": null,
+          "description": "Interfaces/contracts introduced or changed (point at published artifacts).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "decisions": {
+          "default": null,
+          "description": "Important decisions made and why.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "description": "What this session set out to do.",
+          "type": "string"
+        },
+        "next_steps": {
+          "default": null,
+          "description": "Recommended next steps for whoever picks this up.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "risks": {
+          "default": null,
+          "description": "Known risks or gaps.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "Outcome: complete | partial | blocked | failed.",
+          "type": "string"
+        },
+        "validation": {
+          "default": null,
+          "description": "How the work was validated (tests/builds run and their result).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "goal",
+        "status"
+      ],
+      "title": "HandoffArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

@@ -8,8 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, ArtifactArgs, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, PlanArgs, ReadArgs,
-    ShellArgs, SubagentArgs, WriteArgs,
+    self, ArtifactArgs, AskUserArgs, EditArgs, FinalArgs, HandoffArgs, MemoryArgs, PlanArgs,
+    ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -63,7 +63,10 @@ mark steps \"done\" as you complete them (re-send the whole list to update it). 
 Skip it for trivial one-step work.
 
 Before large edits, inspect the repository and form a brief plan. After edits, run \
-relevant checks. When finished, call `final` summarizing what changed, what was \
+relevant checks. Publish durable outputs others may need with `artifact` (e.g. an \
+API/schema contract). At the end of a substantial task, write a `handoff` (goal, \
+status, changed files, decisions, contracts, validation, risks, next steps) so the \
+next worker can continue, then call `final` summarizing what changed, what was \
 validated, and remaining risks or follow-up work.";
 
 /// Drives a single agent session.
@@ -651,6 +654,22 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_HANDOFF => {
+                    let args: HandoffArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    self.ui.tool_use("handoff");
+                    let observation = self.run_handoff(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -821,6 +840,33 @@ impl<'a> AgentLoop<'a> {
                 }
             }
             other => format!("error: unknown artifact action `{other}` (publish|list)"),
+        }
+    }
+
+    /// Host-side `handoff` tool: render the structured summary to `handoff.md`
+    /// (the well-known path `cowboy handoff` reads) and register it as a Handoff
+    /// artifact so it shows up in the artifact index.
+    fn run_handoff(&self, args: &HandoffArgs) -> String {
+        use cowboy_core::artifact::{self, ArtifactKind};
+        let Some(logger) = &self.logger else {
+            return "error: handoff requires an active session log".into();
+        };
+        let dir = logger.dir();
+        let md = render_handoff_md(args);
+        if let Err(e) = std::fs::write(dir.join("handoff.md"), &md) {
+            return format!("error: writing handoff.md: {e}");
+        }
+        match artifact::add_in(
+            dir,
+            logger.id(),
+            ArtifactKind::Handoff,
+            "Handoff",
+            &md,
+            None,
+            now_ms(),
+        ) {
+            Ok(a) => format!("handoff written ({})", a.id),
+            Err(e) => format!("handoff written to handoff.md, but indexing failed: {e}"),
         }
     }
 
@@ -1013,6 +1059,26 @@ fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
         arguments
     };
     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid tool arguments: {e}"))
+}
+
+/// Render a [`HandoffArgs`] into the canonical `handoff.md` markdown.
+fn render_handoff_md(a: &HandoffArgs) -> String {
+    let mut s = String::from("# Handoff\n\n");
+    s.push_str(&format!("## Goal\n{}\n\n", a.goal.trim()));
+    s.push_str(&format!("## Status\n{}\n", a.status.trim()));
+    let section = |title: &str, body: &Option<String>| -> String {
+        match body {
+            Some(b) if !b.trim().is_empty() => format!("\n## {title}\n{}\n", b.trim()),
+            _ => String::new(),
+        }
+    };
+    s.push_str(&section("Changed files", &a.changed_files));
+    s.push_str(&section("Decisions", &a.decisions));
+    s.push_str(&section("Contracts / interfaces", &a.contracts));
+    s.push_str(&section("Validation", &a.validation));
+    s.push_str(&section("Risks", &a.risks));
+    s.push_str(&section("Next steps", &a.next_steps));
+    s
 }
 
 /// Milliseconds since the Unix epoch (artifact/lifecycle timestamps).
@@ -1397,6 +1463,56 @@ mod tests {
         assert_eq!(arts[0].kind, cowboy_core::artifact::ArtifactKind::Contract);
         let (_, body) = cowboy_core::artifact::get_in(&session_dir, &arts[0].id).unwrap();
         assert!(body.contains("GET /things"));
+    }
+
+    #[tokio::test]
+    async fn handoff_tool_writes_handoff_md_and_artifact() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "handoff",
+                    r#"{"goal":"add billing schema","status":"complete",
+                        "contracts":"published schema-contract.md","next_steps":"wire the API"}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let runtime = runtime_with(docker);
+        let root = runtime.root().to_path_buf();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let session_dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+
+        let md = std::fs::read_to_string(session_dir.join("handoff.md")).unwrap();
+        assert!(md.contains("## Goal\nadd billing schema"));
+        assert!(md.contains("## Next steps\nwire the API"));
+        // Registered as a Handoff artifact too.
+        let arts = cowboy_core::artifact::list_in(&session_dir);
+        assert!(arts
+            .iter()
+            .any(|a| a.kind == cowboy_core::artifact::ArtifactKind::Handoff));
     }
 
     #[test]

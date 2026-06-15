@@ -6,6 +6,7 @@ pub mod daemon;
 pub mod doctor;
 pub mod down;
 pub mod fileop;
+pub mod handoff;
 pub mod init;
 pub mod logs;
 pub mod memory;

@@ -150,6 +150,12 @@ pub enum Command {
     /// Inspect or publish session artifacts (contracts, summaries, handoffs, …).
     Artifact(ArtifactCmdArgs),
 
+    /// Print a session's handoff summary (defaults to the most recent).
+    Handoff {
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+    },
+
     /// List session logs.
     Logs,
 

@@ -141,6 +141,26 @@ impl SessionLogger {
             final_message.unwrap_or("(none / interrupted)"),
         );
         let _ = std::fs::write(self.dir.join("context-summary.md"), summary);
+
+        // handoff.md — every finished session has one. If the agent didn't write
+        // a structured handoff via the tool, synthesize a minimal one so a
+        // downstream worker/coordinator always has something to read.
+        let handoff = self.dir.join("handoff.md");
+        if !handoff.exists() {
+            let body = format!(
+                "# Handoff (auto-generated)\n\n## Status\n{}\n\n## Summary\n{}\n\n\
+                 ## Activity\n- messages: {}\n- commands: {}\n- diff: see diff.patch\n",
+                if final_message.is_some() {
+                    "complete"
+                } else {
+                    "incomplete (interrupted)"
+                },
+                final_message.unwrap_or("(no final message)"),
+                self.message_seq,
+                self.command_seq,
+            );
+            let _ = std::fs::write(handoff, body);
+        }
     }
 }
 
@@ -273,6 +293,26 @@ mod tests {
     }
 
     use cowboy_core::model::{Role, ToolCall};
+
+    #[test]
+    fn finalize_synthesizes_handoff_when_none_written() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let log = SessionLogger::create(tmp.path()).unwrap();
+        let dir = log.dir().to_path_buf();
+        assert!(!dir.join("handoff.md").exists());
+        log.finalize(Some("all done"));
+        let md = std::fs::read_to_string(dir.join("handoff.md")).unwrap();
+        assert!(md.contains("auto-generated"));
+        assert!(md.contains("all done"));
+
+        // A pre-existing handoff (e.g. from the tool) is not clobbered.
+        std::fs::write(dir.join("handoff.md"), "AGENT HANDOFF").unwrap();
+        log.finalize(Some("all done"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("handoff.md")).unwrap(),
+            "AGENT HANDOFF"
+        );
+    }
 
     #[test]
     fn load_history_drops_system_and_resolves_latest() {
