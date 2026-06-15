@@ -41,7 +41,9 @@ tiktoken-rs = "0.6"
 reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 
 # tui
-ratatui = "0.29"
+# `unstable-rendered-line-info` enables Paragraph::line_count, used to scroll the
+# transcript by exact wrapped-line counts (so following never cuts off the tail).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 crossterm = "0.28"
 tui-textarea = "0.7"
 ansi-to-tui = "7"

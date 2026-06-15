@@ -791,11 +791,20 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
         height: area.height.saturating_sub(2),
     };
     app.transcript_area.set(text_rect);
-    // Estimate wrapped-line count so scrollback maps to what's on screen.
-    let total: usize = lines
-        .iter()
-        .map(|l| l.width().div_ceil(inner_w).max(1))
-        .sum();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray));
+    // Build the paragraph first so we can ask ratatui for the *exact* wrapped
+    // line count (its own word-wrapper) — a char-width estimate undercounts when
+    // lines wrap, which leaves `follow` short and hides the newest lines under
+    // the input. `line_count(inner_w)` wraps to that width and adds the block's
+    // 2 border rows, so subtract them to get content rows.
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    let total = para.line_count(inner_w as u16).saturating_sub(2);
     let max_scroll = total.saturating_sub(inner_h);
     app.max_scroll.set(max_scroll);
     let offset_top = if app.follow {
@@ -810,16 +819,14 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     } else {
         format!(" {} ", app.title)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(title);
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((offset_top, 0));
-    f.render_widget(para, area);
+    let para = para.block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(ratatui::widgets::BorderType::Rounded)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(title),
+    );
+    f.render_widget(para.scroll((offset_top, 0)), area);
 
     // Scrollbar on the right edge when content overflows. ratatui bottoms the
     // thumb when position == content_length - 1, so content_length is the count
@@ -1100,6 +1107,31 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn following_keeps_the_newest_line_visible_even_when_lines_wrap() {
+        // A transcript taller than the viewport, with long lines that WRAP — the
+        // case where a char-width estimate undercounts and the tail gets hidden
+        // under the input. With follow on, the last line must be on screen.
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        // Three ~28-char words per line: two don't fit on one ~47-wide row, so
+        // word-wrap yields 3 rows while a char-width estimate guesses 2 — the
+        // undercount that, accumulated over many lines, hides the tail.
+        let w = "a".repeat(28);
+        let long = format!("{w} {w} {w}");
+        for i in 0..40 {
+            app.push(LineKind::Agent, format!("{i} {long}"));
+        }
+        app.push(LineKind::Final, "LAST_LINE_SENTINEL");
+        assert!(app.follow, "new content should keep us following the tail");
+
+        let frame = render(&app);
+        assert!(
+            frame.contains("LAST_LINE_SENTINEL"),
+            "the newest line must be visible when following:\n{frame}"
+        );
     }
 
     #[test]
