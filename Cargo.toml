@@ -49,6 +49,10 @@ crossterm = "0.29"
 ratatui-textarea = "0.9"
 ansi-to-tui = "8"
 throbber-widgets-tui = "0.11"
+# Direct OS clipboard (X11 + Wayland). `default-features = false` drops the
+# heavy `image` crate — we only copy text. OSC 52 stays as the SSH/remote
+# fallback. x11rb is always compiled on Linux; `wayland` adds wl-clipboard-rs.
+clipboard-rs = { version = "0.3", default-features = false, features = ["wayland"] }
 
 # Note: process-group termination is done in-container (proc supervisor uses
 # `setsid` + `kill -<pgid>`), and `cowboy shell` uses `docker exec -it` for the

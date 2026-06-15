@@ -13,6 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
+use clipboard_rs::{Clipboard, ClipboardContext};
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 use cowboy_tui::{draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, REASONING_OPTS};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -235,8 +236,10 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Copy `text` to the system clipboard via OSC 52. Works in Ghostty, kitty,
-/// iTerm2, and over SSH/tmux (with passthrough).
+/// Copy `text` to the clipboard via OSC 52 — the *fallback* path, used when the
+/// direct OS clipboard (clipboard-rs) is unavailable, e.g. running the TUI over
+/// SSH with no local display. Works in Ghostty, kitty, iTerm2, and over
+/// SSH/tmux (with passthrough), though some terminal/multiplexer stacks drop it.
 ///
 /// `out` MUST be ratatui's own terminal backend (`terminal.backend_mut()`), not
 /// a fresh `io::stdout()`: crossterm buffers each frame and flushes it at the
@@ -373,6 +376,12 @@ fn event_loop(
         _ => app.mode = Mode::Idle,
     }
 
+    // Direct OS clipboard handle (X11/Wayland), created once and kept alive for
+    // the whole session: on X11 the copied selection is only served while this
+    // context lives. `None` when there's no local display (headless / SSH), in
+    // which case copies fall back to OSC 52 through the terminal.
+    let clipboard = ClipboardContext::new().ok();
+
     loop {
         // If the transcript changes while we're following the tail, the view
         // scrolls and any mouse selection would misalign — drop it.
@@ -481,11 +490,17 @@ fn event_loop(
         app.tick();
         terminal.draw(|f| draw(f, &app))?;
 
-        // Flush any queued clipboard copy *after* the frame is on the wire, and
-        // through ratatui's own backend, so the OSC 52 sequence isn't eaten by
-        // crossterm's buffered frame (see `clipboard_copy`).
+        // Flush any queued clipboard copy. Prefer the direct OS clipboard
+        // (reliable locally on X11/Wayland); fall back to OSC 52 — written
+        // through ratatui's own backend *after* the frame, so it isn't eaten by
+        // crossterm's buffered frame — when there's no local display (SSH).
         if let Some(text) = app.take_pending_copy() {
-            clipboard_copy(terminal.backend_mut(), &text);
+            let copied = clipboard
+                .as_ref()
+                .is_some_and(|c| c.set_text(text.clone()).is_ok());
+            if !copied {
+                clipboard_copy(terminal.backend_mut(), &text);
+            }
         }
 
         if event::poll(Duration::from_millis(120))? {
@@ -913,7 +928,7 @@ const HELP_LINES: &[&str] = &[
     "  /models        browse the provider catalogue and add/select a model",
     "  /crew [usage]  show the crew roster (model routing) or its usage",
     "  /diff          show the working-tree diff",
-    "  /copy          copy the last answer to the clipboard (OSC 52)",
+    "  /copy          copy the last answer to the system clipboard",
     "  /clear         clear the view (conversation memory is kept)",
     "  /detach        leave the session running and exit (re-attach later)",
     "  /quit          end the session",

@@ -21,6 +21,7 @@ cowboy-core.workspace = true
 cowboy-tui.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+clipboard-rs.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
