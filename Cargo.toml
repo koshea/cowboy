@@ -43,11 +43,12 @@ reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 # tui
 # `unstable-rendered-line-info` enables Paragraph::line_count, used to scroll the
 # transcript by exact wrapped-line counts (so following never cuts off the tail).
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
-crossterm = "0.28"
-tui-textarea = "0.7"
-ansi-to-tui = "7"
-throbber-widgets-tui = "0.8"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+crossterm = "0.29"
+# tui-textarea is unmaintained; the project forked to ratatui-textarea (ratatui 0.30+).
+ratatui-textarea = "0.9"
+ansi-to-tui = "8"
+throbber-widgets-tui = "0.11"
 
 # Note: process-group termination is done in-container (proc supervisor uses
 # `setsid` + `kill -<pgid>`), and `cowboy shell` uses `docker exec -it` for the

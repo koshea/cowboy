@@ -9,8 +9,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
+use ratatui_textarea::TextArea;
 use throbber_widgets_tui::{Throbber, ThrobberState};
-use tui_textarea::TextArea;
 
 /// Kind of a transcript line (drives color/prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1374,8 +1374,9 @@ mod tests {
         let mut app = App::new("cowboy");
         assert_eq!(app.input_lines(), 1);
         // Six lines of input; the box should cap its visible height at 5 (+borders).
-        app.textarea =
-            tui_textarea::TextArea::from((1..=6).map(|i| format!("line {i}")).collect::<Vec<_>>());
+        app.textarea = ratatui_textarea::TextArea::from(
+            (1..=6).map(|i| format!("line {i}")).collect::<Vec<_>>(),
+        );
         assert_eq!(app.input_lines(), 6);
         let frame = render(&app);
         // The box grew to its 5-line cap: lines 1..=5 are all visible at once.
