@@ -49,6 +49,60 @@ fn content_chunk(text: &str) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn retries_after_a_429_then_succeeds() {
+    let server = MockServer::start().await;
+    // First call: 429 (Retry-After: 0 so the test doesn't wait), served once.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Subsequent calls: a normal SSE success.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.content.as_deref(),
+        Some("ok"),
+        "a 429 should back off and retry to success"
+    );
+}
+
+#[tokio::test]
+async fn gives_up_after_persistent_429() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let err = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("429"),
+        "after exhausting retries the 429 surfaces as an error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn streams_and_assembles_text() {
     let server = MockServer::start().await;
     let body = sse(&[content_chunk("Hello, "), content_chunk("world")]);
