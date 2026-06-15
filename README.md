@@ -1,6 +1,6 @@
 # cowboy
 
-[![CI](https://github.com/cowboycode/cowboy/actions/workflows/ci.yml/badge.svg)](https://github.com/cowboycode/cowboy/actions/workflows/ci.yml)
+[![CI](https://github.com/koshea/cowboy/actions/workflows/ci.yml/badge.svg)](https://github.com/koshea/cowboy/actions/workflows/ci.yml)
 
 An opinionated local coding agent that lets the AI run wild inside a
 Docker-contained development environment, while the **host** enforces security
@@ -83,3 +83,10 @@ LLVM_PROFDATA=/usr/lib/llvm/<v>/bin/llvm-profdata \
 ```
 
 Build the container images: `docker/build.sh` (or `docker/build.sh agent|gateway`).
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor guide and
+[SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## License
+
+Licensed under the [MIT License](LICENSE). © 2026 Kevin O'Shea (koshea).

@@ -8,8 +8,8 @@ src = "src"
 [output.html]
 default-theme = "navy"
 preferred-dark-theme = "navy"
-git-repository-url = "https://github.com/cowboycode/cowboy"
-edit-url-template = "https://github.com/cowboycode/cowboy/edit/main/docs/{path}"
+git-repository-url = "https://github.com/koshea/cowboy"
+edit-url-template = "https://github.com/koshea/cowboy/edit/main/docs/{path}"
 
 [output.html.fold]
 enable = true

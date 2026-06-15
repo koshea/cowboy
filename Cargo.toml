@@ -13,7 +13,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["cowboycode"]
-repository = "https://github.com/cowboycode/cowboy"
+repository = "https://github.com/koshea/cowboy"
 
 [workspace.dependencies]
 # internal
