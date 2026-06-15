@@ -1227,6 +1227,30 @@ fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
             });
         }
     }
+    // Configured models the provider catalogue didn't return (a stale
+    // `/v1/models` that omits a model you've set up — common with some gateways/
+    // providers). Include them so they're always selectable.
+    for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
+        for (name, def) in &cfg.models {
+            if !seen.insert(def.model.clone()) {
+                continue; // already listed from a provider catalogue
+            }
+            let d = model_defaults::lookup(&def.model);
+            let current = current_id.as_deref() == Some(def.model.as_str());
+            out.push(ModelChoice {
+                label: name.clone(),
+                configured: true,
+                current,
+                configured_name: Some(name.clone()),
+                suggested_name: d.name,
+                context_window: d.context_window,
+                max_tokens: d.max_tokens,
+                temperature: d.temperature,
+                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
+                id: def.model.clone(),
+            });
+        }
+    }
     // Current first, then configured, then alphabetical.
     out.sort_by(|a, b| {
         b.current
