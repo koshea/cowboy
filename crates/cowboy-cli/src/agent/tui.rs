@@ -193,13 +193,15 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn setup_terminal() -> Result<Term> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Capture the mouse for scrollback + transcript-scoped text selection (Shift
-    // bypasses it for native selection); enable bracketed paste so multi-line
-    // pastes arrive as one chunk instead of key-by-key.
+    // We deliberately do NOT capture the mouse: grabbing it disables the
+    // terminal's own click-drag selection + copy (a constant "copy doesn't work"
+    // complaint), and our in-app selection highlight could linger as artifacts.
+    // Without capture, native selection/copy "just works"; scroll with PgUp/PgDn
+    // (terminals with alternate-scroll also map the wheel to that). Bracketed
+    // paste stays on so multi-line pastes into the input arrive as one chunk.
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste
     )?;
     // Best-effort: the kitty keyboard protocol lets us distinguish Shift+Enter
@@ -226,7 +228,6 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture,
         terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -766,10 +767,11 @@ const HELP_LINES: &[&str] = &[
     "  /models        browse the provider catalogue and add/select a model",
     "  /crew [usage]  show the crew roster (model routing) or its usage",
     "  /diff          show the working-tree diff",
-    "  /copy          copy the last answer to the clipboard",
+    "  /copy          copy the last answer to the clipboard (OSC 52)",
     "  /clear         clear the view (conversation memory is kept)",
     "  /detach        leave the session running and exit (re-attach later)",
     "  /quit          end the session",
+    "copy: select text with your mouse (your terminal's native selection) or /copy",
     "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
 ];
 
