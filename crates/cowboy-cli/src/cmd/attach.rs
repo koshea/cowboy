@@ -323,9 +323,13 @@ fn handle_server_msg(
         ServerMsg::Event { event, .. } => {
             let _ = ui_tx.send(to_ui_event(event));
         }
-        ServerMsg::Ask { id, question } => {
+        ServerMsg::Ask {
+            id,
+            question,
+            options,
+        } => {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel::<String>();
-            let _ = ui_tx.send(UiEvent::Ask(question, reply_tx));
+            let _ = ui_tx.send(UiEvent::Ask(question, options, reply_tx));
             let out = out_tx.clone();
             tokio::task::spawn_blocking(move || {
                 let answer = reply_rx.recv().unwrap_or_default();
@@ -459,6 +463,7 @@ mod tests {
                 encode_line(&ServerMsg::Ask {
                     id: 7,
                     question: "ok?".into(),
+                    options: Vec::new(),
                 })
                 .as_bytes(),
             )
@@ -497,7 +502,7 @@ mod tests {
 
         let ask = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match ask {
-            UiEvent::Ask(q, reply) => {
+            UiEvent::Ask(q, _options, reply) => {
                 assert_eq!(q, "ok?");
                 reply.send("yes".into()).unwrap();
             }

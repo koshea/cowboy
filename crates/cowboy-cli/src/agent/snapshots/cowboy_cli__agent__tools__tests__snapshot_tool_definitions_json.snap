@@ -458,12 +458,23 @@ expression: defs
     }
   },
   {
-    "description": "Ask the user a question when you are genuinely blocked and cannot proceed without their input.",
+    "description": "Ask the user a question when you are genuinely blocked and cannot proceed without their input. Provide `options` (2–4 short choices) when the answer is a clear pick — the user gets a selectable list and can still type their own answer.",
     "name": "ask_user",
     "parameters": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "description": "Arguments for the `ask_user` tool.",
       "properties": {
+        "options": {
+          "default": null,
+          "description": "Optional suggested answers to present as a pick-list. The user may still type a free-form answer (\"other\").",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "question": {
           "description": "A question for the user when the agent is genuinely blocked.",
           "type": "string"

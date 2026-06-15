@@ -46,7 +46,9 @@ pub enum UiEvent {
     ToolUse(String),
     Final(String),
     Notice(String),
-    Ask(String, Sender<String>),
+    /// A question for the user: prompt, suggested options (possibly empty), and
+    /// the reply channel.
+    Ask(String, Vec<String>, Sender<String>),
     /// A network approval request: destination label + a reply channel.
     Approval(
         String,
@@ -122,11 +124,11 @@ impl AgentUi for TuiUi {
     fn final_message(&mut self, message: &str) {
         let _ = self.tx.send(UiEvent::Final(message.to_string()));
     }
-    fn ask_user(&mut self, question: &str) -> String {
+    fn ask_user(&mut self, question: &str, options: &[String]) -> String {
         let (rtx, rrx) = std::sync::mpsc::channel();
         if self
             .tx
-            .send(UiEvent::Ask(question.to_string(), rtx))
+            .send(UiEvent::Ask(question.to_string(), options.to_vec(), rtx))
             .is_err()
         {
             return String::new();
@@ -383,9 +385,13 @@ fn event_loop(
                     app.push(LineKind::Final, m);
                 }
                 UiEvent::Notice(m) => app.push(LineKind::Notice, m),
-                UiEvent::Ask(q, reply) => {
+                UiEvent::Ask(q, options, reply) => {
                     app.commit_stream();
-                    app.mode = Mode::AwaitingInput(q);
+                    if options.is_empty() {
+                        app.mode = Mode::AwaitingInput(q);
+                    } else {
+                        app.begin_choice(q, options);
+                    }
                     pending_reply = Some(reply);
                 }
                 UiEvent::Approval(dest, reply) => {
@@ -686,6 +692,33 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             app.mode = Mode::Running;
             app.status = "running".into();
         }
+        // Multiple-choice question: arrows move, digits pick, Enter chooses, and
+        // typing (then Enter) submits a free-form "other" answer.
+        (Mode::AwaitingChoice, KeyCode::Up) => app.choice_move(-1),
+        (Mode::AwaitingChoice, KeyCode::Down) => app.choice_move(1),
+        (Mode::AwaitingChoice, KeyCode::Char(d))
+            if d.is_ascii_digit() && d != '0' && app.input_is_empty() =>
+        {
+            if let Some(answer) = app.choice_option(d as usize - '1' as usize) {
+                app.choice = None;
+                app.push(LineKind::User, answer.clone());
+                if let Some(reply) = ctx.pending_reply.take() {
+                    let _ = reply.send(answer);
+                }
+                app.mode = Mode::Running;
+                app.status = "running".into();
+            }
+        }
+        (Mode::AwaitingChoice, KeyCode::Enter) => {
+            let answer = app.choice_answer();
+            app.push(LineKind::User, answer.clone());
+            if let Some(reply) = ctx.pending_reply.take() {
+                let _ = reply.send(answer);
+            }
+            app.mode = Mode::Running;
+            app.status = "running".into();
+        }
+        (Mode::AwaitingChoice, _) => app.input_event(event),
         // Submit a message (Idle or while a turn is running -> queued).
         (Mode::Idle | Mode::Running, KeyCode::Enter) => {
             let msg = app.take_input();

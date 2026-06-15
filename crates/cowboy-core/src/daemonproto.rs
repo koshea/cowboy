@@ -403,7 +403,13 @@ pub enum ServerMsg {
     /// A journaled display event with its sequence number (= journal line).
     Event { seq: u64, event: UiEventMsg },
     /// A pending question for the user; reply with [`ClientMsg::AskReply`].
-    Ask { id: u64, question: String },
+    /// `options` (possibly empty) are suggested choices for a pick-list.
+    Ask {
+        id: u64,
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+    },
     /// A pending network approval; reply with [`ClientMsg::ApprovalReply`].
     Approval { id: u64, dest: String },
     /// A previously broadcast `Approval` has been decided (by another client or
@@ -540,6 +546,7 @@ mod tests {
         roundtrip(&ServerMsg::Ask {
             id: 1,
             question: "continue?".into(),
+            options: vec!["yes".into(), "no".into()],
         });
         roundtrip(&ServerMsg::Snapshot {
             info: sample_info(),
