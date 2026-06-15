@@ -20,6 +20,7 @@ pub async fn run(command: CrewCommand) -> Result<()> {
         CrewCommand::Show => show(),
         CrewCommand::Validate => validate(),
         CrewCommand::Usage => usage(),
+        CrewCommand::Recommend => recommend(),
     }
 }
 
@@ -180,6 +181,23 @@ fn usage() -> Result<()> {
             r.success_pct(),
             avg_s
         );
+    }
+    Ok(())
+}
+
+fn recommend() -> Result<()> {
+    let outcomes = crew::load_history();
+    let recs = crew::recommend(&outcomes);
+    if recs.is_empty() {
+        println!(
+            "no changes suggested ({} outcomes analyzed).",
+            outcomes.len()
+        );
+        return Ok(());
+    }
+    println!("crew recommendations (review, then edit the roster yourself):");
+    for r in recs {
+        println!("  • {r}");
     }
     Ok(())
 }

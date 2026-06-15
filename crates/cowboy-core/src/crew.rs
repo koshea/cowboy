@@ -438,6 +438,79 @@ pub fn usage_by_model(outcomes: &[CrewOutcome]) -> Vec<UsageRow> {
     rows
 }
 
+/// Aggregate by exact route (category, effort, model) — the grain recommendations
+/// reason over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteStat {
+    pub category: String,
+    pub effort: String,
+    pub model: String,
+    pub tasks: usize,
+    pub succeeded: usize,
+    pub fell_back: usize,
+}
+
+impl RouteStat {
+    pub fn success_pct(&self) -> u32 {
+        (self.succeeded * 100).checked_div(self.tasks).unwrap_or(0) as u32
+    }
+}
+
+/// Aggregate outcomes by (category, effort, model).
+pub fn stats_by_route(outcomes: &[CrewOutcome]) -> Vec<RouteStat> {
+    let mut by: BTreeMap<(String, String, String), RouteStat> = BTreeMap::new();
+    for o in outcomes {
+        let key = (o.category.clone(), o.effort.clone(), o.model.clone());
+        let row = by.entry(key).or_insert_with(|| RouteStat {
+            category: o.category.clone(),
+            effort: o.effort.clone(),
+            model: o.model.clone(),
+            tasks: 0,
+            succeeded: 0,
+            fell_back: 0,
+        });
+        row.tasks += 1;
+        if o.succeeded() {
+            row.succeeded += 1;
+        }
+        if o.fell_back {
+            row.fell_back += 1;
+        }
+    }
+    by.into_values().collect()
+}
+
+/// Minimum samples before we'll say anything about a route (avoid noise).
+const RECOMMEND_MIN_SAMPLES: usize = 3;
+/// Success rate below which a route is flagged for review.
+const RECOMMEND_LOW_SUCCESS_PCT: u32 = 60;
+
+/// Evidence-based, recommend-only suggestions from recorded outcomes. Returns
+/// human-readable lines; NEVER mutates the roster (the user decides + edits).
+pub fn recommend(outcomes: &[CrewOutcome]) -> Vec<String> {
+    let mut out = Vec::new();
+    let stats = stats_by_route(outcomes);
+    for s in &stats {
+        if s.tasks < RECOMMEND_MIN_SAMPLES {
+            continue;
+        }
+        if s.success_pct() < RECOMMEND_LOW_SUCCESS_PCT {
+            out.push(format!(
+                "{}/{} via `{}`: only {}% success over {} tasks — consider a stronger model for this route.",
+                s.category, s.effort, s.model, s.success_pct(), s.tasks
+            ));
+        }
+        // Frequently falling back means the category/effort isn't in the roster.
+        if s.fell_back >= RECOMMEND_MIN_SAMPLES && s.fell_back * 2 >= s.tasks {
+            out.push(format!(
+                "{}/{} fell back to `{}` {}/{} times — add `{}` to your roster to route it explicitly.",
+                s.category, s.effort, s.model, s.fell_back, s.tasks, s.category
+            ));
+        }
+    }
+    out
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -600,6 +673,43 @@ crew:
         assert_eq!(rows[0].avg_duration_ms(), 150);
         assert_eq!(rows[1].model, "opus");
         assert_eq!(rows[1].success_pct(), 100);
+    }
+
+    #[test]
+    fn recommend_flags_low_success_and_frequent_fallback() {
+        let o = |cat: &str, model: &str, status: &str, fb: bool| CrewOutcome {
+            ts_ms: 1,
+            category: cat.into(),
+            effort: "small".into(),
+            model: model.into(),
+            fell_back: fb,
+            status: status.into(),
+            duration_ms: 10,
+        };
+        // tests/small via cheap: 1/4 success → flagged.
+        let mut outcomes = vec![
+            o("tests", "cheap", "complete", false),
+            o("tests", "cheap", "error", false),
+            o("tests", "cheap", "error", false),
+            o("tests", "cheap", "empty", false),
+        ];
+        // frontend/small fell back to general's model 3/3 → flagged to add to roster.
+        outcomes.extend([
+            o("frontend", "sonnet", "complete", true),
+            o("frontend", "sonnet", "complete", true),
+            o("frontend", "sonnet", "complete", true),
+        ]);
+        let recs = recommend(&outcomes);
+        assert!(recs
+            .iter()
+            .any(|r| r.contains("tests/small") && r.contains("success")));
+        assert!(recs
+            .iter()
+            .any(|r| r.contains("frontend/small") && r.contains("fell back")));
+
+        // Below the sample floor → silent.
+        let few = vec![o("docs", "cheap", "error", false)];
+        assert!(recommend(&few).is_empty());
     }
 
     #[test]

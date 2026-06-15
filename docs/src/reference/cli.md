@@ -85,6 +85,11 @@ Write a default crew roster (tiers derived from your models' prices)
 Show the routing matrix (category × effort → model)
 
 
+### `cowboy crew recommend`
+
+Suggest roster changes from recorded outcomes (recommend-only; never edits)
+
+
 ### `cowboy crew show`
 
 Print the full crew.yaml (roster + delegation rules)

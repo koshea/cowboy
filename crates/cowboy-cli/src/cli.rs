@@ -447,6 +447,8 @@ pub enum CrewCommand {
     Validate,
     /// Show recorded delegation usage per model (tasks, success %, avg duration).
     Usage,
+    /// Suggest roster changes from recorded outcomes (recommend-only; never edits).
+    Recommend,
 }
 
 #[derive(Debug, Args)]
