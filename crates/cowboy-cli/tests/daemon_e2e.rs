@@ -786,6 +786,134 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
     reap_new_docker(&docker_before);
 }
 
+/// Ranch acceptance gate: a workstream that declares acceptance criteria does NOT
+/// auto-complete when its session finishes — it pauses at `WaitingForUser`, the
+/// dependent stays blocked, and the coordinator does not launch it. After the
+/// user signs off (`ranch accept`), `ranch start` launches the dependent. Needs
+/// Docker + a real model.
+#[test]
+#[ignore = "real Docker + model: exercises the acceptance gate + sign-off"]
+fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let docker_before = cowboy_docker_objects();
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    // schema declares acceptance criteria → it must pause for sign-off even after
+    // its session completes; api depends on it.
+    let ranch_dir = proj.path().join(".cowboy/ranches/billing");
+    std::fs::create_dir_all(&ranch_dir).unwrap();
+    std::fs::write(
+        ranch_dir.join("ranch.yaml"),
+        "version: 1\nid: billing\ntitle: Billing\nstatus: planning\nauto_advance: true\n\
+         created_ms: 1\nupdated_ms: 1\nworkstreams:\n\
+         \x20 - id: schema\n    title: Schema\n    goal: Create a file hello.txt containing the word hello, then finish.\n    depends_on: []\n    acceptance:\n      - a human confirms hello.txt is correct\n\
+         \x20 - id: api\n    title: API\n    goal: Create a file api.txt containing the word api, then finish.\n    depends_on: [schema]\n",
+    )
+    .unwrap();
+
+    let run_cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cowboy"))
+            .current_dir(proj.path())
+            .env("XDG_RUNTIME_DIR", env.runtime.path())
+            .env("XDG_STATE_HOME", env.state.path())
+            .args(args)
+            .output()
+            .expect("run cowboy")
+    };
+
+    assert!(run_cli(&["ranch", "start", "billing"]).status.success());
+
+    // Wait for schema's session to complete (it runs a trivial task).
+    let schema_sid = cowboy_core::ranch::load(proj.path(), "billing")
+        .unwrap()
+        .workstream("schema")
+        .and_then(|w| w.session_id.clone())
+        .expect("schema should have a session");
+    let mut completed = false;
+    for _ in 0..1200 {
+        if let Some(info) = get(&sock, &schema_sid) {
+            if info.status == SessionStatus::Completed {
+                completed = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(completed, "schema session should complete");
+
+    // Give the coordinator a moment to run its advance, then assert it PAUSED:
+    // schema is waiting for sign-off and api was NOT launched.
+    std::thread::sleep(Duration::from_secs(2));
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    assert_eq!(
+        r.workstream("schema").unwrap().status,
+        cowboy_core::ranch::WorkstreamStatus::WaitingForUser,
+        "schema should pause at the acceptance gate"
+    );
+    assert!(
+        r.workstream("api").unwrap().session_id.is_none(),
+        "api must not launch before sign-off"
+    );
+
+    // Sign off, then start: api now launches.
+    assert!(run_cli(&["ranch", "accept", "billing", "schema"])
+        .status
+        .success());
+    assert!(run_cli(&["ranch", "start", "billing"]).status.success());
+    let mut api_launched = false;
+    for _ in 0..50 {
+        if cowboy_core::ranch::load(proj.path(), "billing")
+            .unwrap()
+            .workstream("api")
+            .and_then(|w| w.session_id.clone())
+            .is_some()
+        {
+            api_launched = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(api_launched, "api should launch after sign-off");
+
+    // Cleanup: end any live workers, remove worktrees, reap containers.
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    for wsid in ["schema", "api"] {
+        if let Some(w) = r.workstream(wsid) {
+            if let Some(sid) = &w.session_id {
+                if let Some(info) = get(&sock, sid) {
+                    if let Some(ws) = &info.worker_sock {
+                        Client::connect(ws).send(&ClientMsg::End);
+                    }
+                }
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    for wsid in ["schema", "api"] {
+        if let Some(p) = r.workstream(wsid).and_then(|w| w.worktree_path.clone()) {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(proj.path())
+                .args(["worktree", "remove", "--force"])
+                .arg(&p)
+                .output();
+        }
+    }
+    reap_new_docker(&docker_before);
+}
+
 /// The flagship real-Docker turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.

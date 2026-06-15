@@ -463,6 +463,13 @@ pub enum RanchCommand {
         #[arg(value_name = "WORKSTREAM")]
         workstream: String,
     },
+    /// Sign off on a workstream waiting at its acceptance gate (unblocks deps).
+    Accept {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "WORKSTREAM")]
+        workstream: String,
+    },
     /// Live TUI dashboard: watch workstreams advance, start/refresh from keys.
     Watch {
         #[arg(value_name = "RANCH")]
