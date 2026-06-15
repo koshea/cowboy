@@ -457,6 +457,22 @@ pub enum WorktreeCommand {
         #[arg(value_name = "NAME")]
         name: Option<String>,
     },
+    /// Show a branch's diff stat vs its fork point (read-only).
+    Diff {
+        /// Branch to inspect (or use --session).
+        #[arg(value_name = "BRANCH")]
+        branch: Option<String>,
+        /// Resolve the branch from a session id instead.
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Summarize a branch's changes + mergeability vs HEAD (read-only).
+    Status {
+        #[arg(value_name = "BRANCH")]
+        branch: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]

@@ -37,6 +37,12 @@ async fn main() -> Result<()> {
         Some(Command::Worktree(args)) => match args.command {
             cowboy_cli::cli::WorktreeCommand::List => cmd::worktree::list().await,
             cowboy_cli::cli::WorktreeCommand::Create { name } => cmd::worktree::create(name).await,
+            cowboy_cli::cli::WorktreeCommand::Diff { branch, session } => {
+                cmd::worktree::diff(branch, session).await
+            }
+            cowboy_cli::cli::WorktreeCommand::Status { branch, session } => {
+                cmd::worktree::status(branch, session).await
+            }
         },
         Some(Command::Memory(args)) => cmd::memory::run(args),
         Some(Command::Secrets(args)) => cmd::secrets::run(args.command),

@@ -60,6 +60,100 @@ pub fn is_dirty(repo: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// A summary of a branch's changes vs its fork point with `HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeStatus {
+    pub branch: String,
+    /// Short sha of the merge-base with HEAD (the fork point), or "HEAD".
+    pub base: String,
+    /// `name-status` lines, e.g. `M\tsrc/lib.rs`.
+    pub files: Vec<String>,
+    pub insertions: u64,
+    pub deletions: u64,
+    /// Whether the branch merges cleanly into HEAD (None = couldn't determine).
+    pub mergeable: Option<bool>,
+}
+
+/// Run `git -C repo <args>` and return trimmed stdout, or an error on failure.
+fn git(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The fork point of `branch` from `HEAD` (merge-base), short; falls back to HEAD.
+fn fork_point(repo: &Path, branch: &str) -> String {
+    git(repo, &["merge-base", "HEAD", branch])
+        .ok()
+        .and_then(|s| s.lines().next().map(|l| l[..l.len().min(12)].to_string()))
+        .unwrap_or_else(|| "HEAD".to_string())
+}
+
+/// Inspect a branch's changes vs where it forked from `HEAD`. Read-only.
+pub fn status(repo: &Path, branch: &str) -> Result<WorktreeStatus> {
+    if !branch_exists(repo, branch) {
+        anyhow::bail!("no such branch: {branch}");
+    }
+    let base = fork_point(repo, branch);
+    let range = format!("{base}..{branch}");
+    let files: Vec<String> = git(repo, &["diff", "--name-status", &range])?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_string)
+        .collect();
+    let (mut insertions, mut deletions) = (0u64, 0u64);
+    for line in git(repo, &["diff", "--numstat", &range])?.lines() {
+        let mut cols = line.split('\t');
+        insertions += cols.next().and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
+        deletions += cols.next().and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
+    }
+    Ok(WorktreeStatus {
+        branch: branch.to_string(),
+        base,
+        files,
+        insertions,
+        deletions,
+        mergeable: mergeability(repo, "HEAD", branch),
+    })
+}
+
+/// The `git diff --stat` of a branch vs its fork point (for `worktree diff`).
+pub fn diff_stat(repo: &Path, branch: &str) -> Result<String> {
+    if !branch_exists(repo, branch) {
+        anyhow::bail!("no such branch: {branch}");
+    }
+    let base = fork_point(repo, branch);
+    git(repo, &["diff", "--stat", &format!("{base}..{branch}")])
+}
+
+/// Whether `branch` merges cleanly into `base` — conservative, never merges.
+/// Uses `git merge-tree --write-tree` (git ≥ 2.38): exit 0 = clean, 1 =
+/// conflicts, anything else (old git / error) → `None` (undetermined).
+pub fn mergeability(repo: &Path, base: &str, branch: &str) -> Option<bool> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["merge-tree", "--write-tree", base, branch])
+        .output()
+        .ok()?;
+    match out.status.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
@@ -220,6 +314,27 @@ mod tests {
             worktrees.iter().any(|w| w.branch == "cowboy/feature-x"),
             "list should include the new branch: {worktrees:?}"
         );
+    }
+
+    #[test]
+    fn status_and_diff_summarize_a_branch() {
+        let repo = init_repo();
+        let (wt, branch) = create(repo.path(), Some("cowboy/feat"), None).unwrap();
+        // Commit a change on the new branch (in its worktree).
+        std::fs::write(wt.join("new.txt"), "hello\nworld\n").unwrap();
+        git(&wt, &["add", "."]);
+        git(&wt, &["commit", "-qm", "add new"]);
+
+        let s = status(repo.path(), &branch).unwrap();
+        assert_eq!(s.files.len(), 1, "one changed file: {:?}", s.files);
+        assert!(s.insertions >= 2, "insertions counted: {s:?}");
+        assert_ne!(s.mergeable, Some(false), "a fresh file should not conflict");
+
+        let stat = diff_stat(repo.path(), &branch).unwrap();
+        assert!(stat.contains("new.txt"), "diff stat names the file: {stat}");
+
+        // Unknown branch errors.
+        assert!(status(repo.path(), "cowboy/nope").is_err());
     }
 
     #[test]
