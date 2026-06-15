@@ -198,6 +198,15 @@ pub fn ranch_path(root: &Path, id: &str) -> PathBuf {
     ranches_dir(root).join(id).join("ranch.yaml")
 }
 
+/// The committed artifact store for a workstream's promoted outputs
+/// (`.cowboy/ranches/<id>/artifacts/<workstream>/`).
+pub fn ranch_artifact_dir(root: &Path, ranch_id: &str, workstream_id: &str) -> PathBuf {
+    ranches_dir(root)
+        .join(ranch_id)
+        .join("artifacts")
+        .join(workstream_id)
+}
+
 /// Load a ranch plan by id.
 pub fn load(root: &Path, id: &str) -> Result<Ranch> {
     let path = ranch_path(root, id);

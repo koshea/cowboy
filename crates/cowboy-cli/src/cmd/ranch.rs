@@ -138,10 +138,19 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
             }
         }
     }
-    let to_start = reconcile_and_pick(&mut ranch, &|sid| session_status.get(sid).copied());
+    let reconciled = reconcile_and_pick(&mut ranch, &|sid| session_status.get(sid).copied());
+
+    // Promote the outputs of workstreams that just finished into the ranch store
+    // (committed, shareable) so downstream workstreams + reviewers can use them.
+    for ws_id in &reconciled.newly_complete {
+        if let Some(ws) = ranch.workstream(ws_id).cloned() {
+            let n = promote_artifacts(root, &ranch, &ws);
+            println!("{ws_id} complete — promoted {n} artifact(s)");
+        }
+    }
 
     let mut started: Vec<(String, String, String)> = Vec::new();
-    for ws_id in &to_start {
+    for ws_id in &reconciled.ready {
         let ws = ranch.workstream(ws_id).unwrap().clone();
         let branch = format!("cowboy/{}-{}", ranch.id, ws.id);
         let (path, branch) = match daemon::request(DaemonReq::CreateWorktree {
@@ -158,7 +167,7 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
             }
             other => bail!("unexpected daemon response: {other:?}"),
         };
-        let task = compose_task(&ranch, &ws);
+        let task = compose_task(root, &ranch, &ws);
         match daemon::request(DaemonReq::StartSession {
             root: path.clone(),
             task: Some(task),
@@ -225,13 +234,22 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
     Ok(())
 }
 
+/// What `reconcile_and_pick` decided this run.
+struct Reconciled {
+    /// Ids ready to launch now (deps complete).
+    ready: Vec<String>,
+    /// Ids that just transitioned to Complete (whose artifacts to promote).
+    newly_complete: Vec<String>,
+}
+
 /// Reconcile already-started workstreams from their session status, recompute
-/// readiness, and return the ids now ready to launch. Pure (clock/IO injected),
-/// so it's unit-testable without a daemon.
+/// readiness, and report what's ready + what just completed. Pure (status
+/// lookup injected), so it's unit-testable without a daemon.
 fn reconcile_and_pick(
     ranch: &mut Ranch,
     session_status: &dyn Fn(&str) -> Option<SessionStatus>,
-) -> Vec<String> {
+) -> Reconciled {
+    let mut newly_complete = Vec::new();
     for w in &mut ranch.workstreams {
         if matches!(
             w.status,
@@ -239,7 +257,10 @@ fn reconcile_and_pick(
         ) {
             if let Some(sid) = &w.session_id {
                 match session_status(sid) {
-                    Some(SessionStatus::Completed) => w.status = WorkstreamStatus::Complete,
+                    Some(SessionStatus::Completed) => {
+                        w.status = WorkstreamStatus::Complete;
+                        newly_complete.push(w.id.clone());
+                    }
                     Some(SessionStatus::Failed) | Some(SessionStatus::Stale) => {
                         w.status = WorkstreamStatus::Failed
                     }
@@ -249,18 +270,58 @@ fn reconcile_and_pick(
         }
     }
     ranch.recompute_readiness();
-    ranch
+    let ready = ranch
         .workstreams
         .iter()
         .filter(|w| w.status == WorkstreamStatus::Ready)
         .map(|w| w.id.clone())
-        .collect()
+        .collect();
+    Reconciled {
+        ready,
+        newly_complete,
+    }
 }
 
-/// Build the worker task prompt for a workstream (Stage 3 will inject the actual
-/// dependency artifacts; for now it states the goal, acceptance, and the
-/// coordination rules).
-fn compose_task(ranch: &Ranch, ws: &cowboy_core::ranch::Workstream) -> String {
+/// Promote a completed workstream's published artifacts (+ handoff) from its
+/// session dir in its worktree into the ranch's committed artifact store, so
+/// downstream workstreams (and reviewers) can consume them. Returns the count.
+fn promote_artifacts(
+    root: &std::path::Path,
+    ranch: &Ranch,
+    ws: &cowboy_core::ranch::Workstream,
+) -> usize {
+    let (Some(wt), Some(sid)) = (&ws.worktree_path, &ws.session_id) else {
+        return 0;
+    };
+    let session_dir = wt.join(".cowboy").join("sessions").join(sid);
+    let dest = ranch::ranch_artifact_dir(root, &ranch.id, &ws.id);
+    if std::fs::create_dir_all(&dest).is_err() {
+        return 0;
+    }
+    let mut n = 0;
+    for a in cowboy_core::artifact::list_in(&session_dir) {
+        let src = session_dir.join(&a.path);
+        if let Some(name) = a.path.file_name() {
+            if std::fs::copy(&src, dest.join(name)).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    // The handoff is the headline output; promote it too if present.
+    let handoff = session_dir.join("handoff.md");
+    if handoff.exists() {
+        let _ = std::fs::copy(&handoff, dest.join("handoff.md"));
+    }
+    n
+}
+
+/// Build the worker task prompt for a workstream, injecting the promoted
+/// artifacts of its completed dependencies so it can consume them directly.
+fn compose_task(
+    root: &std::path::Path,
+    ranch: &Ranch,
+    ws: &cowboy_core::ranch::Workstream,
+) -> String {
     let mut s = format!(
         "You are running ONE workstream of a larger Ranch Plan.\n\nRanch: {}\n",
         ranch.title
@@ -290,6 +351,31 @@ fn compose_task(ranch: &Ranch, ws: &cowboy_core::ranch::Workstream) -> String {
             s.push_str(&format!("- {a}\n"));
         }
     }
+
+    // Inline the dependencies' promoted artifacts (capped) so the worker has the
+    // upstream contracts/handoffs in context.
+    let mut deps_block = String::new();
+    for dep in &ws.depends_on {
+        let dir = ranch::ranch_artifact_dir(root, &ranch.id, dep);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for f in files {
+            let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
+            let Some(name) = name else { continue };
+            if let Ok(body) = std::fs::read_to_string(&f) {
+                let body = truncate(&body, 8000);
+                deps_block.push_str(&format!("\n### {dep}/{name}\n{body}\n"));
+            }
+        }
+    }
+    if !deps_block.is_empty() {
+        s.push_str("\nArtifacts from your dependencies (consume these):\n");
+        s.push_str(&deps_block);
+    }
+
     s.push_str(
         "\nCoordination rules:\n\
          - Work only on this workstream, in this worktree.\n\
@@ -298,6 +384,18 @@ fn compose_task(ranch: &Ranch, ws: &cowboy_core::ranch::Workstream) -> String {
          - When done, publish the expected artifacts and a handoff, then finish.\n",
     );
     s
+}
+
+/// Truncate `s` to at most `max` bytes (on a char boundary), noting the cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…(truncated)", &s[..end])
 }
 
 fn ranch_status(s: RanchStatus) -> &'static str {
@@ -379,10 +477,11 @@ mod tests {
             ws("ui", &["api"], WorkstreamStatus::Planned, None),
         ]);
         // s1 has Completed → schema becomes Complete, api unblocks.
-        let pick = reconcile_and_pick(&mut r, &|sid| {
+        let rec = reconcile_and_pick(&mut r, &|sid| {
             (sid == "s1").then_some(SessionStatus::Completed)
         });
-        assert_eq!(pick, vec!["api"]);
+        assert_eq!(rec.ready, vec!["api"]);
+        assert_eq!(rec.newly_complete, vec!["schema"]);
         assert_eq!(
             r.workstream("schema").unwrap().status,
             WorkstreamStatus::Complete
@@ -402,8 +501,9 @@ mod tests {
             Some("s1"),
         )]);
         // Session still running → no change, nothing new to start.
-        let pick = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Running));
-        assert!(pick.is_empty());
+        let rec = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Running));
+        assert!(rec.ready.is_empty());
+        assert!(rec.newly_complete.is_empty());
         assert_eq!(
             r.workstream("schema").unwrap().status,
             WorkstreamStatus::Running
@@ -411,14 +511,56 @@ mod tests {
     }
 
     #[test]
-    fn compose_task_includes_goal_and_rules() {
+    fn promote_copies_session_artifacts_and_handoff_into_the_ranch_store() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        // Simulate a completed workstream's worktree + session dir with outputs.
+        let wt = root.join("wt");
+        let session_dir = wt.join(".cowboy/sessions/sess1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        cowboy_core::artifact::add_in(
+            &session_dir,
+            "sess1",
+            cowboy_core::artifact::ArtifactKind::Contract,
+            "Schema",
+            "TABLE users",
+            None,
+            1,
+        )
+        .unwrap();
+        std::fs::write(session_dir.join("handoff.md"), "# Handoff\ndone").unwrap();
+
         let r = ranch(vec![]);
+        let mut w = ws("schema", &[], WorkstreamStatus::Complete, Some("sess1"));
+        w.worktree_path = Some(wt.clone());
+        let n = promote_artifacts(root, &r, &w);
+        assert_eq!(n, 1, "one artifact promoted");
+
+        let dest = cowboy_core::ranch::ranch_artifact_dir(root, &r.id, "schema");
+        assert!(dest.join("a0001-schema.md").exists(), "artifact copied");
+        assert!(dest.join("handoff.md").exists(), "handoff copied");
+    }
+
+    #[test]
+    fn compose_task_includes_goal_rules_and_dependency_artifacts() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let r = ranch(vec![]);
+        // A dependency (schema) already promoted a contract into the ranch store.
+        let dep_dir = cowboy_core::ranch::ranch_artifact_dir(tmp.path(), &r.id, "schema");
+        std::fs::create_dir_all(&dep_dir).unwrap();
+        std::fs::write(dep_dir.join("a0001-contract.md"), "# Schema\nTABLE users").unwrap();
+
         let mut w = ws("api", &["schema"], WorkstreamStatus::Ready, None);
         w.acceptance = vec!["tests pass".into()];
-        let task = compose_task(&r, &w);
+        let task = compose_task(tmp.path(), &r, &w);
+
         assert!(task.contains("Your workstream: API (api)"));
         assert!(task.contains("Depends on (complete): schema"));
         assert!(task.contains("tests pass"));
         assert!(task.contains("Coordination rules"));
+        // The dependency's promoted artifact is injected for consumption.
+        assert!(task.contains("Artifacts from your dependencies"));
+        assert!(task.contains("schema/a0001-contract.md"));
+        assert!(task.contains("TABLE users"));
     }
 }
