@@ -41,6 +41,38 @@ fn docker_ok() -> bool {
         .unwrap_or(false)
 }
 
+/// IDs of cowboy-labelled docker containers + networks (for snapshot-diff
+/// cleanup so a test never leaks the worker's agent/gateway objects).
+fn cowboy_docker_objects() -> (Vec<String>, Vec<String>) {
+    let ids = |args: &[&str]| -> Vec<String> {
+        Command::new("docker")
+            .args(args)
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (
+        ids(&["ps", "-aq", "--filter", "label=cowboy=1"]),
+        ids(&["network", "ls", "-q", "--filter", "label=cowboy=1"]),
+    )
+}
+
+/// Remove any cowboy container/network created since `before`.
+fn reap_new_docker(before: &(Vec<String>, Vec<String>)) {
+    let (after_c, after_n) = cowboy_docker_objects();
+    for id in after_c.iter().filter(|id| !before.0.contains(id)) {
+        let _ = Command::new("docker").args(["rm", "-f", id]).output();
+    }
+    for id in after_n.iter().filter(|id| !before.1.contains(id)) {
+        let _ = Command::new("docker").args(["network", "rm", id]).output();
+    }
+}
+
 /// Does the user have a real model provider configured (for the turn test)?
 fn real_provider() -> Option<PathBuf> {
     let mut roots = Vec::new();
@@ -456,6 +488,7 @@ fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
         return;
     };
 
+    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -501,6 +534,9 @@ fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
         .current_dir(proj.path())
         .arg("down")
         .output();
+    // The worker may eagerly bring up its agent/gateway even for a tool-only
+    // task; reap anything new so the suite never leaks containers/networks.
+    reap_new_docker(&docker_before);
 
     // Each coordination tool left its mark.
     for needle in [
