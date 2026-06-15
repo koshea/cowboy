@@ -245,6 +245,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // cancels it (concurrently — control messages are read *while* the turn
     // runs), `End` stops the session, `SwitchModel` swaps the model, and extra
     // `Message`s queue behind the current turn.
+    // A Ranch workstream worker is one-shot: it runs its seeded task and then
+    // ends (so its session goes Completed and `cowboy ranch start` advances the
+    // dependency graph). Ordinary sessions stay alive for further turns.
+    let one_shot = args.workstream_id.is_some();
     let mut queue: VecDeque<String> = VecDeque::new();
     if let Some(task) = args.task.clone() {
         queue.push_back(task);
@@ -318,6 +322,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             apply_switch(&mut agent, &resolve, &emitter, &n);
         }
         if end {
+            break 'serve;
+        }
+        // One-shot Ranch worker: its task turn is done and nothing is queued, so
+        // end the session rather than idling for input that won't come.
+        if one_shot && queue.is_empty() {
             break 'serve;
         }
     }
