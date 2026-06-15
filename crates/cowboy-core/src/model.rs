@@ -18,9 +18,43 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use crate::config::{ReasoningEffort, ResolvedModel};
 use crate::error::{Error, Result};
+
+/// How many times to retry a rate-limited / transiently-failed chat request
+/// before giving up.
+const MAX_RETRIES: u32 = 5;
+
+/// Retry a 429 (rate limit), 529 (overloaded), or any 5xx server error.
+fn is_retryable_status(s: reqwest::StatusCode) -> bool {
+    matches!(s.as_u16(), 429 | 529) || s.is_server_error()
+}
+
+/// Retry transient connection/timeout errors (not request-construction errors).
+fn is_transient(e: &reqwest::Error) -> bool {
+    e.is_timeout() || e.is_connect()
+}
+
+/// Exponential backoff for retry `attempt` (0-based): 0.5s, 1s, 2s, … capped 16s.
+fn backoff(attempt: u32) -> Duration {
+    let secs = (0.5 * 2f64.powi(attempt as i32)).min(16.0);
+    Duration::from_millis((secs * 1000.0) as u64)
+}
+
+/// Honor a numeric `Retry-After` header (seconds), capped at 60s.
+fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
+    let secs: u64 = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs.min(60)))
+}
 
 /// Role of a conversation message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,21 +462,53 @@ impl ModelClient for OpenAiClient {
             }
         }
 
-        let resp = self
-            .http
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(oa_err)?;
-        if !resp.status().is_success() {
-            let code = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(Error::Model(format!(
-                "chat request failed ({code}): {text}"
-            )));
-        }
+        // Send with backoff-retry on rate limits (429), overload (529), 5xx, and
+        // transient connection/timeout errors. Streaming hasn't started yet, so a
+        // retry is clean (no partial output to discard).
+        let url = format!("{}/chat/completions", self.base_url);
+        let mut attempt = 0u32;
+        let resp = loop {
+            match self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(r) if r.status().is_success() => break r,
+                Ok(r) if is_retryable_status(r.status()) && attempt < MAX_RETRIES => {
+                    let delay = retry_after(&r).unwrap_or_else(|| backoff(attempt));
+                    tracing::warn!(
+                        status = %r.status(),
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        "model request throttled/failed; backing off and retrying"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(r) => {
+                    let code = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    return Err(Error::Model(format!(
+                        "chat request failed ({code}): {text}"
+                    )));
+                }
+                Err(e) if is_transient(&e) && attempt < MAX_RETRIES => {
+                    let delay = backoff(attempt);
+                    tracing::warn!(
+                        error = %e,
+                        attempt = attempt + 1,
+                        delay_ms = delay.as_millis() as u64,
+                        "model request connection error; backing off and retrying"
+                    );
+                    attempt += 1;
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => return Err(oa_err(e)),
+            }
+        };
 
         let mut content = String::new();
         let mut acc = ToolCallAccumulator::default();
