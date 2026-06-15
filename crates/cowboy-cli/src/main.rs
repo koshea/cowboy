@@ -43,6 +43,8 @@ async fn main() -> Result<()> {
         Some(Command::Artifact(args)) => cmd::artifact::run(args.command),
         Some(Command::Handoff { session }) => cmd::handoff::run(session),
         Some(Command::Decisions(args)) => cmd::decisions::run(args.command),
+        Some(Command::Message { message, to, all }) => cmd::bus::send(message, to, all).await,
+        Some(Command::Inbox { session }) => cmd::bus::inbox(session).await,
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),

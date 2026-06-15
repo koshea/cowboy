@@ -7,14 +7,14 @@
 //! This module also exposes the client-side helpers (`socket_path`, `request`,
 //! `ensure_running`) that the `cowboy` CLI uses to reach the daemon.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
-    AttachTarget, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode, SessionId,
-    SessionInfo, SessionStatus,
+    AttachTarget, BusMessage, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode,
+    MsgTarget, SessionId, SessionInfo, SessionStatus,
 };
 use cowboy_core::netproto::encode_line;
 use serde::{Deserialize, Serialize};
@@ -87,6 +87,9 @@ struct State {
     /// Keyed by canonical worktree path (as a string).
     #[serde(default)]
     leases: BTreeMap<String, Lease>,
+    /// Per-session message inboxes (the daemon-mediated coordination bus).
+    #[serde(default)]
+    inboxes: BTreeMap<SessionId, VecDeque<BusMessage>>,
 }
 
 /// Daemon runtime state: the registry plus where it persists.
@@ -568,6 +571,56 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                 reclaimed,
                 leases_released,
             }
+        }
+        DaemonReq::SendMessage { to, from, event } => {
+            let mut d = daemon.lock().await;
+            let targets: Vec<SessionId> = match to {
+                MsgTarget::Session(id) => vec![id],
+                // Broadcast to every other known session.
+                MsgTarget::All => d
+                    .state
+                    .sessions
+                    .keys()
+                    .filter(|id| **id != from)
+                    .cloned()
+                    .collect(),
+            };
+            let msg = BusMessage {
+                from,
+                ts_ms: now_ms(),
+                event,
+            };
+            for id in &targets {
+                d.state
+                    .inboxes
+                    .entry(id.clone())
+                    .or_default()
+                    .push_back(msg.clone());
+            }
+            d.save();
+            DaemonResp::Sent {
+                delivered: targets.len(),
+            }
+        }
+        DaemonReq::GetInbox { session, drain } => {
+            let mut d = daemon.lock().await;
+            let messages: Vec<BusMessage> = if drain {
+                d.state
+                    .inboxes
+                    .remove(&session)
+                    .map(|q| q.into_iter().collect())
+                    .unwrap_or_default()
+            } else {
+                d.state
+                    .inboxes
+                    .get(&session)
+                    .map(|q| q.iter().cloned().collect())
+                    .unwrap_or_default()
+            };
+            if drain {
+                d.save();
+            }
+            DaemonResp::Inbox { messages }
         }
         // Worktree create/list are pure git/fs — no registry lock needed. List
         // is annotated with any session that holds each worktree's lease.

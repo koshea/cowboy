@@ -159,6 +159,24 @@ pub enum Command {
     /// List or show decisions recorded in a session.
     Decisions(DecisionsCmdArgs),
 
+    /// Send a structured message to a session inbox (daemon-mediated bus).
+    Message {
+        /// The message text.
+        message: String,
+        /// Target session id.
+        #[arg(long)]
+        to: Option<String>,
+        /// Broadcast to all other sessions instead of one.
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Read (and drain) a session's message inbox (defaults to the most recent).
+    Inbox {
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+    },
+
     /// List session logs.
     Logs,
 

@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod attach;
+pub mod bus;
 pub mod daemon;
 pub mod decisions;
 pub mod doctor;

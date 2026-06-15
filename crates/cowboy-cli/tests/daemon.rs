@@ -85,6 +85,59 @@ fn daemon_pings_lists_and_is_single_instance() {
     );
 }
 
+#[test]
+fn message_bus_delivers_and_drains_inbox() {
+    use cowboy_core::daemonproto::{BusEvent, MsgTarget};
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+
+    for body in ["need the contract", "still waiting"] {
+        match request(
+            &sock,
+            DaemonReq::SendMessage {
+                to: MsgTarget::Session("s1".into()),
+                from: "user".into(),
+                event: BusEvent::UserMessage(body.into()),
+            },
+        ) {
+            Some(DaemonResp::Sent { delivered }) => assert_eq!(delivered, 1),
+            other => panic!("expected Sent, got {other:?}"),
+        }
+    }
+
+    match request(
+        &sock,
+        DaemonReq::GetInbox {
+            session: "s1".into(),
+            drain: true,
+        },
+    ) {
+        Some(DaemonResp::Inbox { messages }) => {
+            assert_eq!(messages.len(), 2);
+            assert_eq!(messages[0].from, "user");
+            assert_eq!(
+                messages[0].event,
+                BusEvent::UserMessage("need the contract".into())
+            );
+        }
+        other => panic!("expected Inbox, got {other:?}"),
+    }
+    // A second drain is empty.
+    match request(
+        &sock,
+        DaemonReq::GetInbox {
+            session: "s1".into(),
+            drain: false,
+        },
+    ) {
+        Some(DaemonResp::Inbox { messages }) => assert!(messages.is_empty()),
+        other => panic!("expected empty Inbox, got {other:?}"),
+    }
+}
+
 fn sample_info(id: &str) -> SessionInfo {
     SessionInfo {
         id: id.into(),

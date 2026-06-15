@@ -112,6 +112,46 @@ pub struct WorktreeInfo {
     pub status: SessionStatus,
 }
 
+/// A structured cross-session message routed by the daemon. This is NOT a free
+/// agent↔agent chat channel — it carries coordination events (a Ranch
+/// coordinator routes these in a later stage).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BusEvent {
+    /// A human message to a session.
+    UserMessage(String),
+    /// A message from another session.
+    SessionMessage(String),
+    /// A status update worth surfacing.
+    StatusUpdate(String),
+    /// The sender became blocked.
+    Blocked(String),
+    /// A handoff is available to consume.
+    HandoffAvailable { artifact_id: String },
+    /// An artifact was published.
+    ArtifactPublished { artifact_id: String, kind: String },
+    /// The sender wants attention.
+    AttentionRequested(String),
+}
+
+/// A delivered bus message: who sent it, when, and what.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusMessage {
+    pub from: String,
+    pub ts_ms: u64,
+    pub event: BusEvent,
+}
+
+/// Who a [`BusEvent`] is addressed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MsgTarget {
+    /// A specific session's inbox.
+    Session(SessionId),
+    /// Every other known session.
+    All,
+}
+
 /// Where a client should attach for a session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -229,6 +269,18 @@ pub enum DaemonReq {
         #[serde(default)]
         dry_run: bool,
     },
+    /// Deliver a structured message to a session inbox (or all sessions).
+    SendMessage {
+        to: MsgTarget,
+        from: SessionId,
+        event: BusEvent,
+    },
+    /// Read (and optionally drain) a session's inbox.
+    GetInbox {
+        session: SessionId,
+        #[serde(default)]
+        drain: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -274,6 +326,14 @@ pub enum DaemonResp {
     CleanedUp {
         reclaimed: Vec<SessionId>,
         leases_released: Vec<PathBuf>,
+    },
+    /// A message was delivered to `delivered` inbox(es).
+    Sent {
+        delivered: usize,
+    },
+    /// The contents of a session's inbox.
+    Inbox {
+        messages: Vec<BusMessage>,
     },
     Err {
         message: String,
@@ -417,6 +477,26 @@ mod tests {
         roundtrip(&DaemonRequest {
             id: 2,
             req: DaemonReq::Ping,
+        });
+        roundtrip(&DaemonRequest {
+            id: 3,
+            req: DaemonReq::SendMessage {
+                to: MsgTarget::Session("s1".into()),
+                from: "user".into(),
+                event: BusEvent::UserMessage("hi".into()),
+            },
+        });
+        roundtrip(&DaemonResponse {
+            id: 3,
+            resp: DaemonResp::Inbox {
+                messages: vec![BusMessage {
+                    from: "user".into(),
+                    ts_ms: 5,
+                    event: BusEvent::HandoffAvailable {
+                        artifact_id: "a0001".into(),
+                    },
+                }],
+            },
         });
         roundtrip(&DaemonResponse {
             id: 2,
