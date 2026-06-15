@@ -710,10 +710,10 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
     if app.has_selection() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                // The selected text was cached during the last `draw` (the live
-                // frame buffer); reading `current_buffer_mut()` here would see
-                // the blank post-swap buffer.
-                match app.take_selected() {
+                // Selection is in logical (wrapped-line) coords; extraction
+                // renders the transcript off-screen, so it captures the whole
+                // selected range even when it spans the scrollback.
+                match app.selected_text() {
                     Some(text) => app.request_copy(text),
                     None => app.status = "copy: nothing under the selection".into(),
                 }
@@ -948,7 +948,8 @@ const HELP_LINES: &[&str] = &[
     "  /clear         clear the view (conversation memory is kept)",
     "  /detach        leave the session running and exit (re-attach later)",
     "  /quit          end the session",
-    "copy: drag to select in the transcript, then `y` to copy (Esc clears) · or /copy",
+    "copy: drag to select (drag to the top/bottom edge to extend across scrollback),",
+    "      then `y` to copy (Esc clears) · or /copy for the whole last answer",
     "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
 ];
 

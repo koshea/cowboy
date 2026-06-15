@@ -7,7 +7,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 use ratatui_textarea::TextArea;
 use throbber_widgets_tui::{Throbber, ThrobberState};
@@ -230,8 +230,9 @@ pub struct App {
     /// `Moved` events as drags (some terminals report button-held motion as
     /// `Moved` rather than `Drag`).
     pub selecting: bool,
-    /// Selected text captured during the last `draw` (see [`App::cache_selection`]).
-    pub selected_cache: std::cell::Cell<Option<String>>,
+    /// Wrapped-line offset of the top visible row, captured each frame so the
+    /// event loop can convert screen rows to logical (wrapped-line) positions.
+    pub scroll_offset: std::cell::Cell<usize>,
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
@@ -250,59 +251,41 @@ pub struct App {
     pub pending_copy: Option<String>,
 }
 
-/// A mouse text selection, in absolute terminal coordinates (col, row).
+/// A text selection in *logical* transcript coordinates: a wrapped-line index
+/// (0-based from the top of the wrapped content) and a column within the
+/// transcript's inner width. Anchoring to logical lines (rather than screen
+/// rows) means the selection survives scrolling, so it can span the whole
+/// scrollback, not just what's currently on screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Selection {
-    /// Where the drag began.
-    pub anchor: (u16, u16),
-    /// Current drag position.
-    pub cursor: (u16, u16),
+    /// Where the drag began: (wrapped-line index, column).
+    pub anchor: (usize, u16),
+    /// Current drag position: (wrapped-line index, column).
+    pub cursor: (usize, u16),
 }
 
-/// Per-row selected column spans `(row, x_start, x_end)` (inclusive), in linear
-/// reading order, clamped to `rect`.
-fn selection_spans(rect: Rect, sel: &Selection) -> Vec<(u16, u16, u16)> {
-    // Order the endpoints by (row, col) so selection reads top-to-bottom.
-    let (start, end) = if (sel.anchor.1, sel.anchor.0) <= (sel.cursor.1, sel.cursor.0) {
-        (sel.anchor, sel.cursor)
-    } else {
-        (sel.cursor, sel.anchor)
-    };
-    let (sx, sy) = start;
-    let (ex, ey) = end;
-    let left = rect.x;
-    let right = rect.right().saturating_sub(1);
-    let (top, bot) = (rect.y, rect.bottom().saturating_sub(1));
-    let mut spans = Vec::new();
-    for y in sy.max(top)..=ey.min(bot) {
-        let x0 = if y == sy { sx } else { left }.clamp(left, right);
-        let x1 = if y == ey { ex } else { right }.clamp(left, right);
-        if x1 >= x0 {
-            spans.push((y, x0, x1));
+impl Selection {
+    /// Endpoints ordered so the selection reads top-to-bottom, left-to-right.
+    fn ordered(&self) -> ((usize, u16), (usize, u16)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
         }
     }
-    spans
-}
 
-/// Read the selected text out of a rendered `buf`, restricted to `rect` (the
-/// transcript columns, so sidebars never bleed in). `None` for a bare click
-/// (anchor == cursor) or an all-whitespace selection.
-fn extract_selection(buf: &Buffer, rect: Rect, sel: &Selection) -> Option<String> {
-    if sel.anchor == sel.cursor {
-        return None; // a click, not a drag
+    /// Inclusive column range `[x0, x1]` selected on wrapped line `line`, given
+    /// the inner width, or `None` if the line is outside the selection.
+    fn cols_on(&self, line: usize, inner_w: u16) -> Option<(u16, u16)> {
+        let (start, end) = self.ordered();
+        if line < start.0 || line > end.0 {
+            return None;
+        }
+        let last = inner_w.saturating_sub(1);
+        let x0 = if line == start.0 { start.1 } else { 0 };
+        let x1 = if line == end.0 { end.1 } else { last };
+        (x1 >= x0).then(|| (x0.min(last), x1.min(last)))
     }
-    let lines: Vec<String> = selection_spans(rect, sel)
-        .into_iter()
-        .map(|(y, x0, x1)| {
-            let mut s = String::new();
-            for x in x0..=x1 {
-                s.push_str(buf[(x, y)].symbol());
-            }
-            s.trim_end().to_string()
-        })
-        .collect();
-    let text = lines.join("\n");
-    (!text.trim().is_empty()).then_some(text)
 }
 
 impl App {
@@ -329,7 +312,7 @@ impl App {
             max_scroll: std::cell::Cell::new(0),
             selection: None,
             selecting: false,
-            selected_cache: std::cell::Cell::new(None),
+            scroll_offset: std::cell::Cell::new(0),
             transcript_area: std::cell::Cell::new(Rect::ZERO),
             model_picker: None,
             model_form: None,
@@ -388,13 +371,24 @@ impl App {
         self.completion = None;
     }
 
+    /// Map an absolute screen position to a logical (wrapped-line, column)
+    /// position within the transcript, if it lands inside the transcript rect.
+    fn screen_to_logical(&self, col: u16, row: u16) -> Option<(usize, u16)> {
+        let r = self.transcript_area.get();
+        if !r.contains(Position::new(col, row)) {
+            return None;
+        }
+        let line = self.scroll_offset.get() + (row - r.y) as usize;
+        Some((line, col - r.x))
+    }
+
     /// Begin a selection at an absolute screen position, but only if it lands in
     /// the transcript (clicks elsewhere just clear any selection).
     pub fn begin_selection(&mut self, col: u16, row: u16) {
-        if self.transcript_area.get().contains(Position::new(col, row)) {
+        if let Some(pos) = self.screen_to_logical(col, row) {
             self.selection = Some(Selection {
-                anchor: (col, row),
-                cursor: (col, row),
+                anchor: pos,
+                cursor: pos,
             });
             self.selecting = true;
         } else {
@@ -408,14 +402,26 @@ impl App {
         self.selecting = false;
     }
 
-    /// Extend the active selection, clamping to the transcript rect.
+    /// Extend the active selection toward an absolute screen position. Dragging
+    /// to (or past) the top/bottom edge auto-scrolls so the selection can grow
+    /// beyond the visible region, across the scrollback.
     pub fn drag_selection(&mut self, col: u16, row: u16) {
         let r = self.transcript_area.get();
+        if self.selection.is_none() || r.height == 0 {
+            return;
+        }
+        // Auto-scroll when dragging at the edges; recompute against the new
+        // offset so the cursor tracks the row the pointer is actually over.
+        if row <= r.y {
+            self.scroll_up(1);
+        } else if row >= r.bottom().saturating_sub(1) {
+            self.scroll_down(1);
+        }
+        let rr = row.clamp(r.y, r.bottom().saturating_sub(1));
+        let cc = col.clamp(r.x, r.right().saturating_sub(1)) - r.x;
+        let line = self.scroll_offset.get() + (rr - r.y) as usize;
         if let Some(sel) = &mut self.selection {
-            sel.cursor = (
-                col.clamp(r.x, r.right().saturating_sub(1)),
-                row.clamp(r.y, r.bottom().saturating_sub(1)),
-            );
+            sel.cursor = (line, cc);
         }
     }
 
@@ -428,28 +434,46 @@ impl App {
         self.selection.is_some()
     }
 
-    /// Extract the selected text from a rendered `buf`, reading only the
-    /// transcript's columns so sidebars never bleed in. Returns `None` for a
-    /// bare click (no drag) or an all-whitespace selection.
-    pub fn selected_text(&self, buf: &Buffer) -> Option<String> {
+    /// Extract the selected text by rendering the transcript off-screen and
+    /// reading the selected logical (wrapped-line) range. Works across the whole
+    /// scrollback, not just the visible viewport. `None` for a bare click
+    /// (anchor == cursor) or an all-whitespace selection.
+    pub fn selected_text(&self) -> Option<String> {
         let sel = self.selection?;
-        extract_selection(buf, self.transcript_area.get(), &sel)
-    }
+        let (start, end) = sel.ordered();
+        if start == end {
+            return None; // a click, not a drag
+        }
+        let inner_w = self.transcript_area.get().width;
+        if inner_w == 0 {
+            return None;
+        }
+        // Render the transcript (no block) into a buffer covering just the
+        // selected wrapped-line range: scroll past the lines above `start`, then
+        // render `height` rows. Uses ratatui's own word-wrapper, so the wrapping
+        // matches what's on screen exactly.
+        let height = (end.0 - start.0 + 1).min(u16::MAX as usize) as u16;
+        let para = Paragraph::new(build_transcript_lines(self))
+            .wrap(Wrap { trim: false })
+            .scroll((start.0.min(u16::MAX as usize) as u16, 0));
+        let mut buf = Buffer::empty(Rect::new(0, 0, inner_w, height));
+        para.render(buf.area, &mut buf);
 
-    /// Cache the selected text from the live frame buffer. Called *during*
-    /// `draw` (where the buffer still holds rendered content) because after
-    /// `draw` returns, ratatui has swapped in a blank buffer — so reading
-    /// `current_buffer_mut()` from the event loop would see only spaces.
-    pub fn cache_selection(&self, buf: &Buffer) {
-        let text = self
-            .selection
-            .and_then(|sel| extract_selection(buf, self.transcript_area.get(), &sel));
-        self.selected_cache.set(text);
-    }
-
-    /// Take the most recently cached selection text (set by [`App::cache_selection`]).
-    pub fn take_selected(&self) -> Option<String> {
-        self.selected_cache.take()
+        let mut out: Vec<String> = Vec::with_capacity(height as usize);
+        for i in 0..height {
+            let line = start.0 + i as usize;
+            let Some((x0, x1)) = sel.cols_on(line, inner_w) else {
+                out.push(String::new());
+                continue;
+            };
+            let mut s = String::new();
+            for x in x0..=x1 {
+                s.push_str(buf[(x, i)].symbol());
+            }
+            out.push(s.trim_end().to_string());
+        }
+        let text = out.join("\n");
+        (!text.trim().is_empty()).then_some(text)
     }
 
     /// Scroll the transcript up (toward older content) by `n` lines.
@@ -912,8 +936,11 @@ fn trunc(s: &str, max: usize) -> String {
     }
 }
 
-fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
-    let mut lines: Vec<Line> = Vec::new();
+/// Build the transcript as a flat list of (unwrapped) lines, exactly as
+/// rendered. Shared by `draw_transcript` and the off-screen selection
+/// extraction so both wrap identically.
+fn build_transcript_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
     let mut prev: Option<LineKind> = None;
     for entry in &app.transcript {
         if spacer_before(prev, entry.kind) {
@@ -968,6 +995,11 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
             lines.push(Line::from(Span::styled(raw.to_string(), style)));
         }
     }
+    lines
+}
+
+fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
+    let lines = build_transcript_lines(app);
 
     let inner_w = area.width.saturating_sub(2).max(1) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
@@ -1002,6 +1034,9 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
         app.scroll_top.min(max_scroll)
     }
     .min(u16::MAX as usize) as u16;
+    // Record the wrapped-line offset so the event loop can map screen rows to
+    // logical positions (and selections can span the scrollback).
+    app.scroll_offset.set(offset_top as usize);
 
     let title = if !app.follow && (offset_top as usize) < max_scroll {
         format!(" {}  ▲ scrollback · Shift+End to follow ", app.title)
@@ -1032,19 +1067,22 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
         f.render_stateful_widget(sb, area, &mut sb_state);
     }
 
-    // Paint the selection highlight over the rendered text.
+    // Paint the selection highlight over the rendered text: for each visible
+    // screen row, map it to its logical wrapped-line and highlight the selected
+    // columns (if any).
     if let Some(sel) = &app.selection {
+        let inner_w = text_rect.width;
         let buf = f.buffer_mut();
-        for (y, x0, x1) in selection_spans(text_rect, sel) {
-            for x in x0..=x1 {
-                let cell = &mut buf[(x, y)];
-                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        for sy in 0..text_rect.height {
+            let line = offset_top as usize + sy as usize;
+            if let Some((x0, x1)) = sel.cols_on(line, inner_w) {
+                for x in x0..=x1 {
+                    let cell = &mut buf[(text_rect.x + x, text_rect.y + sy)];
+                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                }
             }
         }
     }
-    // Capture the selected text now, from the live frame buffer — after `draw`
-    // returns ratatui swaps in a blank buffer, so `y` can't read it later.
-    app.cache_selection(f.buffer_mut());
 }
 
 /// A consistent rounded side/utility panel.
@@ -1675,54 +1713,51 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
         term.draw(|f| draw(f, &app)).unwrap();
 
-        // Select the full first text row of the transcript.
-        let r = app.transcript_area.get();
+        // Select the full first wrapped line of the transcript.
+        let w = app.transcript_area.get().width;
         app.selection = Some(Selection {
-            anchor: (r.x, r.y),
-            cursor: (r.right() - 1, r.y),
+            anchor: (0, 0),
+            cursor: (0, w - 1),
         });
-        let text = app.selected_text(term.backend().buffer()).unwrap();
+        let text = app.selected_text().unwrap();
         assert!(
             text.contains("hello world from the transcript"),
             "got {text:?}"
         );
-        // The sidebar shares the row but lives in other columns — excluded.
+        // Extraction renders only the transcript paragraph, so the sidebar
+        // (a separate pane) can never bleed in.
         assert!(!text.contains("example.com"), "sidebar leaked: {text:?}");
 
         // A bare click (no drag) copies nothing.
         app.selection = Some(Selection {
-            anchor: (r.x, r.y),
-            cursor: (r.x, r.y),
+            anchor: (0, 0),
+            cursor: (0, 0),
         });
-        assert!(app.selected_text(term.backend().buffer()).is_none());
+        assert!(app.selected_text().is_none());
     }
 
     #[test]
-    fn draw_caches_selected_text_for_yank() {
-        // Regression: the event loop reads the cache (populated during draw),
-        // not `current_buffer_mut()` — which ratatui blanks after the buffer
-        // swap, so reading it from a key handler would yield only spaces.
+    fn selection_spans_scrollback_beyond_the_viewport() {
+        // A transcript taller than the viewport. A selection anchored to logical
+        // wrapped-line indices must extract text that isn't currently on screen.
         let mut app = App::new("t");
-        app.push(LineKind::Agent, "hello world from the transcript");
+        // Output lines render 1:1 (no blank spacers between them), so logical
+        // wrapped-line index maps directly to content line index here.
+        for i in 0..100 {
+            app.push(LineKind::Output, format!("transcript line {i}"));
+        }
         let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
-        // First draw establishes the transcript rect.
         term.draw(|f| draw(f, &app)).unwrap();
-        let r = app.transcript_area.get();
+        let w = app.transcript_area.get().width;
+        // Lines 2..=5 are near the top — scrolled out of view when following.
         app.selection = Some(Selection {
-            anchor: (r.x, r.y),
-            cursor: (r.right() - 1, r.y),
+            anchor: (2, 0),
+            cursor: (5, w - 1),
         });
-        // The draw that paints the selection must also cache its text.
-        term.draw(|f| draw(f, &app)).unwrap();
-        let text = app
-            .take_selected()
-            .expect("selection text cached during draw");
-        assert!(
-            text.contains("hello world from the transcript"),
-            "got {text:?}"
-        );
-        // Taking it empties the cache.
-        assert!(app.take_selected().is_none());
+        let text = app.selected_text().expect("offscreen selection extracts");
+        assert!(text.contains("transcript line 2"), "got {text:?}");
+        assert!(text.contains("transcript line 5"), "got {text:?}");
+        assert_eq!(text.lines().count(), 4, "four wrapped lines: {text:?}");
     }
 
     #[test]
