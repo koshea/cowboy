@@ -506,6 +506,7 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             attached_clients,
             running_command,
             branch,
+            blocked_reason,
         } => {
             let mut d = daemon.lock().await;
             match d.state.sessions.get_mut(&id) {
@@ -516,6 +517,7 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                     s.diffstat = diffstat;
                     s.attached_clients = attached_clients;
                     s.running_command = running_command;
+                    s.blocked_reason = blocked_reason;
                     if branch.is_some() {
                         s.branch = branch;
                     }
@@ -689,6 +691,7 @@ async fn start_session(
                 attached_clients: 0,
                 diffstat: String::new(),
                 running_command: None,
+                blocked_reason: None,
             },
         );
         d.save();
@@ -806,6 +809,7 @@ mod tests {
                 attached_clients: 0,
                 diffstat: String::new(),
                 running_command: None,
+                blocked_reason: None,
             },
         );
     }

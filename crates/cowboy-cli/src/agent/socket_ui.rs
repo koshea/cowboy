@@ -71,6 +71,8 @@ pub struct SessionStats {
     pub tokens: (u64, u64),
     pub diffstat: String,
     pub running_command: Option<String>,
+    /// Set while the session has declared itself blocked.
+    pub blocked_reason: Option<String>,
 }
 
 /// Handle to the worker's UI: cloneable, shared between the agent loop (which
@@ -160,6 +162,7 @@ impl SocketUi {
         let mut s = self.inner.stats.lock().unwrap();
         match event {
             UiEventMsg::Tokens { input, output } => s.tokens = (*input, *output),
+            UiEventMsg::Blocked(reason) => s.blocked_reason = reason.clone(),
             UiEventMsg::DiffStat(d) => s.diffstat = d.clone(),
             UiEventMsg::TurnDone => {
                 s.turn += 1;
@@ -256,6 +259,9 @@ impl AgentUi for SocketUi {
     }
     fn cost(&mut self, usd: f64) {
         self.emit(UiEventMsg::Cost(usd));
+    }
+    fn blocked(&mut self, reason: Option<&str>) {
+        self.emit(UiEventMsg::Blocked(reason.map(str::to_string)));
     }
     fn plan(&mut self, steps: &[(String, String)]) {
         self.emit(UiEventMsg::Plan(steps.to_vec()));
@@ -456,6 +462,7 @@ mod tests {
             attached_clients: 0,
             diffstat: String::new(),
             running_command: None,
+            blocked_reason: None,
         }
     }
 

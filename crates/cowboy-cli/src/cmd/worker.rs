@@ -120,6 +120,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         attached_clients: 0,
         diffstat: String::new(),
         running_command: None,
+        blocked_reason: None,
     };
 
     let reg_info = info.clone();
@@ -140,15 +141,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let st = hb_ui.stats();
+                let status = if st.blocked_reason.is_some() {
+                    SessionStatus::Blocked
+                } else {
+                    SessionStatus::Running
+                };
                 let resp = daemon::request(DaemonReq::UpdateSession {
                     id: hb_id.clone(),
-                    status: SessionStatus::Running,
+                    status,
                     turn: st.turn,
                     tokens: st.tokens,
                     diffstat: st.diffstat,
                     attached_clients: hb_ui.attached(),
                     running_command: st.running_command,
                     branch: None,
+                    blocked_reason: st.blocked_reason,
                 })
                 .await;
                 // The daemon forgot us (it restarted or was cleaned) — re-register
@@ -511,6 +518,7 @@ mod tests {
             attached_clients: 0,
             diffstat: String::new(),
             running_command: None,
+            blocked_reason: None,
         }
     }
 

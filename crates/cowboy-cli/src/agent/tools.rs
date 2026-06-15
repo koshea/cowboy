@@ -18,6 +18,8 @@ pub const TOOL_MEMORY: &str = "memory";
 pub const TOOL_PLAN: &str = "plan";
 pub const TOOL_ARTIFACT: &str = "artifact";
 pub const TOOL_HANDOFF: &str = "handoff";
+pub const TOOL_BLOCKED: &str = "blocked";
+pub const TOOL_UNBLOCK: &str = "unblock";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -157,6 +159,16 @@ pub struct HandoffArgs {
     pub next_steps: Option<String>,
 }
 
+/// Arguments for the `blocked` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct BlockedArgs {
+    /// Why you cannot proceed (e.g. "need the API contract from the schema work").
+    pub reason: String,
+    /// Optional: what you're waiting on (artifact names, workstream ids, a person).
+    #[serde(default)]
+    pub waiting_on: Option<Vec<String>>,
+}
+
 /// Arguments for the `artifact` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ArtifactArgs {
@@ -261,6 +273,21 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<HandoffArgs>(),
         },
         ToolDef {
+            name: TOOL_BLOCKED.into(),
+            description: "Declare that you cannot proceed and need an external input \
+                          (a decision, a dependency's artifact, access). Give a clear `reason` \
+                          and optionally `waiting_on`. Use `unblock` once you can continue. This \
+                          surfaces the session as blocked to the user / Ranch coordinator."
+                .into(),
+            parameters: schema_for::<BlockedArgs>(),
+        },
+        ToolDef {
+            name: TOOL_UNBLOCK.into(),
+            description: "Clear a previously-declared blocked state once you can proceed again."
+                .into(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -295,8 +322,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "shell", "read", "edit", "write", "memory", "plan", "artifact", "handoff", "final",
-                "ask_user", "subagent"
+                "shell", "read", "edit", "write", "memory", "plan", "artifact", "handoff",
+                "blocked", "unblock", "final", "ask_user", "subagent"
             ]
         );
     }

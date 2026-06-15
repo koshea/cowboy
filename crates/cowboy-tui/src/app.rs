@@ -184,6 +184,8 @@ pub struct App {
     /// The agent's working plan: ordered (step, status) pairs. When non-empty a
     /// dedicated pane is shown on the right.
     pub plan: Vec<(String, String)>,
+    /// Set while the session has declared itself blocked (shown in the status bar).
+    pub blocked: Option<String>,
     /// Input editor (multi-line, cursor) via tui-textarea.
     pub textarea: TextArea<'static>,
     pub mode: Mode,
@@ -255,6 +257,7 @@ impl App {
             activity: Vec::new(),
             processes: Vec::new(),
             plan: Vec::new(),
+            blocked: None,
             textarea: TextArea::default(),
             mode: Mode::Running,
             throbber: ThrobberState::default(),
@@ -364,6 +367,15 @@ impl App {
     /// Append a network activity line.
     pub fn activity(&mut self, line: impl Into<String>) {
         self.activity.push(line.into());
+    }
+
+    /// Record a blocked/unblocked transition (status-bar flag + a notice line).
+    pub fn set_blocked(&mut self, reason: Option<String>) {
+        match &reason {
+            Some(r) => self.push(LineKind::Notice, format!("⏸ blocked: {r}")),
+            None => self.push(LineKind::Notice, "▶ unblocked"),
+        }
+        self.blocked = reason;
     }
 
     pub fn stream(&mut self, text: &str) {
@@ -956,8 +968,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
     }
     let bar = Style::default().bg(Color::Blue).fg(Color::White);
-    // Right side: running token estimate, then the working-tree diff summary.
+    // Right side: a blocked flag, the running token estimate, then the diff.
     let mut segs: Vec<String> = Vec::new();
+    if app.blocked.is_some() {
+        segs.push("⏸ blocked".to_string());
+    }
     if app.tokens_in > 0 || app.tokens_out > 0 {
         let mut seg = format!(
             "~{}↑ {}↓",

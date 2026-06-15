@@ -29,6 +29,9 @@ pub trait AgentUi {
     /// The agent's working plan changed: ordered (step, status) pairs where
     /// status is "pending" | "in_progress" | "done". Default: ignored.
     fn plan(&mut self, _steps: &[(String, String)]) {}
+    /// The session declared itself blocked (`Some(reason)`) or unblocked
+    /// (`None`). Default: ignored.
+    fn blocked(&mut self, _reason: Option<&str>) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question; return their answer.
@@ -141,6 +144,16 @@ impl AgentUi for ConsoleUi {
             println!("{color}  {mark} {step}\x1b[0m");
         }
         let _ = std::io::stdout().flush();
+    }
+
+    fn blocked(&mut self, reason: Option<&str>) {
+        if self.final_only {
+            return;
+        }
+        match reason {
+            Some(r) => println!("\x1b[1;33m⏸ blocked: {r}\x1b[0m"),
+            None => println!("\x1b[1;32m▶ unblocked\x1b[0m"),
+        }
     }
 
     fn final_message(&mut self, message: &str) {

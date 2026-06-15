@@ -45,6 +45,9 @@ pub enum SessionStatus {
     Idle,
     AwaitingApproval,
     AwaitingInput,
+    /// The session has declared it cannot proceed (see `blocked_reason`); still
+    /// live and attachable, just waiting on an external input/dependency.
+    Blocked,
     Completed,
     Failed,
     Stale,
@@ -94,6 +97,9 @@ pub struct SessionInfo {
     pub diffstat: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub running_command: Option<String>,
+    /// Why the session is blocked (set while `status == Blocked`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
 }
 
 /// A cowboy-created git worktree.
@@ -186,6 +192,8 @@ pub enum DaemonReq {
         running_command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         branch: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        blocked_reason: Option<String>,
     },
     Heartbeat {
         id: SessionId,
@@ -304,6 +312,8 @@ pub enum UiEventMsg {
     },
     /// Running estimated session spend in USD.
     Cost(f64),
+    /// The session is blocked (`Some(reason)`) or unblocked (`None`).
+    Blocked(Option<String>),
     /// The agent's working plan: ordered (step, status) pairs.
     Plan(Vec<(String, String)>),
     Title(String),
@@ -465,6 +475,8 @@ mod tests {
             output: 340,
         });
         roundtrip(&UiEventMsg::Cost(0.42));
+        roundtrip(&UiEventMsg::Blocked(Some("need the contract".into())));
+        roundtrip(&UiEventMsg::Blocked(None));
         roundtrip(&UiEventMsg::Plan(vec![
             ("scope the work".into(), "done".into()),
             ("implement".into(), "in_progress".into()),
@@ -494,6 +506,7 @@ mod tests {
             attached_clients: 1,
             diffstat: "Δ 1f +2 -0".into(),
             running_command: None,
+            blocked_reason: None,
         }
     }
 }

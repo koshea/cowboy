@@ -104,6 +104,7 @@ fn sample_info(id: &str) -> SessionInfo {
         attached_clients: 0,
         diffstat: String::new(),
         running_command: None,
+        blocked_reason: None,
     }
 }
 

@@ -363,6 +363,44 @@ expression: defs
     }
   },
   {
+    "description": "Declare that you cannot proceed and need an external input (a decision, a dependency's artifact, access). Give a clear `reason` and optionally `waiting_on`. Use `unblock` once you can continue. This surfaces the session as blocked to the user / Ranch coordinator.",
+    "name": "blocked",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `blocked` tool.",
+      "properties": {
+        "reason": {
+          "description": "Why you cannot proceed (e.g. \"need the API contract from the schema work\").",
+          "type": "string"
+        },
+        "waiting_on": {
+          "default": null,
+          "description": "Optional: what you're waiting on (artifact names, workstream ids, a person).",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reason"
+      ],
+      "title": "BlockedArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Clear a previously-declared blocked state once you can proceed again.",
+    "name": "unblock",
+    "parameters": {
+      "properties": {},
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

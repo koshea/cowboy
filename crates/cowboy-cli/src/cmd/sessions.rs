@@ -83,6 +83,7 @@ fn status_str(s: SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::AwaitingApproval => "approval",
         SessionStatus::AwaitingInput => "input",
+        SessionStatus::Blocked => "blocked",
         SessionStatus::Completed => "completed",
         SessionStatus::Failed => "failed",
         SessionStatus::Stale => "stale",
@@ -90,6 +91,12 @@ fn status_str(s: SessionStatus) -> &'static str {
 }
 
 fn task_str(s: &SessionInfo) -> String {
+    // While blocked, surface the reason in place of the task so it's visible.
+    if s.status == SessionStatus::Blocked {
+        if let Some(r) = &s.blocked_reason {
+            return format!("⏸ {r}");
+        }
+    }
     s.task.clone().unwrap_or_default()
 }
 

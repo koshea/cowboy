@@ -266,6 +266,7 @@ async fn coordinate_oneshot(root: &std::path::Path, id: &str, task: &str) -> Res
         attached_clients: 0,
         diffstat: String::new(),
         running_command: None,
+        blocked_reason: None,
     };
     let _ = daemon::request(DaemonReq::RegisterWorker { info }).await;
     match daemon::request(DaemonReq::AcquireLease {

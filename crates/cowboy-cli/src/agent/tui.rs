@@ -67,6 +67,8 @@ pub enum UiEvent {
     Cost(f64),
     /// The agent's working plan: ordered (step, status) pairs.
     Plan(Vec<(String, String)>),
+    /// The session is blocked (`Some(reason)`) or unblocked (`None`).
+    Blocked(Option<String>),
     /// Update the transcript title (cwd + branch context).
     Title(String),
     /// Managed processes (name, status) for the process pane.
@@ -113,6 +115,9 @@ impl AgentUi for TuiUi {
     }
     fn plan(&mut self, steps: &[(String, String)]) {
         let _ = self.tx.send(UiEvent::Plan(steps.to_vec()));
+    }
+    fn blocked(&mut self, reason: Option<&str>) {
+        let _ = self.tx.send(UiEvent::Blocked(reason.map(str::to_string)));
     }
     fn final_message(&mut self, message: &str) {
         let _ = self.tx.send(UiEvent::Final(message.to_string()));
@@ -419,6 +424,7 @@ fn event_loop(
                 }
                 UiEvent::Cost(usd) => app.cost_usd = usd,
                 UiEvent::Plan(steps) => app.plan = steps,
+                UiEvent::Blocked(reason) => app.set_blocked(reason),
                 UiEvent::Title(t) => app.title = t,
                 UiEvent::Processes(procs) => app.processes = procs,
                 UiEvent::TurnDone => {

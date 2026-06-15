@@ -8,8 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, ArtifactArgs, AskUserArgs, EditArgs, FinalArgs, HandoffArgs, MemoryArgs, PlanArgs,
-    ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+    self, ArtifactArgs, AskUserArgs, BlockedArgs, EditArgs, FinalArgs, HandoffArgs, MemoryArgs,
+    PlanArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -713,6 +713,35 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_BLOCKED => {
+                    let args: BlockedArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    self.ui.blocked(Some(&args.reason));
+                    self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::Blocked {
+                        reason: args.reason.clone(),
+                        waiting_on: args.waiting_on.clone().unwrap_or_default(),
+                    });
+                    let tool_msg =
+                        Message::tool_result(&call.id, format!("marked blocked: {}", args.reason));
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
+                tools::TOOL_UNBLOCK => {
+                    self.ui.blocked(None);
+                    self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::Unblocked);
+                    let tool_msg = Message::tool_result(&call.id, "unblocked".to_string());
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -1240,6 +1269,7 @@ mod tests {
         tool_uses: Vec<String>,
         costs: Vec<f64>,
         plans: Vec<Vec<(String, String)>>,
+        blocked: Vec<Option<String>>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
@@ -1248,6 +1278,9 @@ mod tests {
         }
         fn plan(&mut self, steps: &[(String, String)]) {
             self.plans.push(steps.to_vec());
+        }
+        fn blocked(&mut self, reason: Option<&str>) {
+            self.blocked.push(reason.map(str::to_string));
         }
         fn command_start(&mut self, command: &str) {
             self.commands.push(command.to_string());
@@ -1519,6 +1552,63 @@ mod tests {
         assert_eq!(arts[0].kind, cowboy_core::artifact::ArtifactKind::Contract);
         let (_, body) = cowboy_core::artifact::get_in(&session_dir, &arts[0].id).unwrap();
         assert!(body.contains("GET /things"));
+    }
+
+    #[tokio::test]
+    async fn blocked_then_unblock_reports_and_logs() {
+        use cowboy_core::lifecycle::{read_in, LifecycleEvent};
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "blocked",
+                    r#"{"reason":"need the API contract","waiting_on":["schema"]}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "unblock", "{}")],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let runtime = runtime_with(docker);
+        let root = runtime.root().to_path_buf();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let session_dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+
+        assert_eq!(
+            ui.blocked,
+            vec![Some("need the API contract".to_string()), None]
+        );
+        let events: Vec<_> = read_in(&session_dir).into_iter().map(|r| r.event).collect();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LifecycleEvent::Blocked { reason, .. } if reason == "need the API contract")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, LifecycleEvent::Unblocked)));
     }
 
     #[tokio::test]
