@@ -1021,6 +1021,101 @@ fn e2e_ranch_agent_proposes_scope_change_then_user_approves() {
     reap_new_docker(&docker_before);
 }
 
+/// Crew routing (agent path): with a crew roster configured, a planner that
+/// delegates subagents has them routed through the roster — each launch logs a
+/// `SubagentRouted` lifecycle event with the resolved model. Uses an isolated
+/// config home (copies the real provider/models, writes its own crew.yaml) so it
+/// never touches `~/.config/cowboy`. Model-dependent + needs Docker.
+#[test]
+#[ignore = "real Docker + model: exercises crew routing of subagents"]
+fn e2e_crew_routes_delegated_subagents() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let Some(real_providers) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let real_dir = real_providers.parent().unwrap().to_path_buf();
+    let docker_before = cowboy_docker_objects();
+
+    // Isolated config home: copy the real provider + models, add our own crew.yaml.
+    let cfg = assert_fs::TempDir::new().unwrap();
+    let cfg_cowboy = cfg.path().join("cowboy");
+    std::fs::create_dir_all(&cfg_cowboy).unwrap();
+    std::fs::copy(&real_providers, cfg_cowboy.join("providers.yaml")).unwrap();
+    std::fs::copy(real_dir.join("models.yaml"), cfg_cowboy.join("models.yaml")).unwrap();
+    let models = cowboy_core::config::ModelsConfig::load(&cfg_cowboy.join("models.yaml")).unwrap();
+    let default_model = models.default.clone().expect("a default model");
+    // Route everything at the one real model so the subagents actually run.
+    std::fs::write(
+        cfg_cowboy.join("crew.yaml"),
+        format!(
+            "version: 1\nplanner:\n  model: {default_model}\ncrew:\n  general: {default_model}\n  \
+             tests: {default_model}\ndelegation:\n  max_parallel: 4\n  max_depth: 1\n"
+        ),
+    )
+    .unwrap();
+
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let proj = make_project();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("XDG_STATE_HOME", state.path())
+        .stdin(std::process::Stdio::null())
+        .arg(
+            "Delegate two subagents with the `subagent` tool: one with category=tests effort=small \
+             task 'create a file a.txt containing the letter a', another with category=general \
+             effort=small task 'create a file b.txt containing the letter b'. Then finish.",
+        )
+        .output()
+        .expect("run cowboy one-shot");
+    assert!(
+        out.status.success(),
+        "one-shot failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Scan the session lifecycle logs for routing events.
+    let mut routed = Vec::new();
+    let sessions = proj.path().join(".cowboy/sessions");
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for e in entries.flatten() {
+            let lc = e.path().join("lifecycle.jsonl");
+            if let Ok(text) = std::fs::read_to_string(&lc) {
+                for line in text.lines() {
+                    if let Ok(rec) =
+                        serde_json::from_str::<cowboy_core::lifecycle::LifecycleRecord>(line)
+                    {
+                        if let cowboy_core::lifecycle::LifecycleEvent::SubagentRouted {
+                            model,
+                            ..
+                        } = rec.event
+                        {
+                            routed.push(model);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        !routed.is_empty(),
+        "expected at least one SubagentRouted event; the planner didn't delegate"
+    );
+    assert!(
+        routed.iter().all(|m| m == &default_model),
+        "subagents should route to the rostered model {default_model}, got {routed:?}"
+    );
+
+    reap_new_docker(&docker_before);
+}
+
 /// The flagship real-Docker turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.
