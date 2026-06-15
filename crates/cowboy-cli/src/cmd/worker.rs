@@ -54,6 +54,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Consecutive 5s heartbeats the daemon may be unreachable before an unattended
+/// worker considers itself orphaned and shuts down (~20s — tolerates a daemon
+/// restart while reaping true zombies).
+const ORPHAN_GRACE_BEATS: u32 = 4;
+
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root).unwrap_or(args.root.clone());
     let paths = ConfigPaths::for_root(&root);
@@ -144,6 +149,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let emitter = ui.clone(); // post-turn events without borrowing `ui`
     println!("{}", sock.display()); // so the daemon/manual client can locate it
 
+    // Cancelled by the heartbeat watchdog if the daemon vanishes for good and no
+    // client is attached — so an orphaned worker shuts itself down (container +
+    // finalize) instead of lingering forever.
+    let orphan = CancellationToken::new();
+
     // Register with the daemon + heartbeat (daemon-managed sessions only).
     if args.register {
         let _ = daemon::request(DaemonReq::RegisterWorker {
@@ -153,7 +163,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let hb_id = id.clone();
         let hb_ui = emitter.clone();
         let hb_info = reg_info;
+        let hb_orphan = orphan.clone();
         tokio::spawn(async move {
+            // Consecutive heartbeats the daemon has been unreachable.
+            let mut unreachable = 0u32;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 let st = hb_ui.stats();
@@ -162,26 +175,44 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 } else {
                     SessionStatus::Running
                 };
+                let attached = hb_ui.attached();
                 let resp = daemon::request(DaemonReq::UpdateSession {
                     id: hb_id.clone(),
                     status,
                     turn: st.turn,
                     tokens: st.tokens,
                     diffstat: st.diffstat,
-                    attached_clients: hb_ui.attached(),
+                    attached_clients: attached,
                     running_command: st.running_command,
                     branch: None,
                     blocked_reason: st.blocked_reason,
                 })
                 .await;
-                // The daemon forgot us (it restarted or was cleaned) — re-register
-                // so a surviving worker is re-adopted. A connection error means
-                // the daemon is down; the next tick retries.
-                if matches!(resp, Ok(cowboy_core::daemonproto::DaemonResp::Err { .. })) {
-                    let _ = daemon::request(DaemonReq::RegisterWorker {
-                        info: hb_info.clone(),
-                    })
-                    .await;
+                match resp {
+                    // Daemon is up but forgot us (it restarted / was cleaned) —
+                    // re-register so a surviving worker is re-adopted. Reachable.
+                    Ok(cowboy_core::daemonproto::DaemonResp::Err { .. }) => {
+                        unreachable = 0;
+                        let _ = daemon::request(DaemonReq::RegisterWorker {
+                            info: hb_info.clone(),
+                        })
+                        .await;
+                    }
+                    Ok(_) => unreachable = 0,
+                    // Connection error → the daemon is down. If it stays down past
+                    // the grace window and no client is attached, this session is
+                    // unreachable; shut down rather than orphan a zombie worker.
+                    Err(_) => {
+                        unreachable += 1;
+                        if unreachable >= ORPHAN_GRACE_BEATS && attached == 0 {
+                            tracing::warn!(
+                                "daemon unreachable for {unreachable} beats and no client \
+                                 attached; shutting down orphaned worker"
+                            );
+                            hb_orphan.cancel();
+                            return;
+                        }
+                    }
                 }
             }
         });
@@ -275,18 +306,25 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     'serve: loop {
         let next = match queue.pop_front() {
             Some(m) => m,
-            None => match cmd_rx.recv().await {
-                None => break,
-                Some(ClientMsg::Message(m)) => m,
-                Some(ClientMsg::End) => break,
-                Some(ClientMsg::SwitchModel(name)) => {
-                    apply_switch(&mut agent, &resolve, &emitter, &name);
-                    continue;
+            None => {
+                // Idle: wait for the next client message, or shut down if orphaned.
+                let msg = tokio::select! {
+                    _ = orphan.cancelled() => break 'serve,
+                    m = cmd_rx.recv() => m,
+                };
+                match msg {
+                    None => break,
+                    Some(ClientMsg::Message(m)) => m,
+                    Some(ClientMsg::End) => break,
+                    Some(ClientMsg::SwitchModel(name)) => {
+                        apply_switch(&mut agent, &resolve, &emitter, &name);
+                        continue;
+                    }
+                    // No turn is running; interrupts and other control messages are
+                    // no-ops.
+                    _ => continue,
                 }
-                // No turn is running; interrupts and other control messages are
-                // no-ops.
-                _ => continue,
-            },
+            }
         };
 
         let mut end = false;
@@ -298,6 +336,13 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             loop {
                 tokio::select! {
                     _ = &mut turn => break, // turn finished (emits TurnDone)
+                    // Daemon gone + no client mid-turn → cancel and end the session.
+                    _ = orphan.cancelled() => {
+                        tc.cancel();
+                        let _ = (&mut turn).await;
+                        end = true;
+                        break;
+                    }
                     ctl = cmd_rx.recv() => match ctl {
                         None => {
                             tc.cancel();
