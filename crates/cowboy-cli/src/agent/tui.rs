@@ -800,19 +800,32 @@ fn crew_command(arg: Option<&str>, app: &mut App) {
     }
     match crew::load() {
         Ok(Some(cfg)) => {
+            // Shorten ids to their last path segment so the grid stays readable.
+            let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
+            let mut col_w = crew::Effort::all()
+                .iter()
+                .map(|e| e.as_str().len())
+                .max()
+                .unwrap_or(6);
+            for cat in cfg.crew.keys() {
+                for (_, model) in cfg.expanded(cat) {
+                    col_w = col_w.max(short(&model).len());
+                }
+            }
+            col_w += 2;
             app.push(
                 LineKind::Notice,
                 format!("crew planner: {}", cfg.planner.model),
             );
             let mut header = format!("{:<14}", "CATEGORY");
             for e in crew::Effort::all() {
-                header.push_str(&format!("{:<9}", e.as_str()));
+                header.push_str(&format!("{:<col_w$}", e.as_str()));
             }
             app.push(LineKind::Notice, header);
             for cat in cfg.crew.keys() {
                 let mut row = format!("{cat:<14}");
                 for (_, model) in cfg.expanded(cat) {
-                    row.push_str(&format!("{model:<9}"));
+                    row.push_str(&format!("{:<col_w$}", short(&model)));
                 }
                 app.push(LineKind::Notice, row);
             }

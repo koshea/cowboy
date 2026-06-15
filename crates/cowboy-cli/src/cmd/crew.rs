@@ -116,21 +116,46 @@ fn load_or_explain() -> Result<CrewConfig> {
     }
 }
 
+/// Shorten a model id to its last path segment for a readable grid
+/// (e.g. `accounts/fireworks/models/kimi-k2p7-code` → `kimi-k2p7-code`).
+fn short_model(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
 fn list() -> Result<()> {
     let cfg = load_or_explain()?;
     println!("planner: {}", cfg.planner.model);
     println!();
-    // Header
-    print!("{:<14}", "CATEGORY");
+    // Size columns to the widest shortened model name so long ids stay readable.
+    let cat_w = cfg
+        .crew
+        .keys()
+        .map(|c| c.len())
+        .chain(std::iter::once("CATEGORY".len()))
+        .max()
+        .unwrap_or(8)
+        + 2;
+    let mut col_w = Effort::all()
+        .iter()
+        .map(|e| e.as_str().len())
+        .max()
+        .unwrap_or(6);
+    for cat in cfg.crew.keys() {
+        for (_, model) in cfg.expanded(cat) {
+            col_w = col_w.max(short_model(&model).len());
+        }
+    }
+    col_w += 2;
+
+    print!("{:<cat_w$}", "CATEGORY");
     for e in Effort::all() {
-        print!("{:<10}", e.as_str());
+        print!("{:<col_w$}", e.as_str());
     }
     println!();
-    // One row per category, ramps expanded to concrete models.
     for cat in cfg.crew.keys() {
-        print!("{cat:<14}");
+        print!("{cat:<cat_w$}");
         for (_, model) in cfg.expanded(cat) {
-            print!("{model:<10}");
+            print!("{:<col_w$}", short_model(&model));
         }
         println!();
     }
