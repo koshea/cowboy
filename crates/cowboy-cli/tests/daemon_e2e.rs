@@ -914,6 +914,113 @@ fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
     reap_new_docker(&docker_before);
 }
 
+/// Ranch scope proposals (agent path): a workstream worker, told to, uses the
+/// `propose_scope_change` tool; the proposal lands PENDING in the main ranch's
+/// proposals store (it must NOT edit ranch.yaml). Then `ranch approve` applies it.
+/// Model-dependent (the agent must choose to call the tool) — exactly the kind of
+/// behavior this manual suite is meant to check across models.
+#[test]
+#[ignore = "real Docker + model: exercises the propose_scope_change agent tool"]
+fn e2e_ranch_agent_proposes_scope_change_then_user_approves() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let docker_before = cowboy_docker_objects();
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    // A single workstream whose task is to file a scope-change proposal.
+    let ranch_dir = proj.path().join(".cowboy/ranches/billing");
+    std::fs::create_dir_all(&ranch_dir).unwrap();
+    std::fs::write(
+        ranch_dir.join("ranch.yaml"),
+        "version: 1\nid: billing\ntitle: Billing\nstatus: planning\nauto_advance: false\n\
+         created_ms: 1\nupdated_ms: 1\nworkstreams:\n\
+         \x20 - id: schema\n    title: Schema\n    goal: \"Call the propose_scope_change tool to propose adding a new workstream with workstream_id 'cache' (change=add_workstream), summary 'add a caching layer'. Then finish — do not do anything else.\"\n    depends_on: []\n",
+    )
+    .unwrap();
+
+    let run_cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_cowboy"))
+            .current_dir(proj.path())
+            .env("XDG_RUNTIME_DIR", env.runtime.path())
+            .env("XDG_STATE_HOME", env.state.path())
+            .args(args)
+            .output()
+            .expect("run cowboy")
+    };
+    assert!(run_cli(&["ranch", "start", "billing"]).status.success());
+
+    // Wait for a pending proposal to appear in the main ranch store.
+    let mut proposal_id = None;
+    for _ in 0..1500 {
+        let pending = cowboy_core::scope::list(proj.path(), "billing");
+        if let Some(p) = pending
+            .into_iter()
+            .find(|p| p.status == cowboy_core::scope::ProposalStatus::Pending)
+        {
+            proposal_id = Some(p);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let p = proposal_id.expect("agent should file a pending scope proposal");
+    assert!(
+        matches!(
+            p.change,
+            cowboy_core::scope::ScopeChange::AddWorkstream { .. }
+        ),
+        "proposal should be an add_workstream: {:?}",
+        p.change
+    );
+    // The agent must NOT have edited the plan itself.
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    assert!(
+        r.workstream("cache").is_none(),
+        "the plan must be unchanged until approval"
+    );
+
+    // The user approves → the plan now contains the new workstream.
+    assert!(run_cli(&["ranch", "approve", "billing", &p.id])
+        .status
+        .success());
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    assert!(
+        r.workstream("cache").is_some(),
+        "approval should add the workstream"
+    );
+
+    // Cleanup: end the worker, remove its worktree, reap containers.
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    if let Some(w) = r.workstream("schema") {
+        if let Some(sid) = &w.session_id {
+            if let Some(info) = get(&sock, sid) {
+                if let Some(ws) = &info.worker_sock {
+                    Client::connect(ws).send(&ClientMsg::End);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        if let Some(p) = w.worktree_path.clone() {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(proj.path())
+                .args(["worktree", "remove", "--force"])
+                .arg(&p)
+                .output();
+        }
+    }
+    reap_new_docker(&docker_before);
+}
+
 /// The flagship real-Docker turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.

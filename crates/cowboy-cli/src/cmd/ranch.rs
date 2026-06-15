@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::daemonproto::{DaemonReq, DaemonResp, LeaseMode, SessionStatus};
-use cowboy_core::ranch::{self, Ranch, RanchStatus, WorkstreamStatus};
+use cowboy_core::ranch::{self, Ranch, RanchStatus, Workstream, WorkstreamStatus};
+use cowboy_core::scope::{self, ProposalStatus, ScopeChange, ScopeProposal};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
@@ -35,6 +36,35 @@ pub async fn run(command: RanchCommand) -> Result<()> {
         RanchCommand::Complete { id, workstream } => complete(&root, &id, &workstream),
         RanchCommand::Accept { id, workstream } => accept(&root, &id, &workstream),
         RanchCommand::Watch { id } => watch(&root, &id).await,
+        RanchCommand::Propose {
+            id,
+            summary,
+            rationale,
+            add_workstream,
+            remove_workstream,
+            note,
+            title,
+            goal,
+            depends_on,
+        } => propose(
+            &root,
+            &id,
+            summary,
+            rationale,
+            add_workstream,
+            remove_workstream,
+            note,
+            title,
+            goal,
+            depends_on,
+        ),
+        RanchCommand::Proposals { id, all } => list_proposals(&root, &id, all),
+        RanchCommand::Approve { id, proposal } => approve(&root, &id, &proposal),
+        RanchCommand::Reject {
+            id,
+            proposal,
+            reason,
+        } => reject(&root, &id, &proposal, reason),
     }
 }
 
@@ -93,6 +123,198 @@ fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> 
         println!("ranch complete 🎉");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scope-change proposals (gated edits to the plan)
+// ---------------------------------------------------------------------------
+
+/// `cowboy ranch propose` — record a pending scope-change proposal. The plan is
+/// NOT modified until a human approves it.
+#[allow(clippy::too_many_arguments)]
+fn propose(
+    root: &std::path::Path,
+    id: &str,
+    summary: String,
+    rationale: Option<String>,
+    add_workstream: Option<String>,
+    remove_workstream: Option<String>,
+    note: bool,
+    title: Option<String>,
+    goal: Option<String>,
+    depends_on: Vec<String>,
+) -> Result<()> {
+    // The ranch must exist (and gives a clear error otherwise).
+    let ranch = ranch::load(root, id)?;
+    let change = match (add_workstream, remove_workstream, note) {
+        (Some(ws_id), None, false) => {
+            if ranch.workstream(&ws_id).is_some() {
+                bail!("workstream `{ws_id}` already exists in ranch `{id}`");
+            }
+            ScopeChange::AddWorkstream {
+                workstream: Workstream {
+                    title: title.unwrap_or_else(|| ws_id.clone()),
+                    goal: goal.unwrap_or_default(),
+                    depends_on,
+                    id: ws_id,
+                    status: WorkstreamStatus::Planned,
+                    session_id: None,
+                    branch: None,
+                    worktree_path: None,
+                    expected_artifacts: vec![],
+                    acceptance: vec![],
+                },
+            }
+        }
+        (None, Some(ws_id), false) => {
+            if ranch.workstream(&ws_id).is_none() {
+                bail!("no workstream `{ws_id}` in ranch `{id}`");
+            }
+            ScopeChange::RemoveWorkstream { id: ws_id }
+        }
+        (None, None, true) => ScopeChange::Note,
+        _ => bail!("specify exactly one of --add-workstream, --remove-workstream, or --note"),
+    };
+    let p = ScopeProposal {
+        id: scope::fresh_id(root, id),
+        ranch_id: id.to_string(),
+        from: "user".to_string(),
+        summary,
+        rationale,
+        change,
+        status: ProposalStatus::Pending,
+        created_ms: now_ms(),
+        decided_ms: None,
+        decision_reason: None,
+    };
+    scope::save(root, &p)?;
+    println!("✓ filed proposal {} — {}", p.id, p.change.label());
+    println!("  review with `cowboy ranch proposals {id}`,");
+    println!("  then `cowboy ranch approve {id} {}` (or reject).", p.id);
+    Ok(())
+}
+
+/// `cowboy ranch proposals <id>` — list scope-change proposals.
+fn list_proposals(root: &std::path::Path, id: &str, all: bool) -> Result<()> {
+    ranch::load(root, id)?; // validate
+    let proposals = scope::list(root, id);
+    let shown: Vec<_> = proposals
+        .iter()
+        .filter(|p| all || p.status == ProposalStatus::Pending)
+        .collect();
+    if shown.is_empty() {
+        println!(
+            "no {}proposals for ranch `{id}`",
+            if all { "" } else { "pending " }
+        );
+        return Ok(());
+    }
+    println!("{:<8} {:<9} {:<8} CHANGE / SUMMARY", "ID", "STATUS", "FROM");
+    for p in shown {
+        println!(
+            "{:<8} {:<9} {:<8} {} — {}",
+            p.id,
+            proposal_status_str(p.status),
+            p.from,
+            p.change.label(),
+            p.summary
+        );
+        if let Some(r) = &p.rationale {
+            println!("         rationale: {r}");
+        }
+    }
+    Ok(())
+}
+
+/// `cowboy ranch approve <id> <proposal>` — apply a pending proposal's change to
+/// the plan and mark it approved.
+fn approve(root: &std::path::Path, id: &str, pid: &str) -> Result<()> {
+    let mut p = scope::load(root, id, pid)?;
+    if p.status != ProposalStatus::Pending {
+        bail!(
+            "proposal {pid} is already {}",
+            proposal_status_str(p.status)
+        );
+    }
+    let mut ranch = ranch::load(root, id)?;
+    let msg = apply_change(&mut ranch, &p.change)?;
+    ranch.updated_ms = now_ms();
+    ranch::save(root, &ranch)?;
+    p.status = ProposalStatus::Approved;
+    p.decided_ms = Some(now_ms());
+    scope::save(root, &p)?;
+    println!("✓ approved {pid}: {msg}");
+    Ok(())
+}
+
+/// `cowboy ranch reject <id> <proposal>` — record a rejection; plan unchanged.
+fn reject(root: &std::path::Path, id: &str, pid: &str, reason: Option<String>) -> Result<()> {
+    let mut p = scope::load(root, id, pid)?;
+    if p.status != ProposalStatus::Pending {
+        bail!(
+            "proposal {pid} is already {}",
+            proposal_status_str(p.status)
+        );
+    }
+    p.status = ProposalStatus::Rejected;
+    p.decided_ms = Some(now_ms());
+    p.decision_reason = reason;
+    scope::save(root, &p)?;
+    println!("✓ rejected {pid} (plan unchanged)");
+    Ok(())
+}
+
+/// Apply a scope change to a ranch in memory, returning a human-readable summary.
+/// Rejects unsafe edits (duplicate add, removing started/done work).
+fn apply_change(ranch: &mut Ranch, change: &ScopeChange) -> Result<String> {
+    match change {
+        ScopeChange::AddWorkstream { workstream } => {
+            if ranch.workstream(&workstream.id).is_some() {
+                bail!("workstream `{}` already exists", workstream.id);
+            }
+            let mut w = workstream.clone();
+            w.status = WorkstreamStatus::Planned; // a freshly-added workstream starts planned
+            let wid = w.id.clone();
+            ranch.workstreams.push(w);
+            ranch.recompute_readiness();
+            Ok(format!("added workstream `{wid}`"))
+        }
+        ScopeChange::RemoveWorkstream { id } => {
+            let Some(w) = ranch.workstream(id) else {
+                bail!("no workstream `{id}`");
+            };
+            // Don't rip out work that's already running or done.
+            if !matches!(
+                w.status,
+                WorkstreamStatus::Planned | WorkstreamStatus::Blocked | WorkstreamStatus::Ready
+            ) {
+                bail!(
+                    "can't remove `{id}`: it is {} (only not-yet-started workstreams can be removed)",
+                    ws_status(w.status)
+                );
+            }
+            // Refuse if another workstream still depends on it.
+            if let Some(dep) = ranch
+                .workstreams
+                .iter()
+                .find(|o| o.depends_on.iter().any(|d| d == id))
+            {
+                bail!("can't remove `{id}`: `{}` depends on it", dep.id);
+            }
+            ranch.workstreams.retain(|o| &o.id != id);
+            ranch.recompute_readiness();
+            Ok(format!("removed workstream `{id}`"))
+        }
+        ScopeChange::Note => Ok("note acknowledged (no plan change)".to_string()),
+    }
+}
+
+fn proposal_status_str(s: ProposalStatus) -> &'static str {
+    match s {
+        ProposalStatus::Pending => "pending",
+        ProposalStatus::Approved => "approved",
+        ProposalStatus::Rejected => "rejected",
+    }
 }
 
 fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<()> {
@@ -810,7 +1032,9 @@ fn compose_task(
         "\nCoordination rules:\n\
          - Work only on this workstream, in this worktree.\n\
          - Publish status/blockers/outputs with your tools (artifact / blocked / handoff).\n\
-         - Do NOT edit the ranch plan; if it looks wrong, say so and stop rather than diverging.\n\
+         - Do NOT edit the ranch plan. If it looks wrong (a workstream is missing, \
+           unnecessary, or misscoped), use `propose_scope_change` to file a proposal \
+           for the user to approve — never change scope on your own.\n\
          - When done, publish the expected artifacts and a handoff, then finish.\n",
     );
     s
@@ -969,6 +1193,92 @@ mod tests {
             r.workstream("ui").unwrap().status,
             WorkstreamStatus::Blocked
         );
+    }
+
+    #[test]
+    fn apply_change_adds_removes_and_guards() {
+        let mk = || {
+            ranch(vec![
+                ws("schema", &[], WorkstreamStatus::Complete, Some("s1")),
+                ws("api", &["schema"], WorkstreamStatus::Planned, None),
+            ])
+        };
+
+        // Add a new workstream → present + readiness recomputed.
+        let mut r = mk();
+        let new_ws = Workstream {
+            id: "cache".into(),
+            title: "Cache".into(),
+            goal: "add caching".into(),
+            depends_on: vec!["api".into()],
+            status: WorkstreamStatus::Planned,
+            session_id: None,
+            branch: None,
+            worktree_path: None,
+            expected_artifacts: vec![],
+            acceptance: vec![],
+        };
+        let msg = apply_change(
+            &mut r,
+            &ScopeChange::AddWorkstream {
+                workstream: new_ws.clone(),
+            },
+        )
+        .unwrap();
+        assert!(msg.contains("cache"));
+        assert!(r.workstream("cache").is_some());
+        // Duplicate add is rejected.
+        assert!(apply_change(&mut r, &ScopeChange::AddWorkstream { workstream: new_ws }).is_err());
+
+        // Remove a not-started workstream → gone. But api is depended on by cache,
+        // so removing api is refused; remove cache first.
+        let mut r = mk();
+        apply_change(
+            &mut r,
+            &ScopeChange::AddWorkstream {
+                workstream: Workstream {
+                    id: "cache".into(),
+                    title: "Cache".into(),
+                    goal: String::new(),
+                    depends_on: vec!["api".into()],
+                    status: WorkstreamStatus::Planned,
+                    session_id: None,
+                    branch: None,
+                    worktree_path: None,
+                    expected_artifacts: vec![],
+                    acceptance: vec![],
+                },
+            },
+        )
+        .unwrap();
+        assert!(
+            apply_change(&mut r, &ScopeChange::RemoveWorkstream { id: "api".into() }).is_err(),
+            "can't remove a dependency of another workstream"
+        );
+        apply_change(
+            &mut r,
+            &ScopeChange::RemoveWorkstream { id: "cache".into() },
+        )
+        .unwrap();
+        assert!(r.workstream("cache").is_none());
+
+        // Can't remove a completed (done) workstream.
+        let mut r = mk();
+        assert!(
+            apply_change(
+                &mut r,
+                &ScopeChange::RemoveWorkstream {
+                    id: "schema".into()
+                }
+            )
+            .is_err(),
+            "can't remove completed work"
+        );
+
+        // Note is a no-op that succeeds.
+        let mut r = mk();
+        assert!(apply_change(&mut r, &ScopeChange::Note).is_ok());
+        assert_eq!(r.workstreams.len(), 2);
     }
 
     #[test]

@@ -249,6 +249,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // ends (so its session goes Completed and `cowboy ranch start` advances the
     // dependency graph). Ordinary sessions stay alive for further turns.
     let one_shot = args.workstream_id.is_some();
+    // Expose the ranch context to the agent loop (the `propose_scope_change` tool
+    // reads these to file proposals against the right ranch; absent outside a ranch).
+    if let Some(rid) = &args.ranch_id {
+        std::env::set_var("COWBOY_RANCH_ID", rid);
+    }
+    if let Some(wid) = &args.workstream_id {
+        std::env::set_var("COWBOY_WORKSTREAM_ID", wid);
+    }
     let mut queue: VecDeque<String> = VecDeque::new();
     if let Some(task) = args.task.clone() {
         queue.push_back(task);

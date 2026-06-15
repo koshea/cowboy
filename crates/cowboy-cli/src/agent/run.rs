@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{
     self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
-    MemoryArgs, PlanArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+    MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -759,6 +759,21 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_PROPOSE_SCOPE_CHANGE => {
+                    let args: ProposeScopeChangeArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    let observation = self.run_propose_scope_change(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -939,6 +954,93 @@ impl<'a> AgentLoop<'a> {
                 }
             }
             other => format!("error: unknown artifact action `{other}` (publish|list)"),
+        }
+    }
+
+    /// Host-side `propose_scope_change` tool: the agent can't (and must not) edit
+    /// the committed ranch plan, so it files a *pending* proposal into the ranch's
+    /// proposals store. The user reviews it (`cowboy ranch proposals`) and approves
+    /// or rejects it; the plan changes only on approval. Available only inside a
+    /// ranch workstream (the daemon sets `COWBOY_RANCH_ID` for those workers).
+    fn run_propose_scope_change(&self, args: &ProposeScopeChangeArgs) -> String {
+        use cowboy_core::scope::{self, ProposalStatus, ScopeChange, ScopeProposal};
+        let ranch_id = match std::env::var("COWBOY_RANCH_ID") {
+            Ok(s) if !s.is_empty() => s,
+            _ => {
+                return "error: not running inside a ranch workstream — there is no plan to \
+                        propose changes to"
+                    .into()
+            }
+        };
+        // The plan lives in the main repo; this worker is in a linked worktree.
+        let main = match crate::net::worktree::main_repo_root(self.runtime.root()) {
+            Ok(p) => p,
+            Err(e) => return format!("error: cannot locate the ranch's main repository: {e}"),
+        };
+        let change = match args.change.as_str() {
+            "add_workstream" | "add" => {
+                let Some(ws_id) = args.workstream_id.clone() else {
+                    return "error: add_workstream requires `workstream_id`".into();
+                };
+                ScopeChange::AddWorkstream {
+                    workstream: cowboy_core::ranch::Workstream {
+                        title: args.title.clone().unwrap_or_else(|| ws_id.clone()),
+                        goal: args.goal.clone().unwrap_or_default(),
+                        depends_on: args.depends_on.clone().unwrap_or_default(),
+                        id: ws_id,
+                        status: cowboy_core::ranch::WorkstreamStatus::Planned,
+                        session_id: None,
+                        branch: None,
+                        worktree_path: None,
+                        expected_artifacts: vec![],
+                        acceptance: vec![],
+                    },
+                }
+            }
+            "remove_workstream" | "remove" => {
+                let Some(ws_id) = args.workstream_id.clone() else {
+                    return "error: remove_workstream requires `workstream_id`".into();
+                };
+                ScopeChange::RemoveWorkstream { id: ws_id }
+            }
+            "note" => ScopeChange::Note,
+            other => {
+                return format!(
+                    "error: unknown change `{other}` (add_workstream|remove_workstream|note)"
+                )
+            }
+        };
+        let from = std::env::var("COWBOY_WORKSTREAM_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.logger.as_ref().map(|l| l.id().to_string()))
+            .unwrap_or_else(|| "workstream".into());
+        let p = ScopeProposal {
+            id: scope::fresh_id(&main, &ranch_id),
+            ranch_id: ranch_id.clone(),
+            from,
+            summary: args.summary.clone(),
+            rationale: args.rationale.clone(),
+            change,
+            status: ProposalStatus::Pending,
+            created_ms: now_ms(),
+            decided_ms: None,
+            decision_reason: None,
+        };
+        let label = p.change.label();
+        match scope::save(&main, &p) {
+            Ok(()) => {
+                self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRequested {
+                    question: format!("scope change: {} — {}", label, p.summary),
+                });
+                format!(
+                    "filed scope proposal {} ({label}) — PENDING the user's approval. The plan is \
+                     unchanged until they run `cowboy ranch approve {ranch_id} {}`. Continue with \
+                     your current workstream or `blocked` if you can't proceed without it.",
+                    p.id, p.id
+                )
+            }
+            Err(e) => format!("error: filing proposal: {e}"),
         }
     }
 

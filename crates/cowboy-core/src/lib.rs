@@ -13,6 +13,7 @@ pub mod model_defaults;
 pub mod netproto;
 pub mod policy;
 pub mod ranch;
+pub mod scope;
 pub mod skills;
 pub mod tokens;
 pub mod usersecrets;

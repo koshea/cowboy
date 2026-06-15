@@ -439,6 +439,73 @@ expression: defs
     }
   },
   {
+    "description": "When running a Ranch workstream and the plan itself looks wrong (a workstream is missing, unnecessary, or misscoped), DO NOT edit the ranch plan — file a proposal here. It records a pending change the user reviews and approves/rejects; the plan only changes on approval. Use `change`: add_workstream (with workstream_id/title/goal/depends_on), remove_workstream (workstream_id), or note (a concern). Outside a ranch this is unavailable.",
+    "name": "propose_scope_change",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `propose_scope_change` tool.",
+      "properties": {
+        "change": {
+          "description": "The change: \"add_workstream\", \"remove_workstream\", or \"note\" (a concern with no concrete edit).",
+          "type": "string"
+        },
+        "depends_on": {
+          "default": null,
+          "description": "For add_workstream: ids it depends on.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "goal": {
+          "default": null,
+          "description": "For add_workstream: the goal/description.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rationale": {
+          "default": null,
+          "description": "Why the plan should change (what you learned that the plan didn't anticipate).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "description": "One-line summary of the proposed change.",
+          "type": "string"
+        },
+        "title": {
+          "default": null,
+          "description": "For add_workstream: a short title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workstream_id": {
+          "default": null,
+          "description": "For add/remove: the workstream id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "change",
+        "summary"
+      ],
+      "title": "ProposeScopeChangeArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

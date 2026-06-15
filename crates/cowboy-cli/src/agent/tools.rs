@@ -21,6 +21,7 @@ pub const TOOL_HANDOFF: &str = "handoff";
 pub const TOOL_BLOCKED: &str = "blocked";
 pub const TOOL_UNBLOCK: &str = "unblock";
 pub const TOOL_DECISION: &str = "decision";
+pub const TOOL_PROPOSE_SCOPE_CHANGE: &str = "propose_scope_change";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -187,6 +188,31 @@ pub struct BlockedArgs {
     pub waiting_on: Option<Vec<String>>,
 }
 
+/// Arguments for the `propose_scope_change` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProposeScopeChangeArgs {
+    /// One-line summary of the proposed change.
+    pub summary: String,
+    /// Why the plan should change (what you learned that the plan didn't anticipate).
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// The change: "add_workstream", "remove_workstream", or "note" (a concern with
+    /// no concrete edit).
+    pub change: String,
+    /// For add/remove: the workstream id.
+    #[serde(default)]
+    pub workstream_id: Option<String>,
+    /// For add_workstream: a short title.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// For add_workstream: the goal/description.
+    #[serde(default)]
+    pub goal: Option<String>,
+    /// For add_workstream: ids it depends on.
+    #[serde(default)]
+    pub depends_on: Option<Vec<String>>,
+}
+
 /// Arguments for the `artifact` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ArtifactArgs {
@@ -315,6 +341,18 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: serde_json::json!({"type": "object", "properties": {}}),
         },
         ToolDef {
+            name: TOOL_PROPOSE_SCOPE_CHANGE.into(),
+            description: "When running a Ranch workstream and the plan itself looks wrong \
+                          (a workstream is missing, unnecessary, or misscoped), DO NOT edit the \
+                          ranch plan — file a proposal here. It records a pending change the user \
+                          reviews and approves/rejects; the plan only changes on approval. Use \
+                          `change`: add_workstream (with workstream_id/title/goal/depends_on), \
+                          remove_workstream (workstream_id), or note (a concern). Outside a ranch \
+                          this is unavailable."
+                .into(),
+            parameters: schema_for::<ProposeScopeChangeArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -351,8 +389,21 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "shell", "read", "edit", "write", "memory", "plan", "artifact", "handoff",
-                "decision", "blocked", "unblock", "final", "ask_user", "subagent"
+                "shell",
+                "read",
+                "edit",
+                "write",
+                "memory",
+                "plan",
+                "artifact",
+                "handoff",
+                "decision",
+                "blocked",
+                "unblock",
+                "propose_scope_change",
+                "final",
+                "ask_user",
+                "subagent"
             ]
         );
     }

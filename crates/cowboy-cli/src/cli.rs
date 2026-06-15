@@ -475,6 +475,59 @@ pub enum RanchCommand {
         #[arg(value_name = "RANCH")]
         id: String,
     },
+    /// Propose a scope change to the plan (recorded as pending; needs approval).
+    Propose {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        /// One-line summary of the proposal.
+        #[arg(long)]
+        summary: String,
+        /// Why this change is needed.
+        #[arg(long)]
+        rationale: Option<String>,
+        /// Propose adding a workstream with this id.
+        #[arg(long, value_name = "WORKSTREAM_ID", group = "change")]
+        add_workstream: Option<String>,
+        /// Propose removing this (not-yet-started) workstream.
+        #[arg(long, value_name = "WORKSTREAM_ID", group = "change")]
+        remove_workstream: Option<String>,
+        /// File a free-form note/concern (no automatic edit).
+        #[arg(long, group = "change")]
+        note: bool,
+        /// Title for an added workstream.
+        #[arg(long)]
+        title: Option<String>,
+        /// Goal for an added workstream.
+        #[arg(long)]
+        goal: Option<String>,
+        /// Dependencies for an added workstream (comma-separated ids).
+        #[arg(long, value_delimiter = ',')]
+        depends_on: Vec<String>,
+    },
+    /// List a ranch's scope-change proposals.
+    Proposals {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        /// Include already-decided proposals (default: pending only).
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pending proposal: apply its change to the plan.
+    Approve {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "PROPOSAL")]
+        proposal: String,
+    },
+    /// Reject a pending proposal (records the decision; plan unchanged).
+    Reject {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "PROPOSAL")]
+        proposal: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
