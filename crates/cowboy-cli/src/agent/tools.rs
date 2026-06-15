@@ -60,6 +60,22 @@ pub struct SubagentArgs {
     /// conversation, so include anything it needs to know).
     #[serde(default)]
     pub context: Option<String>,
+    /// The KIND of work, so Cowboy routes it to the right crew model. One of:
+    /// general, exploration, backend, frontend, tests, review, docs, debugging,
+    /// refactor, e2e. Defaults to `general`. Do NOT name a model — routing is the
+    /// user's crew roster.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// How hard the task is: tiny, small, medium, large, or deep. Defaults to
+    /// `medium`. Used with `category` to pick the model.
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// Why you're delegating this (one line) — recorded with the routing decision.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// The concrete artifact you expect back (e.g. "changed test files + summary").
+    #[serde(default)]
+    pub expected_artifact: Option<String>,
 }
 
 /// Arguments for the `read` tool.
@@ -370,9 +386,12 @@ pub fn definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: TOOL_SUBAGENT.into(),
-            description: "Delegate a large, independent sub-task to a fresh subagent that shares \
-                          this workspace/container. Returns the subagent's final summary. Use for \
-                          focused work you want handled with its own context."
+            description: "Delegate a focused, independent sub-task to a worker that shares this \
+                          workspace/container. Describe the work by `category` (the kind: tests, \
+                          exploration, frontend, review, …) and `effort` (tiny/small/medium/large/\
+                          deep) — Cowboy routes it to the right model from the user's crew roster. \
+                          Do NOT pick a model. Include a `reason` and the `expected_artifact`. \
+                          Returns the worker's final summary. Prefer small, well-scoped tasks."
                 .into(),
             parameters: schema_for::<SubagentArgs>(),
         },

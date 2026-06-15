@@ -31,8 +31,18 @@ show` and `cowboy proc start <name>`. You do not need to ask before ordinary \
 development actions inside the container.
 
 Reusable skills may be available: run `cowboy skill list` to see them and \
-`cowboy skill show <name>` to read a skill's instructions, then follow them. \
-For a large, independent sub-task, use the `subagent` tool to delegate it.
+`cowboy skill show <name>` to read a skill's instructions, then follow them.
+
+You are the foreman of a crew. For focused, separable work, delegate it with the \
+`subagent` tool instead of doing everything yourself: describe the work by \
+`category` (the kind — exploration, tests, frontend, backend, review, docs, \
+debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
+deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
+routes each request to the right crew model. Delegate when work is scoped and \
+separable (exploration, test-writing, an independent component, a review pass); \
+do it yourself when the task is tiny, the hand-off costs more than the work, or \
+it needs continuous coordination with your current state. Prefer small, \
+well-scoped subagent tasks that return a concrete artifact.
 
 Project conventions may live in AGENTS.md (or CLAUDE.md) files, which are \
 authoritative. Before working in an area, `read` the repo-root AGENTS.md and the \
@@ -1201,23 +1211,70 @@ impl<'a> AgentLoop<'a> {
     /// reusing this session's container (via `COWBOY_CONTAINER_NAME`) so the
     /// subagent shares the workspace and gateway. Returns its final answer.
     async fn run_subagent(&mut self, args: &SubagentArgs) -> String {
-        if self.subagent_depth >= MAX_SUBAGENT_DEPTH {
+        use cowboy_core::crew;
+
+        // Crew roster (if configured) drives the depth limit and model routing.
+        let crew_cfg = crew::load().ok().flatten();
+        let max_depth = match &crew_cfg {
+            Some(c) if !c.delegation.allow_recursive_delegation => c.delegation.max_depth as usize,
+            _ => MAX_SUBAGENT_DEPTH,
+        }
+        .min(MAX_SUBAGENT_DEPTH);
+        if self.subagent_depth >= max_depth {
             return format!(
-                "error: maximum subagent depth ({MAX_SUBAGENT_DEPTH}) reached; do this work directly"
+                "error: delegation depth limit ({max_depth}) reached; do this work directly"
             );
         }
         let exe = match std::env::current_exe() {
             Ok(e) => e,
             Err(e) => return format!("subagent error: cannot locate cowboy binary: {e}"),
         };
-        let task = match &args.context {
-            Some(ctx) if !ctx.is_empty() => format!("{ctx}\n\n{}", args.task),
-            _ => args.task.clone(),
-        };
-        self.ui.notice(&format!("↳ subagent: {}", args.task));
 
-        let output = tokio::process::Command::new(exe)
-            .arg(&task)
+        // Resolve the worker's model from the roster by category + effort. The
+        // planner requests a KIND of work; Cowboy owns the model choice.
+        let category = args
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(crew::GENERAL);
+        let effort = args
+            .effort
+            .as_deref()
+            .and_then(crew::Effort::parse)
+            .unwrap_or(crew::DEFAULT_EFFORT);
+        let routed = crew_cfg.as_ref().map(|c| c.resolve(category, effort));
+
+        // Build the worker brief: optional context, the task, and the expected artifact.
+        let mut task = String::new();
+        if let Some(ctx) = &args.context {
+            if !ctx.is_empty() {
+                task.push_str(ctx);
+                task.push_str("\n\n");
+            }
+        }
+        task.push_str(&args.task);
+        if let Some(art) = args.expected_artifact.as_deref().filter(|s| !s.is_empty()) {
+            task.push_str(&format!("\n\nExpected artifact: {art}"));
+        }
+
+        let label = match &routed {
+            Some(r) => format!("{category}/{} → {}", effort.as_str(), r.model),
+            None => format!("{category}/{}", effort.as_str()),
+        };
+        self.ui
+            .notice(&format!("↳ subagent [{label}]: {}", args.task));
+        if let Some(r) = &routed {
+            self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SubagentRouted {
+                category: category.to_string(),
+                effort: effort.as_str().to_string(),
+                model: r.model.clone(),
+                fell_back: r.fell_back,
+            });
+        }
+
+        let mut cmd = tokio::process::Command::new(exe);
+        cmd.arg(&task)
             .current_dir(self.runtime.root())
             .env("COWBOY_CONTAINER_NAME", self.runtime.container_name())
             .env(
@@ -1227,9 +1284,12 @@ impl<'a> AgentLoop<'a> {
             .env("COWBOY_PRINT_FINAL_ONLY", "1")
             // Don't let the child's logs corrupt the parent TUI/console.
             .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .output()
-            .await;
+            .kill_on_drop(true);
+        // Route the worker to its resolved model (the child honors COWBOY_MODEL).
+        if let Some(r) = &routed {
+            cmd.env("COWBOY_MODEL", &r.model);
+        }
+        let output = cmd.output().await;
 
         match output {
             Ok(o) => {
@@ -2122,10 +2182,14 @@ mod tests {
             .run_subagent(&super::super::tools::SubagentArgs {
                 task: "do a thing".into(),
                 context: None,
+                category: None,
+                effort: None,
+                reason: None,
+                expected_artifact: None,
             })
             .await;
         // At max depth it returns an error string without spawning a subprocess.
-        assert!(result.contains("maximum subagent depth"), "got: {result}");
+        assert!(result.contains("depth limit"), "got: {result}");
     }
 
     #[tokio::test]

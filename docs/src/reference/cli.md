@@ -66,6 +66,35 @@ Attach the TUI to a running session (by id, or a worker socket path)
 | `<SESSION>` |  |
 
 
+## `cowboy crew`
+
+Manage the Crew Roster (route delegated work to models by category/effort)
+
+
+### `cowboy crew init`
+
+Write a default crew roster (tiers derived from your models' prices)
+
+| Arg | Description |
+|-----|-------------|
+| `--force` | Overwrite an existing crew.yaml |
+
+
+### `cowboy crew list`
+
+Show the routing matrix (category × effort → model)
+
+
+### `cowboy crew show`
+
+Print the full crew.yaml (roster + delegation rules)
+
+
+### `cowboy crew validate`
+
+Check the roster (models exist, `general` defined, etc.)
+
+
 ## `cowboy decisions`
 
 List or show decisions recorded in a session

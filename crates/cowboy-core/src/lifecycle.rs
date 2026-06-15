@@ -42,6 +42,13 @@ pub enum LifecycleEvent {
     HandoffCreated {
         artifact_id: String,
     },
+    /// A subagent was routed through the crew roster and launched.
+    SubagentRouted {
+        category: String,
+        effort: String,
+        model: String,
+        fell_back: bool,
+    },
     MergeReady,
     SessionCompleted {
         status: String,

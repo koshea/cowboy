@@ -190,6 +190,9 @@ pub enum Command {
     /// Create or inspect Ranch Plans (multi-workstream tasks).
     Ranch(RanchArgs),
 
+    /// Manage the Crew Roster (route delegated work to models by category/effort).
+    Crew(CrewArgs),
+
     /// List session logs.
     Logs,
 
@@ -420,6 +423,28 @@ pub enum ArtifactCommand {
         #[arg(long)]
         session: Option<String>,
     },
+}
+
+#[derive(Debug, Args)]
+pub struct CrewArgs {
+    #[command(subcommand)]
+    pub command: CrewCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CrewCommand {
+    /// Write a default crew roster (tiers derived from your models' prices).
+    Init {
+        /// Overwrite an existing crew.yaml.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show the routing matrix (category × effort → model).
+    List,
+    /// Print the full crew.yaml (roster + delegation rules).
+    Show,
+    /// Check the roster (models exist, `general` defined, etc.).
+    Validate,
 }
 
 #[derive(Debug, Args)]

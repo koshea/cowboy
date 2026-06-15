@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod attach;
 pub mod bus;
+pub mod crew;
 pub mod daemon;
 pub mod decisions;
 pub mod doctor;

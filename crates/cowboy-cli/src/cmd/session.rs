@@ -54,12 +54,23 @@ pub async fn run(
         .transpose()?
         .flatten();
     let project_models = ModelsConfig::load_opt(&paths.models)?;
+    // A subagent sets COWBOY_MODEL to its routed crew model; otherwise the crew
+    // planner model is the default. A bad override falls back to models.yaml.
+    let model_override = crate::cmd::crew::session_model_override();
     let resolved = resolve_model(
         &providers,
         user_models.as_ref(),
         project_models.as_ref(),
-        None,
-    )?;
+        model_override.as_deref(),
+    )
+    .or_else(|_| {
+        resolve_model(
+            &providers,
+            user_models.as_ref(),
+            project_models.as_ref(),
+            None,
+        )
+    })?;
 
     let interactive = std::io::stdout().is_terminal();
 
