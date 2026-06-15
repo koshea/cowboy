@@ -58,10 +58,20 @@ cowboy crew init        # write a default roster (tiers derived from model price
 cowboy crew list        # the routing matrix (category × effort → model)
 cowboy crew show        # the full crew.yaml
 cowboy crew validate    # check models exist, `general` defined, etc.
+cowboy crew usage       # recorded activity per model (tasks, success %, avg time)
 ```
 
 `crew init` ranks your models by price into three tiers (cheap / standard /
-premium) and emits sensible ramps — edit from there.
+premium) and emits sensible ramps — edit from there. Inside an interactive
+session, `/crew` shows the roster and `/crew usage` its activity.
+
+## Usage tracking
+
+Each routed delegation appends a small outcome record (category, effort, model,
+status, duration — never the task text) to `~/.config/cowboy/crew-history.jsonl`.
+`cowboy crew usage` aggregates it per model so you can see what your crew is
+actually doing and how each model performs. There is no spend tracking here — the
+[gateway](../security/network.md) owns cost and quotas.
 
 ## Delegating
 

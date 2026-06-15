@@ -764,6 +764,7 @@ const HELP_LINES: &[&str] = &[
     "  /help          show this help",
     "  /model [name]  show or switch the active model",
     "  /models        browse the provider catalogue and add/select a model",
+    "  /crew [usage]  show the crew roster (model routing) or its usage",
     "  /diff          show the working-tree diff",
     "  /copy          copy the last answer to the clipboard",
     "  /clear         clear the view (conversation memory is kept)",
@@ -771,6 +772,62 @@ const HELP_LINES: &[&str] = &[
     "  /quit          end the session",
     "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
 ];
+
+/// `/crew` (and `/crew usage`): show the crew roster matrix or usage summary as
+/// notices. Read-only — manage the roster with the `cowboy crew` CLI.
+fn crew_command(arg: Option<&str>, app: &mut App) {
+    use cowboy_core::crew;
+    if arg == Some("usage") {
+        let rows = crew::usage_by_model(&crew::load_history());
+        if rows.is_empty() {
+            app.push(LineKind::Notice, "no recorded crew activity yet");
+            return;
+        }
+        app.push(LineKind::Notice, "crew usage (per model):");
+        for r in rows {
+            app.push(
+                LineKind::Notice,
+                format!(
+                    "  {:<14} {} tasks · {}% ok · {}ms avg",
+                    r.model,
+                    r.tasks,
+                    r.success_pct(),
+                    r.avg_duration_ms()
+                ),
+            );
+        }
+        return;
+    }
+    match crew::load() {
+        Ok(Some(cfg)) => {
+            app.push(
+                LineKind::Notice,
+                format!("crew planner: {}", cfg.planner.model),
+            );
+            let mut header = format!("{:<14}", "CATEGORY");
+            for e in crew::Effort::all() {
+                header.push_str(&format!("{:<9}", e.as_str()));
+            }
+            app.push(LineKind::Notice, header);
+            for cat in cfg.crew.keys() {
+                let mut row = format!("{cat:<14}");
+                for (_, model) in cfg.expanded(cat) {
+                    row.push_str(&format!("{model:<9}"));
+                }
+                app.push(LineKind::Notice, row);
+            }
+            app.push(
+                LineKind::Notice,
+                "(edit with the `cowboy crew` CLI; `/crew usage` for activity)",
+            );
+        }
+        Ok(None) => app.push(
+            LineKind::Notice,
+            "no crew roster — create one with `cowboy crew init`",
+        ),
+        Err(e) => app.push(LineKind::Error, format!("crew: {e}")),
+    }
+}
 
 /// Handle a `/command` typed into the input (the leading `/` is stripped).
 /// Handle a `/command`. Returns `true` if the client should exit the event loop
@@ -852,6 +909,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             app.push(LineKind::Notice, "fetching models…");
             spawn_model_fetch(ctx.ui_tx.clone(), ctx.session.current_model.clone());
         }
+        "crew" => crew_command(arg, app),
         "quit" | "exit" | "q" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
