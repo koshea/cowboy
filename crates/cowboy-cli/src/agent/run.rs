@@ -114,6 +114,54 @@ pub struct AgentLoop<'a> {
     logger: Option<SessionLogger>,
 }
 
+/// A planned subagent delegation, ready to execute. Owns everything it needs so
+/// a batch can run concurrently without borrowing the parent loop.
+#[derive(Debug)]
+struct SubagentPlan {
+    exe: std::path::PathBuf,
+    root: std::path::PathBuf,
+    container_name: String,
+    child_depth: usize,
+    /// Full brief sent to the worker (context + task + expected artifact).
+    task: String,
+    /// The original one-line task, for UI notices.
+    display_task: String,
+    /// Display label, e.g. `tests/small → cheap`.
+    label: String,
+    /// The crew-resolved model (routed via `COWBOY_MODEL`); None when no roster.
+    model: Option<String>,
+    /// (category, effort, model, fell_back) for the lifecycle event.
+    routed: Option<(String, String, String, bool)>,
+}
+
+/// Execute one planned subagent: a nested one-shot `cowboy` run sharing this
+/// session's container. No parent borrow, so many can run concurrently.
+async fn exec_subagent(plan: SubagentPlan) -> String {
+    let mut cmd = tokio::process::Command::new(&plan.exe);
+    cmd.arg(&plan.task)
+        .current_dir(&plan.root)
+        .env("COWBOY_CONTAINER_NAME", &plan.container_name)
+        .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
+        .env("COWBOY_PRINT_FINAL_ONLY", "1")
+        // Don't let the child's logs corrupt the parent TUI/console.
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    if let Some(model) = &plan.model {
+        cmd.env("COWBOY_MODEL", model);
+    }
+    match cmd.output().await {
+        Ok(o) => {
+            let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if result.is_empty() {
+                "subagent produced no final answer".to_string()
+            } else {
+                result
+            }
+        }
+        Err(e) => format!("subagent failed to start: {e}"),
+    }
+}
+
 /// Instruction for the context-compaction summary call.
 const SUMMARY_SYSTEM: &str = "\
 You are compacting an AI coding agent's conversation so it fits the context \
@@ -576,6 +624,12 @@ impl<'a> AgentLoop<'a> {
     /// Process this turn's tool calls. Returns `Some(message)` if `final` was
     /// called.
     async fn handle_tool_calls(&mut self, response: &ChatResponse) -> Result<Option<String>> {
+        // Pre-pass: a planner that delegates several subtasks in one turn gets
+        // them run *concurrently* (the gateway is the real backpressure; we only
+        // cap local fan-out). Results are keyed by call id and consumed in order
+        // by the sequential loop below, so tool-result ordering is preserved.
+        let sub_results = self.run_subagents(&response.tool_calls).await;
+
         for call in &response.tool_calls {
             match call.name.as_str() {
                 tools::TOOL_FINAL => {
@@ -802,14 +856,11 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_SUBAGENT => {
-                    let args: SubagentArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
-                    };
-                    let result = self.run_subagent(&args).await;
+                    // Already executed in the concurrent pre-pass.
+                    let result = sub_results
+                        .get(&call.id)
+                        .cloned()
+                        .unwrap_or_else(|| "subagent error: no result produced".to_string());
                     let tool_msg = Message::tool_result(&call.id, result);
                     if let Some(l) = &mut self.logger {
                         l.log_message(&tool_msg);
@@ -1207,45 +1258,112 @@ impl<'a> AgentLoop<'a> {
         let _ = self.runtime.stop_all_processes().await;
     }
 
-    /// Run a subagent by recursively invoking the `cowboy` CLI in one-shot mode,
-    /// reusing this session's container (via `COWBOY_CONTAINER_NAME`) so the
-    /// subagent shares the workspace and gateway. Returns its final answer.
-    async fn run_subagent(&mut self, args: &SubagentArgs) -> String {
+    /// Plan every `subagent` call in this turn, announce them, then execute them
+    /// concurrently (capped by `delegation.max_parallel`). Returns call id →
+    /// result. Parse / depth errors become the result for that call.
+    async fn run_subagents(
+        &mut self,
+        calls: &[cowboy_core::model::ToolCall],
+    ) -> std::collections::HashMap<String, String> {
+        use futures::stream::StreamExt;
+        let mut results: std::collections::HashMap<String, String> = Default::default();
+        let sub_calls: Vec<&cowboy_core::model::ToolCall> = calls
+            .iter()
+            .filter(|c| c.name == tools::TOOL_SUBAGENT)
+            .collect();
+        if sub_calls.is_empty() {
+            return results;
+        }
+        let crew_cfg = cowboy_core::crew::load().ok().flatten();
+        let max_parallel = crew_cfg
+            .as_ref()
+            .map(|c| c.delegation.max_parallel.max(1) as usize)
+            .unwrap_or(4);
+
+        // Plan + announce sequentially (needs &mut self); collect runnable plans.
+        let mut plans: Vec<(String, SubagentPlan)> = Vec::new();
+        for call in &sub_calls {
+            match parse_args::<SubagentArgs>(&call.arguments) {
+                Ok(args) => match self.plan_subagent(&args, &crew_cfg) {
+                    Ok(plan) => {
+                        self.announce_subagent(&plan);
+                        plans.push((call.id.clone(), plan));
+                    }
+                    Err(msg) => {
+                        results.insert(call.id.clone(), msg);
+                    }
+                },
+                Err(e) => {
+                    results.insert(
+                        call.id.clone(),
+                        format!("error: invalid subagent args: {e}"),
+                    );
+                }
+            }
+        }
+        if plans.is_empty() {
+            return results;
+        }
+        if plans.len() > 1 {
+            self.ui
+                .notice(&format!("↳ running {} subagents in parallel", plans.len()));
+        }
+        // Execute concurrently (owned plans → no borrow of self).
+        let done: Vec<(String, String)> = futures::stream::iter(
+            plans
+                .into_iter()
+                .map(|(id, plan)| async move { (id, exec_subagent(plan).await) }),
+        )
+        .buffer_unordered(max_parallel)
+        .collect()
+        .await;
+        self.ui.notice("↳ subagent(s) finished");
+        for (id, res) in done {
+            results.insert(id, res);
+        }
+        results
+    }
+
+    /// Resolve a delegation into an executable plan: enforce the depth limit,
+    /// route the model via the crew roster (category + effort), and build the
+    /// worker brief. No side effects (so a batch can be planned then run
+    /// concurrently). `Err` carries a message to return to the model as-is.
+    fn plan_subagent(
+        &self,
+        args: &SubagentArgs,
+        crew_cfg: &Option<cowboy_core::crew::CrewConfig>,
+    ) -> std::result::Result<SubagentPlan, String> {
         use cowboy_core::crew;
 
-        // Crew roster (if configured) drives the depth limit and model routing.
-        let crew_cfg = crew::load().ok().flatten();
-        let max_depth = match &crew_cfg {
+        let max_depth = match crew_cfg {
             Some(c) if !c.delegation.allow_recursive_delegation => c.delegation.max_depth as usize,
             _ => MAX_SUBAGENT_DEPTH,
         }
         .min(MAX_SUBAGENT_DEPTH);
         if self.subagent_depth >= max_depth {
-            return format!(
+            return Err(format!(
                 "error: delegation depth limit ({max_depth}) reached; do this work directly"
-            );
+            ));
         }
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => return format!("subagent error: cannot locate cowboy binary: {e}"),
-        };
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("subagent error: cannot locate cowboy binary: {e}"))?;
 
-        // Resolve the worker's model from the roster by category + effort. The
-        // planner requests a KIND of work; Cowboy owns the model choice.
+        // The planner requests a KIND of work; Cowboy owns the model choice.
         let category = args
             .category
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .unwrap_or(crew::GENERAL);
+            .unwrap_or(crew::GENERAL)
+            .to_string();
         let effort = args
             .effort
             .as_deref()
             .and_then(crew::Effort::parse)
             .unwrap_or(crew::DEFAULT_EFFORT);
-        let routed = crew_cfg.as_ref().map(|c| c.resolve(category, effort));
+        let routed = crew_cfg.as_ref().map(|c| c.resolve(&category, effort));
 
-        // Build the worker brief: optional context, the task, and the expected artifact.
+        // Worker brief: optional context, the task, then the expected artifact.
         let mut task = String::new();
         if let Some(ctx) = &args.context {
             if !ctx.is_empty() {
@@ -1262,46 +1380,33 @@ impl<'a> AgentLoop<'a> {
             Some(r) => format!("{category}/{} → {}", effort.as_str(), r.model),
             None => format!("{category}/{}", effort.as_str()),
         };
-        self.ui
-            .notice(&format!("↳ subagent [{label}]: {}", args.task));
-        if let Some(r) = &routed {
+        Ok(SubagentPlan {
+            exe,
+            root: self.runtime.root().to_path_buf(),
+            container_name: self.runtime.container_name().to_string(),
+            child_depth: self.subagent_depth + 1,
+            task,
+            display_task: args.task.clone(),
+            label,
+            model: routed.as_ref().map(|r| r.model.clone()),
+            routed: routed.map(|r| (category, effort.as_str().to_string(), r.model, r.fell_back)),
+        })
+    }
+
+    /// Surface a planned delegation to the UI + lifecycle log (needs `&mut self`,
+    /// so it runs before the concurrent exec).
+    fn announce_subagent(&mut self, plan: &SubagentPlan) {
+        self.ui.notice(&format!(
+            "↳ subagent [{}]: {}",
+            plan.label, plan.display_task
+        ));
+        if let Some((category, effort, model, fell_back)) = &plan.routed {
             self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SubagentRouted {
-                category: category.to_string(),
-                effort: effort.as_str().to_string(),
-                model: r.model.clone(),
-                fell_back: r.fell_back,
+                category: category.clone(),
+                effort: effort.clone(),
+                model: model.clone(),
+                fell_back: *fell_back,
             });
-        }
-
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.arg(&task)
-            .current_dir(self.runtime.root())
-            .env("COWBOY_CONTAINER_NAME", self.runtime.container_name())
-            .env(
-                "COWBOY_SUBAGENT_DEPTH",
-                (self.subagent_depth + 1).to_string(),
-            )
-            .env("COWBOY_PRINT_FINAL_ONLY", "1")
-            // Don't let the child's logs corrupt the parent TUI/console.
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        // Route the worker to its resolved model (the child honors COWBOY_MODEL).
-        if let Some(r) = &routed {
-            cmd.env("COWBOY_MODEL", &r.model);
-        }
-        let output = cmd.output().await;
-
-        match output {
-            Ok(o) => {
-                self.ui.notice("↳ subagent finished");
-                let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if result.is_empty() {
-                    "subagent produced no final answer".to_string()
-                } else {
-                    result
-                }
-            }
-            Err(e) => format!("subagent failed to start: {e}"),
         }
     }
 
@@ -2178,18 +2283,57 @@ mod tests {
             &mut ui,
         );
         agent.subagent_depth = MAX_SUBAGENT_DEPTH; // already at the limit
-        let result = agent
-            .run_subagent(&super::super::tools::SubagentArgs {
-                task: "do a thing".into(),
-                context: None,
-                category: None,
-                effort: None,
-                reason: None,
-                expected_artifact: None,
-            })
-            .await;
-        // At max depth it returns an error string without spawning a subprocess.
-        assert!(result.contains("depth limit"), "got: {result}");
+        let err = agent
+            .plan_subagent(
+                &super::super::tools::SubagentArgs {
+                    task: "do a thing".into(),
+                    context: None,
+                    category: None,
+                    effort: None,
+                    reason: None,
+                    expected_artifact: None,
+                },
+                &None,
+            )
+            .unwrap_err();
+        // At max depth it refuses to plan (no subprocess spawned).
+        assert!(err.contains("depth limit"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_subagents_batches_results_by_call_id() {
+        // Three delegations in one turn. At max depth they all short-circuit in
+        // planning (no subprocess), but we still get one result per call id —
+        // proving the batch maps every subagent call.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.subagent_depth = MAX_SUBAGENT_DEPTH;
+        let calls = vec![
+            tool_call(
+                "a",
+                "subagent",
+                r#"{"task":"x","category":"tests","effort":"small"}"#,
+            ),
+            tool_call(
+                "b",
+                "subagent",
+                r#"{"task":"y","category":"review","effort":"deep"}"#,
+            ),
+            tool_call("c", "shell", r#"{"command":"echo hi"}"#), // non-subagent ignored
+        ];
+        let results = agent.run_subagents(&calls).await;
+        assert_eq!(results.len(), 2, "only subagent calls produce results");
+        assert!(results.contains_key("a") && results.contains_key("b"));
+        assert!(!results.contains_key("c"));
+        assert!(results["a"].contains("depth limit"));
     }
 
     #[tokio::test]
