@@ -97,6 +97,10 @@ struct Daemon {
     state: State,
     state_path: PathBuf,
     next_seq: u64,
+    /// Ranch ids with an in-flight background advance. The bool is a "dirty"
+    /// flag: set when another workstream finishes while an advance is running, so
+    /// the coordinator re-runs once to pick up the late completion. Runtime-only.
+    coordinating: std::collections::HashMap<String, bool>,
 }
 
 fn now_ms() -> u64 {
@@ -126,6 +130,7 @@ impl Daemon {
             state,
             state_path,
             next_seq: 0,
+            coordinating: std::collections::HashMap::new(),
         }
     }
 
@@ -271,6 +276,34 @@ impl Daemon {
         (reap, released)
     }
 
+    /// Claim the coordinator slot for a ranch. Returns true if the caller should
+    /// run an advance now; false if one is already in flight (in which case the
+    /// slot is marked dirty so the running advance re-runs once when it finishes).
+    fn claim_coordination(&mut self, ranch_id: &str) -> bool {
+        if let Some(dirty) = self.coordinating.get_mut(ranch_id) {
+            *dirty = true;
+            false
+        } else {
+            self.coordinating.insert(ranch_id.to_string(), false);
+            true
+        }
+    }
+
+    /// Finish a coordination run. Returns true if it was marked dirty meanwhile
+    /// and should re-run (the slot is kept); false if the slot is now free.
+    fn finish_coordination(&mut self, ranch_id: &str) -> bool {
+        match self.coordinating.get(ranch_id).copied() {
+            Some(true) => {
+                self.coordinating.insert(ranch_id.to_string(), false);
+                true
+            }
+            _ => {
+                self.coordinating.remove(ranch_id);
+                false
+            }
+        }
+    }
+
     /// Persist the registry atomically (temp file + rename).
     fn save(&self) {
         if let Some(parent) = self.state_path.parent() {
@@ -326,11 +359,18 @@ pub async fn serve() -> Result<()> {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         loop {
             tick.tick().await;
-            let mut d = sweeper.lock().await;
-            let newly = d.sweep_stale(true);
-            if !newly.is_empty() {
-                tracing::info!(?newly, "sessions went stale");
-                d.save();
+            let newly = {
+                let mut d = sweeper.lock().await;
+                let newly = d.sweep_stale(true);
+                if !newly.is_empty() {
+                    tracing::info!(?newly, "sessions went stale");
+                    d.save();
+                }
+                newly
+            };
+            // Advance any ranch whose workstream just went stale.
+            for id in &newly {
+                coordinate_after_terminal(&sweeper, id).await;
             }
         }
     });
@@ -557,25 +597,32 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             DaemonResp::Updated
         }
         DaemonReq::CompleteSession { id } => {
-            let mut d = daemon.lock().await;
-            if let Some(s) = d.state.sessions.get_mut(&id) {
-                s.status = SessionStatus::Completed;
-                s.worker_sock = None;
+            {
+                let mut d = daemon.lock().await;
+                if let Some(s) = d.state.sessions.get_mut(&id) {
+                    s.status = SessionStatus::Completed;
+                    s.worker_sock = None;
+                }
+                // A cleanly finished session frees its worktree immediately.
+                d.release_all_for(&id);
+                d.save();
             }
-            // A cleanly finished session frees its worktree immediately.
-            d.release_all_for(&id);
-            d.save();
+            // If this session ran a ranch workstream, advance the plan.
+            coordinate_after_terminal(daemon, &id).await;
             DaemonResp::Completed
         }
         DaemonReq::FailSession { id, error } => {
-            let mut d = daemon.lock().await;
-            if let Some(s) = d.state.sessions.get_mut(&id) {
-                s.status = SessionStatus::Failed;
-                s.worker_sock = None;
-                s.running_command = Some(format!("error: {error}"));
+            {
+                let mut d = daemon.lock().await;
+                if let Some(s) = d.state.sessions.get_mut(&id) {
+                    s.status = SessionStatus::Failed;
+                    s.worker_sock = None;
+                    s.running_command = Some(format!("error: {error}"));
+                }
+                d.release_all_for(&id);
+                d.save();
             }
-            d.release_all_for(&id);
-            d.save();
+            coordinate_after_terminal(daemon, &id).await;
             DaemonResp::Failed
         }
         DaemonReq::CleanupStale { dry_run } => {
@@ -665,6 +712,91 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             },
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ranch coordinator (background auto-advance)
+// ---------------------------------------------------------------------------
+
+/// When a ranch workstream's session reaches a terminal state, advance the plan
+/// in the background: reconcile finished workstreams, promote their outputs, and
+/// launch newly-ready ones — without the user re-running `cowboy ranch start`.
+///
+/// Mechanism: spawn `cowboy ranch start <ranch_id>` with its cwd set to the
+/// ranch's main repo (derived from the finished session's worktree). That reuses
+/// the exact, tested advance path and runs out-of-band, so it never deadlocks on
+/// the daemon mutex. A per-ranch in-flight guard coalesces bursts; a dirty flag
+/// re-runs once if another workstream finished mid-advance. Honors the ranch's
+/// `auto_advance` flag and stops at acceptance gates (workstreams needing
+/// sign-off don't unblock dependents).
+async fn coordinate_after_terminal(daemon: &Arc<Mutex<Daemon>>, session: &SessionId) {
+    // Resolve the finished session's ranch + worktree, then its main repo root.
+    let (ranch_id, worktree) = {
+        let d = daemon.lock().await;
+        match d.state.sessions.get(session) {
+            Some(s) => match &s.ranch_id {
+                Some(rid) => (rid.clone(), s.root.clone()),
+                None => return, // not part of a ranch
+            },
+            None => return,
+        }
+    };
+    let Ok(main_root) = crate::net::worktree::main_repo_root(&worktree) else {
+        tracing::debug!(%session, "coordinator: can't resolve main repo for worktree");
+        return;
+    };
+    // Respect the ranch's auto-advance preference.
+    match cowboy_core::ranch::load(&main_root, &ranch_id) {
+        Ok(r) if !r.auto_advance => {
+            tracing::debug!(ranch = %ranch_id, "coordinator: auto_advance disabled, skipping");
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::debug!(ranch = %ranch_id, error = %e, "coordinator: can't load ranch");
+            return;
+        }
+    }
+
+    // In-flight guard: if an advance is already running for this ranch, mark it
+    // dirty (so it re-runs once more) and return; otherwise claim the slot.
+    {
+        let mut d = daemon.lock().await;
+        if !d.claim_coordination(&ranch_id) {
+            return;
+        }
+    }
+
+    spawn_advance(daemon.clone(), ranch_id, main_root);
+}
+
+/// Spawn one `cowboy ranch start` advance for a ranch and, when it exits, either
+/// clear the in-flight guard or re-run once if it was marked dirty meanwhile.
+fn spawn_advance(daemon: Arc<Mutex<Daemon>>, ranch_id: String, main_root: PathBuf) {
+    tokio::spawn(async move {
+        tracing::info!(ranch = %ranch_id, "coordinator: advancing");
+        let status = tokio::process::Command::new(worker_binary())
+            .arg("ranch")
+            .arg("start")
+            .arg(&ranch_id)
+            .current_dir(&main_root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        if let Err(e) = status {
+            tracing::warn!(ranch = %ranch_id, error = %e, "coordinator: advance failed to run");
+        }
+        // Decide whether to re-run (dirty) or finish.
+        let rerun = {
+            let mut d = daemon.lock().await;
+            d.finish_coordination(&ranch_id)
+        };
+        if rerun {
+            spawn_advance(daemon, ranch_id, main_root);
+        }
+    });
 }
 
 /// Spawn a worker process for a new session, supervise it, and return its
@@ -781,14 +913,24 @@ async fn start_session(
     tokio::spawn(async move {
         let mut child = child;
         let _ = child.wait().await;
-        let mut d = sup.lock().await;
-        if let Some(s) = d.state.sessions.get_mut(&sup_id) {
-            if !s.status.is_terminal() {
-                s.status = SessionStatus::Stale;
-                s.worker_sock = None;
+        let went_stale = {
+            let mut d = sup.lock().await;
+            let mut staled = false;
+            if let Some(s) = d.state.sessions.get_mut(&sup_id) {
+                if !s.status.is_terminal() {
+                    s.status = SessionStatus::Stale;
+                    s.worker_sock = None;
+                    staled = true;
+                }
             }
+            d.save();
+            staled
+        };
+        // A crashed ranch workstream should still advance the plan (so it's
+        // reflected as failed and the user is prompted), mirroring clean exits.
+        if went_stale {
+            coordinate_after_terminal(&sup, &sup_id).await;
         }
-        d.save();
     });
 
     // Wait for the worker to bind its socket.
@@ -861,6 +1003,7 @@ mod tests {
             state: State::default(),
             state_path: PathBuf::from("/dev/null"),
             next_seq: 0,
+            coordinating: std::collections::HashMap::new(),
         }
     }
 
@@ -1056,6 +1199,26 @@ mod tests {
         assert!(!d.state.sessions.contains_key("stale"));
         assert!(!d.state.leases.contains_key("/w"));
         assert!(d.state.sessions.contains_key("done"));
+    }
+
+    #[test]
+    fn coordination_guard_coalesces_bursts_and_reruns_when_dirty() {
+        let mut d = daemon();
+        // First completion claims the slot and runs now.
+        assert!(d.claim_coordination("billing"));
+        // A second completion mid-advance does NOT run; it marks the slot dirty.
+        assert!(!d.claim_coordination("billing"));
+        assert!(!d.claim_coordination("billing"));
+        // A different ranch is independent.
+        assert!(d.claim_coordination("infra"));
+        // The advance finishes: it was dirty, so it should re-run (slot kept).
+        assert!(d.finish_coordination("billing"));
+        // No further completions arrived during the re-run → slot frees.
+        assert!(!d.finish_coordination("billing"));
+        assert!(!d.coordinating.contains_key("billing"));
+        // infra finishes clean (never dirtied) → frees immediately.
+        assert!(!d.finish_coordination("infra"));
+        assert!(d.coordinating.is_empty());
     }
 
     #[test]

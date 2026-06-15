@@ -116,6 +116,12 @@ pub struct Ranch {
     pub status: RanchStatus,
     #[serde(default)]
     pub workstreams: Vec<Workstream>,
+    /// When true (the default), the daemon coordinator auto-advances the plan as
+    /// workstreams finish: it reconciles, promotes outputs, and launches newly
+    /// ready workstreams without the user re-running `ranch start`. Set false to
+    /// drive the plan manually. Acceptance gates still pause for sign-off.
+    #[serde(default = "default_true")]
+    pub auto_advance: bool,
     #[serde(default)]
     pub created_ms: u64,
     #[serde(default)]
@@ -124,6 +130,10 @@ pub struct Ranch {
 
 fn default_planning() -> RanchStatus {
     RanchStatus::Planning
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Ranch {
@@ -283,6 +293,7 @@ mod tests {
             goal: String::new(),
             status: RanchStatus::Planning,
             workstreams: ws,
+            auto_advance: true,
             created_ms: 1,
             updated_ms: 1,
         }

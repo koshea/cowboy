@@ -91,6 +91,7 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
          title: {title:?}\n\
          goal: {goal:?}\n\
          status: planning\n\
+         auto_advance: true  # daemon launches ready workstreams as deps finish\n\
          created_ms: {now}\n\
          updated_ms: {now}\n\
          workstreams: []\n\
@@ -815,6 +816,7 @@ mod tests {
             goal: String::new(),
             status: RanchStatus::Running,
             workstreams: ws,
+            auto_advance: true,
             created_ms: 1,
             updated_ms: 1,
         }

@@ -680,6 +680,112 @@ fn e2e_ranch_start_launches_ready_workstream() {
     reap_new_docker(&docker_before);
 }
 
+/// Ranch coordinator (auto-advance): start a ranch's first workstream, let it
+/// actually run to completion in Docker, and assert the daemon AUTO-launches the
+/// dependent workstream — without a second manual `ranch start`. This exercises
+/// the full loop: one-shot worker finishes → CompleteSession → coordinator spawns
+/// an advance → api launches. Needs Docker + a real model.
+#[test]
+#[ignore = "real Docker + model: exercises background auto-advance"]
+fn e2e_ranch_coordinator_auto_advances_to_dependent() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let docker_before = cowboy_docker_objects();
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    // schema does a trivial, quickly-completable task; api depends on it. No
+    // acceptance criteria / expected artifacts on schema, so it auto-completes
+    // (the acceptance gate would otherwise pause for sign-off).
+    let ranch_dir = proj.path().join(".cowboy/ranches/billing");
+    std::fs::create_dir_all(&ranch_dir).unwrap();
+    std::fs::write(
+        ranch_dir.join("ranch.yaml"),
+        "version: 1\nid: billing\ntitle: Billing\nstatus: planning\nauto_advance: true\n\
+         created_ms: 1\nupdated_ms: 1\nworkstreams:\n\
+         \x20 - id: schema\n    title: Schema\n    goal: Create a file hello.txt containing the word hello, then finish.\n    depends_on: []\n\
+         \x20 - id: api\n    title: API\n    goal: Create a file api.txt containing the word api, then finish.\n    depends_on: [schema]\n",
+    )
+    .unwrap();
+
+    // Launch only the ready workstream (schema). We never call start again.
+    let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .env("XDG_RUNTIME_DIR", env.runtime.path())
+        .env("XDG_STATE_HOME", env.state.path())
+        .args(["ranch", "start", "billing"])
+        .output()
+        .expect("run ranch start");
+    assert!(
+        out.status.success(),
+        "ranch start failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Wait (generously) for the coordinator to launch a session tagged
+    // workstream=api — proof the dependent advanced automatically.
+    let mut api = None;
+    for _ in 0..1200 {
+        if let Some(DaemonResp::Sessions { sessions }) =
+            dreq(&sock, DaemonReq::ListSessions { root: None })
+        {
+            if let Some(s) = sessions
+                .into_iter()
+                .find(|s| s.workstream_id.as_deref() == Some("api"))
+            {
+                api = Some(s);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let api = api.expect("coordinator should auto-launch the api workstream");
+    assert_eq!(api.ranch_id.as_deref(), Some("billing"));
+
+    // ranch.yaml reflects schema done + api launched on its branch.
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    assert!(
+        r.workstream("schema").unwrap().status.is_done(),
+        "schema should be complete: {:?}",
+        r.workstream("schema").unwrap().status
+    );
+
+    // Cleanup: end any live workstream worker, remove worktrees, reap containers.
+    for wsid in ["schema", "api"] {
+        if let Some(w) = r.workstream(wsid) {
+            if let Some(sid) = &w.session_id {
+                if let Some(info) = get(&sock, sid) {
+                    if let Some(ws) = &info.worker_sock {
+                        Client::connect(ws).send(&ClientMsg::End);
+                    }
+                }
+            }
+        }
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    for wsid in ["schema", "api"] {
+        if let Some(p) = r.workstream(wsid).and_then(|w| w.worktree_path.clone()) {
+            let _ = Command::new("git")
+                .arg("-C")
+                .arg(proj.path())
+                .args(["worktree", "remove", "--force"])
+                .arg(&p)
+                .output();
+        }
+    }
+    reap_new_docker(&docker_before);
+}
+
 /// The flagship real-Docker turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.

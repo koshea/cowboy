@@ -46,6 +46,27 @@ pub fn repo_root(root: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
+/// The main repository root for a (possibly linked) worktree — where the ranch
+/// plan and other committed `.cowboy` state live. For a linked worktree this is
+/// the original checkout, not the worktree directory. `git-common-dir` resolves
+/// to `<main>/.git`; its parent is the main repo root.
+pub fn main_repo_root(worktree: &Path) -> Result<PathBuf> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .context("running git rev-parse --git-common-dir")?;
+    if !out.status.success() {
+        anyhow::bail!("{} is not inside a git repository", worktree.display());
+    }
+    let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    common
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| anyhow::anyhow!("unexpected git-common-dir: {}", common.display()))
+}
+
 /// Does the base repo have uncommitted changes? (Only used to warn — a new
 /// worktree checks out committed HEAD, so dirty changes don't carry over.)
 pub fn is_dirty(repo: &Path) -> bool {
@@ -335,6 +356,20 @@ mod tests {
 
         // Unknown branch errors.
         assert!(status(repo.path(), "cowboy/nope").is_err());
+    }
+
+    #[test]
+    fn main_repo_root_resolves_from_a_linked_worktree() {
+        let repo = init_repo();
+        let (wt, _branch) = create(repo.path(), Some("cowboy/feat"), None).unwrap();
+        // From inside the linked worktree we recover the original checkout, not
+        // the worktree dir.
+        let main = main_repo_root(&wt).unwrap();
+        let expect = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(std::fs::canonicalize(&main).unwrap(), expect);
+        // And from the main checkout itself it's a no-op (still the main root).
+        let from_main = main_repo_root(repo.path()).unwrap();
+        assert_eq!(std::fs::canonicalize(&from_main).unwrap(), expect);
     }
 
     #[test]
