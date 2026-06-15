@@ -346,6 +346,9 @@ fn event_loop(
     // Submitted-message history for Up/Down recall.
     let mut history: Vec<String> = Vec::new();
     let mut hist_pos: Option<usize> = None;
+    // Slash-command autocomplete catalog (built-ins + discovered skills),
+    // computed once: skills rarely change mid-session.
+    let completion_catalog = build_completion_catalog(&session);
 
     // Welcome banner (project info) at the top of the transcript.
     for line in intro {
@@ -475,7 +478,9 @@ fn event_loop(
         terminal.draw(|f| draw(f, &app))?;
 
         if event::poll(Duration::from_millis(120))? {
-            match event::read()? {
+            let ev = event::read()?;
+            let input_before = app.input_text();
+            match ev {
                 // Ignore key *release* events (kitty protocol reports them).
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctx = KeyCtx {
@@ -506,9 +511,86 @@ fn event_loop(
                 }
                 _ => {}
             }
+            // Refresh the slash-command autocomplete when the input changed (so
+            // navigation keys, which don't touch the text, keep the selection).
+            if matches!(app.mode, Mode::Idle | Mode::Running) {
+                if app.input_text() != input_before {
+                    refresh_completions(&mut app, &completion_catalog);
+                }
+            } else {
+                app.clear_completions();
+            }
         }
     }
     Ok(())
+}
+
+/// Built-in slash commands offered by autocomplete (value, hint).
+const COMMAND_COMPLETIONS: &[(&str, &str)] = &[
+    ("help", "show help"),
+    ("skills", "list skills"),
+    ("model", "[name] show/switch model"),
+    ("models", "browse the model catalogue"),
+    ("crew", "[usage] show the crew roster"),
+    ("diff", "working-tree diff"),
+    ("copy", "copy the last answer"),
+    ("clear", "clear the view"),
+    ("detach", "leave running, re-attach later"),
+    ("quit", "end the session"),
+];
+
+/// Build the autocomplete catalog once: built-in commands + discovered skills.
+fn build_completion_catalog(session: &SessionCtx) -> Vec<cowboy_tui::Completion> {
+    let mut out: Vec<cowboy_tui::Completion> = COMMAND_COMPLETIONS
+        .iter()
+        .map(|(v, h)| cowboy_tui::Completion {
+            value: v.to_string(),
+            hint: h.to_string(),
+        })
+        .collect();
+    for s in cowboy_core::skills::discover(&session.root) {
+        let hint = s.argument_hint.clone().unwrap_or_else(|| {
+            s.description
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        });
+        out.push(cowboy_tui::Completion {
+            value: s.name,
+            hint,
+        });
+    }
+    out
+}
+
+/// Recompute autocomplete candidates from the current input. Active only while
+/// the (single-line) input is `/<partial>` with no space yet; matches by
+/// substring with prefix matches first.
+fn refresh_completions(app: &mut App, catalog: &[cowboy_tui::Completion]) {
+    let input = app.input_text();
+    let partial = match input.strip_prefix('/') {
+        Some(rest) if input.lines().count() <= 1 && !rest.contains(char::is_whitespace) => {
+            rest.to_lowercase()
+        }
+        _ => {
+            app.clear_completions();
+            return;
+        }
+    };
+    let mut items: Vec<cowboy_tui::Completion> = catalog
+        .iter()
+        .filter(|c| c.value.to_lowercase().contains(&partial))
+        .cloned()
+        .collect();
+    // Prefix matches first, then by name.
+    items.sort_by(|a, b| {
+        let ap = a.value.to_lowercase().starts_with(&partial);
+        let bp = b.value.to_lowercase().starts_with(&partial);
+        bp.cmp(&ap).then(a.value.cmp(&b.value))
+    });
+    app.set_completions(items);
 }
 
 /// Mouse → transcript-scoped selection (drag to select; press `y` to copy) +
@@ -558,6 +640,30 @@ fn handle_key(
     mut ctx: KeyCtx,
     terminal: &mut Term,
 ) -> bool {
+    // Slash-command autocomplete popup: Up/Down navigate, Tab accepts, Esc
+    // dismisses. (Enter falls through to submit what's typed; typing refines.)
+    if app.has_completions() {
+        match key.code {
+            KeyCode::Up => {
+                app.completion_move(-1);
+                return false;
+            }
+            KeyCode::Down => {
+                app.completion_move(1);
+                return false;
+            }
+            KeyCode::Tab => {
+                app.accept_completion();
+                return false;
+            }
+            KeyCode::Esc => {
+                app.clear_completions();
+                return false;
+            }
+            _ => {}
+        }
+    }
+
     // A live transcript selection captures `y` (copy, vim-style) and `Esc`
     // (clear); any other key dismisses the highlight, then proceeds normally — so
     // the selection is always a transient, explicit copy gesture (never lingers).

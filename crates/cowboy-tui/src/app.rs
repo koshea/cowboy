@@ -172,6 +172,22 @@ pub struct Choice {
 }
 
 /// Full renderable TUI state.
+/// One autocomplete candidate (a slash command or a skill).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Completion {
+    /// The token inserted after `/` (e.g. `help`, `github:review-pr`).
+    pub value: String,
+    /// A short usage/description hint shown beside it.
+    pub hint: String,
+}
+
+/// Active slash-command autocomplete popup state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionState {
+    pub items: Vec<Completion>,
+    pub selected: usize,
+}
+
 pub struct App {
     pub title: String,
     pub status: String,
@@ -219,6 +235,8 @@ pub struct App {
     pub model_form: Option<ModelForm>,
     /// Pending multiple-choice question (set while `mode == AwaitingChoice`).
     pub choice: Option<Choice>,
+    /// Slash-command autocomplete popup (set while the input is `/<partial>`).
+    pub completion: Option<CompletionState>,
 }
 
 /// A mouse text selection, in absolute terminal coordinates (col, row).
@@ -282,7 +300,46 @@ impl App {
             model_picker: None,
             model_form: None,
             choice: None,
+            completion: None,
         }
+    }
+
+    /// Set the autocomplete candidates (selection reset to the top); empty clears.
+    pub fn set_completions(&mut self, items: Vec<Completion>) {
+        self.completion = if items.is_empty() {
+            None
+        } else {
+            Some(CompletionState { items, selected: 0 })
+        };
+    }
+
+    pub fn clear_completions(&mut self) {
+        self.completion = None;
+    }
+
+    pub fn has_completions(&self) -> bool {
+        self.completion.is_some()
+    }
+
+    /// Move the autocomplete selection, wrapping.
+    pub fn completion_move(&mut self, delta: isize) {
+        if let Some(c) = &mut self.completion {
+            let n = c.items.len() as isize;
+            if n > 0 {
+                c.selected = (c.selected as isize + delta).rem_euclid(n) as usize;
+            }
+        }
+    }
+
+    /// Replace the input with the selected completion (`/<value> `) and dismiss.
+    pub fn accept_completion(&mut self) {
+        if let Some(c) = &self.completion {
+            if let Some(item) = c.items.get(c.selected) {
+                let v = item.value.clone();
+                self.set_input(&format!("/{v} "));
+            }
+        }
+        self.completion = None;
     }
 
     /// Begin a selection at an absolute screen position, but only if it lands in
@@ -600,6 +657,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     draw_status(f, app, rows[1]);
     draw_input(f, app, rows[2]);
+    // Slash-command autocomplete floats just above the input.
+    if matches!(app.mode, Mode::Idle | Mode::Running) {
+        draw_completions(f, app, rows[2]);
+    }
 
     match &app.mode {
         Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, "type your answer · Enter"),
@@ -1108,6 +1169,72 @@ fn fmt_cost(usd: f64) -> String {
     }
 }
 
+/// The slash-command/skill autocomplete popup, anchored just above the input.
+fn draw_completions(f: &mut Frame, app: &App, input_area: Rect) {
+    let Some(cs) = &app.completion else { return };
+    if cs.items.is_empty() {
+        return;
+    }
+    const MAX_ROWS: usize = 8;
+    let shown = cs.items.len().min(MAX_ROWS);
+    // Scroll a window so the selected item stays visible.
+    let start = if cs.selected < MAX_ROWS {
+        0
+    } else {
+        cs.selected - MAX_ROWS + 1
+    };
+    let widest = cs
+        .items
+        .iter()
+        .map(|c| c.value.chars().count() + c.hint.chars().count() + 5)
+        .max()
+        .unwrap_or(24);
+    let width = (widest as u16)
+        .max(24)
+        .min(input_area.width.saturating_sub(2).max(24));
+    let height = shown as u16 + 2;
+    let rect = Rect {
+        x: input_area.x,
+        y: input_area.y.saturating_sub(height),
+        width,
+        height,
+    };
+    let lines: Vec<Line> = cs.items[start..start + shown]
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let selected = start + i == cs.selected;
+            let name = Style::default().fg(if selected { Color::Black } else { Color::Cyan });
+            let hint = Style::default().fg(if selected {
+                Color::Black
+            } else {
+                Color::DarkGray
+            });
+            let row = Line::from(vec![
+                Span::styled(format!("/{}", c.value), name),
+                Span::styled(format!("  {}", c.hint), hint),
+            ]);
+            if selected {
+                row.style(Style::default().bg(Color::Cyan))
+            } else {
+                row
+            }
+        })
+        .collect();
+    let title = format!(
+        " {} match{} · Tab ",
+        cs.items.len(),
+        if cs.items.len() == 1 { "" } else { "es" }
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
+    f.render_widget(Clear, rect);
+    f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::Done => "session finished — press q to quit",
@@ -1383,6 +1510,38 @@ mod tests {
         app.push(LineKind::User, "do work");
         app.mode = Mode::Paused;
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_completion_popup() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_input("/gi");
+        app.set_completions(vec![
+            Completion {
+                value: "github:review-pr".into(),
+                hint: "<pr-number-or-url> [filename]".into(),
+            },
+            Completion {
+                value: "git:setup-worktree".into(),
+                hint: "set up a new worktree".into(),
+            },
+        ]);
+        app.completion_move(1); // select the second
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn completion_accept_replaces_input() {
+        let mut app = App::new("cowboy");
+        app.set_input("/git");
+        app.set_completions(vec![Completion {
+            value: "github:review-pr".into(),
+            hint: "h".into(),
+        }]);
+        app.accept_completion();
+        assert_eq!(app.input_text(), "/github:review-pr ");
+        assert!(!app.has_completions());
     }
 
     fn sample_choice(id: &str, label: &str, configured: bool, current: bool) -> ModelChoice {
