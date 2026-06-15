@@ -26,6 +26,7 @@ async fn main() -> Result<()> {
         Some(Command::Proc(args)) => cmd::proc::run(args).await,
         Some(Command::Models(args)) => cmd::models::run(args).await,
         Some(Command::Skill(args)) => cmd::skill::run(args),
+        Some(Command::Agents(args)) => cmd::agents::run(args),
         Some(Command::Down(args)) => cmd::down::run(args).await,
         Some(Command::Attach { target }) => cmd::attach::run(target).await,
         Some(Command::Sessions) => cmd::sessions::run().await,

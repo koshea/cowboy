@@ -7,6 +7,10 @@ use predicates::prelude::*;
 fn cowboy(dir: &std::path::Path) -> Command {
     let mut c = Command::cargo_bin("cowboy").unwrap();
     c.current_dir(dir);
+    // Isolate from the real home so global `~/.config/cowboy/skills` and
+    // `~/.claude/skills` don't leak into these project-scoped tests.
+    c.env("HOME", dir);
+    c.env("XDG_CONFIG_HOME", dir);
     c
 }
 

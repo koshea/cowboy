@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod agents;
 pub mod artifact;
 pub mod attach;
 pub mod bus;

@@ -31,18 +31,22 @@ show` and `cowboy proc start <name>`. You do not need to ask before ordinary \
 development actions inside the container.
 
 Reusable skills may be available: run `cowboy skill list` to see them and \
-`cowboy skill show <name>` to read a skill's instructions, then follow them.
+`cowboy skill show <name>` to read a skill's instructions, then follow them \
+(skills are discovered from `.cowboy/skills/` and `.claude/skills/`).
 
 You are the foreman of a crew. For focused, separable work, delegate it with the \
 `subagent` tool instead of doing everything yourself: describe the work by \
 `category` (the kind — exploration, tests, frontend, backend, review, docs, \
 debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
 deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
-routes each request to the right crew model. Delegate when work is scoped and \
-separable (exploration, test-writing, an independent component, a review pass); \
-do it yourself when the task is tiny, the hand-off costs more than the work, or \
-it needs continuous coordination with your current state. Prefer small, \
-well-scoped subagent tasks that return a concrete artifact.
+routes each request to the right crew model. To run work in parallel, emit \
+several `subagent` calls in one message. Named specialist agents may be defined \
+under `.claude/agents/`/`.cowboy/agents/` (`cowboy agents list`); adopt one by \
+passing `agent: <name>` to `subagent`. Delegate when work is scoped and separable \
+(exploration, test-writing, an independent component, a review pass); do it \
+yourself when the task is tiny, the hand-off costs more than the work, or it \
+needs continuous coordination with your current state. Prefer small, well-scoped \
+subagent tasks that return a concrete artifact.
 
 Project conventions may live in AGENTS.md (or CLAUDE.md) files, which are \
 authoritative. Before working in an area, `read` the repo-root AGENTS.md and the \
@@ -1410,8 +1414,32 @@ impl<'a> AgentLoop<'a> {
         let routed = crew_cfg.as_ref().map(|c| c.resolve(&category, effort));
         let temperature = crew_cfg.as_ref().and_then(|c| c.temperature_for(&category));
 
-        // Worker brief: optional context, the task, then the expected artifact.
+        // Worker brief: an optional adopted agent persona, then context, the task,
+        // then the expected artifact.
         let mut task = String::new();
+        let mut agent_name = None;
+        if let Some(name) = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if let Some(agent) = cowboy_core::agents::load(self.runtime.root(), name) {
+                task.push_str(&format!(
+                    "You are the `{}` agent.\n\n{}\n\n---\n\n",
+                    agent.name, agent.instructions
+                ));
+                agent_name = Some(agent.name);
+            } else {
+                // Unknown agent: tell the worker to read the file itself (the
+                // skill convention) rather than silently dropping the persona.
+                task.push_str(&format!(
+                    "Act as the `{name}` agent: read `.claude/agents/{name}.md` (or \
+                     `.cowboy/agents/{name}.md`) and follow it.\n\n---\n\n"
+                ));
+                agent_name = Some(name.to_string());
+            }
+        }
         if let Some(ctx) = &args.context {
             if !ctx.is_empty() {
                 task.push_str(ctx);
@@ -1423,9 +1451,13 @@ impl<'a> AgentLoop<'a> {
             task.push_str(&format!("\n\nExpected artifact: {art}"));
         }
 
+        let who = agent_name
+            .as_deref()
+            .map(|a| format!("{a} "))
+            .unwrap_or_default();
         let label = match &routed {
-            Some(r) => format!("{category}/{} → {}", effort.as_str(), r.model),
-            None => format!("{category}/{}", effort.as_str()),
+            Some(r) => format!("{who}{category}/{} → {}", effort.as_str(), r.model),
+            None => format!("{who}{category}/{}", effort.as_str()),
         };
         Ok(SubagentPlan {
             exe,
@@ -2340,6 +2372,7 @@ mod tests {
                     effort: None,
                     reason: None,
                     expected_artifact: None,
+                    agent: None,
                 },
                 &None,
             )

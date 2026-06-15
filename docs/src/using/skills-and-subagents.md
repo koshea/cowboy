@@ -1,15 +1,31 @@
-# Skills & subagents
+# Skills, agents & subagents
 
 ## Skills
 
-**Skills** are reusable instructions in `.cowboy/skills/<name>/SKILL.md` (YAML
-frontmatter `name`/`description`, then a markdown body), discovered from the
-project and from `~/.config/cowboy/skills/`.
+**Skills** are reusable instructions in a `SKILL.md` (YAML frontmatter
+`name`/`description`, then a markdown body). They're discovered, in precedence
+order, from `.cowboy/skills/` and **`.claude/skills/`** in the project, then
+`~/.config/cowboy/skills/` and **`~/.claude/skills/`** globally — so Cowboy and
+Claude Code users share the same skills in a repo.
 
 The agent finds them with `cowboy skill list` and pulls a skill's instructions
 into context with `cowboy skill show <name>`. Both run through the `shell` tool —
 skills are a CLI surface, not a built-in tool, so humans and CI use the same
 commands.
+
+## Agents
+
+**Agent definitions** are named specialist personas — a Markdown file with
+frontmatter (`name`, `description`, optional `model`) whose body is the agent's
+system prompt. They're discovered from `.cowboy/agents/` and **`.claude/agents/`**
+(project), then the same `~/.config/cowboy/` and `~/.claude/` globals — again
+shared with Claude Code.
+
+`cowboy agents list` / `cowboy agents show <name>` surface them. To have a
+subagent **adopt** one, pass `agent: <name>` to the `subagent` tool: its
+instructions are prepended so the worker takes on that persona. The model is
+still chosen by the [crew](crew.md) (category + effort), not the agent's
+frontmatter — Cowboy's routing stays in charge.
 
 ## Subagents
 

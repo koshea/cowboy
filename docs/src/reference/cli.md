@@ -20,6 +20,25 @@ An opinionated local coding agent that runs wild inside a Docker corral.
 | `--resume` | Resume a specific session by id, keeping its conversation history |
 
 
+## `cowboy agents`
+
+List or show agent definitions (specialist personas under .claude/agents/)
+
+
+### `cowboy agents list`
+
+List available agent definitions (name + description + model)
+
+
+### `cowboy agents show`
+
+Print an agent's definition (its system prompt / review approach)
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
 ## `cowboy artifact`
 
 Inspect or publish session artifacts (contracts, summaries, handoffs, …)

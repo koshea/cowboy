@@ -1,6 +1,7 @@
 //! Core types shared by the cowboy host process: configuration, model client,
 //! network policy, and error types.
 
+pub mod agents;
 pub mod artifact;
 pub mod config;
 pub mod crew;

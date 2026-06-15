@@ -76,6 +76,12 @@ pub struct SubagentArgs {
     /// The concrete artifact you expect back (e.g. "changed test files + summary").
     #[serde(default)]
     pub expected_artifact: Option<String>,
+    /// Optional: a named agent definition to adopt (from `.claude/agents/` or
+    /// `.cowboy/agents/`, e.g. "security-reviewer"). Its instructions are
+    /// prepended so the worker takes on that persona. Discover names with
+    /// `cowboy agents list`. (The crew still picks the model from category/effort.)
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 /// Arguments for the `read` tool.
@@ -390,8 +396,12 @@ pub fn definitions() -> Vec<ToolDef> {
                           workspace/container. Describe the work by `category` (the kind: tests, \
                           exploration, frontend, review, …) and `effort` (tiny/small/medium/large/\
                           deep) — Cowboy routes it to the right model from the user's crew roster. \
-                          Do NOT pick a model. Include a `reason` and the `expected_artifact`. \
-                          Returns the worker's final summary. Prefer small, well-scoped tasks."
+                          Do NOT pick a model. Optionally set `agent` to adopt a named specialist \
+                          definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \
+                          \"security-reviewer\"; discover with `cowboy agents list`). Include a \
+                          `reason` and the `expected_artifact`. Returns the worker's final summary. \
+                          Prefer small, well-scoped tasks; emit several calls in one message to run \
+                          them in parallel."
                 .into(),
             parameters: schema_for::<SubagentArgs>(),
         },

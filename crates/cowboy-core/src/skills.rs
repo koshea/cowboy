@@ -1,8 +1,11 @@
 //! Agent skills: named, reusable capabilities described in `SKILL.md` files.
 //!
 //! A skill is a directory containing `SKILL.md` (with YAML frontmatter giving a
-//! `name` and `description`) plus optional scripts/resources. Skills live under
-//! `.cowboy/skills/` in the project and `~/.config/cowboy/skills/` globally.
+//! `name` and `description`) plus optional scripts/resources. Skills are
+//! discovered from, in precedence order: `.cowboy/skills/` and `.claude/skills/`
+//! in the project, then `~/.config/cowboy/skills/` and `~/.claude/skills/`
+//! globally. The `.claude/` locations let Cowboy share skills with Claude Code
+//! users in the same repo.
 //!
 //! In keeping with the shell-first design, skills are surfaced via the
 //! `cowboy skill` CLI: the agent runs `cowboy skill list` to discover them and
@@ -24,23 +27,43 @@ pub struct Skill {
     pub global: bool,
 }
 
-/// The project skills directory.
+/// The project skills directory (`.cowboy/skills/`).
 pub fn project_dir(root: &Path) -> PathBuf {
     root.join(".cowboy").join("skills")
 }
 
-/// The global (user) skills directory, if a config dir is resolvable.
+/// The global (user) skills directory (`~/.config/cowboy/skills/`), if resolvable.
 pub fn global_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.config_dir().join("cowboy").join("skills"))
 }
 
-/// Discover all skills (project first, then global), de-duplicated by name
-/// (project overrides global).
+/// The home directory, for resolving `~/.claude/...`.
+fn home_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
+}
+
+/// The skill search path, in precedence order. `.claude/` locations are shared
+/// with Claude Code; the `global` flag marks user-level (vs project) dirs.
+fn search_dirs(root: &Path) -> Vec<(PathBuf, bool)> {
+    let mut dirs = vec![
+        (project_dir(root), false),
+        (root.join(".claude").join("skills"), false),
+    ];
+    if let Some(g) = global_dir() {
+        dirs.push((g, true));
+    }
+    if let Some(h) = home_dir() {
+        dirs.push((h.join(".claude").join("skills"), true));
+    }
+    dirs
+}
+
+/// Discover all skills (project first, then global; `.cowboy` before `.claude`),
+/// de-duplicated by name (earlier dirs win).
 pub fn discover(root: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    for (dir, global) in [(Some(project_dir(root)), false), (global_dir(), true)] {
-        let Some(dir) = dir else { continue };
+    for (dir, global) in search_dirs(root) {
         for skill in read_dir(&dir, global) {
             if seen.insert(skill.name.clone()) {
                 out.push(skill);
@@ -173,6 +196,45 @@ mod tests {
         assert!(review.instructions.contains("Run the linter"));
         // A skill dir without frontmatter falls back to its directory name.
         assert!(skills.iter().any(|s| s.name == "noname"));
+    }
+
+    #[test]
+    fn discovers_claude_skills_with_namespaced_name() {
+        // A Claude Code skill in `.claude/skills/` with a namespaced (colon) name.
+        let tmp = tempdir();
+        let sd = tmp
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("github:review-pr");
+        std::fs::create_dir_all(&sd).unwrap();
+        std::fs::write(
+            sd.join("SKILL.md"),
+            "---\nname: \"github:review-pr\"\ndescription: review a PR\nuser-invocable: true\n---\nDo the review.\n",
+        )
+        .unwrap();
+        let s = load(tmp.path(), "github:review-pr").expect("claude skill discovered");
+        assert_eq!(s.description, "review a PR");
+        assert!(s.instructions.contains("Do the review"));
+    }
+
+    #[test]
+    fn cowboy_skills_take_precedence_over_claude() {
+        let tmp = tempdir();
+        write(
+            tmp.path(),
+            "dup",
+            "---\nname: dup\ndescription: cowboy one\n---\nx\n",
+        );
+        let cd = tmp.path().join(".claude").join("skills").join("dup");
+        std::fs::create_dir_all(&cd).unwrap();
+        std::fs::write(
+            cd.join("SKILL.md"),
+            "---\nname: dup\ndescription: claude one\n---\ny\n",
+        )
+        .unwrap();
+        let s = load(tmp.path(), "dup").unwrap();
+        assert_eq!(s.description, "cowboy one"); // .cowboy/skills wins
     }
 
     #[test]

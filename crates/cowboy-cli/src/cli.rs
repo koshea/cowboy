@@ -123,6 +123,9 @@ pub enum Command {
     /// List or show agent skills (reusable instructions under .cowboy/skills/).
     Skill(SkillArgs),
 
+    /// List or show agent definitions (specialist personas under .claude/agents/).
+    Agents(AgentsArgs),
+
     /// Stop and remove this project's agent + gateway containers and networks.
     Down(DownArgs),
 
@@ -641,6 +644,20 @@ pub enum SkillCommand {
     /// List available skills (name + description).
     List,
     /// Print a skill's instructions (to follow / pull into context).
+    Show { name: String },
+}
+
+#[derive(Debug, Args)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: AgentsCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentsCommand {
+    /// List available agent definitions (name + description + model).
+    List,
+    /// Print an agent's definition (its system prompt / review approach).
     Show { name: String },
 }
 
