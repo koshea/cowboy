@@ -1,5 +1,6 @@
 //! Subcommand implementations.
 
+pub mod artifact;
 pub mod attach;
 pub mod daemon;
 pub mod doctor;

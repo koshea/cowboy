@@ -106,6 +106,13 @@ pub fn replay(root: &Path, id: &str) -> Result<()> {
             }
         }
     }
+    let artifacts = cowboy_core::artifact::list_in(&dir);
+    if !artifacts.is_empty() {
+        println!("--- artifacts ({}) ---", artifacts.len());
+        for a in &artifacts {
+            println!("  {} [{}] {}", a.id, a.kind.as_str(), a.title);
+        }
+    }
     if let Ok(meta) = std::fs::metadata(dir.join("diff.patch")) {
         if meta.len() > 0 {
             println!("--- diff.patch ({} bytes) ---", meta.len());

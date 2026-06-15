@@ -147,6 +147,9 @@ pub enum Command {
     /// Grant host credentials (gh, gcloud, kubectl, …) into the container.
     Secrets(SecretsCmdArgs),
 
+    /// Inspect or publish session artifacts (contracts, summaries, handoffs, …).
+    Artifact(ArtifactCmdArgs),
+
     /// List session logs.
     Logs,
 
@@ -335,6 +338,43 @@ pub struct SecretsAddArgs {
     /// writing your personal (home-dir) overlay.
     #[arg(long)]
     pub repo: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ArtifactCmdArgs {
+    #[command(subcommand)]
+    pub command: ArtifactCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    /// List artifacts for a session (defaults to the most recent).
+    List {
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+    },
+    /// Print an artifact's body by id.
+    Show {
+        id: String,
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Publish a file as a session artifact.
+    Add {
+        /// Path to the file to publish.
+        path: String,
+        /// Kind: contract|summary|patch|diff|test_result|notes|review|other.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Friendly title (defaults to the file name).
+        #[arg(long)]
+        title: Option<String>,
+        /// One-line summary.
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]

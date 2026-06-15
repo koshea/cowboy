@@ -232,6 +232,65 @@ expression: defs
     }
   },
   {
+    "description": "Publish a durable, typed output others (or a later session) can consume — a contract, summary, test result, patch, notes, etc. `publish` with a workspace `path` or inline `content`, a `kind`, a `title`, and a one-line `summary`; `list` shows this session's artifacts. Prefer publishing a concrete artifact (e.g. an API/schema contract) over describing it only in prose.",
+    "name": "artifact",
+    "parameters": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "description": "Arguments for the `artifact` tool.",
+      "properties": {
+        "action": {
+          "description": "\"publish\" (store an output) or \"list\" (show this session's artifacts).",
+          "type": "string"
+        },
+        "content": {
+          "default": null,
+          "description": "For `publish`: inline content instead of (or in addition to) `path`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "default": null,
+          "description": "For `publish`: kind — contract|summary|patch|diff|test_result|notes|review|other.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "For `publish`: a workspace-relative file to publish (e.g. `docs/api.md`).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "summary": {
+          "default": null,
+          "description": "For `publish`: a one-line summary of what the artifact is/contains.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "default": null,
+          "description": "For `publish`: a short human title (defaults to the file name).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ArtifactArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

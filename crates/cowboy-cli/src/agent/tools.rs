@@ -16,6 +16,7 @@ pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_WRITE: &str = "write";
 pub const TOOL_MEMORY: &str = "memory";
 pub const TOOL_PLAN: &str = "plan";
+pub const TOOL_ARTIFACT: &str = "artifact";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -127,6 +128,28 @@ pub struct PlanArgs {
     pub steps: Vec<PlanStep>,
 }
 
+/// Arguments for the `artifact` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ArtifactArgs {
+    /// "publish" (store an output) or "list" (show this session's artifacts).
+    pub action: String,
+    /// For `publish`: a workspace-relative file to publish (e.g. `docs/api.md`).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// For `publish`: inline content instead of (or in addition to) `path`.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// For `publish`: kind — contract|summary|patch|diff|test_result|notes|review|other.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// For `publish`: a short human title (defaults to the file name).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// For `publish`: a one-line summary of what the artifact is/contains.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}))
 }
@@ -189,6 +212,17 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<PlanArgs>(),
         },
         ToolDef {
+            name: TOOL_ARTIFACT.into(),
+            description: "Publish a durable, typed output others (or a later session) can \
+                          consume — a contract, summary, test result, patch, notes, etc. \
+                          `publish` with a workspace `path` or inline `content`, a `kind`, a \
+                          `title`, and a one-line `summary`; `list` shows this session's \
+                          artifacts. Prefer publishing a concrete artifact (e.g. an API/schema \
+                          contract) over describing it only in prose."
+                .into(),
+            parameters: schema_for::<ArtifactArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -223,7 +257,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "shell", "read", "edit", "write", "memory", "plan", "final", "ask_user", "subagent"
+                "shell", "read", "edit", "write", "memory", "plan", "artifact", "final",
+                "ask_user", "subagent"
             ]
         );
     }

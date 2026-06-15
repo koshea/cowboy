@@ -8,8 +8,8 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, PlanArgs, ReadArgs, ShellArgs,
-    SubagentArgs, WriteArgs,
+    self, ArtifactArgs, AskUserArgs, EditArgs, FinalArgs, MemoryArgs, PlanArgs, ReadArgs,
+    ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -635,6 +635,22 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_ARTIFACT => {
+                    let args: ArtifactArgs = match parse_args(&call.arguments) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            self.tool_error(&call.id, &call.name, &e.to_string());
+                            continue;
+                        }
+                    };
+                    self.ui.tool_use(&format!("artifact {}", args.action));
+                    let observation = self.run_artifact(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_ASK_USER => {
                     let args: AskUserArgs = match parse_args(&call.arguments) {
                         Ok(a) => a,
@@ -730,6 +746,81 @@ impl<'a> AgentLoop<'a> {
             other => {
                 format!("error: unknown memory action `{other}` (save|recall|list|delete)")
             }
+        }
+    }
+
+    /// Host-side `artifact` tool: publish a typed output under the session dir,
+    /// or list this session's artifacts. Requires an active session log.
+    fn run_artifact(&self, args: &ArtifactArgs) -> String {
+        use cowboy_core::artifact::{self, ArtifactKind};
+        let Some(logger) = &self.logger else {
+            return "error: artifacts require an active session log".into();
+        };
+        let dir = logger.dir();
+        match args.action.as_str() {
+            "list" => {
+                let arts = artifact::list_in(dir);
+                if arts.is_empty() {
+                    return "no artifacts published".into();
+                }
+                arts.iter()
+                    .map(|a| {
+                        format!(
+                            "{} [{}] {} — {}",
+                            a.id,
+                            a.kind.as_str(),
+                            a.title,
+                            a.path.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+            "publish" | "add" => {
+                let content = match (&args.content, &args.path) {
+                    (Some(c), _) => c.clone(),
+                    (None, Some(p)) => match std::fs::read_to_string(self.runtime.root().join(p)) {
+                        Ok(s) => s,
+                        Err(e) => return format!("error: cannot read {p}: {e}"),
+                    },
+                    (None, None) => return "error: `publish` requires `path` or `content`".into(),
+                };
+                let title = args
+                    .title
+                    .clone()
+                    .or_else(|| {
+                        args.path.as_ref().and_then(|p| {
+                            std::path::Path::new(p)
+                                .file_stem()
+                                .map(|s| s.to_string_lossy().into_owned())
+                        })
+                    })
+                    .unwrap_or_else(|| "artifact".into());
+                let kind = args
+                    .kind
+                    .as_deref()
+                    .map(ArtifactKind::parse)
+                    .unwrap_or(ArtifactKind::Notes);
+                match artifact::add_in(
+                    dir,
+                    logger.id(),
+                    kind,
+                    &title,
+                    &content,
+                    args.summary.clone(),
+                    now_ms(),
+                ) {
+                    Ok(a) => format!(
+                        "published artifact {} [{}] {} → {}",
+                        a.id,
+                        a.kind.as_str(),
+                        a.title,
+                        a.path.display()
+                    ),
+                    Err(e) => format!("error: {e}"),
+                }
+            }
+            other => format!("error: unknown artifact action `{other}` (publish|list)"),
         }
     }
 
@@ -922,6 +1013,14 @@ fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
         arguments
     };
     serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid tool arguments: {e}"))
+}
+
+/// Milliseconds since the Unix epoch (artifact/lifecycle timestamps).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Render a plan as check-boxed lines (for the model observation / console).
@@ -1250,6 +1349,54 @@ mod tests {
         )
         .with_memory_context("   ".into());
         assert_eq!(agent2.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn artifact_tool_publishes_to_the_session_store() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "artifact",
+                    r##"{"action":"publish","kind":"contract","title":"API Contract",
+                        "content":"# API\nGET /things\n","summary":"billing API"}"##,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let runtime = runtime_with(docker);
+        let root = runtime.root().to_path_buf();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let session_dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+
+        let arts = cowboy_core::artifact::list_in(&session_dir);
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].title, "API Contract");
+        assert_eq!(arts[0].kind, cowboy_core::artifact::ArtifactKind::Contract);
+        let (_, body) = cowboy_core::artifact::get_in(&session_dir, &arts[0].id).unwrap();
+        assert!(body.contains("GET /things"));
     }
 
     #[test]

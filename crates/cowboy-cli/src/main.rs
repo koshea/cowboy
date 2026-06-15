@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         },
         Some(Command::Memory(args)) => cmd::memory::run(args),
         Some(Command::Secrets(args)) => cmd::secrets::run(args.command),
+        Some(Command::Artifact(args)) => cmd::artifact::run(args.command),
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
