@@ -1,5 +1,7 @@
 # cowboy
 
+[![CI](https://github.com/cowboycode/cowboy/actions/workflows/ci.yml/badge.svg)](https://github.com/cowboycode/cowboy/actions/workflows/ci.yml)
+
 An opinionated local coding agent that lets the AI run wild inside a
 Docker-contained development environment, while the **host** enforces security
 at the container and network layer.

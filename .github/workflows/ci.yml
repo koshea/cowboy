@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The default suite is host-only: every test that needs Docker, a real model
+      # provider, or the full network boundary is `#[ignore]` and self-skips, so it
+      # is safe to run on a vanilla runner. (Run those manually; see AGENTS.md.)
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Doctests
+        run: cargo test --doc
+
+  docs:
+    name: build docs (mdbook)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdBook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: latest
+
+      # Fails on broken links / missing SUMMARY entries — the CLI-reference drift
+      # guard runs as a normal test in the `check` job.
+      - name: Build the book
+        run: mdbook build docs
