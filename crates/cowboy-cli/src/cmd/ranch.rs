@@ -17,7 +17,52 @@ pub async fn run(command: RanchCommand) -> Result<()> {
         RanchCommand::Create { title, goal } => create(&root, &title, goal),
         RanchCommand::Status { id } => status(&root, id),
         RanchCommand::Start { id } => start(&root, &id).await,
+        RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
+        RanchCommand::Complete { id, workstream } => complete(&root, &id, &workstream),
     }
+}
+
+/// `cowboy ranch attach <id> <workstream>` — attach to that workstream's session.
+async fn attach(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
+    let ranch = ranch::load(root, id)?;
+    let ws = ranch
+        .workstream(workstream)
+        .with_context(|| format!("no workstream `{workstream}` in ranch `{id}`"))?;
+    let sid = ws
+        .session_id
+        .clone()
+        .with_context(|| format!("{workstream} has not been started yet"))?;
+    crate::cmd::attach::run(sid).await
+}
+
+/// `cowboy ranch complete <id> <workstream>` — manually mark a workstream done
+/// (e.g. after verifying acceptance), promote its artifacts, and unblock
+/// dependents. Useful when the session ended without a clean completion signal.
+fn complete(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
+    let mut ranch = ranch::load(root, id)?;
+    {
+        let ws = ranch
+            .workstream_mut(workstream)
+            .with_context(|| format!("no workstream `{workstream}` in ranch `{id}`"))?;
+        ws.status = WorkstreamStatus::Complete;
+    }
+    let ws = ranch.workstream(workstream).unwrap().clone();
+    let n = promote_artifacts(root, &ranch, &ws);
+    let newly = ranch.recompute_readiness();
+    if !ranch.workstreams.is_empty() && ranch.workstreams.iter().all(|w| w.status.is_done()) {
+        ranch.status = RanchStatus::Complete;
+    }
+    ranch.updated_ms = now_ms();
+    ranch::save(root, &ranch)?;
+    println!("✓ {workstream} marked complete — promoted {n} artifact(s)");
+    if !newly.is_empty() {
+        println!("newly ready: {}", newly.join(", "));
+        println!("launch them with `cowboy ranch start {id}`.");
+    }
+    if ranch.status == RanchStatus::Complete {
+        println!("ranch complete 🎉");
+    }
+    Ok(())
 }
 
 fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<()> {
@@ -146,6 +191,12 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
         if let Some(ws) = ranch.workstream(ws_id).cloned() {
             let n = promote_artifacts(root, &ranch, &ws);
             println!("{ws_id} complete — promoted {n} artifact(s)");
+            if !ws.expected_artifacts.is_empty() && n == 0 {
+                eprintln!(
+                    "  warning: {ws_id} declared expected artifacts ({}) but published none",
+                    ws.expected_artifacts.join(", ")
+                );
+            }
         }
     }
 
@@ -507,6 +558,51 @@ mod tests {
         assert_eq!(
             r.workstream("schema").unwrap().status,
             WorkstreamStatus::Running
+        );
+    }
+
+    #[test]
+    fn complete_marks_done_promotes_and_unblocks_dependents() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        // schema is Running with a worktree session that published an artifact.
+        let wt = root.join("wt-schema");
+        let sdir = wt.join(".cowboy/sessions/s1");
+        std::fs::create_dir_all(&sdir).unwrap();
+        cowboy_core::artifact::add_in(
+            &sdir,
+            "s1",
+            cowboy_core::artifact::ArtifactKind::Contract,
+            "Schema",
+            "TABLE users",
+            None,
+            1,
+        )
+        .unwrap();
+        let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("s1"));
+        schema.worktree_path = Some(wt);
+        let mut r = ranch(vec![
+            schema,
+            ws("api", &["schema"], WorkstreamStatus::Planned, None),
+        ]);
+        r.id = "billing".into();
+        ranch::save(root, &r).unwrap();
+
+        complete(root, "billing", "schema").unwrap();
+
+        let r2 = ranch::load(root, "billing").unwrap();
+        assert_eq!(
+            r2.workstream("schema").unwrap().status,
+            WorkstreamStatus::Complete
+        );
+        assert_eq!(
+            r2.workstream("api").unwrap().status,
+            WorkstreamStatus::Ready
+        );
+        assert!(
+            cowboy_core::ranch::ranch_artifact_dir(root, "billing", "schema")
+                .join("a0001-schema.md")
+                .exists()
         );
     }
 

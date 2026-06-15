@@ -449,6 +449,20 @@ pub enum RanchCommand {
         #[arg(value_name = "RANCH")]
         id: String,
     },
+    /// Attach the TUI to a workstream's running session.
+    Attach {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "WORKSTREAM")]
+        workstream: String,
+    },
+    /// Mark a workstream complete (promotes its artifacts + unblocks dependents).
+    Complete {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "WORKSTREAM")]
+        workstream: String,
+    },
 }
 
 #[derive(Debug, Args)]
