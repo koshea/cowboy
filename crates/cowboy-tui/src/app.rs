@@ -233,6 +233,9 @@ pub struct App {
     /// Wrapped-line offset of the top visible row, captured each frame so the
     /// event loop can convert screen rows to logical (wrapped-line) positions.
     pub scroll_offset: std::cell::Cell<usize>,
+    /// Whether we were following the tail when the current selection began, so
+    /// finishing the selection (copy/clear) can resume following.
+    followed_before_select: bool,
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
@@ -313,6 +316,7 @@ impl App {
             selection: None,
             selecting: false,
             scroll_offset: std::cell::Cell::new(0),
+            followed_before_select: false,
             transcript_area: std::cell::Cell::new(Rect::ZERO),
             model_picker: None,
             model_form: None,
@@ -385,6 +389,7 @@ impl App {
     /// Begin a selection at an absolute screen position, but only if it lands in
     /// the transcript (clicks elsewhere just clear any selection).
     pub fn begin_selection(&mut self, col: u16, row: u16) {
+        self.followed_before_select = self.follow;
         if let Some(pos) = self.screen_to_logical(col, row) {
             self.selection = Some(Selection {
                 anchor: pos,
@@ -410,12 +415,19 @@ impl App {
         if self.selection.is_none() || r.height == 0 {
             return;
         }
-        // Auto-scroll when dragging at the edges; recompute against the new
-        // offset so the cursor tracks the row the pointer is actually over.
+        // Pin the view while dragging: detach from the tail so streaming output
+        // doesn't slide the content out from under the selection. (Shift+End
+        // resumes following afterward.)
+        if self.follow {
+            self.follow = false;
+            self.scroll_top = self.scroll_offset.get();
+        }
+        // Auto-scroll when dragging at the edges — adjust scroll_top directly
+        // (not via scroll_down, which would re-engage follow mid-selection).
         if row <= r.y {
-            self.scroll_up(1);
+            self.scroll_top = self.scroll_top.saturating_sub(1);
         } else if row >= r.bottom().saturating_sub(1) {
-            self.scroll_down(1);
+            self.scroll_top = (self.scroll_top + 1).min(self.max_scroll.get());
         }
         let rr = row.clamp(r.y, r.bottom().saturating_sub(1));
         let cc = col.clamp(r.x, r.right().saturating_sub(1)) - r.x;
@@ -428,6 +440,16 @@ impl App {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.selecting = false;
+    }
+
+    /// Finish a selection (after copy or Esc): clear it and, if we were
+    /// following the tail when it began, resume following — so a quick
+    /// select-and-copy doesn't strand you in scrollback while output streams.
+    pub fn finish_selection(&mut self) {
+        self.clear_selection();
+        if self.followed_before_select {
+            self.follow = true;
+        }
     }
 
     pub fn has_selection(&self) -> bool {

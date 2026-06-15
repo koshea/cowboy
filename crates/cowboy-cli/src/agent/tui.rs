@@ -383,9 +383,6 @@ fn event_loop(
     let clipboard = ClipboardContext::new().ok();
 
     loop {
-        // If the transcript changes while we're following the tail, the view
-        // scrolls and any mouse selection would misalign — drop it.
-        let content_sig = (app.transcript.len(), app.streaming.len());
         while let Ok(ev) = events.try_recv() {
             match ev {
                 UiEvent::Delta(t) => app.stream(&t),
@@ -478,13 +475,6 @@ fn event_loop(
                     app.status = "session ended".into();
                 }
             }
-        }
-
-        if app.has_selection()
-            && app.follow
-            && (app.transcript.len(), app.streaming.len()) != content_sig
-        {
-            app.clear_selection();
         }
 
         app.tick();
@@ -650,14 +640,10 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
                 app.status = "y: copy selection · Esc: clear".into();
             }
         }
-        MouseEventKind::ScrollUp => {
-            app.clear_selection();
-            app.scroll_up(3);
-        }
-        MouseEventKind::ScrollDown => {
-            app.clear_selection();
-            app.scroll_down(3);
-        }
+        // Wheel scrolls the view but keeps any selection — it's anchored to
+        // logical lines, so it survives scrolling (and can be extended after).
+        MouseEventKind::ScrollUp => app.scroll_up(3),
+        MouseEventKind::ScrollDown => app.scroll_down(3),
         _ => {}
     }
 }
@@ -717,11 +703,12 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                     Some(text) => app.request_copy(text),
                     None => app.status = "copy: nothing under the selection".into(),
                 }
-                app.clear_selection();
+                // Resume following the tail if we were before selecting.
+                app.finish_selection();
                 return false;
             }
             KeyCode::Esc => {
-                app.clear_selection();
+                app.finish_selection();
                 return false;
             }
             _ => app.clear_selection(),
