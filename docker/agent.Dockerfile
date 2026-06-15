@@ -15,9 +15,13 @@ RUN cargo build --release -p cowboy-cli
 FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PATH=/usr/local/cargo/bin:/usr/local/go/bin:$PATH \
     CARGO_HOME=/usr/local/cargo \
-    RUSTUP_HOME=/usr/local/rustup
+    RUSTUP_HOME=/usr/local/rustup \
+    MISE_ENV=devcontainer \
+    MISE_DATA_DIR=/usr/local/share/mise \
+    MISE_TRUSTED_CONFIG_PATHS=/workspace \
+    MISE_YES=1 \
+    PATH=/usr/local/share/mise/shims:/usr/local/cargo/bin:/usr/local/go/bin:$PATH
 
 # Core CLI tooling + language toolchains commonly needed by coding tasks.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,6 +34,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         sqlite3 postgresql-client redis-tools \
         iproute2 util-linux \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+    && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI (`gh`) — commonly used for PR review/creation, issues, releases.
+# Not in Debian's repos, so add GitHub's signed apt source.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
 # pnpm via corepack (ships with modern node).
@@ -46,9 +60,20 @@ RUN set -eux; \
     curl -sSL "https://go.dev/dl/go1.23.4.linux-${goarch}.tar.gz" -o /tmp/go.tgz; \
     tar -C /usr/local -xzf /tmp/go.tgz; rm /tmp/go.tgz
 
-# Make the toolchains available in login shells too (interactive `cowboy shell`).
+# mise (https://mise.jdx.dev) — the preferred way to manage per-project dev
+# dependencies (language runtimes, tools, env). Cowboy auto-runs `mise install`
+# at launch when the workspace has a mise config, and the image defaults to
+# MISE_ENV=devcontainer. Installed system-wide with a shared, world-writable
+# data dir so its shims work for the non-root agent (HOME=/tmp at runtime).
+RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+    && mkdir -p /usr/local/share/mise \
+    && chmod -R a+rwX /usr/local/share/mise
+
+# Make the toolchains available in login shells too (interactive `cowboy shell`),
+# and activate mise so its managed tools + env are on PATH there.
 RUN printf 'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:$PATH\n' \
-        > /etc/profile.d/cowboy.sh
+        > /etc/profile.d/cowboy.sh \
+    && printf 'eval "$(/usr/local/bin/mise activate bash)"\n' >> /etc/profile.d/cowboy.sh
 
 # The mounted /workspace is owned by the host user; let in-container git treat
 # it as safe so `cowboy patch` works without "dubious ownership" errors.

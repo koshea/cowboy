@@ -25,6 +25,36 @@ The exact, current list is asserted by a test and rendered in the
 [CLI reference](../reference/cli.md) companion; adding a tool follows the pattern
 documented in `AGENTS.md`.
 
+## The container environment
+
+The agent runs in a **batteries-included** image (`docker/agent.Dockerfile`):
+bash, git, [`gh`](https://cli.github.com/), ripgrep/fd/jq, Python, Node (npm +
+pnpm), Go, a Rust toolchain, and common build/db client tooling. The workspace is
+mounted at `/workspace`; the agent runs as your (non-root) host user.
+
+> Working in a **git worktree**? Cowboy detects it and also mounts the main
+> repository's git directory into the container, so `git` (status/diff/log/commit)
+> works even though the worktree's `.git` points outside `/workspace`.
+
+### Managing dependencies with mise (recommended)
+
+[mise](https://mise.jdx.dev/) is the **preferred way to manage per-project dev
+dependencies** (language runtimes, CLIs, env vars) in the container. It's
+installed in the image, and:
+
+- The container sets **`MISE_ENV=devcontainer`**, so a `[env]`/task config can
+  branch on the devcontainer environment (e.g. `mise.devcontainer.toml`).
+- When the workspace has a mise config (`mise.toml`, `.mise.toml`,
+  `.config/mise/config.toml`, `.tool-versions`, …), Cowboy runs **`mise install`
+  automatically at launch** — so a freshly-created worktree comes up with its
+  declared toolchain ready, no manual step.
+- The workspace is trusted automatically inside the container
+  (`MISE_TRUSTED_CONFIG_PATHS=/workspace`), and mise's shims are on `PATH` for
+  both the agent's commands and an interactive `cowboy shell`.
+
+Commit a mise config to your repo and the agent gets a consistent, reproducible
+toolchain every session.
+
 ## Context management
 
 Conversation history is kept within the model's window using `tiktoken`-based

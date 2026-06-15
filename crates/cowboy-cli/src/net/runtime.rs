@@ -95,6 +95,17 @@ impl AgentRuntime {
             });
         }
 
+        // Git worktree support: when the project root is a linked worktree, its
+        // `.git` is a *file* pointing into the main repo's git dir, which lives
+        // OUTSIDE /workspace — so in-container git can't resolve it. Mount the
+        // shared git common dir at its own host path so the absolute gitdir
+        // reference resolves and git (status/diff/log/commit) works. rw so the
+        // worktree branch can write objects/refs into the shared store.
+        if let Some(common) = git_common_dir(&self.root) {
+            let p = common.to_string_lossy().into_owned();
+            mounts.push(BindMount::rw(p.clone(), p));
+        }
+
         // Mask host-owned config that would otherwise be visible via the
         // project mount. NEVER let the agent read security.yaml.
         let mask = ensure_mask_file()?;
@@ -262,7 +273,51 @@ impl AgentRuntime {
                     .await?;
             }
         }
+
+        // If the workspace declares dev dependencies via mise, install them once
+        // at launch so the toolchain is ready (matches how worktrees expect their
+        // env to be set up). Best-effort — a failure here shouldn't block the
+        // session.
+        self.mise_install_if_configured().await;
         Ok(())
+    }
+
+    /// mise config files we recognize at the workspace root.
+    const MISE_CONFIGS: &'static [&'static str] = &[
+        "mise.toml",
+        ".mise.toml",
+        "mise/config.toml",
+        ".mise/config.toml",
+        ".config/mise/config.toml",
+        ".tool-versions",
+    ];
+
+    /// Run `mise install` in the container when the workspace has a mise config.
+    /// Best-effort: logs but never errors (the session proceeds regardless).
+    async fn mise_install_if_configured(&self) {
+        if !Self::MISE_CONFIGS
+            .iter()
+            .any(|f| self.root.join(f).exists())
+        {
+            return;
+        }
+        let argv = ["mise".to_string(), "install".to_string()];
+        match self
+            .docker
+            .exec_capture(
+                &self.container_name,
+                &self.security.container.workdir,
+                self.user(),
+                &argv,
+            )
+            .await
+        {
+            Ok((r, _)) if r.exit_code == 0 => tracing::info!("mise install: ready"),
+            Ok((r, out)) => {
+                tracing::warn!(code = r.exit_code, output = %out, "mise install exited non-zero")
+            }
+            Err(e) => tracing::warn!(error = %e, "mise install failed to run"),
+        }
     }
 
     /// Run a command inside the container, streaming output, returning its exit code.
@@ -436,6 +491,37 @@ fn resolve_source(root: &Path, source: &str) -> PathBuf {
         let joined = root.join(p);
         std::fs::canonicalize(&joined).unwrap_or(joined)
     }
+}
+
+/// The shared git directory to mount when `root` is a *linked worktree* — i.e.
+/// `<root>/.git` is a file (a `gitdir:` pointer into the main repo) rather than
+/// a directory. Returns the main repo's git common dir (e.g. `<main>/.git`),
+/// which lives outside `<root>` and must be mounted at its own absolute path so
+/// the worktree's gitdir reference resolves in the container. `None` for a
+/// normal repo (its `.git` dir is already inside the workspace mount) or a
+/// non-git directory.
+fn git_common_dir(root: &Path) -> Option<PathBuf> {
+    // Only linked worktrees have a `.git` *file*; a normal repo has a directory
+    // that's already covered by the /workspace mount.
+    if !root.join(".git").is_file() {
+        return None;
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    // It lives outside the workspace by definition; guard anyway, and require
+    // that it actually exists on the host.
+    if dir.as_os_str().is_empty() || dir.starts_with(root) || !dir.exists() {
+        return None;
+    }
+    Some(dir)
 }
 
 /// Create (once) an empty file used to mask host-owned config inside the container.
@@ -709,5 +795,61 @@ mod tests {
         let a = container_name_for(Path::new("/a/project"));
         let b = container_name_for(Path::new("/b/project"));
         assert_ne!(a, b);
+    }
+
+    fn git(args: &[&str], cwd: &Path) -> bool {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn git_common_dir_only_set_for_worktrees() {
+        // Self-skip when git is unavailable.
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("cowboy-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        assert!(git(&["init", "-q"], &main));
+        assert!(git(&["config", "user.email", "t@t"], &main));
+        assert!(git(&["config", "user.name", "t"], &main));
+        std::fs::write(main.join("f.txt"), "hi").unwrap();
+        assert!(git(&["add", "."], &main));
+        assert!(git(&["commit", "-qm", "init"], &main));
+
+        // A normal repo: `.git` is a directory → no extra mount needed.
+        assert!(git_common_dir(&main).is_none());
+
+        // A linked worktree: `.git` is a file → mount the main repo's git dir.
+        let wt = base.join("wt");
+        assert!(git(
+            &[
+                "worktree",
+                "add",
+                "-q",
+                wt.to_str().unwrap(),
+                "-b",
+                "feature"
+            ],
+            &main,
+        ));
+        assert!(wt.join(".git").is_file());
+        let common = git_common_dir(&wt).expect("worktree → common git dir");
+        // It points at the main repo's .git, outside the worktree.
+        assert!(common.ends_with(".git"));
+        assert!(!common.starts_with(&wt));
+        assert!(common.is_dir());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
