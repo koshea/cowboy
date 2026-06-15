@@ -193,15 +193,15 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 fn setup_terminal() -> Result<Term> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // We deliberately do NOT capture the mouse: grabbing it disables the
-    // terminal's own click-drag selection + copy (a constant "copy doesn't work"
-    // complaint), and our in-app selection highlight could linger as artifacts.
-    // Without capture, native selection/copy "just works"; scroll with PgUp/PgDn
-    // (terminals with alternate-scroll also map the wheel to that). Bracketed
+    // Capture the mouse so drag-selection is scoped to the transcript panel (not
+    // the side panels / borders); `y` then copies just that text via OSC 52 and
+    // clears the highlight (any other key dismisses it). Hold Shift to bypass
+    // capture for your terminal's native (whole-screen) selection. Bracketed
     // paste stays on so multi-line pastes into the input arrive as one chunk.
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste
     )?;
     // Best-effort: the kitty keyboard protocol lets us distinguish Shift+Enter
@@ -228,6 +228,7 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
         terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -489,11 +490,11 @@ fn event_loop(
                         hist_pos: &mut hist_pos,
                         session: &mut session,
                     };
-                    if handle_key(Event::Key(key), key, &mut app, ctx) {
+                    if handle_key(Event::Key(key), key, &mut app, ctx, terminal) {
                         break;
                     }
                 }
-                Event::Mouse(me) => handle_mouse(me, &mut app, terminal),
+                Event::Mouse(me) => handle_mouse(me, &mut app),
                 // Bracketed paste — insert as one chunk (when editing input).
                 Event::Paste(text) => {
                     if matches!(
@@ -510,18 +511,16 @@ fn event_loop(
     Ok(())
 }
 
-/// Mouse → transcript selection (copy-on-release via OSC 52) + wheel scroll.
-fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App, terminal: &mut Term) {
+/// Mouse → transcript-scoped selection (drag to select; press `y` to copy) +
+/// wheel scroll.
+fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
     use crossterm::event::{MouseButton, MouseEventKind};
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => app.begin_selection(me.column, me.row),
         MouseEventKind::Drag(MouseButton::Left) => app.drag_selection(me.column, me.row),
-        MouseEventKind::Up(MouseButton::Left) => {
-            if let Some(text) = app.selected_text(terminal.current_buffer_mut()) {
-                let chars = text.chars().count();
-                clipboard_copy(&text);
-                app.status = format!("copied {chars} chars");
-            }
+        // Keep the highlight after release; `y` copies it (vim-style yank).
+        MouseEventKind::Up(MouseButton::Left) if app.has_selection() => {
+            app.status = "y: copy selection · Esc: clear".into();
         }
         MouseEventKind::ScrollUp => {
             app.clear_selection();
@@ -552,7 +551,35 @@ struct KeyCtx<'a> {
 }
 
 /// Returns true if the loop should exit.
-fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bool {
+fn handle_key(
+    event: Event,
+    key: KeyEvent,
+    app: &mut App,
+    mut ctx: KeyCtx,
+    terminal: &mut Term,
+) -> bool {
+    // A live transcript selection captures `y` (copy, vim-style) and `Esc`
+    // (clear); any other key dismisses the highlight, then proceeds normally — so
+    // the selection is always a transient, explicit copy gesture (never lingers).
+    if app.has_selection() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(text) = app.selected_text(terminal.current_buffer_mut()) {
+                    let n = text.chars().count();
+                    clipboard_copy(&text);
+                    app.status = format!("copied {n} chars");
+                }
+                app.clear_selection();
+                return false;
+            }
+            KeyCode::Esc => {
+                app.clear_selection();
+                return false;
+            }
+            _ => app.clear_selection(),
+        }
+    }
+
     // Transcript scrollback — works in any mode so you can read while the agent
     // runs or while typing. Uses keys the text editor doesn't claim.
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -771,7 +798,7 @@ const HELP_LINES: &[&str] = &[
     "  /clear         clear the view (conversation memory is kept)",
     "  /detach        leave the session running and exit (re-attach later)",
     "  /quit          end the session",
-    "copy: select text with your mouse (your terminal's native selection) or /copy",
+    "copy: drag to select in the transcript, then `y` to copy (Esc clears) · or /copy",
     "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
 ];
 
