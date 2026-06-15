@@ -90,6 +90,11 @@ Show the routing matrix (category × effort → model)
 Print the full crew.yaml (roster + delegation rules)
 
 
+### `cowboy crew usage`
+
+Show recorded delegation usage per model (tasks, success %, avg duration)
+
+
 ### `cowboy crew validate`
 
 Check the roster (models exist, `general` defined, etc.)

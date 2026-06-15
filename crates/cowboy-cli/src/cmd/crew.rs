@@ -19,6 +19,7 @@ pub async fn run(command: CrewCommand) -> Result<()> {
         CrewCommand::List => list(),
         CrewCommand::Show => show(),
         CrewCommand::Validate => validate(),
+        CrewCommand::Usage => usage(),
     }
 }
 
@@ -153,4 +154,32 @@ fn validate() -> Result<()> {
         }
         Err(e) => bail!("crew roster invalid: {e}"),
     }
+}
+
+fn usage() -> Result<()> {
+    let rows = crew::usage_by_model(&crew::load_history());
+    if rows.is_empty() {
+        println!("no recorded crew activity yet (delegations are logged as they run)");
+        return Ok(());
+    }
+    println!(
+        "{:<16} {:>6} {:>9} {:>12}",
+        "MODEL", "TASKS", "SUCCESS", "AVG"
+    );
+    for r in rows {
+        let avg = r.avg_duration_ms();
+        let avg_s = if avg >= 1000 {
+            format!("{:.1}s", avg as f64 / 1000.0)
+        } else {
+            format!("{avg}ms")
+        };
+        println!(
+            "{:<16} {:>6} {:>8}% {:>12}",
+            r.model,
+            r.tasks,
+            r.success_pct(),
+            avg_s
+        );
+    }
+    Ok(())
 }

@@ -334,6 +334,110 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
     }
 }
 
+// ---------------------------------------------------------------------------
+// Outcome history  (~/.config/cowboy/crew-history.jsonl — host-owned)
+// ---------------------------------------------------------------------------
+
+/// One recorded delegation outcome (appended after each routed subagent runs).
+/// Carries no task text — just the routing + a coarse result — so it's safe to
+/// aggregate across projects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrewOutcome {
+    pub ts_ms: u64,
+    pub category: String,
+    pub effort: String,
+    pub model: String,
+    pub fell_back: bool,
+    /// "complete" | "empty" | "error".
+    pub status: String,
+    pub duration_ms: u64,
+}
+
+impl CrewOutcome {
+    pub fn succeeded(&self) -> bool {
+        self.status == "complete"
+    }
+}
+
+/// The home outcome log (`~/.config/cowboy/crew-history.jsonl`).
+pub fn history_path() -> Option<PathBuf> {
+    crate::config::global_config_dir().map(|d| d.join("crew-history.jsonl"))
+}
+
+/// Append one outcome (best-effort; creates the dir). Errors are swallowed so a
+/// telemetry write never breaks a session.
+pub fn record_outcome(outcome: &CrewOutcome) {
+    let Some(p) = history_path() else { return };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(line) = serde_json::to_string(outcome) else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+/// Load all recorded outcomes (skips malformed lines).
+pub fn load_history() -> Vec<CrewOutcome> {
+    let Some(p) = history_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&p) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<CrewOutcome>(l).ok())
+        .collect()
+}
+
+/// Per-model usage summary aggregated from outcomes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageRow {
+    pub model: String,
+    pub tasks: usize,
+    pub succeeded: usize,
+    pub total_duration_ms: u64,
+}
+
+impl UsageRow {
+    pub fn avg_duration_ms(&self) -> u64 {
+        self.total_duration_ms
+            .checked_div(self.tasks as u64)
+            .unwrap_or(0)
+    }
+    pub fn success_pct(&self) -> u32 {
+        (self.succeeded * 100).checked_div(self.tasks).unwrap_or(0) as u32
+    }
+}
+
+/// Aggregate outcomes by model (sorted by task count, descending).
+pub fn usage_by_model(outcomes: &[CrewOutcome]) -> Vec<UsageRow> {
+    let mut by: BTreeMap<String, UsageRow> = BTreeMap::new();
+    for o in outcomes {
+        let row = by.entry(o.model.clone()).or_insert_with(|| UsageRow {
+            model: o.model.clone(),
+            tasks: 0,
+            succeeded: 0,
+            total_duration_ms: 0,
+        });
+        row.tasks += 1;
+        if o.succeeded() {
+            row.succeeded += 1;
+        }
+        row.total_duration_ms += o.duration_ms;
+    }
+    let mut rows: Vec<_> = by.into_values().collect();
+    rows.sort_by(|a, b| b.tasks.cmp(&a.tasks).then(a.model.cmp(&b.model)));
+    rows
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -469,6 +573,33 @@ crew:
             steps(&[(Effort::Tiny, "cheap"), (Effort::Deep, "opus")]),
         );
         assert!(cfg(crew).validate(&available).is_ok());
+    }
+
+    #[test]
+    fn usage_aggregates_by_model() {
+        let o = |model: &str, status: &str, dur: u64| CrewOutcome {
+            ts_ms: 1,
+            category: "tests".into(),
+            effort: "small".into(),
+            model: model.into(),
+            fell_back: false,
+            status: status.into(),
+            duration_ms: dur,
+        };
+        let outcomes = vec![
+            o("cheap", "complete", 100),
+            o("cheap", "complete", 300),
+            o("cheap", "error", 50),
+            o("opus", "complete", 1000),
+        ];
+        let rows = usage_by_model(&outcomes);
+        assert_eq!(rows[0].model, "cheap"); // most tasks first
+        assert_eq!(rows[0].tasks, 3);
+        assert_eq!(rows[0].succeeded, 2);
+        assert_eq!(rows[0].success_pct(), 66);
+        assert_eq!(rows[0].avg_duration_ms(), 150);
+        assert_eq!(rows[1].model, "opus");
+        assert_eq!(rows[1].success_pct(), 100);
     }
 
     #[test]

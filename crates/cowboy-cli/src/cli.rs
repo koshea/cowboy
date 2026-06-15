@@ -445,6 +445,8 @@ pub enum CrewCommand {
     Show,
     /// Check the roster (models exist, `general` defined, etc.).
     Validate,
+    /// Show recorded delegation usage per model (tasks, success %, avg duration).
+    Usage,
 }
 
 #[derive(Debug, Args)]

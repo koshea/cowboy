@@ -162,6 +162,23 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
     }
 }
 
+/// Coarsely classify a subagent's result string for the crew history:
+/// "error" (failed to start / depth-limited), "empty" (no final answer), else
+/// "complete". A heuristic — good enough for usage trends, not a verdict.
+fn classify_subagent_result(result: &str) -> &'static str {
+    let r = result.trim();
+    if r.starts_with("subagent failed to start")
+        || r.starts_with("error:")
+        || r.starts_with("subagent error")
+    {
+        "error"
+    } else if r.is_empty() || r == "subagent produced no final answer" {
+        "empty"
+    } else {
+        "complete"
+    }
+}
+
 /// Instruction for the context-compaction summary call.
 const SUMMARY_SYSTEM: &str = "\
 You are compacting an AI coding agent's conversation so it fits the context \
@@ -1308,17 +1325,37 @@ impl<'a> AgentLoop<'a> {
             self.ui
                 .notice(&format!("↳ running {} subagents in parallel", plans.len()));
         }
-        // Execute concurrently (owned plans → no borrow of self).
-        let done: Vec<(String, String)> = futures::stream::iter(
-            plans
-                .into_iter()
-                .map(|(id, plan)| async move { (id, exec_subagent(plan).await) }),
-        )
-        .buffer_unordered(max_parallel)
-        .collect()
-        .await;
+        // Execute concurrently (owned plans → no borrow of self), timing each and
+        // capturing a coarse outcome for the crew history.
+        let done: Vec<(String, String, Option<cowboy_core::crew::CrewOutcome>)> =
+            futures::stream::iter(plans.into_iter().map(|(id, plan)| {
+                let routed = plan.routed.clone();
+                async move {
+                    let started = std::time::Instant::now();
+                    let result = exec_subagent(plan).await;
+                    let duration_ms = started.elapsed().as_millis() as u64;
+                    let outcome = routed.map(|(category, effort, model, fell_back)| {
+                        cowboy_core::crew::CrewOutcome {
+                            ts_ms: now_ms(),
+                            category,
+                            effort,
+                            model,
+                            fell_back,
+                            status: classify_subagent_result(&result).to_string(),
+                            duration_ms,
+                        }
+                    });
+                    (id, result, outcome)
+                }
+            }))
+            .buffer_unordered(max_parallel)
+            .collect()
+            .await;
         self.ui.notice("↳ subagent(s) finished");
-        for (id, res) in done {
+        for (id, res, outcome) in done {
+            if let Some(o) = outcome {
+                cowboy_core::crew::record_outcome(&o);
+            }
             results.insert(id, res);
         }
         results
