@@ -226,6 +226,14 @@ pub struct App {
     pub max_scroll: std::cell::Cell<usize>,
     /// Active mouse text-selection in the transcript (absolute screen coords).
     pub selection: Option<Selection>,
+    /// True between mouse-down and mouse-up while drag-selecting. Lets us treat
+    /// `Moved` events as drags (some terminals report button-held motion as
+    /// `Moved` rather than `Drag`).
+    pub selecting: bool,
+    /// Diagnostic counters since the current selection began: (drag, moved)
+    /// motion events received. Surfaced when a copy finds no text.
+    pub drag_events: u32,
+    pub move_events: u32,
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
@@ -301,6 +309,9 @@ impl App {
             scroll_top: 0,
             max_scroll: std::cell::Cell::new(0),
             selection: None,
+            selecting: false,
+            drag_events: 0,
+            move_events: 0,
             transcript_area: std::cell::Cell::new(Rect::ZERO),
             model_picker: None,
             model_form: None,
@@ -362,14 +373,23 @@ impl App {
     /// Begin a selection at an absolute screen position, but only if it lands in
     /// the transcript (clicks elsewhere just clear any selection).
     pub fn begin_selection(&mut self, col: u16, row: u16) {
+        self.drag_events = 0;
+        self.move_events = 0;
         if self.transcript_area.get().contains(Position::new(col, row)) {
             self.selection = Some(Selection {
                 anchor: (col, row),
                 cursor: (col, row),
             });
+            self.selecting = true;
         } else {
             self.selection = None;
+            self.selecting = false;
         }
+    }
+
+    /// End the drag (mouse-up); the selection itself is kept for `y` to copy.
+    pub fn end_selecting(&mut self) {
+        self.selecting = false;
     }
 
     /// Extend the active selection, clamping to the transcript rect.
@@ -385,6 +405,7 @@ impl App {
 
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.selecting = false;
     }
 
     pub fn has_selection(&self) -> bool {

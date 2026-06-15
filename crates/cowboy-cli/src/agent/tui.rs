@@ -638,10 +638,23 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
     use crossterm::event::{MouseButton, MouseEventKind};
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => app.begin_selection(me.column, me.row),
-        MouseEventKind::Drag(MouseButton::Left) => app.drag_selection(me.column, me.row),
+        MouseEventKind::Drag(MouseButton::Left) => {
+            app.drag_events += 1;
+            app.drag_selection(me.column, me.row);
+        }
+        // Some terminals (and some crossterm/terminal combos) report button-held
+        // motion as `Moved` rather than `Drag`. While a drag is in progress,
+        // treat it as a selection extend so the cursor actually moves.
+        MouseEventKind::Moved if app.selecting => {
+            app.move_events += 1;
+            app.drag_selection(me.column, me.row);
+        }
         // Keep the highlight after release; `y` copies it (vim-style yank).
-        MouseEventKind::Up(MouseButton::Left) if app.has_selection() => {
-            app.status = "y: copy selection · Esc: clear".into();
+        MouseEventKind::Up(MouseButton::Left) => {
+            app.end_selecting();
+            if app.has_selection() {
+                app.status = "y: copy selection · Esc: clear".into();
+            }
         }
         MouseEventKind::ScrollUp => {
             app.clear_selection();
@@ -713,7 +726,26 @@ fn handle_key(
                     // Status/outcome is set by the event-loop drain once the
                     // copy actually runs (so it reports the real result).
                     Some(text) => app.request_copy(text),
-                    None => app.status = "copy: nothing under the selection".into(),
+                    // Diagnostic: show the selection geometry so we can tell a
+                    // non-drag (anchor==cursor → terminal isn't reporting drag)
+                    // from an empty-cell extraction.
+                    None => {
+                        let a = app.transcript_area.get();
+                        app.status = match app.selection {
+                            Some(s) => format!(
+                                "copy: no text [sel {:?}->{:?} area {}x{}@{},{} drag={} move={}]",
+                                s.anchor,
+                                s.cursor,
+                                a.width,
+                                a.height,
+                                a.x,
+                                a.y,
+                                app.drag_events,
+                                app.move_events
+                            ),
+                            None => "copy: no selection".into(),
+                        };
+                    }
                 }
                 app.clear_selection();
                 return false;
