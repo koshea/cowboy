@@ -37,7 +37,7 @@ fn add_writes_personal_per_project_overlay() {
         .args(["secrets", "add", "gh"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("this worktree"));
+        .stdout(predicate::str::contains("this repo (all worktrees)"));
 
     // It shows up as a user-project grant in the merged listing.
     cowboy()
