@@ -19,21 +19,49 @@ pub async fn run() -> Result<()> {
         println!("no sessions");
         return Ok(());
     }
-    println!(
-        "{:<22} {:<11} {:<18} {:<34} TASK",
-        "ID", "STATUS", "BRANCH", "WORKTREE"
-    );
-    for s in &sessions {
+    // Show the ranch/workstream column only when some session has one.
+    let any_ranch = sessions.iter().any(|s| s.ranch_id.is_some());
+    if any_ranch {
         println!(
-            "{:<22} {:<11} {:<18} {:<34} {}",
-            s.id,
-            status_str(s.status),
-            s.branch.as_deref().unwrap_or("-"),
-            truncate(&s.root.display().to_string(), 34),
-            task_str(s),
+            "{:<22} {:<11} {:<18} {:<22} TASK",
+            "ID", "STATUS", "BRANCH", "RANCH/WORKSTREAM"
         );
+        for s in &sessions {
+            println!(
+                "{:<22} {:<11} {:<18} {:<22} {}",
+                s.id,
+                status_str(s.status),
+                s.branch.as_deref().unwrap_or("-"),
+                truncate(&ranch_cell(s), 22),
+                task_str(s),
+            );
+        }
+    } else {
+        println!(
+            "{:<22} {:<11} {:<18} {:<34} TASK",
+            "ID", "STATUS", "BRANCH", "WORKTREE"
+        );
+        for s in &sessions {
+            println!(
+                "{:<22} {:<11} {:<18} {:<34} {}",
+                s.id,
+                status_str(s.status),
+                s.branch.as_deref().unwrap_or("-"),
+                truncate(&s.root.display().to_string(), 34),
+                task_str(s),
+            );
+        }
     }
     Ok(())
+}
+
+/// "ranch/workstream" for a session, or "-".
+fn ranch_cell(s: &SessionInfo) -> String {
+    match (&s.ranch_id, &s.workstream_id) {
+        (Some(r), Some(w)) => format!("{r}/{w}"),
+        (Some(r), None) => r.clone(),
+        _ => "-".to_string(),
+    }
 }
 
 /// `cowboy session cleanup [--dry-run]` — reap stale session records and

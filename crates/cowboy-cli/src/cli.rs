@@ -230,6 +230,11 @@ pub struct SessionWorkerArgs {
     /// Continue a prior session: load its transcript as the starting history.
     #[arg(long)]
     pub resume: Option<String>,
+    /// Tag this session as a Ranch workstream.
+    #[arg(long)]
+    pub ranch_id: Option<String>,
+    #[arg(long)]
+    pub workstream_id: Option<String>,
 }
 
 #[derive(Debug, Args)]

@@ -100,6 +100,12 @@ pub struct SessionInfo {
     /// Why the session is blocked (set while `status == Blocked`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// The ranch this session belongs to (set for Ranch workstream sessions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranch_id: Option<String>,
+    /// The workstream within the ranch this session is running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream_id: Option<String>,
 }
 
 /// A cowboy-created git worktree.
@@ -199,6 +205,11 @@ pub enum DaemonReq {
         /// new session's starting history.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         resume: Option<String>,
+        /// Tag the session as a Ranch workstream (set by `cowboy ranch start`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ranch_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workstream_id: Option<String>,
     },
     ListSessions {
         #[serde(default)]
@@ -472,6 +483,8 @@ mod tests {
                 mode: LeaseMode::Exclusive,
                 force: false,
                 resume: None,
+                ranch_id: None,
+                workstream_id: None,
             },
         });
         roundtrip(&DaemonRequest {
@@ -587,6 +600,8 @@ mod tests {
             diffstat: "Δ 1f +2 -0".into(),
             running_command: None,
             blocked_reason: None,
+            ranch_id: None,
+            workstream_id: None,
         }
     }
 }

@@ -86,6 +86,31 @@ fn daemon_pings_lists_and_is_single_instance() {
 }
 
 #[test]
+fn registry_carries_ranch_and_workstream_tags() {
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock));
+
+    let mut info = sample_info("rs1");
+    info.ranch_id = Some("billing-v2".into());
+    info.workstream_id = Some("schema".into());
+    assert!(matches!(
+        request(&sock, DaemonReq::RegisterWorker { info }),
+        Some(DaemonResp::Registered)
+    ));
+
+    match request(&sock, DaemonReq::GetSession { id: "rs1".into() }) {
+        Some(DaemonResp::Session { info }) => {
+            assert_eq!(info.ranch_id.as_deref(), Some("billing-v2"));
+            assert_eq!(info.workstream_id.as_deref(), Some("schema"));
+        }
+        other => panic!("expected Session, got {other:?}"),
+    }
+}
+
+#[test]
 fn message_bus_delivers_and_drains_inbox() {
     use cowboy_core::daemonproto::{BusEvent, MsgTarget};
     let runtime = assert_fs::TempDir::new().unwrap();
@@ -158,6 +183,8 @@ fn sample_info(id: &str) -> SessionInfo {
         diffstat: String::new(),
         running_command: None,
         blocked_reason: None,
+        ranch_id: None,
+        workstream_id: None,
     }
 }
 
@@ -565,6 +592,8 @@ fn start_session_spawns_and_registers_a_worker() {
             mode: LeaseMode::Exclusive,
             force: false,
             resume: None,
+            ranch_id: None,
+            workstream_id: None,
         },
     ) {
         Some(DaemonResp::Started { id, worker_sock }) => (id, worker_sock),

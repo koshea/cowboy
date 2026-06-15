@@ -82,6 +82,8 @@ pub async fn run(
                 mode: LeaseMode::Exclusive,
                 force,
                 resume: resume_id.clone(),
+                ranch_id: None,
+                workstream_id: None,
             })
             .await
             .context("starting session via cowboyd")?;
@@ -267,6 +269,8 @@ async fn coordinate_oneshot(root: &std::path::Path, id: &str, task: &str) -> Res
         diffstat: String::new(),
         running_command: None,
         blocked_reason: None,
+        ranch_id: None,
+        workstream_id: None,
     };
     let _ = daemon::request(DaemonReq::RegisterWorker { info }).await;
     match daemon::request(DaemonReq::AcquireLease {

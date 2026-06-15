@@ -440,7 +440,21 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             mode,
             force,
             resume,
-        } => start_session(daemon, root, task, mode, force, resume).await,
+            ranch_id,
+            workstream_id,
+        } => {
+            start_session(
+                daemon,
+                root,
+                task,
+                mode,
+                force,
+                resume,
+                ranch_id,
+                workstream_id,
+            )
+            .await
+        }
         DaemonReq::AcquireLease { key, session, mode } => {
             let mut d = daemon.lock().await;
             let k = Daemon::lease_key(&key);
@@ -655,6 +669,7 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
 
 /// Spawn a worker process for a new session, supervise it, and return its
 /// socket once it is listening.
+#[allow(clippy::too_many_arguments)]
 async fn start_session(
     daemon: &Arc<Mutex<Daemon>>,
     root: PathBuf,
@@ -662,6 +677,8 @@ async fn start_session(
     mode: LeaseMode,
     force: bool,
     resume: Option<String>,
+    ranch_id: Option<String>,
+    workstream_id: Option<String>,
 ) -> DaemonResp {
     let key = Daemon::lease_key(&root);
     // Acquire the worktree lease up front (exclusive sessions only). On conflict
@@ -708,6 +725,12 @@ async fn start_session(
     if let Some(r) = &resume {
         cmd.arg("--resume").arg(r);
     }
+    if let Some(r) = &ranch_id {
+        cmd.arg("--ranch-id").arg(r);
+    }
+    if let Some(w) = &workstream_id {
+        cmd.arg("--workstream-id").arg(w);
+    }
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -745,6 +768,8 @@ async fn start_session(
                 diffstat: String::new(),
                 running_command: None,
                 blocked_reason: None,
+                ranch_id,
+                workstream_id,
             },
         );
         d.save();
@@ -863,6 +888,8 @@ mod tests {
                 diffstat: String::new(),
                 running_command: None,
                 blocked_reason: None,
+                ranch_id: None,
+                workstream_id: None,
             },
         );
     }

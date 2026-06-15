@@ -131,6 +131,8 @@ fn start(fx: &Fixture, task: Option<&str>) -> std::path::PathBuf {
             mode: LeaseMode::Exclusive,
             force: false,
             resume: None,
+            ranch_id: None,
+            workstream_id: None,
         },
     ) {
         Some(DaemonResp::Started { worker_sock, .. }) => worker_sock,

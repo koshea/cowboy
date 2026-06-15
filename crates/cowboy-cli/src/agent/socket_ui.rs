@@ -463,6 +463,8 @@ mod tests {
             diffstat: String::new(),
             running_command: None,
             blocked_reason: None,
+            ranch_id: None,
+            workstream_id: None,
         }
     }
 

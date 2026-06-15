@@ -64,6 +64,8 @@ async fn main() -> Result<()> {
                 id: a.id,
                 register: a.register,
                 resume: a.resume,
+                ranch_id: a.ranch_id,
+                workstream_id: a.workstream_id,
             })
             .await
         }

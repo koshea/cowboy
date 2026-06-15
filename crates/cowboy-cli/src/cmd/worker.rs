@@ -42,6 +42,9 @@ pub struct WorkerArgs {
     pub register: bool,
     /// Continue a prior session: load its transcript as the starting history.
     pub resume: Option<String>,
+    /// Ranch/workstream this session belongs to (set by `cowboy ranch start`).
+    pub ranch_id: Option<String>,
+    pub workstream_id: Option<String>,
 }
 
 fn now_ms() -> u64 {
@@ -121,6 +124,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         diffstat: String::new(),
         running_command: None,
         blocked_reason: None,
+        ranch_id: args.ranch_id.clone(),
+        workstream_id: args.workstream_id.clone(),
     };
 
     let reg_info = info.clone();
@@ -519,6 +524,8 @@ mod tests {
             diffstat: String::new(),
             running_command: None,
             blocked_reason: None,
+            ranch_id: None,
+            workstream_id: None,
         }
     }
 

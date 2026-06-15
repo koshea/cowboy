@@ -211,6 +211,8 @@ fn start(sock: &Path, root: &Path, task: Option<&str>) -> DaemonResp {
             mode: LeaseMode::Exclusive,
             force: false,
             resume: None,
+            ranch_id: None,
+            workstream_id: None,
         },
     )
     .expect("daemon reachable")
