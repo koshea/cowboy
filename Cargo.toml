@@ -32,7 +32,7 @@ libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
-schemars = "0.8"
+schemars = "1"
 ipnet = { version = "2", features = ["serde"] }
 
 # model client
@@ -55,7 +55,7 @@ throbber-widgets-tui = "0.8"
 # not needed for the docker-exec model.
 
 # gateway networking (DNS forwarder is a small UDP relay over hickory-proto)
-hickory-proto = "0.25"
+hickory-proto = "0.26"
 tls-parser = "0.12"
 socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"
@@ -64,18 +64,18 @@ httparse = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
-jiff = "0.1"
-directories = "5"
+jiff = "0.2"
+directories = "6"
 rpassword = "7"
 anyhow = "1"
-thiserror = "1"
+thiserror = "2"
 
 # dev / test
 insta = { version = "1", features = ["yaml", "json"] }
-rstest = "0.23"
+rstest = "0.26"
 proptest = "1"
 wiremock = "0.6"
-mockall = "0.13"
+mockall = "0.14"
 assert_cmd = "2"
 assert_fs = "1"
 predicates = "3"

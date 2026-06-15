@@ -7,7 +7,7 @@ expression: defs
     "description": "Run a shell command inside the container and observe its output. Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. For reading or editing files, prefer the `read`/`edit`/`write` tools.",
     "name": "shell",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `shell` tool.",
       "properties": {
         "command": {
@@ -34,14 +34,14 @@ expression: defs
     "description": "Read a file from the workspace with line numbers. Prefer this over `cat`/`sed` — the line numbers help you make precise edits.",
     "name": "read",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `read` tool.",
       "properties": {
         "limit": {
           "default": null,
           "description": "Maximum number of lines to return.",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -51,7 +51,7 @@ expression: defs
           "default": null,
           "description": "1-based line to start at (default 1).",
           "format": "uint",
-          "minimum": 0.0,
+          "minimum": 0,
           "type": [
             "integer",
             "null"
@@ -73,7 +73,7 @@ expression: defs
     "description": "Replace an exact span of text in a file. `old` must match exactly and be unique unless `replace_all` is set. Prefer this over `sed`/heredocs for edits — it is precise and fails loudly if `old` is missing or ambiguous.",
     "name": "edit",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `edit` tool.",
       "properties": {
         "new": {
@@ -95,9 +95,9 @@ expression: defs
         }
       },
       "required": [
-        "new",
+        "path",
         "old",
-        "path"
+        "new"
       ],
       "title": "EditArgs",
       "type": "object"
@@ -107,7 +107,7 @@ expression: defs
     "description": "Create a new file or overwrite an existing one with the given content. Parent directories are created. Prefer this over `echo >`/heredocs.",
     "name": "write",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `write` tool.",
       "properties": {
         "content": {
@@ -120,8 +120,8 @@ expression: defs
         }
       },
       "required": [
-        "content",
-        "path"
+        "path",
+        "content"
       ],
       "title": "WriteArgs",
       "type": "object"
@@ -131,7 +131,7 @@ expression: defs
     "description": "Your durable cross-session memory (stored on the host, not in the repo). `save` a concise fact or user preference worth remembering next time (scope \"project\" by default, or \"global\" across projects); `recall` a full entry by name; `list` the index; `delete` one. The index of saved memories is shown to you at the start of each session. Do NOT use this for project conventions that belong in the repo — put those in AGENTS.md.",
     "name": "memory",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `memory` tool.",
       "properties": {
         "action": {
@@ -190,8 +190,7 @@ expression: defs
     "description": "Maintain a short, visible checklist for a multi-step task. Pass the full ordered list of `steps` (each with a `status` of \"pending\", \"in_progress\", or \"done\"); the list REPLACES the previous plan. Create a plan before starting non-trivial work, mark exactly one step \"in_progress\" at a time, and update statuses as you go. Skip it for trivial one-step tasks.",
     "name": "plan",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "definitions": {
+      "$defs": {
         "PlanStep": {
           "description": "One step in the agent's working plan.",
           "properties": {
@@ -214,12 +213,13 @@ expression: defs
           "type": "object"
         }
       },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `plan` tool. The whole list is replaced on each call.",
       "properties": {
         "steps": {
           "description": "The full, ordered list of steps; replaces the current plan.",
           "items": {
-            "$ref": "#/definitions/PlanStep"
+            "$ref": "#/$defs/PlanStep"
           },
           "type": "array"
         }
@@ -235,7 +235,7 @@ expression: defs
     "description": "Publish a durable, typed output others (or a later session) can consume — a contract, summary, test result, patch, notes, etc. `publish` with a workspace `path` or inline `content`, a `kind`, a `title`, and a one-line `summary`; `list` shows this session's artifacts. Prefer publishing a concrete artifact (e.g. an API/schema contract) over describing it only in prose.",
     "name": "artifact",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `artifact` tool.",
       "properties": {
         "action": {
@@ -294,8 +294,8 @@ expression: defs
     "description": "Write a structured handoff summary for whoever continues this work (a teammate, a later session, or a Ranch coordinator): goal, status, changed files, decisions, contracts, validation, risks, next steps. Call this at the end of a substantial task, just before `final`.",
     "name": "handoff",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
-      "description": "Arguments for the `handoff` tool — a structured end-of-session summary that the next worker (or a Ranch coordinator) can rely on.",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `handoff` tool — a structured end-of-session summary that\nthe next worker (or a Ranch coordinator) can rely on.",
       "properties": {
         "changed_files": {
           "default": null,
@@ -366,7 +366,7 @@ expression: defs
     "description": "Ask the user to make a decision and record it durably (question, options, chosen answer, rationale) so the rationale survives and downstream work can depend on it. Use for choices that shape the work (data model, protocol, API shape), not routine questions.",
     "name": "decision",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `decision` tool — ask the user to decide and record it.",
       "properties": {
         "options": {
@@ -404,7 +404,7 @@ expression: defs
     "description": "Declare that you cannot proceed and need an external input (a decision, a dependency's artifact, access). Give a clear `reason` and optionally `waiting_on`. Use `unblock` once you can continue. This surfaces the session as blocked to the user / Ranch coordinator.",
     "name": "blocked",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `blocked` tool.",
       "properties": {
         "reason": {
@@ -442,11 +442,11 @@ expression: defs
     "description": "When running a Ranch workstream and the plan itself looks wrong (a workstream is missing, unnecessary, or misscoped), DO NOT edit the ranch plan — file a proposal here. It records a pending change the user reviews and approves/rejects; the plan only changes on approval. Use `change`: add_workstream (with workstream_id/title/goal/depends_on), remove_workstream (workstream_id), or note (a concern). Outside a ranch this is unavailable.",
     "name": "propose_scope_change",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `propose_scope_change` tool.",
       "properties": {
         "change": {
-          "description": "The change: \"add_workstream\", \"remove_workstream\", or \"note\" (a concern with no concrete edit).",
+          "description": "The change: \"add_workstream\", \"remove_workstream\", or \"note\" (a concern with\nno concrete edit).",
           "type": "string"
         },
         "depends_on": {
@@ -498,8 +498,8 @@ expression: defs
         }
       },
       "required": [
-        "change",
-        "summary"
+        "summary",
+        "change"
       ],
       "title": "ProposeScopeChangeArgs",
       "type": "object"
@@ -509,7 +509,7 @@ expression: defs
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `final` tool.",
       "properties": {
         "message": {
@@ -528,12 +528,12 @@ expression: defs
     "description": "Ask the user a question when you are genuinely blocked and cannot proceed without their input. Provide `options` (2–4 short choices) when the answer is a clear pick — the user gets a selectable list and can still type their own answer.",
     "name": "ask_user",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `ask_user` tool.",
       "properties": {
         "options": {
           "default": null,
-          "description": "Optional suggested answers to present as a pick-list. The user may still type a free-form answer (\"other\").",
+          "description": "Optional suggested answers to present as a pick-list. The user may still\ntype a free-form answer (\"other\").",
           "items": {
             "type": "string"
           },
@@ -558,12 +558,12 @@ expression: defs
     "description": "Delegate a focused, independent sub-task to a worker that shares this workspace/container. Describe the work by `category` (the kind: tests, exploration, frontend, review, …) and `effort` (tiny/small/medium/large/deep) — Cowboy routes it to the right model from the user's crew roster. Do NOT pick a model. Optionally set `agent` to adopt a named specialist definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \"security-reviewer\"; discover with `cowboy agents list`). Include a `reason` and the `expected_artifact`. Returns the worker's final summary. Prefer small, well-scoped tasks; emit several calls in one message to run them in parallel.",
     "name": "subagent",
     "parameters": {
-      "$schema": "http://json-schema.org/draft-07/schema#",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `subagent` tool.",
       "properties": {
         "agent": {
           "default": null,
-          "description": "Optional: a named agent definition to adopt (from `.claude/agents/` or `.cowboy/agents/`, e.g. \"security-reviewer\"). Its instructions are prepended so the worker takes on that persona. Discover names with `cowboy agents list`. (The crew still picks the model from category/effort.)",
+          "description": "Optional: a named agent definition to adopt (from `.claude/agents/` or\n`.cowboy/agents/`, e.g. \"security-reviewer\"). Its instructions are\nprepended so the worker takes on that persona. Discover names with\n`cowboy agents list`. (The crew still picks the model from category/effort.)",
           "type": [
             "string",
             "null"
@@ -571,7 +571,7 @@ expression: defs
         },
         "category": {
           "default": null,
-          "description": "The KIND of work, so Cowboy routes it to the right crew model. One of: general, exploration, backend, frontend, tests, review, docs, debugging, refactor, e2e. Defaults to `general`. Do NOT name a model — routing is the user's crew roster.",
+          "description": "The KIND of work, so Cowboy routes it to the right crew model. One of:\ngeneral, exploration, backend, frontend, tests, review, docs, debugging,\nrefactor, e2e. Defaults to `general`. Do NOT name a model — routing is the\nuser's crew roster.",
           "type": [
             "string",
             "null"
@@ -579,7 +579,7 @@ expression: defs
         },
         "context": {
           "default": null,
-          "description": "Optional extra context to prepend (the subagent starts with a fresh conversation, so include anything it needs to know).",
+          "description": "Optional extra context to prepend (the subagent starts with a fresh\nconversation, so include anything it needs to know).",
           "type": [
             "string",
             "null"
@@ -587,7 +587,7 @@ expression: defs
         },
         "effort": {
           "default": null,
-          "description": "How hard the task is: tiny, small, medium, large, or deep. Defaults to `medium`. Used with `category` to pick the model.",
+          "description": "How hard the task is: tiny, small, medium, large, or deep. Defaults to\n`medium`. Used with `category` to pick the model.",
           "type": [
             "string",
             "null"

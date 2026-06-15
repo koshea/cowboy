@@ -41,13 +41,13 @@ impl DnsMap {
 
     /// Record every A/AAAA answer in a DNS response message.
     pub fn record_answers(&self, msg: &Message) {
-        for record in msg.answers() {
-            let name = record.name().to_utf8();
+        for record in &msg.answers {
+            let name = record.name.to_utf8();
             let host = name.trim_end_matches('.').to_string();
             if host.is_empty() {
                 continue;
             }
-            match record.data() {
+            match &record.data {
                 RData::A(a) => self.record(IpAddr::V4(a.0), host),
                 RData::AAAA(aaaa) => self.record(IpAddr::V6(aaaa.0), host),
                 _ => {}
