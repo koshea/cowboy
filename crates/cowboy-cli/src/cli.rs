@@ -463,6 +463,11 @@ pub enum RanchCommand {
         #[arg(value_name = "WORKSTREAM")]
         workstream: String,
     },
+    /// Live TUI dashboard: watch workstreams advance, start/refresh from keys.
+    Watch {
+        #[arg(value_name = "RANCH")]
+        id: String,
+    },
 }
 
 #[derive(Debug, Args)]

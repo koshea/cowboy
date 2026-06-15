@@ -4,9 +4,23 @@
 //! shared source of truth). `create` writes a skeleton to fill in; launching
 //! workstreams arrives in a later stage.
 
+use std::collections::HashMap;
+use std::io::{self, Stdout};
+use std::path::Path;
+use std::time::Duration;
+
 use anyhow::{bail, Context, Result};
 use cowboy_core::daemonproto::{DaemonReq, DaemonResp, LeaseMode, SessionStatus};
 use cowboy_core::ranch::{self, Ranch, RanchStatus, WorkstreamStatus};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::{execute, terminal};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
+use ratatui::{Frame, Terminal};
+use tokio::runtime::Handle;
 
 use crate::cli::RanchCommand;
 use crate::cmd::daemon;
@@ -19,6 +33,7 @@ pub async fn run(command: RanchCommand) -> Result<()> {
         RanchCommand::Start { id } => start(&root, &id).await,
         RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
         RanchCommand::Complete { id, workstream } => complete(&root, &id, &workstream),
+        RanchCommand::Watch { id } => watch(&root, &id).await,
     }
 }
 
@@ -170,6 +185,19 @@ fn show_one(root: &std::path::Path, id: &str) -> Result<()> {
 /// again as workstreams complete to advance the dependency graph.
 async fn start(root: &std::path::Path, id: &str) -> Result<()> {
     daemon::ensure_running().await?;
+    for line in advance(root, id).await? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// Reconcile finished workstreams, promote their outputs, launch newly-ready
+/// ones, persist the ranch, and return human-readable log lines describing what
+/// happened. Shared by `start` (prints them) and the `watch` dashboard (renders
+/// them in-pane, so it never writes to the raw-mode terminal). Assumes the
+/// daemon is already running.
+async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
+    let mut log: Vec<String> = Vec::new();
     let mut ranch = ranch::load(root, id)?;
 
     // Look up the live status of each already-started workstream's session.
@@ -190,12 +218,12 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
     for ws_id in &reconciled.newly_complete {
         if let Some(ws) = ranch.workstream(ws_id).cloned() {
             let n = promote_artifacts(root, &ranch, &ws);
-            println!("{ws_id} complete — promoted {n} artifact(s)");
+            log.push(format!("{ws_id} complete — promoted {n} artifact(s)"));
             if !ws.expected_artifacts.is_empty() && n == 0 {
-                eprintln!(
+                log.push(format!(
                     "  warning: {ws_id} declared expected artifacts ({}) but published none",
                     ws.expected_artifacts.join(", ")
-                );
+                ));
             }
         }
     }
@@ -213,7 +241,7 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
         {
             DaemonResp::WorktreeCreated { path, branch } => (path, branch),
             DaemonResp::Err { message } => {
-                eprintln!("skip {}: worktree: {message}", ws.id);
+                log.push(format!("skip {}: worktree: {message}", ws.id));
                 continue;
             }
             other => bail!("unexpected daemon response: {other:?}"),
@@ -238,8 +266,10 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
                 w.worktree_path = Some(path.clone());
                 started.push((ws_id.clone(), sid, branch));
             }
-            DaemonResp::LeaseDenied { .. } => eprintln!("skip {}: worktree already in use", ws.id),
-            DaemonResp::Err { message } => eprintln!("skip {}: {message}", ws.id),
+            DaemonResp::LeaseDenied { .. } => {
+                log.push(format!("skip {}: worktree already in use", ws.id))
+            }
+            DaemonResp::Err { message } => log.push(format!("skip {}: {message}", ws.id)),
             other => bail!("unexpected daemon response: {other:?}"),
         }
     }
@@ -259,11 +289,11 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
     ranch::save(root, &ranch)?;
 
     if started.is_empty() {
-        println!("nothing ready to start.");
+        log.push("nothing ready to start.".into());
     } else {
-        println!("started {} workstream(s):", started.len());
+        log.push(format!("started {} workstream(s):", started.len()));
         for (wid, sid, branch) in &started {
-            println!("  {wid}  → session {sid}  on {branch}");
+            log.push(format!("  {wid}  → session {sid}  on {branch}"));
         }
     }
     let blocked: Vec<_> = ranch
@@ -273,16 +303,243 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
         .map(|w| w.id.clone())
         .collect();
     if !blocked.is_empty() {
-        println!("still blocked: {}", blocked.join(", "));
-        println!(
+        log.push(format!("still blocked: {}", blocked.join(", ")));
+        log.push(format!(
             "re-run `cowboy ranch start {}` as workstreams complete.",
             ranch.id
-        );
+        ));
     }
     if ranch.status == RanchStatus::Complete {
-        println!("ranch complete 🎉");
+        log.push("ranch complete 🎉".into());
     }
+    Ok(log)
+}
+
+/// `cowboy ranch watch <id>` — a live TUI dashboard for a ranch: the workstream
+/// table refreshes on a 1s poll, `s` advances the plan (reconcile + launch ready)
+/// in-pane, `r` refreshes, `q`/Esc quits. Advance output is rendered into the log
+/// pane rather than printed, so it never corrupts the raw-mode terminal.
+async fn watch(root: &Path, id: &str) -> Result<()> {
+    daemon::ensure_running().await?;
+    // Validate up-front so a bad id errors cleanly before we enter raw mode.
+    ranch::load(root, id)?;
+    let handle = Handle::current();
+    let root = root.to_path_buf();
+    let id = id.to_string();
+    // The render loop is synchronous (crossterm blocking poll); daemon calls hop
+    // back onto the runtime via the captured handle.
+    tokio::task::spawn_blocking(move || dashboard_loop(&handle, &root, &id))
+        .await
+        .context("dashboard task panicked")?
+}
+
+/// A non-saving display snapshot: load the ranch, query live session statuses,
+/// and reconcile in memory (no write) so the table reflects the dependency graph.
+async fn live_view(root: &Path, id: &str) -> Result<(Ranch, HashMap<String, SessionStatus>)> {
+    let mut ranch = ranch::load(root, id)?;
+    let mut session_status: HashMap<String, SessionStatus> = HashMap::new();
+    for w in &ranch.workstreams {
+        if let Some(sid) = &w.session_id {
+            if let Ok(DaemonResp::Session { info }) =
+                daemon::request(DaemonReq::GetSession { id: sid.clone() }).await
+            {
+                session_status.insert(sid.clone(), info.status);
+            }
+        }
+    }
+    // Reflect readiness/finished transitions for display only (result discarded).
+    reconcile_and_pick(&mut ranch, &|sid| session_status.get(sid).copied());
+    Ok((ranch, session_status))
+}
+
+type DashTerm = Terminal<CrosstermBackend<Stdout>>;
+
+fn dashboard_loop(handle: &Handle, root: &Path, id: &str) -> Result<()> {
+    let mut terminal = setup_dashboard_terminal()?;
+    let mut log: Vec<String> = Vec::new();
+    let mut view = handle.block_on(live_view(root, id))?;
+    let res = (|| -> Result<()> {
+        loop {
+            terminal.draw(|f| draw_dashboard(f, &view.0, &view.1, &log))?;
+            // Poll with a 1s timeout → auto-refresh when idle.
+            if event::poll(Duration::from_secs(1))? {
+                if let Event::Key(k) = event::read()? {
+                    if k.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match k.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('s') => {
+                            match handle.block_on(advance(root, id)) {
+                                Ok(lines) => log.extend(lines),
+                                Err(e) => log.push(format!("error: {e}")),
+                            }
+                            if let Ok(v) = handle.block_on(live_view(root, id)) {
+                                view = v;
+                            }
+                        }
+                        KeyCode::Char('r') => {
+                            if let Ok(v) = handle.block_on(live_view(root, id)) {
+                                view = v;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if let Ok(v) = handle.block_on(live_view(root, id)) {
+                view = v;
+            }
+        }
+        Ok(())
+    })();
+    restore_dashboard_terminal(&mut terminal)?;
+    res
+}
+
+fn setup_dashboard_terminal() -> Result<DashTerm> {
+    terminal::enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, terminal::EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn restore_dashboard_terminal(terminal: &mut DashTerm) -> Result<()> {
+    terminal::disable_raw_mode()?;
+    execute!(terminal.backend_mut(), terminal::LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
     Ok(())
+}
+
+fn draw_dashboard(
+    f: &mut Frame,
+    ranch: &Ranch,
+    session_status: &HashMap<String, SessionStatus>,
+    log: &[String],
+) {
+    let log_h = if log.is_empty() { 0 } else { 8 };
+    let chunks = Layout::vertical([
+        Constraint::Length(4),     // header
+        Constraint::Min(3),        // workstream table
+        Constraint::Length(log_h), // advance log (hidden when empty)
+        Constraint::Length(1),     // footer / key hints
+    ])
+    .split(f.area());
+
+    // Header: title, status, goal.
+    let mut header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("ranch {} ", ranch.id),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("— {}", ranch.title)),
+        ]),
+        Line::from(vec![
+            Span::raw("status: "),
+            Span::styled(ranch_status(ranch.status), ranch_status_style(ranch.status)),
+        ]),
+    ];
+    if !ranch.goal.is_empty() {
+        header.push(Line::from(format!("goal: {}", ranch.goal)));
+    }
+    f.render_widget(
+        Paragraph::new(header).block(Block::default().borders(Borders::ALL)),
+        chunks[0],
+    );
+
+    // Workstream table.
+    let header_row = Row::new(["WORKSTREAM", "STATUS", "SESSION", "DEPENDS ON"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows = ranch.workstreams.iter().map(|w| {
+        let sess = w.session_id.as_deref().unwrap_or("-");
+        // Show live session status alongside the workstream status when it adds info.
+        let sess_cell = match w.session_id.as_deref().and_then(|s| session_status.get(s)) {
+            Some(st) => format!("{sess} ({})", session_status_str(*st)),
+            None => sess.to_string(),
+        };
+        Row::new(vec![
+            Cell::from(w.id.clone()),
+            Cell::from(Span::styled(ws_status(w.status), ws_status_style(w.status))),
+            Cell::from(sess_cell),
+            Cell::from(w.depends_on.join(", ")),
+        ])
+    });
+    let widths = [
+        Constraint::Length(16),
+        Constraint::Length(12),
+        Constraint::Length(28),
+        Constraint::Min(10),
+    ];
+    f.render_widget(
+        Table::new(rows, widths).header(header_row).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" workstreams "),
+        ),
+        chunks[1],
+    );
+
+    // Advance log pane (only when there's output).
+    if log_h > 0 {
+        let tail: Vec<Line> = log
+            .iter()
+            .rev()
+            .take(6)
+            .rev()
+            .map(|l| Line::from(l.clone()))
+            .collect();
+        f.render_widget(
+            Paragraph::new(tail).block(Block::default().borders(Borders::ALL).title(" log ")),
+            chunks[2],
+        );
+    }
+
+    // Footer key hints.
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            " q quit · s advance (launch ready) · r refresh · auto-refresh 1s ",
+            Style::default().fg(Color::DarkGray),
+        )])),
+        chunks[3],
+    );
+}
+
+fn ranch_status_style(s: RanchStatus) -> Style {
+    let c = match s {
+        RanchStatus::Complete => Color::Green,
+        RanchStatus::Running | RanchStatus::Integrating => Color::Cyan,
+        RanchStatus::WaitingForUser | RanchStatus::Paused => Color::Yellow,
+        RanchStatus::Failed | RanchStatus::Cancelled => Color::Red,
+        _ => Color::Gray,
+    };
+    Style::default().fg(c)
+}
+
+fn ws_status_style(s: WorkstreamStatus) -> Style {
+    let c = match s {
+        WorkstreamStatus::Complete | WorkstreamStatus::Integrated => Color::Green,
+        WorkstreamStatus::Running | WorkstreamStatus::Starting => Color::Cyan,
+        WorkstreamStatus::Ready | WorkstreamStatus::MergeReady => Color::LightGreen,
+        WorkstreamStatus::WaitingForUser => Color::Yellow,
+        WorkstreamStatus::Blocked => Color::DarkGray,
+        WorkstreamStatus::Failed | WorkstreamStatus::Cancelled => Color::Red,
+        WorkstreamStatus::Planned => Color::Gray,
+    };
+    Style::default().fg(c)
+}
+
+fn session_status_str(s: SessionStatus) -> &'static str {
+    match s {
+        SessionStatus::Starting => "starting",
+        SessionStatus::Running => "running",
+        SessionStatus::Idle => "idle",
+        SessionStatus::AwaitingApproval => "approval",
+        SessionStatus::AwaitingInput => "input",
+        SessionStatus::Blocked => "blocked",
+        SessionStatus::Completed => "completed",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Stale => "stale",
+    }
 }
 
 /// What `reconcile_and_pick` decided this run.
@@ -490,6 +747,50 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use cowboy_core::ranch::Workstream;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn draw_dashboard_renders_header_table_and_keys() {
+        let r = ranch(vec![
+            ws("schema", &[], WorkstreamStatus::Complete, Some("s1")),
+            ws("api", &["schema"], WorkstreamStatus::Running, Some("s2")),
+            ws("ui", &["api"], WorkstreamStatus::Blocked, None),
+        ]);
+        let mut statuses = HashMap::new();
+        statuses.insert("s2".to_string(), SessionStatus::Running);
+        let log = vec!["api → session s2 on cowboy/r-api".to_string()];
+
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_dashboard(f, &r, &statuses, &log))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+
+        assert!(text.contains("ranch r"));
+        assert!(text.contains("WORKSTREAM"));
+        assert!(text.contains("schema"));
+        assert!(text.contains("blocked")); // ui's status
+        assert!(text.contains("s2 (running)")); // api session + live session status
+        assert!(text.contains("q quit"));
+        assert!(text.contains("cowboy/r-api")); // the advance log line
+    }
+
+    #[test]
+    fn draw_dashboard_hides_empty_log_pane() {
+        // With no log lines the dashboard still renders (log pane collapses to 0).
+        let r = ranch(vec![ws("only", &[], WorkstreamStatus::Planned, None)]);
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_dashboard(f, &r, &HashMap::new(), &[]))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("only"));
+        assert!(!text.contains(" log ")); // no log pane title when empty
+    }
 
     fn ws(id: &str, deps: &[&str], status: WorkstreamStatus, session: Option<&str>) -> Workstream {
         Workstream {
