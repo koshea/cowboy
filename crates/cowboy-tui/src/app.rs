@@ -558,12 +558,14 @@ fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
 /// Draw the whole UI.
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
+    // The input box grows with its content, up to 5 visible lines (+2 borders).
+    let input_h = (app.input_lines().clamp(1, 5) as u16) + 2;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),    // main
-            Constraint::Length(1), // status bar
-            Constraint::Length(3), // input
+            Constraint::Min(3),          // main
+            Constraint::Length(1),       // status bar
+            Constraint::Length(input_h), // input (grows to 5 lines)
         ])
         .split(area);
 
@@ -1238,6 +1240,24 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    #[test]
+    fn input_box_grows_with_content_up_to_five_lines() {
+        let mut app = App::new("cowboy");
+        assert_eq!(app.input_lines(), 1);
+        // Six lines of input; the box should cap its visible height at 5 (+borders).
+        app.textarea =
+            tui_textarea::TextArea::from((1..=6).map(|i| format!("line {i}")).collect::<Vec<_>>());
+        assert_eq!(app.input_lines(), 6);
+        let frame = render(&app);
+        // The box grew to its 5-line cap: lines 1..=5 are all visible at once.
+        for i in 1..=5 {
+            assert!(
+                frame.contains(&format!("line {i}")),
+                "input should show {i} lines:\n{frame}"
+            );
+        }
     }
 
     #[test]
