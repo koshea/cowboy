@@ -83,9 +83,27 @@ models:
     provider: litellm
     model: anthropic/claude-sonnet-4-6
     temperature: 0.2
-    max_tokens: 8192
-    context_window: 200000
+    max_tokens: 32768          # max OUTPUT tokens per response (see note)
+    context_window: 1000000    # total input+output window the model supports
+    input_cost_per_mtok: 3.0   # optional, for usage/cost display
+    output_cost_per_mtok: 15.0
+    anthropic_cache: true      # optional: see below
 ```
+
+**`context_window` vs `max_tokens`.** `context_window` is the model's *total*
+window (prompt + completion); Cowboy prunes history to fit it. `max_tokens` is the
+cap on a *single response's output* — not always 8192. Tune it to the model's real
+max output (e.g. Claude Sonnet 4.6 ≈ 64k, Opus 4.8 ≈ 128k) but keep it a sane
+agent cap (16k–32k is a good sweet spot — enough for a long file/edit without
+letting one response run away). Cowboy reserves `max_tokens` of the window for the
+answer when pruning, so `prompt + output` never exceeds `context_window`; setting
+it accurately keeps requests valid even when the context is nearly full.
+
+**`anthropic_cache`** (opt-in): when true, Cowboy adds Anthropic `cache_control`
+markers to the static system prompt and the latest message, so a gateway that
+understands Anthropic prompt caching reuses the cached prefix across turns (big
+latency/cost win for Claude). Only enable it for Anthropic models behind a gateway
+that supports `cache_control` — it's ignored or rejected elsewhere.
 
 Manage with `cowboy models setup` / `list` / `use [-g] <name>`. Works with any
 OpenAI-compatible backend. Cowboy does not manage or endorse a gateway.

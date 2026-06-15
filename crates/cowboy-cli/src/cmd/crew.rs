@@ -60,6 +60,14 @@ pub fn session_model_override() -> Option<String> {
     }
 }
 
+/// Per-task-type temperature override for this session, set by the crew router
+/// (`COWBOY_TEMPERATURE`). `None` → the model keeps its configured temperature.
+pub fn temperature_override() -> Option<f32> {
+    std::env::var("COWBOY_TEMPERATURE")
+        .ok()
+        .and_then(|t| t.parse::<f32>().ok())
+}
+
 /// Rank models cheapest→priciest by known total $/Mtok; unknown-priced last.
 fn price_sorted(models: &BTreeMap<String, ModelDef>) -> Vec<String> {
     let mut v: Vec<(&String, f64, bool)> = models

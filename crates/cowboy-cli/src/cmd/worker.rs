@@ -85,7 +85,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // The crew planner model (or a COWBOY_MODEL override) is the session default;
     // a stale/unknown override falls back to the models.yaml default.
     let model_override = crate::cmd::crew::session_model_override();
-    let resolved = resolve_model(
+    let mut resolved = resolve_model(
         &providers,
         user_models.as_ref(),
         project_models.as_ref(),
@@ -99,6 +99,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             None,
         )
     })?;
+    // A crew-routed subagent may override the temperature per task type.
+    if let Some(t) = crate::cmd::crew::temperature_override() {
+        resolved.temperature = t;
+    }
     let context_window = resolved.context_window as usize;
     let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
 

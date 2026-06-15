@@ -29,11 +29,20 @@ crew:
     small: sonnet        # ≤ medium → sonnet (tiny falls to the lowest floor)
     large: opus          # large, deep → opus
   general: sonnet        # required: the cross-category fallback
+temperature:             # optional: override temperature per task type
+  tests: 0.0             #   cooler for precise work…
+  exploration: 0.6       #   …warmer for ideation (falls back to general's, else
+                         #   the model's own default)
 delegation:
   max_parallel: 4        # local fan-out hint (not a quota)
   max_depth: 1           # planner delegates; workers don't, by default
   allow_recursive_delegation: false
 ```
+
+The optional `temperature` map overrides the sampling temperature **per category**
+(task type): a delegated `tests` task runs cooler, an `exploration` task warmer,
+regardless of the chosen model's default. Unlisted categories fall back to
+`general`'s temperature, then to the model's own.
 
 Model names are entries from your [model catalogue](../getting-started/configuration.md)
 (`models.yaml`), so they resolve through the gateway — and a name can even be a

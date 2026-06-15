@@ -385,6 +385,16 @@ pub struct ModelDef {
     /// USD per 1M output (completion) tokens, for cost estimation (omitted when unknown).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_cost_per_mtok: Option<f64>,
+    /// Opt in to Anthropic prompt caching: Cowboy adds `cache_control` markers to
+    /// the (static) system prompt and the latest message so a compatible gateway
+    /// caches the prefix. Only enable for Anthropic models behind a gateway that
+    /// understands `cache_control`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anthropic_cache: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A fully-resolved model ready to build a client from: provider credentials
@@ -405,6 +415,7 @@ pub struct ResolvedModel {
     pub headers: BTreeMap<String, String>,
     pub input_cost_per_mtok: Option<f64>,
     pub output_cost_per_mtok: Option<f64>,
+    pub anthropic_cache: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -859,6 +870,7 @@ pub fn resolve_model(
         headers,
         input_cost_per_mtok: def.input_cost_per_mtok,
         output_cost_per_mtok: def.output_cost_per_mtok,
+        anthropic_cache: def.anthropic_cache,
     })
 }
 

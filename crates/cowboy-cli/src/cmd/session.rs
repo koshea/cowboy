@@ -57,7 +57,7 @@ pub async fn run(
     // A subagent sets COWBOY_MODEL to its routed crew model; otherwise the crew
     // planner model is the default. A bad override falls back to models.yaml.
     let model_override = crate::cmd::crew::session_model_override();
-    let resolved = resolve_model(
+    let mut resolved = resolve_model(
         &providers,
         user_models.as_ref(),
         project_models.as_ref(),
@@ -71,6 +71,10 @@ pub async fn run(
             None,
         )
     })?;
+    // A crew-routed subagent may override the temperature per task type.
+    if let Some(t) = crate::cmd::crew::temperature_override() {
+        resolved.temperature = t;
+    }
 
     let interactive = std::io::stdout().is_terminal();
 

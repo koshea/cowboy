@@ -130,6 +130,8 @@ struct SubagentPlan {
     label: String,
     /// The crew-resolved model (routed via `COWBOY_MODEL`); None when no roster.
     model: Option<String>,
+    /// Per-task-type temperature override (routed via `COWBOY_TEMPERATURE`).
+    temperature: Option<f32>,
     /// (category, effort, model, fell_back) for the lifecycle event.
     routed: Option<(String, String, String, bool)>,
 }
@@ -148,6 +150,9 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         .kill_on_drop(true);
     if let Some(model) = &plan.model {
         cmd.env("COWBOY_MODEL", model);
+    }
+    if let Some(t) = plan.temperature {
+        cmd.env("COWBOY_TEMPERATURE", t.to_string());
     }
     match cmd.output().await {
         Ok(o) => {
@@ -370,7 +375,11 @@ impl<'a> AgentLoop<'a> {
     /// Compaction happens at user-turn boundaries (turn starts) so a tool result
     /// is never orphaned. Falls back to dropping if a summary can't be made.
     async fn fit_context(&mut self) {
-        let budget = self.context_window.saturating_sub(RESPONSE_HEADROOM);
+        // Reserve room for the response: the model's own max output tokens (so
+        // prompt + output never exceeds the window), with RESPONSE_HEADROOM as a
+        // floor that also covers tool-schema overhead.
+        let reserve = self.model.max_output_tokens().max(RESPONSE_HEADROOM);
+        let budget = self.context_window.saturating_sub(reserve);
         if budget == 0 || self.total_tokens() <= budget {
             return;
         }
@@ -1399,6 +1408,7 @@ impl<'a> AgentLoop<'a> {
             .and_then(crew::Effort::parse)
             .unwrap_or(crew::DEFAULT_EFFORT);
         let routed = crew_cfg.as_ref().map(|c| c.resolve(&category, effort));
+        let temperature = crew_cfg.as_ref().and_then(|c| c.temperature_for(&category));
 
         // Worker brief: optional context, the task, then the expected artifact.
         let mut task = String::new();
@@ -1426,6 +1436,7 @@ impl<'a> AgentLoop<'a> {
             display_task: args.task.clone(),
             label,
             model: routed.as_ref().map(|r| r.model.clone()),
+            temperature,
             routed: routed.map(|r| (category, effort.as_str().to_string(), r.model, r.fell_back)),
         })
     }

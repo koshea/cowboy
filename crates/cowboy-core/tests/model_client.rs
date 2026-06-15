@@ -26,6 +26,7 @@ fn profile(base_url: String) -> ResolvedModel {
         headers: BTreeMap::new(),
         input_cost_per_mtok: None,
         output_cost_per_mtok: None,
+        anthropic_cache: false,
     }
 }
 

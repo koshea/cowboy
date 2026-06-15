@@ -108,6 +108,7 @@ fn setup() -> Result<()> {
                 input_cost_per_mtok: None,
                 output_cost_per_mtok: None,
                 headers: BTreeMap::new(),
+                anthropic_cache: false,
             },
         );
         // Make the first-ever model the default.
@@ -344,6 +345,7 @@ fn add(a: AddArgs) -> Result<()> {
         headers: BTreeMap::new(),
         input_cost_per_mtok: d.input_cost_per_mtok,
         output_cost_per_mtok: d.output_cost_per_mtok,
+        anthropic_cache: false,
     };
 
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
@@ -421,6 +423,7 @@ pub fn save_user_model(
         headers: BTreeMap::new(),
         input_cost_per_mtok: d.input_cost_per_mtok,
         output_cost_per_mtok: d.output_cost_per_mtok,
+        anthropic_cache: false,
     };
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();

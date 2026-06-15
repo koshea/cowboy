@@ -146,13 +146,18 @@ impl Default for Delegation {
 }
 
 /// The crew roster.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CrewConfig {
     #[serde(default = "default_version")]
     pub version: u32,
     pub planner: Planner,
     #[serde(default)]
     pub crew: BTreeMap<String, Ramp>,
+    /// Optional per-category temperature override (by task type). A delegated
+    /// task in this category runs at this temperature instead of the model's
+    /// default — e.g. tests/refactor cooler, exploration warmer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub temperature: BTreeMap<String, f32>,
     #[serde(default)]
     pub delegation: Delegation,
 }
@@ -205,6 +210,15 @@ impl CrewConfig {
             via: ResolveVia::Planner,
             fell_back: true,
         }
+    }
+
+    /// The temperature override for a category (falling back to `general`'s, then
+    /// none → the model keeps its own default).
+    pub fn temperature_for(&self, category: &str) -> Option<f32> {
+        self.temperature
+            .get(category)
+            .or_else(|| self.temperature.get(GENERAL))
+            .copied()
     }
 
     /// The effective model for each effort level of a category (ramps expanded),
@@ -330,6 +344,7 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
             may_delegate: true,
         },
         crew,
+        temperature: BTreeMap::new(),
         delegation: Delegation::default(),
     }
 }
@@ -540,8 +555,26 @@ mod tests {
                 may_delegate: true,
             },
             crew,
+            temperature: BTreeMap::new(),
             delegation: Delegation::default(),
         }
+    }
+
+    #[test]
+    fn temperature_override_falls_back_to_general() {
+        let mut c = cfg(BTreeMap::from([(
+            GENERAL.to_string(),
+            Ramp::Single("m".into()),
+        )]));
+        c.temperature.insert("tests".into(), 0.0);
+        c.temperature.insert(GENERAL.into(), 0.5);
+        assert_eq!(c.temperature_for("tests"), Some(0.0)); // explicit
+        assert_eq!(c.temperature_for("frontend"), Some(0.5)); // general fallback
+        let c2 = cfg(BTreeMap::from([(
+            GENERAL.to_string(),
+            Ramp::Single("m".into()),
+        )]));
+        assert_eq!(c2.temperature_for("tests"), None); // no overrides → model default
     }
 
     #[test]

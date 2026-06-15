@@ -152,6 +152,14 @@ pub trait ModelClient: Send + Sync {
         tools: &[ToolDef],
         deltas: Option<UnboundedSender<Delta>>,
     ) -> Result<ChatResponse>;
+
+    /// Max output tokens this client will request per response. The agent loop
+    /// reserves this much of the context window for the answer when pruning
+    /// history, so `prompt + output` never exceeds the window. Default is a
+    /// conservative floor for mock/test clients.
+    fn max_output_tokens(&self) -> usize {
+        4096
+    }
 }
 
 /// OpenAI-compatible client. Requests are built with `async-openai`'s typed
@@ -168,6 +176,8 @@ pub struct OpenAiClient {
     top_p: Option<f32>,
     stop: Vec<String>,
     extra: BTreeMap<String, serde_json::Value>,
+    /// Inject Anthropic `cache_control` markers (opt-in per model).
+    anthropic_cache: bool,
 }
 
 impl OpenAiClient {
@@ -200,6 +210,7 @@ impl OpenAiClient {
             top_p: model.top_p,
             stop: model.stop.clone(),
             extra: model.extra.clone(),
+            anthropic_cache: model.anthropic_cache,
         })
     }
 }
@@ -426,8 +437,37 @@ struct FnChunk {
     arguments: Option<String>,
 }
 
+/// Rewrite an OpenAI chat message so its text carries an Anthropic ephemeral
+/// `cache_control` marker: string content becomes a single text block with the
+/// marker; an existing block array gets the marker on its last text block.
+/// Messages without text content (e.g. tool-call-only assistant turns) are left
+/// alone.
+fn mark_ephemeral_cache(msg: &mut serde_json::Value) {
+    let marker = serde_json::json!({ "type": "ephemeral" });
+    match msg.get_mut("content") {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => {
+            let text = std::mem::take(s);
+            msg["content"] = serde_json::json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": marker,
+            }]);
+        }
+        Some(serde_json::Value::Array(blocks)) => {
+            if let Some(last) = blocks.iter_mut().rev().find(|b| b["type"] == "text") {
+                last["cache_control"] = marker;
+            }
+        }
+        _ => {}
+    }
+}
+
 #[async_trait]
 impl ModelClient for OpenAiClient {
+    fn max_output_tokens(&self) -> usize {
+        self.max_tokens as usize
+    }
+
     async fn chat(
         &self,
         messages: &[Message],
@@ -454,6 +494,20 @@ impl ModelClient for OpenAiClient {
         }
         if !self.stop.is_empty() {
             body["stop"] = serde_json::json!(self.stop);
+        }
+        // Anthropic prompt caching (opt-in): mark the static system prompt and the
+        // latest message with `cache_control` so a compatible gateway caches the
+        // prefix. Harmless on gateways that ignore unknown fields; only enable for
+        // models behind one that understands it.
+        if self.anthropic_cache {
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                if let Some(sys) = msgs.iter_mut().find(|m| m["role"] == "system") {
+                    mark_ephemeral_cache(sys);
+                }
+                if let Some(last) = msgs.last_mut() {
+                    mark_ephemeral_cache(last);
+                }
+            }
         }
         // Config escape hatch: merge arbitrary top-level params last.
         if let Some(obj) = body.as_object_mut() {
@@ -588,6 +642,30 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "shell");
         assert_eq!(calls[0].arguments, "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn ephemeral_cache_marks_string_and_block_content() {
+        // String content becomes a single text block with cache_control.
+        let mut m = serde_json::json!({"role": "system", "content": "you are a foreman"});
+        mark_ephemeral_cache(&mut m);
+        assert_eq!(m["content"][0]["type"], "text");
+        assert_eq!(m["content"][0]["text"], "you are a foreman");
+        assert_eq!(m["content"][0]["cache_control"]["type"], "ephemeral");
+
+        // An existing block array gets the marker on its last text block.
+        let mut m = serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+        });
+        mark_ephemeral_cache(&mut m);
+        assert!(m["content"][0].get("cache_control").is_none());
+        assert_eq!(m["content"][1]["cache_control"]["type"], "ephemeral");
+
+        // No text content (tool-call-only assistant turn) → untouched.
+        let mut m = serde_json::json!({"role": "assistant", "content": null});
+        mark_ephemeral_cache(&mut m);
+        assert!(m["content"].is_null());
     }
 
     #[test]
