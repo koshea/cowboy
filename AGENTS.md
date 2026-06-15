@@ -1,7 +1,8 @@
 # AGENTS.md — working in the `cowboy` repo
 
 Guidance for AI coding agents (and humans) working on **cowboy** itself. For the
-product overview and the security rationale, read `README.md` and `docs/`.
+product overview and the security rationale, read `README.md` and the docs site
+(`docs/src/`, an mdBook).
 
 ## What this is
 
@@ -13,7 +14,7 @@ enforces security at the container + network layer.
 boundary. Security is enforced by Docker, host-owned config, and a Cowboy-owned
 network gateway — *never* by prompting the model. When you change anything near
 config, mounts, networking, credentials, or the agent loop, preserve this. See
-`docs/SECURITY.md`.
+`docs/src/security/model.md`.
 
 ## Build / test / run
 
@@ -121,6 +122,25 @@ Invariants to preserve here:
 - **Acceptance gates** pause a finished workstream for human sign-off
   (`cowboy ranch accept`) rather than auto-completing.
 
+## Documentation — keep it current
+
+The docs site is an **mdBook** at `docs/` (`docs/book.toml`, content in
+`docs/src/`, TOC in `docs/src/SUMMARY.md`). **Docs are part of the change, not an
+afterthought — when you add or change a feature, update the relevant chapter in the
+same change.** The chapter map mirrors the feature areas (getting started,
+security, using Cowboy, Ranch Plans, reference).
+
+Two guards keep it honest (both run under `cargo test`):
+
+- **CLI reference is auto-generated** from the clap tree into
+  `docs/src/reference/cli.md`. After any CLI change, regenerate:
+  `COWBOY_REGEN_DOCS=1 cargo test -p cowboy-cli --test cli_docs`. A normal test run
+  **fails** if it's stale — never hand-edit `cli.md`.
+- **The book must build:** the `book_builds` test runs `mdbook build docs` when
+  `mdbook` is on PATH (skips otherwise), catching broken links / missing
+  `SUMMARY.md` entries. Install once with `cargo install mdbook`; preview with
+  `mdbook serve docs`.
+
 ## Gotchas
 
 - **Never `pkill -f cowboyd`** — the pattern matches the shell running the command
@@ -136,5 +156,7 @@ Invariants to preserve here:
 
 `cargo fmt --all` · `cargo clippy --workspace --all-targets` (clean) ·
 `cargo nextest run` (or `cargo test --workspace`). If you touched a snapshotted
-surface, review the `insta` diff. If you changed model-dependent behavior, run the
-relevant `#[ignore]` E2E and report whether it passed.
+surface, review the `insta` diff. If you changed the CLI, regenerate `cli.md`
+(above). If you added/changed a feature, update its docs chapter. If you changed
+model-dependent behavior, run the relevant `#[ignore]` E2E and report whether it
+passed.

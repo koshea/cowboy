@@ -1,0 +1,16 @@
+[book]
+title = "Cowboy"
+description = "An opinionated local coding agent that runs wild inside a Docker corral, while the host enforces security."
+authors = ["cowboycode"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/cowboycode/cowboy"
+edit-url-template = "https://github.com/cowboycode/cowboy/edit/main/docs/{path}"
+
+[output.html.fold]
+enable = true
+level = 1

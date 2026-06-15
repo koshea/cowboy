@@ -1,7 +1,7 @@
-# cowboy — network enforcement
+# Network gateway
 
-Outbound network access is enforced by **routing + dropped capabilities**, not
-by asking the model. This is the security thesis.
+Outbound network access is enforced by **routing + dropped capabilities**, not by
+asking the model. This is the security thesis.
 
 ## Topology (per project)
 
@@ -33,17 +33,24 @@ run rather than become an open router.
 - **Explicit CONNECT proxy** for proxy-aware clients (convenience).
 - **DNS resolver** (`:53`): forwards upstream and records `ip → domain` so the
   transparent path can map a destination IP back to a hostname for policy.
-- **Policy**: deny-list wins, then allow-list (domain via SNI/Host, or CIDR;
-  with optional port restriction), else `default_external`. `ask` is sent to the
-  host; with no approver it fails closed.
+- **Policy**: deny-list wins, then allow-list (domain via SNI/Host, or CIDR; with
+  optional port restriction), else `default_external`. `ask` is sent to the host;
+  with no approver it fails closed.
+
+## Live approvals
+
+In the TUI, an `ask` opens an approval modal — allow once / session / project /
+global, or deny. Project/global approvals persist to `.cowboy/approvals.json` and
+merge into the policy on the next run. Non-interactive runs fail closed (deny) and
+log the decision.
 
 ## Approved Compose/Docker networks
 
 `networks.compose.approved` networks are attached directly to the agent. That
 traffic routes peer-to-peer over Docker's own bridge and **bypasses the gateway**
-entirely — no prompt.
+entirely — no prompt. Approve such networks deliberately.
 
-## Honest MVP scope
+## Honest scope
 
 - Outbound = TCP 80/443 through the gateway with allow/deny/ask by domain/CIDR.
 - DNS only via the gateway resolver.

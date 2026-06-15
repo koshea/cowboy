@@ -1,11 +1,13 @@
-# cowboy — configuration
+# Configuration
 
-Three files live under `.cowboy/`. `cowboy init` writes commented defaults.
+Three files live under `.cowboy/`. `cowboy init` writes commented defaults. A
+deeper field reference is in [Config files](../reference/config-files.md).
 
 ## `security.yaml` (host-owned, never mounted)
 
-Read only by the host `cowboy` process. Controls the container, mounts,
-networks, network policy, and secret injection.
+Read only by the host `cowboy` process. Controls the container, mounts, networks,
+network policy, and secret injection. It is **masked** inside the container, so
+the agent cannot read it even though it lives under `.cowboy/`.
 
 ```yaml
 version: 1
@@ -86,5 +88,4 @@ models:
 ```
 
 Manage with `cowboy models setup` / `list` / `use [-g] <name>`. Works with any
-OpenAI-compatible backend (LiteLLM, OpenRouter, Ollama, vLLM, an internal
-gateway, …). Cowboy does not manage or endorse a gateway.
+OpenAI-compatible backend. Cowboy does not manage or endorse a gateway.

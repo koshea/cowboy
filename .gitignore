@@ -10,5 +10,8 @@
 # insta pending snapshots
 **/*.snap.new
 
+# mdBook build output (the docs site is built from docs/src/)
+/docs/book
+
 # OS / editor cruft
 .DS_Store

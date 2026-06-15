@@ -1,4 +1,4 @@
-# cowboy — security model
+# The boundary
 
 The central principle: **the agent is not trusted for security**. Controls are
 enforced by Docker, host-owned configuration, and a Cowboy-controlled network
@@ -23,20 +23,28 @@ gateway — never by prompting the model.
 - **Network egress is route-enforced, not prompt-enforced.** The agent runs on
   an internal-only Docker network with its default route forced through the
   gateway and `NET_ADMIN`/`NET_RAW` dropped, so it cannot change its route. See
-  [NETWORK.md](NETWORK.md). Default external policy is `ask`; with no approver
-  connected, asks **fail closed** (deny).
+  [Network gateway](network.md). Default external policy is `ask`; with no
+  approver connected, asks **fail closed** (deny).
 - **Secrets are explicit and host-configured.** `secrets.env` injects host env
-  vars into the container by name. Values are never printed at startup or
-  written to logs; only names appear.
+  vars into the container by name. Values are never printed at startup or written
+  to logs; only names appear.
+
+## Where the agent loop runs
+
+The agent loop runs **host-side** (in the worker process), not inside the
+container. The Docker container is the sandbox for the agent's *shell commands*.
+Host-handled tools (memory, artifacts, handoffs, plan, decisions, scope
+proposals) are executed by the loop on the host and so can read/write
+host-visible state under the workspace — but never the masked host-owned config
+or the home-only credentials.
 
 ## Dangerous options (surfaced, not silently honored)
 
 `cowboy doctor` warns when `container.privileged` or `container.docker_socket`
 is enabled — both widen the boundary and should be used deliberately.
 
-## Follow-ups (post-MVP)
+## Follow-ups
 
-- Host control-socket server + TUI approval for live `ask` decisions.
-- Log redaction, per-command secret exposure, secret provenance, and
-  integration with 1Password/Vault/SOPS.
+- Log redaction, per-command secret exposure, secret provenance, and integration
+  with 1Password/Vault/SOPS.
 - Full DNS policy and DNS-tunnel detection.

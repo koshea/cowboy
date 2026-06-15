@@ -32,10 +32,20 @@ credentials); set the default with `cowboy models use [-g] <name>` and review wi
 
 ## Docs
 
-- [docs/MVP.md](docs/MVP.md) — overview & command reference
-- [docs/SECURITY.md](docs/SECURITY.md) — the security model
-- [docs/CONFIG.md](docs/CONFIG.md) — the three config files
-- [docs/NETWORK.md](docs/NETWORK.md) — the sole-egress network gateway
+Full documentation is an [mdBook](https://rust-lang.github.io/mdBook/) site under
+[`docs/`](docs/src/SUMMARY.md). Build/read it locally:
+
+```sh
+cargo install mdbook        # once
+mdbook serve docs           # live preview at http://localhost:3000 (or: mdbook build docs)
+```
+
+Highlights: [Quick start](docs/src/getting-started/quickstart.md) ·
+[Security model](docs/src/security/model.md) ·
+[Network gateway](docs/src/security/network.md) ·
+[Configuration](docs/src/getting-started/configuration.md) ·
+[Ranch Plans](docs/src/ranch/overview.md) ·
+[CLI reference](docs/src/reference/cli.md).
 
 ## Workspace layout
 
