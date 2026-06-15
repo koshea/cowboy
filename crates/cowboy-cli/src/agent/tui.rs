@@ -790,6 +790,8 @@ fn handle_key(
 const HELP_LINES: &[&str] = &[
     "commands:",
     "  /help          show this help",
+    "  /skills        list available skills",
+    "  /<skill> [args]  run a skill (e.g. /github:review-pr 162)",
     "  /model [name]  show or switch the active model",
     "  /models        browse the provider catalogue and add/select a model",
     "  /crew [usage]  show the crew roster (model routing) or its usage",
@@ -967,10 +969,50 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             app.status = "detaching…".into();
             return true;
         }
-        other => app.push(
-            LineKind::Error,
-            format!("unknown command /{other} — try /help"),
-        ),
+        "skills" => {
+            let skills = cowboy_core::skills::discover(&ctx.session.root);
+            if skills.is_empty() {
+                app.push(
+                    LineKind::Notice,
+                    "no skills found (.cowboy/skills or .claude/skills)",
+                );
+            } else {
+                app.push(LineKind::Notice, "skills (run with `/<name> [args]`):");
+                for s in skills {
+                    let hint = s.argument_hint.map(|h| format!(" {h}")).unwrap_or_default();
+                    app.push(
+                        LineKind::Notice,
+                        format!("  /{}{hint}  — {}", s.name, s.description),
+                    );
+                }
+            }
+        }
+        other => {
+            // A user-invocable skill? Run it: send its instructions (with
+            // `$ARGUMENTS` filled in) as the turn so the agent follows them.
+            if let Some(skill) = cowboy_core::skills::load(&ctx.session.root, other) {
+                let args = input.get(other.len()..).unwrap_or("").trim();
+                let mut body = skill.instructions.clone();
+                if body.contains("$ARGUMENTS") {
+                    body = body.replace("$ARGUMENTS", args);
+                } else if !args.is_empty() {
+                    body.push_str(&format!("\n\nArguments: {args}"));
+                }
+                let prompt = format!("Run the `{}` skill.\n\n{body}", skill.name);
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    app.push(LineKind::User, format!("/{input}"));
+                    let _ = tx.send(AgentCmd::Message(prompt));
+                    *ctx.pending_turns += 1;
+                    app.mode = Mode::Running;
+                    app.status = format!("running skill {}", skill.name);
+                }
+            } else {
+                app.push(
+                    LineKind::Error,
+                    format!("unknown command /{other} — try /help or /skills"),
+                );
+            }
+        }
     }
     false
 }

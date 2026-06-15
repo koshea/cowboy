@@ -19,6 +19,8 @@ use std::path::{Path, PathBuf};
 pub struct Skill {
     pub name: String,
     pub description: String,
+    /// Usage hint for arguments (Claude Code's `argument-hint` frontmatter), if any.
+    pub argument_hint: Option<String>,
     /// The `SKILL.md` body (instructions), with frontmatter stripped.
     pub instructions: String,
     /// The skill's directory (holds scripts/resources).
@@ -107,6 +109,7 @@ fn read_dir(dir: &Path, global: bool) -> Vec<Skill> {
         out.push(Skill {
             name: parsed.name.unwrap_or(default_name),
             description: parsed.description.unwrap_or_default(),
+            argument_hint: parsed.argument_hint,
             instructions: parsed.body,
             dir: if path.is_dir() {
                 path
@@ -122,6 +125,7 @@ fn read_dir(dir: &Path, global: bool) -> Vec<Skill> {
 struct Parsed {
     name: Option<String>,
     description: Option<String>,
+    argument_hint: Option<String>,
     body: String,
 }
 
@@ -129,6 +133,8 @@ struct Parsed {
 struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
+    #[serde(rename = "argument-hint")]
+    argument_hint: Option<String>,
 }
 
 /// Parse `SKILL.md`: optional `---`-delimited YAML frontmatter, then the body.
@@ -144,6 +150,7 @@ fn parse(text: &str) -> Parsed {
                 return Parsed {
                     name: meta.name,
                     description: meta.description,
+                    argument_hint: meta.argument_hint,
                     body: body.trim_start().to_string(),
                 };
             }
@@ -152,6 +159,7 @@ fn parse(text: &str) -> Parsed {
     Parsed {
         name: None,
         description: None,
+        argument_hint: None,
         body: trimmed.trim_start().to_string(),
     }
 }
