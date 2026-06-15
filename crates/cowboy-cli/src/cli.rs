@@ -187,6 +187,9 @@ pub enum Command {
         branch: Option<String>,
     },
 
+    /// Create or inspect Ranch Plans (multi-workstream tasks).
+    Ranch(RanchArgs),
+
     /// List session logs.
     Logs,
 
@@ -411,6 +414,29 @@ pub enum ArtifactCommand {
         summary: Option<String>,
         #[arg(long)]
         session: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct RanchArgs {
+    #[command(subcommand)]
+    pub command: RanchCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RanchCommand {
+    /// Create a new ranch plan (writes a skeleton ranch.yaml to fill in).
+    Create {
+        /// The ranch's title (also seeds its id).
+        title: String,
+        /// The overall goal.
+        #[arg(long)]
+        goal: Option<String>,
+    },
+    /// Show ranch status: all ranches, or one with its workstreams.
+    Status {
+        #[arg(value_name = "RANCH")]
+        id: Option<String>,
     },
 }
 

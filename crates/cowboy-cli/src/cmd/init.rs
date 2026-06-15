@@ -62,7 +62,15 @@ fn write_file(path: &Path, contents: &str, force: bool) -> Result<()> {
 /// Ensure `.gitignore` ignores secrets and session artifacts.
 fn ensure_gitignore(root: &Path) -> Result<()> {
     let path = root.join(".gitignore");
-    let wanted = [".env", ".cowboy/sessions/", "/target"];
+    // Ranch plans + their published artifacts are committed (shared source of
+    // truth); only per-ranch runtime/scratch files are ignored.
+    let wanted = [
+        ".env",
+        ".cowboy/sessions/",
+        ".cowboy/ranches/*/events.jsonl",
+        ".cowboy/ranches/*/workstreams/",
+        "/target",
+    ];
     let existing = fs::read_to_string(&path).unwrap_or_default();
     let mut additions = String::new();
     for entry in wanted {

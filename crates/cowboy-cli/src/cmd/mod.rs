@@ -15,6 +15,7 @@ pub mod memory;
 pub mod models;
 pub mod patch;
 pub mod proc;
+pub mod ranch;
 pub mod review;
 pub mod run;
 pub mod secrets;
