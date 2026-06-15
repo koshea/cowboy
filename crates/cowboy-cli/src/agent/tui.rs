@@ -236,10 +236,15 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 }
 
 /// Copy `text` to the system clipboard via OSC 52. Works in Ghostty, kitty,
-/// iTerm2, and over SSH/tmux (with passthrough). Written straight to stdout —
-/// it's an escape sequence the terminal consumes, not visible output.
-fn clipboard_copy(text: &str) {
-    use std::io::Write;
+/// iTerm2, and over SSH/tmux (with passthrough).
+///
+/// `out` MUST be ratatui's own terminal backend (`terminal.backend_mut()`), not
+/// a fresh `io::stdout()`: crossterm buffers each frame and flushes it at the
+/// end of `draw()`, so a write to an independent stdout handle interleaves with
+/// a queued-but-unflushed frame and the OSC 52 bytes get eaten. Routing it
+/// through the same writer keeps everything on one buffer with deterministic
+/// ordering. The event loop calls this *after* `draw()` has flushed the frame.
+fn clipboard_copy(out: &mut impl io::Write, text: &str) {
     // OSC 52: ask the terminal to set the system clipboard. Works over SSH and
     // in most modern terminals (the terminal must allow clipboard writes).
     let osc = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
@@ -254,7 +259,6 @@ fn clipboard_copy(text: &str) {
     } else {
         osc
     };
-    let mut out = io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
 }
@@ -477,6 +481,13 @@ fn event_loop(
         app.tick();
         terminal.draw(|f| draw(f, &app))?;
 
+        // Flush any queued clipboard copy *after* the frame is on the wire, and
+        // through ratatui's own backend, so the OSC 52 sequence isn't eaten by
+        // crossterm's buffered frame (see `clipboard_copy`).
+        if let Some(text) = app.take_pending_copy() {
+            clipboard_copy(terminal.backend_mut(), &text);
+        }
+
         if event::poll(Duration::from_millis(120))? {
             let ev = event::read()?;
             let input_before = app.input_text();
@@ -672,7 +683,7 @@ fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 if let Some(text) = app.selected_text(terminal.current_buffer_mut()) {
                     let n = text.chars().count();
-                    clipboard_copy(&text);
+                    app.request_copy(text);
                     app.status = format!("copied {n} chars");
                 }
                 app.clear_selection();
@@ -1017,7 +1028,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         "copy" => match last_answer(app) {
             Some(text) => {
                 let n = text.chars().count();
-                clipboard_copy(&text);
+                app.request_copy(text);
                 app.status = format!("copied {n} chars");
             }
             None => app.push(LineKind::Notice, "nothing to copy yet"),

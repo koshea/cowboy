@@ -213,7 +213,7 @@ pub struct App {
     pub plan: Vec<(String, String)>,
     /// Set while the session has declared itself blocked (shown in the status bar).
     pub blocked: Option<String>,
-    /// Input editor (multi-line, cursor) via tui-textarea.
+    /// Input editor (multi-line, cursor) via ratatui-textarea.
     pub textarea: TextArea<'static>,
     pub mode: Mode,
     pub throbber: ThrobberState,
@@ -237,6 +237,11 @@ pub struct App {
     pub choice: Option<Choice>,
     /// Slash-command autocomplete popup (set while the input is `/<partial>`).
     pub completion: Option<CompletionState>,
+    /// Text awaiting copy to the system clipboard. The event loop drains it
+    /// *after* the frame is flushed, writing the OSC 52 sequence through
+    /// ratatui's own backend — writing to an independent stdout handle here
+    /// races crossterm's buffered frame and the bytes get eaten.
+    pub pending_copy: Option<String>,
 }
 
 /// A mouse text selection, in absolute terminal coordinates (col, row).
@@ -301,7 +306,19 @@ impl App {
             model_form: None,
             choice: None,
             completion: None,
+            pending_copy: None,
         }
+    }
+
+    /// Request that `text` be copied to the system clipboard. The actual OSC 52
+    /// write is deferred to the event loop (see [`App::pending_copy`]).
+    pub fn request_copy(&mut self, text: impl Into<String>) {
+        self.pending_copy = Some(text.into());
+    }
+
+    /// Take any text queued for clipboard copy (called by the event loop).
+    pub fn take_pending_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
     }
 
     /// Set the autocomplete candidates (selection reset to the top); empty clears.
