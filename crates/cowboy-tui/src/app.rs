@@ -1004,7 +1004,7 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
     .min(u16::MAX as usize) as u16;
 
     let title = if !app.follow && (offset_top as usize) < max_scroll {
-        format!(" {}  ▲ scrollback · End to follow ", app.title)
+        format!(" {}  ▲ scrollback · Shift+End to follow ", app.title)
     } else {
         format!(" {} ", app.title)
     };
