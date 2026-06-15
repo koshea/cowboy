@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         Some(Command::Message { message, to, all }) => cmd::bus::send(message, to, all).await,
         Some(Command::Inbox { session }) => cmd::bus::inbox(session).await,
         Some(Command::Review { session, branch }) => cmd::review::run(session, branch),
-        Some(Command::Ranch(args)) => cmd::ranch::run(args.command),
+        Some(Command::Ranch(args)) => cmd::ranch::run(args.command).await,
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),

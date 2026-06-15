@@ -170,6 +170,18 @@ fn make_project() -> assert_fs::TempDir {
         .status
         .success();
     assert!(ok, "cowboy init should succeed");
+    // An initial commit so `git worktree add` (ranch start) has a base HEAD.
+    let git = |args: &[&str]| {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(args)
+            .output();
+    };
+    git(&["config", "user.email", "t@t"]);
+    git(&["config", "user.name", "t"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "init"]);
     dir
 }
 
@@ -564,6 +576,108 @@ fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
         lifecycle_final.contains("session_completed"),
         "ending the session should emit session_completed"
     );
+}
+
+/// Ranch Stage 2: `cowboy ranch start` launches the ready workstream (schema) in
+/// its own worktree/branch, tags its session, and leaves the dependent one (api)
+/// waiting — the dependency-aware launch loop. Needs a provider; cleans up its
+/// worktree + any containers.
+#[test]
+#[ignore = "real model: launches a ranch workstream worker"]
+fn e2e_ranch_start_launches_ready_workstream() {
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let docker_before = cowboy_docker_objects();
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    // Seed a ranch: schema (no deps) + api (depends on schema).
+    let ranch_dir = proj.path().join(".cowboy/ranches/billing");
+    std::fs::create_dir_all(&ranch_dir).unwrap();
+    std::fs::write(
+        ranch_dir.join("ranch.yaml"),
+        "version: 1\nid: billing\ntitle: Billing\nstatus: planning\n\
+         created_ms: 1\nupdated_ms: 1\nworkstreams:\n\
+         \x20 - id: schema\n    title: Schema\n    goal: write hello to a file\n    depends_on: []\n\
+         \x20 - id: api\n    title: API\n    depends_on: [schema]\n",
+    )
+    .unwrap();
+
+    // Launch via the real CLI against the test daemon.
+    let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .env("XDG_RUNTIME_DIR", env.runtime.path())
+        .env("XDG_STATE_HOME", env.state.path())
+        .args(["ranch", "start", "billing"])
+        .output()
+        .expect("run ranch start");
+    assert!(
+        out.status.success(),
+        "ranch start failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A session tagged ranch=billing / workstream=schema is registered.
+    let mut tagged = None;
+    for _ in 0..50 {
+        if let Some(DaemonResp::Sessions { sessions }) =
+            dreq(&sock, DaemonReq::ListSessions { root: None })
+        {
+            if let Some(s) = sessions
+                .into_iter()
+                .find(|s| s.workstream_id.as_deref() == Some("schema"))
+            {
+                tagged = Some(s);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let tagged = tagged.expect("schema workstream session should be registered");
+    assert_eq!(tagged.ranch_id.as_deref(), Some("billing"));
+
+    // ranch.yaml advanced: schema running on its branch; api still only declared.
+    let yaml = std::fs::read_to_string(ranch_dir.join("ranch.yaml")).unwrap();
+    assert!(
+        yaml.contains("cowboy/billing-schema"),
+        "schema branch recorded:\n{yaml}"
+    );
+    let branch_ok = Command::new("git")
+        .arg("-C")
+        .arg(proj.path())
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "refs/heads/cowboy/billing-schema",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(branch_ok, "branch cowboy/billing-schema should exist");
+
+    // Cleanup: end the worker, remove its worktree, reap any containers.
+    if let Some(ws) = &tagged.worker_sock {
+        Client::connect(ws).send(&ClientMsg::End);
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    if let Some(p) = cowboy_core::ranch::load(proj.path(), "billing")
+        .ok()
+        .and_then(|r| r.workstream("schema").and_then(|w| w.worktree_path.clone()))
+    {
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(proj.path())
+            .args(["worktree", "remove", "--force"])
+            .arg(&p)
+            .output();
+    }
+    reap_new_docker(&docker_before);
 }
 
 /// The flagship real-Docker turn: the daemon starts a session that runs an

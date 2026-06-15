@@ -443,6 +443,12 @@ pub enum RanchCommand {
         #[arg(value_name = "RANCH")]
         id: Option<String>,
     },
+    /// Launch ready workstreams (deps complete), each in its own worktree/branch.
+    /// Re-run as workstreams finish to advance the plan.
+    Start {
+        #[arg(value_name = "RANCH")]
+        id: String,
+    },
 }
 
 #[derive(Debug, Args)]
