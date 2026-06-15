@@ -494,13 +494,26 @@ fn event_loop(
         // (reliable locally on X11/Wayland); fall back to OSC 52 — written
         // through ratatui's own backend *after* the frame, so it isn't eaten by
         // crossterm's buffered frame — when there's no local display (SSH).
+        // Outcome is reported both in the status line and the per-run log
+        // ($TMPDIR/cowboy-<pid>.log) so copy failures are diagnosable.
         if let Some(text) = app.take_pending_copy() {
-            let copied = clipboard
-                .as_ref()
-                .is_some_and(|c| c.set_text(text.clone()).is_ok());
-            if !copied {
-                clipboard_copy(terminal.backend_mut(), &text);
-            }
+            let n = text.chars().count();
+            app.status = match clipboard.as_ref().map(|c| c.set_text(text.clone())) {
+                Some(Ok(())) => {
+                    eprintln!("[copy] {n} chars -> OS clipboard ok");
+                    format!("copied {n} chars")
+                }
+                Some(Err(e)) => {
+                    eprintln!("[copy] OS clipboard failed ({e}); OSC 52 fallback");
+                    clipboard_copy(terminal.backend_mut(), &text);
+                    format!("copied {n} chars (osc52 fallback)")
+                }
+                None => {
+                    eprintln!("[copy] no OS clipboard (headless/SSH?); OSC 52");
+                    clipboard_copy(terminal.backend_mut(), &text);
+                    format!("copied {n} chars (osc52)")
+                }
+            };
         }
 
         if event::poll(Duration::from_millis(120))? {
@@ -696,10 +709,11 @@ fn handle_key(
     if app.has_selection() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(text) = app.selected_text(terminal.current_buffer_mut()) {
-                    let n = text.chars().count();
-                    app.request_copy(text);
-                    app.status = format!("copied {n} chars");
+                match app.selected_text(terminal.current_buffer_mut()) {
+                    // Status/outcome is set by the event-loop drain once the
+                    // copy actually runs (so it reports the real result).
+                    Some(text) => app.request_copy(text),
+                    None => app.status = "copy: nothing under the selection".into(),
                 }
                 app.clear_selection();
                 return false;
@@ -1041,11 +1055,8 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             }
         }
         "copy" => match last_answer(app) {
-            Some(text) => {
-                let n = text.chars().count();
-                app.request_copy(text);
-                app.status = format!("copied {n} chars");
-            }
+            // Outcome/status is set by the event-loop drain once it runs.
+            Some(text) => app.request_copy(text),
             None => app.push(LineKind::Notice, "nothing to copy yet"),
         },
         "model" => match arg {
