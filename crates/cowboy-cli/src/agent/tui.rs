@@ -511,6 +511,21 @@ fn event_loop(
             let ev = event::read()?;
             let input_before = app.input_text();
             match ev {
+                // Ctrl-L: force a full repaint — escape hatch for terminal render
+                // artifacts (stale cells some terminals leave behind). Discards
+                // ratatui's known-screen state so the next draw rewrites every cell.
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('l')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    let _ = terminal.clear();
+                    app.status = "redrawn".into();
+                }
+                // A resize can leave stale cells from the old geometry; repaint.
+                Event::Resize(_, _) => {
+                    let _ = terminal.clear();
+                }
                 // Ignore key *release* events (kitty protocol reports them).
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctx = KeyCtx {
@@ -898,6 +913,9 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         (Mode::AwaitingChoice, _) => app.input_event(event),
         // Submit a message (Idle or while a turn is running -> queued).
         (Mode::Idle | Mode::Running, KeyCode::Enter) => {
+            // A new turn streams output; drop any stray selection so its
+            // highlight can't linger over the incoming text.
+            app.clear_selection();
             let msg = app.take_input();
             let trimmed = msg.trim();
             if trimmed.is_empty() {
