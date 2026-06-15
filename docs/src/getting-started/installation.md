@@ -5,10 +5,30 @@
 - **Linux** (the current target).
 - **Docker** and **`docker compose`**.
 - **`nftables`** (the gateway applies an nft ruleset).
-- An **OpenAI-compatible model endpoint** (LiteLLM, OpenRouter, Ollama, vLLM, an
-  internal gateway, …).
+- An **OpenAI-compatible model endpoint** (see below).
 
 `cowboy doctor` checks all of these and reports what's missing.
+
+## Recommended: an LLM gateway
+
+Cowboy talks to one OpenAI-compatible endpoint, and by design it does **not**
+handle quotas, rate limits, spend caps, retries, or failover — those belong to an
+**LLM gateway** in front of your providers. Before you get started, the smoothest
+setup is to stand one up:
+
+- **[LiteLLM](https://github.com/BerriAI/litellm)** or
+  **[Bifrost](https://github.com/maximhq/bifrost)** — point Cowboy at the gateway,
+  and define as many backend models as you like behind it (different providers,
+  fallbacks, budgets, keys) without changing anything in Cowboy.
+
+A gateway is what makes the [crew](../using/crew.md) shine: your roster names
+logical models, the gateway resolves them — including routing aliases and
+failover — and owns the rate/quota/spend policy.
+
+**Just want one provider?** That's fine too — Cowboy works with any single
+OpenAI-compatible endpoint directly (OpenAI, OpenRouter, a local Ollama or vLLM,
+an internal gateway). You don't need to run a gateway to start; reach for one when
+you want multiple models, budgets, or failover.
 
 ## Install the binaries
 
@@ -32,7 +52,8 @@ if missing.
 
 ## Configure a model provider
 
-Provider credentials are **host-owned** and stored outside any project:
+Provider credentials are **host-owned** and stored outside any project. Point the
+endpoint at your gateway (if you set one up) or directly at a provider:
 
 ```sh
 cowboy models setup             # save an endpoint + key to ~/.config/cowboy/providers.yaml (0600)
