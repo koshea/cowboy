@@ -237,6 +237,33 @@ fn get(sock: &Path, id: &str) -> Option<cowboy_core::daemonproto::SessionInfo> {
     }
 }
 
+/// A live `SessionInfo` for a fake lease holder (our own pid, so it reads as
+/// alive and its exclusive lease is NOT reclaimable — like a real parent).
+fn fake_parent(id: &str, root: &Path) -> cowboy_core::daemonproto::SessionInfo {
+    cowboy_core::daemonproto::SessionInfo {
+        id: id.into(),
+        root: root.to_path_buf(),
+        task: None,
+        status: SessionStatus::Running,
+        pid: Some(std::process::id()),
+        branch: None,
+        container_name: None,
+        worker_sock: None,
+        journal_path: None,
+        lease_mode: Some(LeaseMode::Exclusive),
+        started_ms: 1,
+        last_heartbeat_ms: 1,
+        turn: 0,
+        tokens: (0, 0),
+        attached_clients: 0,
+        diffstat: String::new(),
+        running_command: None,
+        blocked_reason: None,
+        ranch_id: None,
+        workstream_id: None,
+    }
+}
+
 /// A client connection to a worker's per-session socket.
 struct Client {
     r: BufReader<UnixStream>,
@@ -1111,6 +1138,73 @@ fn e2e_crew_routes_delegated_subagents() {
     assert!(
         routed.iter().all(|m| m == &default_model),
         "subagents should route to the rostered model {default_model}, got {routed:?}"
+    );
+
+    reap_new_docker(&docker_before);
+}
+
+/// Subagents share their parent's worktree by design — a subagent (run with a
+/// held worktree lease) must NOT try to acquire the lease, or it's denied and
+/// returns nothing ("no final answer"). This reproduces a parent holding the
+/// exclusive lease and asserts a subagent-style child still produces a final
+/// answer. Needs Docker + a real model.
+#[test]
+#[ignore = "real Docker + model: subagent runs in a parent-held worktree"]
+fn e2e_subagent_runs_in_held_worktree() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    let docker_before = cowboy_docker_objects();
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+    let root = std::fs::canonicalize(proj.path()).unwrap();
+
+    // A live "parent" holds the exclusive lease on the worktree.
+    dreq(
+        &sock,
+        DaemonReq::RegisterWorker {
+            info: fake_parent("parent", &root),
+        },
+    );
+    match dreq(
+        &sock,
+        DaemonReq::AcquireLease {
+            key: root.clone(),
+            session: "parent".into(),
+            mode: LeaseMode::Exclusive,
+        },
+    ) {
+        Some(DaemonResp::LeaseGranted { .. }) => {}
+        other => panic!("expected the parent lease to be granted, got {other:?}"),
+    }
+
+    // A subagent-style child in the SAME worktree (COWBOY_SUBAGENT_DEPTH set,
+    // print-final-only) must run uncoordinated and produce an answer.
+    let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .env("XDG_RUNTIME_DIR", env.runtime.path())
+        .env("XDG_STATE_HOME", env.state.path())
+        .env("COWBOY_SUBAGENT_DEPTH", "1")
+        .env("COWBOY_PRINT_FINAL_ONLY", "1")
+        .stdin(std::process::Stdio::null())
+        .arg("Reply with exactly the word: ready. Then finish.")
+        .output()
+        .expect("run subagent-style child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && !stdout.trim().is_empty(),
+        "subagent should produce a final answer despite the held lease; status={:?} stdout={:?} stderr={:?}",
+        out.status.code(),
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
     );
 
     reap_new_docker(&docker_before);

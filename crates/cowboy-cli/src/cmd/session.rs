@@ -175,7 +175,16 @@ pub async fn run(
 
         // Take the worktree lease (bails if another session holds it). Best-effort:
         // if the daemon is unreachable we run uncoordinated rather than block.
-        let coordinated = coordinate_oneshot(&root, &id, &task).await?;
+        // EXCEPTION: a subagent shares its parent's worktree + container by design
+        // (it runs in the root the parent already holds exclusively), so it must
+        // not try to acquire the lease — that would be denied and abort it. Only
+        // top-level one-shot runs coordinate.
+        let is_subagent = std::env::var_os("COWBOY_SUBAGENT_DEPTH").is_some();
+        let coordinated = if is_subagent {
+            false
+        } else {
+            coordinate_oneshot(&root, &id, &task).await?
+        };
 
         let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
         // Continue a prior session if asked (load its transcript as history).
