@@ -179,12 +179,9 @@ fn check_credentials(path: &Path, root: &Path) -> Status {
         Ok(c) => c,
         Err(_) => return Status::Ok("none".into()),
     };
-    // Include the user's personal overlay (global + per-worktree).
+    // Include the user's personal overlay (global + per-repo, all worktrees).
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    cowboy_core::usersecrets::merge_into(
-        &mut cfg,
-        &format!("{:08x}", crate::net::runtime::project_hash(&canon)),
-    );
+    cowboy_core::usersecrets::merge_into(&mut cfg, &crate::net::runtime::repo_key(&canon));
     let (mut count, mut warns, mut fails) = (0usize, Vec::new(), Vec::new());
     for e in &cfg.secrets.env {
         count += 1;

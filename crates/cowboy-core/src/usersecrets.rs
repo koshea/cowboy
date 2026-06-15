@@ -3,13 +3,13 @@
 //!
 //! Some credential grants are personal preference and per-machine paths that
 //! shouldn't be committed into a repo's opinionated `security.yaml`. Those live
-//! in the home dir, segmented like memory: a cross-project `global.yaml` and a
-//! per-worktree `projects/<key>.yaml` (key = the same project hash used for
-//! memory/containers). At session start the effective config is:
+//! in the home dir: a cross-project `global.yaml` and a per-**repository**
+//! `projects/<key>.yaml` (key derived from the main repo, so a grant applies to
+//! every worktree of that repo). At session start the effective config is:
 //!
 //! ```text
 //! repo .cowboy/security.yaml  ∪  ~/.config/cowboy/secrets/global.yaml
-//!                            ∪  ~/.config/cowboy/secrets/projects/<key>.yaml
+//!                            ∪  ~/.config/cowboy/secrets/projects/<repo-key>.yaml
 //! ```
 //!
 //! Only credential grants (`env`, `files`) and the additive network `allow`-list
@@ -46,7 +46,8 @@ pub fn global_file() -> Option<PathBuf> {
     base().map(|b| b.join("global.yaml"))
 }
 
-/// The per-worktree overlay file (`secrets/projects/<key>.yaml`).
+/// The per-repository overlay file (`secrets/projects/<key>.yaml`), shared by
+/// all of the repo's worktrees.
 pub fn project_file(key: &str) -> Option<PathBuf> {
     base().map(|b| b.join("projects").join(format!("{key}.yaml")))
 }

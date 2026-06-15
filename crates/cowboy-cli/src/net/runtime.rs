@@ -464,6 +464,35 @@ pub fn project_hash(root: &Path) -> u32 {
     hasher.finish() as u32
 }
 
+/// The repository root that's shared by every worktree: `git rev-parse
+/// --git-common-dir` resolves to `<main-repo>/.git` from both a normal checkout
+/// and a linked worktree, so its parent is the one repo they share. Falls back
+/// to `root` for a non-git directory.
+pub fn repo_root(root: &Path) -> PathBuf {
+    if let Ok(out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()
+    {
+        if out.status.success() {
+            let common = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
+            if let Some(parent) = common.parent() {
+                if !parent.as_os_str().is_empty() {
+                    return parent.to_path_buf();
+                }
+            }
+        }
+    }
+    root.to_path_buf()
+}
+
+/// The per-repository overlay key (stable across all of a repo's worktrees).
+/// Used for the personal credential overlay so a grant applies to every worktree.
+pub fn repo_key(root: &Path) -> String {
+    format!("{:08x}", project_hash(&repo_root(root)))
+}
+
 /// Derive a stable, unique container name from the project path.
 pub fn container_name_for(root: &Path) -> String {
     let mut hasher = DefaultHasher::new();

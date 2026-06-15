@@ -65,9 +65,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 
     let mut security = SecurityConfig::load(&paths.security)
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-    // Merge the user's personal credential overlay (global + per-worktree) and
-    // re-validate the combined config.
-    cowboy_core::usersecrets::merge_into(&mut security, &format!("{:08x}", project_hash(&root)));
+    // Merge the user's personal credential overlay (global + per-repo, shared by
+    // all of a repo's worktrees) and re-validate the combined config.
+    cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(&root));
     security
         .validate()
         .context("validating merged credential grants")?;

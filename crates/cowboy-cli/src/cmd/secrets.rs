@@ -3,16 +3,17 @@
 //! Grants come from three host-owned sources, merged at session start:
 //! the repo's `.cowboy/security.yaml` (committed, opinionated), and your personal
 //! overlay under `~/.config/cowboy/secrets/` — `global.yaml` (all projects) and
-//! `projects/<key>.yaml` (this worktree, keyed like memory). The agent can write
-//! none of these. `add` writes your personal overlay by default (so personal
-//! paths don't end up in the repo); `--repo` instead prints a snippet to paste.
+//! `projects/<key>.yaml` (this repository — keyed by the main repo, so it applies
+//! to every worktree). The agent can write none of these. `add` writes your
+//! personal overlay by default (so personal paths don't end up in the repo);
+//! `--repo` instead prints a snippet to paste.
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{expand_path, ConfigPaths, SecretEnv, SecretMount, SecurityConfig};
 use cowboy_core::usersecrets;
 
 use crate::cli::{SecretsAddArgs, SecretsCommand};
-use crate::net::runtime::project_hash;
+use crate::net::runtime::repo_key;
 
 pub fn run(command: SecretsCommand) -> Result<()> {
     match command {
@@ -21,11 +22,12 @@ pub fn run(command: SecretsCommand) -> Result<()> {
     }
 }
 
-/// The merge key for the current worktree (matches the agent's).
+/// The merge key for the current repository (matches the agent's). Keyed by the
+/// repo (not the worktree), so a grant applies to every worktree of the repo.
 fn project_key() -> Result<String> {
     let root = crate::cmd::project_root()?;
     let canon = std::fs::canonicalize(&root).unwrap_or(root);
-    Ok(format!("{:08x}", project_hash(&canon)))
+    Ok(repo_key(&canon))
 }
 
 /// A known-tool preset: read-only file grants + the network it needs.
@@ -181,7 +183,7 @@ fn add(args: SecretsAddArgs) -> Result<()> {
     let scope = if args.global {
         "all projects"
     } else {
-        "this worktree"
+        "this repo (all worktrees)"
     };
     println!("✓ wrote credential grant to {}", path.display());
     println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
