@@ -95,6 +95,8 @@ pub struct AgentLoop<'a> {
     budget_warned: bool,
     /// The agent's current working plan: (step, status) in order.
     plan: Vec<(String, String)>,
+    /// One-shot latch so `SessionStarted` is emitted to the lifecycle log once.
+    lifecycle_started: bool,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -145,6 +147,7 @@ impl<'a> AgentLoop<'a> {
             cost_usd: 0.0,
             budget_warned: false,
             plan: Vec::new(),
+            lifecycle_started: false,
             messages: vec![Message::system(SYSTEM_PROMPT)],
             ui,
             logger: None,
@@ -174,6 +177,7 @@ impl<'a> AgentLoop<'a> {
     /// Replace the working plan, surface it to the UI, and echo it back to the
     /// model as the tool observation. Statuses are normalized to a known set.
     fn run_plan(&mut self, args: PlanArgs) -> String {
+        let prev = std::mem::take(&mut self.plan);
         self.plan = args
             .steps
             .into_iter()
@@ -186,6 +190,25 @@ impl<'a> AgentLoop<'a> {
                 (s.step, status.to_string())
             })
             .collect();
+        // Emit lifecycle events for steps that newly entered in_progress/done.
+        use cowboy_core::lifecycle::LifecycleEvent;
+        let was = |step: &str| {
+            prev.iter()
+                .find(|(s, _)| s == step)
+                .map(|(_, st)| st.as_str())
+        };
+        for (step, status) in &self.plan {
+            let before = was(step);
+            match status.as_str() {
+                "in_progress" if before != Some("in_progress") => {
+                    self.emit_lifecycle(LifecycleEvent::PlanStepStarted { step: step.clone() });
+                }
+                "done" if before != Some("done") => {
+                    self.emit_lifecycle(LifecycleEvent::PlanStepCompleted { step: step.clone() });
+                }
+                _ => {}
+            }
+        }
         self.ui.plan(&self.plan);
         let done = self.plan.iter().filter(|(_, s)| s == "done").count();
         let rendered = render_plan(&self.plan);
@@ -193,6 +216,14 @@ impl<'a> AgentLoop<'a> {
             "Plan updated ({done}/{} done):\n{rendered}",
             self.plan.len()
         )
+    }
+
+    /// Append a semantic lifecycle event to the session log (best-effort, no-op
+    /// without a logger). These drive Ranch coordination + the message bus.
+    fn emit_lifecycle(&self, event: cowboy_core::lifecycle::LifecycleEvent) {
+        if let Some(l) = &self.logger {
+            cowboy_core::lifecycle::append_in(l.dir(), l.id(), event, now_ms());
+        }
     }
 
     /// Hard stop reason if a configured budget has been reached, else `None`.
@@ -421,6 +452,14 @@ impl<'a> AgentLoop<'a> {
     /// Finalize the session log (diff + summary). Call once when the
     /// conversation ends.
     pub fn finalize_session(&self) {
+        let status = if self.last_final.is_some() {
+            "complete"
+        } else {
+            "incomplete"
+        };
+        self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SessionCompleted {
+            status: status.to_string(),
+        });
         if let Some(l) = &self.logger {
             l.finalize(self.last_final.as_deref());
         }
@@ -442,6 +481,10 @@ impl<'a> AgentLoop<'a> {
     /// Run the loop for `task` until completion, cancellation, or the iteration
     /// cap. Returns the final message if the agent produced one.
     async fn run_inner(&mut self, task: &str) -> Result<Option<String>> {
+        if !self.lifecycle_started {
+            self.lifecycle_started = true;
+            self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SessionStarted);
+        }
         let user_msg = Message::user(task);
         if let Some(l) = &mut self.logger {
             l.log_message(&user_msg);
@@ -829,13 +872,21 @@ impl<'a> AgentLoop<'a> {
                     args.summary.clone(),
                     now_ms(),
                 ) {
-                    Ok(a) => format!(
-                        "published artifact {} [{}] {} → {}",
-                        a.id,
-                        a.kind.as_str(),
-                        a.title,
-                        a.path.display()
-                    ),
+                    Ok(a) => {
+                        self.emit_lifecycle(
+                            cowboy_core::lifecycle::LifecycleEvent::ArtifactPublished {
+                                artifact_id: a.id.clone(),
+                                kind: a.kind.as_str().to_string(),
+                            },
+                        );
+                        format!(
+                            "published artifact {} [{}] {} → {}",
+                            a.id,
+                            a.kind.as_str(),
+                            a.title,
+                            a.path.display()
+                        )
+                    }
                     Err(e) => format!("error: {e}"),
                 }
             }
@@ -865,7 +916,12 @@ impl<'a> AgentLoop<'a> {
             None,
             now_ms(),
         ) {
-            Ok(a) => format!("handoff written ({})", a.id),
+            Ok(a) => {
+                self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::HandoffCreated {
+                    artifact_id: a.id.clone(),
+                });
+                format!("handoff written ({})", a.id)
+            }
             Err(e) => format!("handoff written to handoff.md, but indexing failed: {e}"),
         }
     }
@@ -1463,6 +1519,68 @@ mod tests {
         assert_eq!(arts[0].kind, cowboy_core::artifact::ArtifactKind::Contract);
         let (_, body) = cowboy_core::artifact::get_in(&session_dir, &arts[0].id).unwrap();
         assert!(body.contains("GET /things"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_recorded_in_order() {
+        use cowboy_core::lifecycle::{read_in, LifecycleEvent};
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "plan",
+                    r#"{"steps":[{"step":"build","status":"in_progress"}]}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call(
+                    "2",
+                    "artifact",
+                    r#"{"action":"publish","kind":"summary","title":"notes","content":"x"}"#,
+                )],
+            },
+            ChatResponse {
+                content: None,
+                tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+
+        let runtime = runtime_with(docker);
+        let root = runtime.root().to_path_buf();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let session_dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+
+        let kinds: Vec<_> = read_in(&session_dir).into_iter().map(|r| r.event).collect();
+        assert_eq!(kinds.first(), Some(&LifecycleEvent::SessionStarted));
+        assert!(kinds
+            .iter()
+            .any(|e| matches!(e, LifecycleEvent::PlanStepStarted { step } if step == "build")));
+        assert!(kinds
+            .iter()
+            .any(|e| matches!(e, LifecycleEvent::ArtifactPublished { .. })));
+        assert!(matches!(
+            kinds.last(),
+            Some(LifecycleEvent::SessionCompleted { .. })
+        ));
     }
 
     #[tokio::test]

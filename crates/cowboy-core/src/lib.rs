@@ -5,6 +5,7 @@ pub mod artifact;
 pub mod config;
 pub mod daemonproto;
 pub mod error;
+pub mod lifecycle;
 pub mod memory;
 pub mod model;
 pub mod model_defaults;
