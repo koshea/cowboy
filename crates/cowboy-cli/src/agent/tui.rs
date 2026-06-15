@@ -238,7 +238,20 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
 /// it's an escape sequence the terminal consumes, not visible output.
 fn clipboard_copy(text: &str) {
     use std::io::Write;
-    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    // OSC 52: ask the terminal to set the system clipboard. Works over SSH and
+    // in most modern terminals (the terminal must allow clipboard writes).
+    let osc = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    // Inside tmux/screen the sequence must be wrapped in DCS passthrough or it
+    // never reaches the outer terminal (a very common "copy doesn't work" cause).
+    let seq = if std::env::var_os("TMUX").is_some() {
+        // tmux: wrap in `\ePtmux;…\e\\` with inner ESCs doubled.
+        format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
+    } else if std::env::var_os("STY").is_some() {
+        // GNU screen: pass through via DCS.
+        format!("\x1bP{osc}\x1b\\")
+    } else {
+        osc
+    };
     let mut out = io::stdout();
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
