@@ -230,10 +230,8 @@ pub struct App {
     /// `Moved` events as drags (some terminals report button-held motion as
     /// `Moved` rather than `Drag`).
     pub selecting: bool,
-    /// Diagnostic counters since the current selection began: (drag, moved)
-    /// motion events received. Surfaced when a copy finds no text.
-    pub drag_events: u32,
-    pub move_events: u32,
+    /// Selected text captured during the last `draw` (see [`App::cache_selection`]).
+    pub selected_cache: std::cell::Cell<Option<String>>,
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
@@ -286,6 +284,27 @@ fn selection_spans(rect: Rect, sel: &Selection) -> Vec<(u16, u16, u16)> {
     spans
 }
 
+/// Read the selected text out of a rendered `buf`, restricted to `rect` (the
+/// transcript columns, so sidebars never bleed in). `None` for a bare click
+/// (anchor == cursor) or an all-whitespace selection.
+fn extract_selection(buf: &Buffer, rect: Rect, sel: &Selection) -> Option<String> {
+    if sel.anchor == sel.cursor {
+        return None; // a click, not a drag
+    }
+    let lines: Vec<String> = selection_spans(rect, sel)
+        .into_iter()
+        .map(|(y, x0, x1)| {
+            let mut s = String::new();
+            for x in x0..=x1 {
+                s.push_str(buf[(x, y)].symbol());
+            }
+            s.trim_end().to_string()
+        })
+        .collect();
+    let text = lines.join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
 impl App {
     pub fn new(title: impl Into<String>) -> Self {
         Self {
@@ -310,8 +329,7 @@ impl App {
             max_scroll: std::cell::Cell::new(0),
             selection: None,
             selecting: false,
-            drag_events: 0,
-            move_events: 0,
+            selected_cache: std::cell::Cell::new(None),
             transcript_area: std::cell::Cell::new(Rect::ZERO),
             model_picker: None,
             model_form: None,
@@ -373,8 +391,6 @@ impl App {
     /// Begin a selection at an absolute screen position, but only if it lands in
     /// the transcript (clicks elsewhere just clear any selection).
     pub fn begin_selection(&mut self, col: u16, row: u16) {
-        self.drag_events = 0;
-        self.move_events = 0;
         if self.transcript_area.get().contains(Position::new(col, row)) {
             self.selection = Some(Selection {
                 anchor: (col, row),
@@ -417,22 +433,23 @@ impl App {
     /// bare click (no drag) or an all-whitespace selection.
     pub fn selected_text(&self, buf: &Buffer) -> Option<String> {
         let sel = self.selection?;
-        if sel.anchor == sel.cursor {
-            return None; // a click, not a drag
-        }
-        let rect = self.transcript_area.get();
-        let lines: Vec<String> = selection_spans(rect, &sel)
-            .into_iter()
-            .map(|(y, x0, x1)| {
-                let mut s = String::new();
-                for x in x0..=x1 {
-                    s.push_str(buf[(x, y)].symbol());
-                }
-                s.trim_end().to_string()
-            })
-            .collect();
-        let text = lines.join("\n");
-        (!text.trim().is_empty()).then_some(text)
+        extract_selection(buf, self.transcript_area.get(), &sel)
+    }
+
+    /// Cache the selected text from the live frame buffer. Called *during*
+    /// `draw` (where the buffer still holds rendered content) because after
+    /// `draw` returns, ratatui has swapped in a blank buffer — so reading
+    /// `current_buffer_mut()` from the event loop would see only spaces.
+    pub fn cache_selection(&self, buf: &Buffer) {
+        let text = self
+            .selection
+            .and_then(|sel| extract_selection(buf, self.transcript_area.get(), &sel));
+        self.selected_cache.set(text);
+    }
+
+    /// Take the most recently cached selection text (set by [`App::cache_selection`]).
+    pub fn take_selected(&self) -> Option<String> {
+        self.selected_cache.take()
     }
 
     /// Scroll the transcript up (toward older content) by `n` lines.
@@ -1025,6 +1042,9 @@ fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     }
+    // Capture the selected text now, from the live frame buffer — after `draw`
+    // returns ratatui swaps in a blank buffer, so `y` can't read it later.
+    app.cache_selection(f.buffer_mut());
 }
 
 /// A consistent rounded side/utility panel.
@@ -1675,6 +1695,34 @@ mod tests {
             cursor: (r.x, r.y),
         });
         assert!(app.selected_text(term.backend().buffer()).is_none());
+    }
+
+    #[test]
+    fn draw_caches_selected_text_for_yank() {
+        // Regression: the event loop reads the cache (populated during draw),
+        // not `current_buffer_mut()` — which ratatui blanks after the buffer
+        // swap, so reading it from a key handler would yield only spaces.
+        let mut app = App::new("t");
+        app.push(LineKind::Agent, "hello world from the transcript");
+        let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
+        // First draw establishes the transcript rect.
+        term.draw(|f| draw(f, &app)).unwrap();
+        let r = app.transcript_area.get();
+        app.selection = Some(Selection {
+            anchor: (r.x, r.y),
+            cursor: (r.right() - 1, r.y),
+        });
+        // The draw that paints the selection must also cache its text.
+        term.draw(|f| draw(f, &app)).unwrap();
+        let text = app
+            .take_selected()
+            .expect("selection text cached during draw");
+        assert!(
+            text.contains("hello world from the transcript"),
+            "got {text:?}"
+        );
+        // Taking it empties the cache.
+        assert!(app.take_selected().is_none());
     }
 
     #[test]
