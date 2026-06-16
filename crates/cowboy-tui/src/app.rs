@@ -191,6 +191,29 @@ pub struct CompletionState {
     pub selected: usize,
 }
 
+/// One aggregated network-activity row: a verdict + destination, with how many
+/// times it's been seen (gateway decisions repeat a lot for chatty hosts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivityEntry {
+    pub verdict: String,
+    pub host: String,
+    pub count: u32,
+}
+
+/// Parse a raw gateway-activity line (`"<verdict> <host:port> (<reason>)"`) into
+/// its verdict and destination, dropping the verbose reason.
+fn parse_activity(raw: &str) -> (String, String) {
+    let raw = raw.trim();
+    let (verdict, rest) = raw.split_once(' ').unwrap_or((raw, ""));
+    let host = rest
+        .split_once(" (")
+        .map(|(h, _)| h)
+        .unwrap_or(rest)
+        .trim()
+        .to_string();
+    (verdict.to_string(), host)
+}
+
 /// The shell command currently running, for the live status indicator.
 #[derive(Debug, Clone)]
 pub struct RunningCmd {
@@ -219,8 +242,9 @@ pub struct App {
     /// In-progress streamed "thinking" (reasoning), shown dimmed and cleared
     /// when the response commits. Never added to the transcript.
     pub reasoning: String,
-    /// Network activity log (gateway decisions).
-    pub activity: Vec<String>,
+    /// Network activity log (gateway decisions), aggregated by verdict+host so
+    /// repeated hits collapse to one row with a count.
+    pub activity: Vec<ActivityEntry>,
     /// Managed processes: (name, status).
     pub processes: Vec<(String, String)>,
     /// The agent's working plan: ordered (step, status) pairs. When non-empty a
@@ -609,9 +633,28 @@ impl App {
         }
     }
 
-    /// Append a network activity line.
+    /// Record a network-activity line, aggregating by verdict+host: a repeat
+    /// bumps the existing row's count instead of appending a duplicate. Caps the
+    /// number of distinct rows (oldest dropped) so the pane stays bounded.
     pub fn activity(&mut self, line: impl Into<String>) {
-        self.activity.push(line.into());
+        const MAX_ROWS: usize = 100;
+        let (verdict, host) = parse_activity(&line.into());
+        if let Some(e) = self
+            .activity
+            .iter_mut()
+            .find(|e| e.verdict == verdict && e.host == host)
+        {
+            e.count = e.count.saturating_add(1);
+            return;
+        }
+        if self.activity.len() >= MAX_ROWS {
+            self.activity.remove(0);
+        }
+        self.activity.push(ActivityEntry {
+            verdict,
+            host,
+            count: 1,
+        });
     }
 
     /// Record a blocked/unblocked transition (status-bar flag + a notice line).
@@ -1204,18 +1247,24 @@ fn panel(title: &str) -> Block<'_> {
 }
 
 /// Color a `verdict label (reason)` activity line by its leading verdict word.
-fn activity_line(raw: &str) -> Line<'static> {
-    let (verdict, rest) = raw.split_once(' ').unwrap_or((raw, ""));
-    let vstyle = match verdict {
+fn activity_line(e: &ActivityEntry) -> Line<'static> {
+    let vstyle = match e.verdict.as_str() {
         "allow" => Style::default().fg(Color::Green),
         "deny" => Style::default().fg(Color::Red),
         "ask" => Style::default().fg(Color::Yellow),
         _ => Style::default().fg(Color::DarkGray),
     };
-    Line::from(vec![
-        Span::styled(format!("{verdict} "), vstyle),
-        Span::styled(rest.to_string(), Style::default().fg(Color::Gray)),
-    ])
+    let mut spans = vec![
+        Span::styled(format!("{} ", e.verdict), vstyle),
+        Span::styled(e.host.clone(), Style::default().fg(Color::Gray)),
+    ];
+    if e.count > 1 {
+        spans.push(Span::styled(
+            format!(" ({}x)", e.count),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
@@ -1226,11 +1275,9 @@ fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
+        // Show the most recent rows (one per distinct destination).
         let start = app.activity.len().saturating_sub(inner);
-        app.activity[start..]
-            .iter()
-            .map(|l| activity_line(l))
-            .collect()
+        app.activity[start..].iter().map(activity_line).collect()
     };
     let para = Paragraph::new(lines)
         .block(panel("network"))
@@ -1897,6 +1944,32 @@ mod tests {
         assert_eq!(app.running.as_ref().unwrap().elapsed_secs, 3);
         app.end_command();
         assert!(app.running.is_none());
+    }
+
+    #[test]
+    fn network_activity_aggregates_by_verdict_and_host() {
+        let mut app = App::new("t");
+        app.activity("allow github.com:443 (allowed by policy (domain github.com))");
+        app.activity("allow github.com:443 (allowed by policy (domain github.com))");
+        app.activity("deny evil.com:443 (blocked)");
+        app.activity("allow github.com:443 (allowed by policy)"); // same key, diff reason
+                                                                  // Two distinct rows; the repeated github.com collapsed to a count of 3.
+        assert_eq!(app.activity.len(), 2);
+        let gh = app
+            .activity
+            .iter()
+            .find(|e| e.verdict == "allow" && e.host == "github.com:443")
+            .unwrap();
+        assert_eq!(gh.count, 3);
+        assert_eq!(app.activity[1].verdict, "deny");
+        assert_eq!(app.activity[1].count, 1);
+        // A line with no reason still parses to verdict + host.
+        app.activity("ask api.github.com:443");
+        let ask = app.activity.last().unwrap();
+        assert_eq!(
+            (ask.verdict.as_str(), ask.host.as_str()),
+            ("ask", "api.github.com:443")
+        );
     }
 
     #[test]
