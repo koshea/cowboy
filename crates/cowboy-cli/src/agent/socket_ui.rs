@@ -266,6 +266,18 @@ impl AgentUi for SocketUi {
     fn plan(&mut self, steps: &[(String, String)]) {
         self.emit(UiEventMsg::Plan(steps.to_vec()));
     }
+    fn subagent_started(&mut self, label: &str, model: &str) {
+        self.emit(UiEventMsg::SubagentStarted {
+            label: label.to_string(),
+            model: model.to_string(),
+        });
+    }
+    fn subagent_done(&mut self, label: &str, ok: bool) {
+        self.emit(UiEventMsg::SubagentDone {
+            label: label.to_string(),
+            ok,
+        });
+    }
     fn final_message(&mut self, message: &str) {
         self.emit(UiEventMsg::Final(message.to_string()));
     }

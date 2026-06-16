@@ -10,8 +10,8 @@ expression: render(&app)
 │                                               ││                     │
 │                                               ││                     │
 │                                               │╰─────────────────────╯
-│                                               │╭ processes ──────────╮
-│                                               ││web            runnin│
+│                                               │╭ background ─────────╮
+│                                               ││web          running │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │

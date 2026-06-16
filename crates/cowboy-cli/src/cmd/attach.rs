@@ -387,6 +387,8 @@ fn to_ui_event(e: UiEventMsg) -> UiEvent {
         UiEventMsg::Plan(steps) => UiEvent::Plan(steps),
         UiEventMsg::Title(t) => UiEvent::Title(t),
         UiEventMsg::Processes(p) => UiEvent::Processes(p),
+        UiEventMsg::SubagentStarted { label, model } => UiEvent::SubagentStarted { label, model },
+        UiEventMsg::SubagentDone { label, ok } => UiEvent::SubagentDone { label, ok },
         UiEventMsg::TurnDone => UiEvent::TurnDone,
     }
 }

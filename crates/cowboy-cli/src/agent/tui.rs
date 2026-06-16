@@ -74,8 +74,18 @@ pub enum UiEvent {
     Blocked(Option<String>),
     /// Update the transcript title (cwd + branch context).
     Title(String),
-    /// Managed processes (name, status) for the process pane.
+    /// Managed processes (name, status) for the background pane.
     Processes(Vec<(String, String)>),
+    /// A crew subagent was dispatched (routing label + resolved model).
+    SubagentStarted {
+        label: String,
+        model: String,
+    },
+    /// A crew subagent finished (`ok` = produced a result).
+    SubagentDone {
+        label: String,
+        ok: bool,
+    },
     /// The agent finished a turn; ready for the next user message.
     TurnDone,
     Done,
@@ -466,6 +476,10 @@ fn event_loop(
                 UiEvent::Blocked(reason) => app.set_blocked(reason),
                 UiEvent::Title(t) => app.title = t,
                 UiEvent::Processes(procs) => app.processes = procs,
+                UiEvent::SubagentStarted { label, model } => {
+                    app.subagent_started(label, model, now_ms())
+                }
+                UiEvent::SubagentDone { label, ok } => app.subagent_done(&label, ok),
                 UiEvent::TurnDone => {
                     pending_turns = pending_turns.saturating_sub(1);
                     app.commit_stream();
@@ -484,6 +498,7 @@ fn event_loop(
 
         app.tick();
         app.tick_command(now_ms());
+        app.tick_crew(now_ms());
         terminal.draw(|f| draw(f, &app))?;
 
         // Flush any queued clipboard copy. Prefer the direct OS clipboard

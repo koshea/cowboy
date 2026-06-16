@@ -1452,38 +1452,46 @@ impl<'a> AgentLoop<'a> {
                 .notice(&format!("↳ running {} subagents in parallel", plans.len()));
         }
         // Execute concurrently (owned plans → no borrow of self), timing each and
-        // capturing a coarse outcome for the crew history.
-        let done: Vec<(String, String, Option<cowboy_core::crew::CrewOutcome>)> =
-            futures::stream::iter(plans.into_iter().map(|(id, plan)| {
-                let routed = plan.routed.clone();
-                async move {
-                    let started = std::time::Instant::now();
-                    let result = exec_subagent(plan).await;
-                    let duration_ms = started.elapsed().as_millis() as u64;
-                    let outcome = routed.map(|(category, effort, model, fell_back)| {
-                        cowboy_core::crew::CrewOutcome {
-                            ts_ms: now_ms(),
-                            category,
-                            effort,
-                            model,
-                            fell_back,
-                            status: classify_subagent_result(&result).to_string(),
-                            duration_ms,
-                        }
-                    });
-                    (id, result, outcome)
-                }
-            }))
-            .buffer_unordered(max_parallel)
-            .collect()
-            .await;
-        self.ui.notice("↳ subagent(s) finished");
-        for (id, res, outcome) in done {
+        // capturing a coarse outcome for the crew history. Process completions as
+        // they arrive so the background pane flips each subagent to done/failed
+        // with its own elapsed time (rather than all at once at the end).
+        let mut stream = futures::stream::iter(plans.into_iter().map(|(id, plan)| {
+            let routed = plan.routed.clone();
+            let label = plan
+                .label
+                .split(" → ")
+                .next()
+                .unwrap_or(&plan.label)
+                .to_string();
+            async move {
+                let started = std::time::Instant::now();
+                let result = exec_subagent(plan).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let status = classify_subagent_result(&result).to_string();
+                let outcome = routed.map(|(category, effort, model, fell_back)| {
+                    cowboy_core::crew::CrewOutcome {
+                        ts_ms: now_ms(),
+                        category,
+                        effort,
+                        model,
+                        fell_back,
+                        status: status.clone(),
+                        duration_ms,
+                    }
+                });
+                (id, label, result, status, outcome)
+            }
+        }))
+        .buffer_unordered(max_parallel);
+
+        while let Some((id, label, res, status, outcome)) = stream.next().await {
+            self.ui.subagent_done(&label, status == "complete");
             if let Some(o) = outcome {
                 cowboy_core::crew::record_outcome(&o);
             }
             results.insert(id, res);
         }
+        self.ui.notice("↳ subagent(s) finished");
         results
     }
 
@@ -1598,6 +1606,10 @@ impl<'a> AgentLoop<'a> {
             "↳ subagent [{}]: {}",
             plan.label, plan.display_task
         ));
+        // Pane label is the category/effort part (the model is shown separately).
+        let label = plan.label.split(" → ").next().unwrap_or(&plan.label);
+        self.ui
+            .subagent_started(label, plan.model.as_deref().unwrap_or("<default>"));
         if let Some((category, effort, model, fell_back)) = &plan.routed {
             self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SubagentRouted {
                 category: category.clone(),

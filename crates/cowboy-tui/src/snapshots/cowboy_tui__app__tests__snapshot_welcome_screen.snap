@@ -10,8 +10,8 @@ expression: render(&app)
 │(gw.local)                                     ││                     │
 │branch     main                                ││                     │
 │Type a message to begin · Enter sends · Ctrl-C │╰─────────────────────╯
-│menu                                           │╭ processes ──────────╮
-│                                               ││no managed processes │
+│menu                                           │╭ background ─────────╮
+│                                               ││no background activit│
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │

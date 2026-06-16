@@ -10,8 +10,8 @@ expression: render(&app)
 │                                               ││                     │
 │                                               ││                     │
 │                                               │╰─────────────────────╯
-│                                               │╭ processes ──────────╮
-│                                               ││no managed processes │
+│                                               │╭ background ─────────╮
+│                                               ││no background activit│
 │                                               ││                     │
 ╭ 2 matches · Tab ───────────────────────────────╮                     │
 │/github:review-pr  <pr-number-or-url> [filename]│                     │

@@ -389,6 +389,16 @@ pub enum UiEventMsg {
     Plan(Vec<(String, String)>),
     Title(String),
     Processes(Vec<(String, String)>),
+    /// A crew subagent was dispatched (routing label + resolved model).
+    SubagentStarted {
+        label: String,
+        model: String,
+    },
+    /// A crew subagent finished (`ok` = produced a result).
+    SubagentDone {
+        label: String,
+        ok: bool,
+    },
     TurnDone,
 }
 

@@ -11,7 +11,7 @@ expression: render(&app)
 │   │github.com:443                                                │   │
 │   │                                                              │───╯
 │   │[o]nce [s]ession [p]roject [g]lobal [d]eny                    │───╮
-│   │                                                              │es │
+│   │                                                              │vit│
 │   │                                                              │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │
 │                                               ││                     │

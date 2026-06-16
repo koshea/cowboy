@@ -11,7 +11,7 @@ expression: render(&app)
 │   │                                                              │   │
 │   │  1. PostgreSQL                                               │───╯
 │   │▸ 2. SQLite                                                   │───╮
-│   │  3. MySQL                                                    │es │
+│   │  3. MySQL                                                    │vit│
 │   │  (or type a custom answer)                                   │   │
 │   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │

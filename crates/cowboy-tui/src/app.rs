@@ -226,6 +226,27 @@ pub struct RunningCmd {
     pub last: String,
 }
 
+/// Status of a spawned subagent (crew member).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrewStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+/// A spawned crew subagent, shown in the background pane.
+#[derive(Debug, Clone)]
+pub struct CrewMember {
+    /// Short routing label (e.g. category or agent name).
+    pub label: String,
+    /// Resolved model (displayed shortened to its last path segment).
+    pub model: String,
+    pub status: CrewStatus,
+    pub started_ms: u64,
+    /// Seconds elapsed (frozen when the subagent finishes).
+    pub elapsed_secs: u64,
+}
+
 pub struct App {
     pub title: String,
     pub status: String,
@@ -245,8 +266,10 @@ pub struct App {
     /// Network activity log (gateway decisions), aggregated by verdict+host so
     /// repeated hits collapse to one row with a count.
     pub activity: Vec<ActivityEntry>,
-    /// Managed processes: (name, status).
+    /// Managed processes: (name, status). Shown in the background pane.
     pub processes: Vec<(String, String)>,
+    /// Spawned crew subagents (this turn's fan-out), shown in the background pane.
+    pub crew: Vec<CrewMember>,
     /// The agent's working plan: ordered (step, status) pairs. When non-empty a
     /// dedicated pane is shown on the right.
     pub plan: Vec<(String, String)>,
@@ -349,6 +372,7 @@ impl App {
             reasoning: String::new(),
             activity: Vec::new(),
             processes: Vec::new(),
+            crew: Vec::new(),
             plan: Vec::new(),
             blocked: None,
             running: None,
@@ -622,6 +646,51 @@ impl App {
         self.last_output_transient = false;
     }
 
+    /// A subagent was dispatched. Starting a fresh fan-out (no member still
+    /// running) replaces the previous batch so the pane shows the current crew.
+    pub fn subagent_started(
+        &mut self,
+        label: impl Into<String>,
+        model: impl Into<String>,
+        now_ms: u64,
+    ) {
+        if !self.crew.iter().any(|m| m.status == CrewStatus::Running) {
+            self.crew.clear();
+        }
+        self.crew.push(CrewMember {
+            label: label.into(),
+            model: model.into(),
+            status: CrewStatus::Running,
+            started_ms: now_ms,
+            elapsed_secs: 0,
+        });
+    }
+
+    /// A subagent finished (mark by label; freezes its elapsed time).
+    pub fn subagent_done(&mut self, label: &str, ok: bool) {
+        if let Some(m) = self
+            .crew
+            .iter_mut()
+            .rev()
+            .find(|m| m.label == label && m.status == CrewStatus::Running)
+        {
+            m.status = if ok {
+                CrewStatus::Done
+            } else {
+                CrewStatus::Failed
+            };
+        }
+    }
+
+    /// Refresh elapsed time for running crew members (event-loop tick).
+    pub fn tick_crew(&mut self, now_ms: u64) {
+        for m in &mut self.crew {
+            if m.status == CrewStatus::Running {
+                m.elapsed_secs = now_ms.saturating_sub(m.started_ms) / 1000;
+            }
+        }
+    }
+
     /// Append (or, for a transient carriage-return update, overwrite-in-place) a
     /// line of streamed command output, and update the live tail.
     pub fn command_output_line(&mut self, text: impl Into<String>, committed: bool) {
@@ -867,7 +936,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(main[1]);
         draw_activity(f, app, side[0]);
-        draw_processes(f, app, side[1]);
+        draw_background(f, app, side[1]);
     } else {
         // With a plan, give it the top third and split the rest as before.
         let side = Layout::default()
@@ -880,7 +949,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             .split(main[1]);
         draw_plan(f, app, side[0]);
         draw_activity(f, app, side[1]);
-        draw_processes(f, app, side[2]);
+        draw_background(f, app, side[2]);
     }
 
     draw_status(f, app, rows[1]);
@@ -1331,24 +1400,45 @@ fn draw_plan(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(para, area);
 }
 
-fn draw_processes(f: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = if app.processes.is_empty() {
-        vec![Line::from(Span::styled(
-            "no managed processes",
+/// One combined pane for background activity: spawned crew subagents and any
+/// managed (`cowboy proc`) processes.
+fn draw_background(f: &mut Frame, app: &App, area: Rect) {
+    let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
+    let mut lines: Vec<Line> = Vec::new();
+    // Crew subagents first (most active background work).
+    for m in &app.crew {
+        let (mark, color) = match m.status {
+            CrewStatus::Running => ("⟳", Color::Yellow),
+            CrewStatus::Done => ("✓", Color::Green),
+            CrewStatus::Failed => ("✗", Color::Red),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark} "), Style::default().fg(color)),
+            Span::styled(
+                format!("{:<10} ", m.label),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(short(&m.model), Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!(" {}s", m.elapsed_secs),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
+    // Then managed processes.
+    for (n, s) in &app.processes {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{n:<12} "), Style::default().fg(Color::White)),
+            Span::styled(s.clone(), Style::default().fg(Color::Green)),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no background activity",
             Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        app.processes
-            .iter()
-            .map(|(n, s)| {
-                Line::from(vec![
-                    Span::styled(format!("{n:<14} "), Style::default().fg(Color::White)),
-                    Span::styled(s.clone(), Style::default().fg(Color::Green)),
-                ])
-            })
-            .collect()
-    };
-    let para = Paragraph::new(lines).block(panel("processes"));
+        )));
+    }
+    let para = Paragraph::new(lines).block(panel("background"));
     f.render_widget(para, area);
 }
 
@@ -1959,6 +2049,36 @@ mod tests {
         assert_eq!(app.running.as_ref().unwrap().elapsed_secs, 3);
         app.end_command();
         assert!(app.running.is_none());
+    }
+
+    #[test]
+    fn crew_pane_tracks_subagents() {
+        let mut app = App::new("t");
+        app.subagent_started(
+            "review",
+            "fireworks/accounts/fireworks/models/minimax-m3",
+            1000,
+        );
+        app.subagent_started("tests", "cerebras/zai-glm-4.7", 1000);
+        assert_eq!(app.crew.len(), 2);
+        app.tick_crew(5000);
+        assert_eq!(app.crew[0].elapsed_secs, 4);
+
+        // Finishing freezes elapsed; status reflects success/failure.
+        app.subagent_done("tests", true);
+        app.tick_crew(9000);
+        let tests = app.crew.iter().find(|m| m.label == "tests").unwrap();
+        assert_eq!(tests.status, CrewStatus::Done);
+        assert_eq!(tests.elapsed_secs, 4, "done member's time is frozen");
+        assert_eq!(app.crew[0].elapsed_secs, 8, "running member keeps ticking");
+
+        app.subagent_done("review", false);
+        assert_eq!(app.crew[0].status, CrewStatus::Failed);
+
+        // A fresh fan-out (no member still running) replaces the previous batch.
+        app.subagent_started("docs", "glm", 10000);
+        assert_eq!(app.crew.len(), 1);
+        assert_eq!(app.crew[0].label, "docs");
     }
 
     #[test]
