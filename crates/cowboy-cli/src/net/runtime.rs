@@ -273,12 +273,6 @@ impl AgentRuntime {
                     .await?;
             }
         }
-
-        // If the workspace declares dev dependencies via mise, install them once
-        // at launch so the toolchain is ready (matches how worktrees expect their
-        // env to be set up). Best-effort — a failure here shouldn't block the
-        // session.
-        self.mise_install_if_configured().await;
         Ok(())
     }
 
@@ -292,32 +286,14 @@ impl AgentRuntime {
         ".tool-versions",
     ];
 
-    /// Run `mise install` in the container when the workspace has a mise config.
-    /// Best-effort: logs but never errors (the session proceeds regardless).
-    async fn mise_install_if_configured(&self) {
-        if !Self::MISE_CONFIGS
+    /// Whether the workspace declares dev dependencies via mise. The agent loop
+    /// uses this to run a *visible* `mise install` at session start (so the
+    /// toolchain setup streams to the UI instead of silently delaying the first
+    /// request).
+    pub fn has_mise_config(&self) -> bool {
+        Self::MISE_CONFIGS
             .iter()
             .any(|f| self.root.join(f).exists())
-        {
-            return;
-        }
-        let argv = ["mise".to_string(), "install".to_string()];
-        match self
-            .docker
-            .exec_capture(
-                &self.container_name,
-                &self.security.container.workdir,
-                self.user(),
-                &argv,
-            )
-            .await
-        {
-            Ok((r, _)) if r.exit_code == 0 => tracing::info!("mise install: ready"),
-            Ok((r, out)) => {
-                tracing::warn!(code = r.exit_code, output = %out, "mise install exited non-zero")
-            }
-            Err(e) => tracing::warn!(error = %e, "mise install failed to run"),
-        }
     }
 
     /// Run a command inside the container, streaming output, returning its exit code.

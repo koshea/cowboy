@@ -118,6 +118,8 @@ pub struct AgentLoop<'a> {
     plan: Vec<(String, String)>,
     /// One-shot latch so `SessionStarted` is emitted to the lifecycle log once.
     lifecycle_started: bool,
+    /// One-shot latch for the per-session setup step (e.g. `mise install`).
+    setup_done: bool,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -255,6 +257,7 @@ impl<'a> AgentLoop<'a> {
             budget_warned: false,
             plan: Vec::new(),
             lifecycle_started: false,
+            setup_done: false,
             messages: vec![Message::system(system)],
             ui,
             logger: None,
@@ -553,11 +556,40 @@ impl<'a> AgentLoop<'a> {
         turn_cancel: CancellationToken,
     ) -> Result<Option<String>> {
         self.cancel = turn_cancel;
+        self.run_session_setup().await;
         let outcome = self.run_inner(task).await;
         if let Ok(Some(m)) = &outcome {
             self.last_final = Some(m.clone());
         }
         outcome
+    }
+
+    /// One-time per-session setup, run before the first turn while the UI is
+    /// live. When the workspace uses mise, run a *visible* `mise install` (it
+    /// streams to the transcript with the live indicator) so installing the
+    /// project toolchain doesn't look like a hung first request. Best-effort:
+    /// a failure surfaces its exit code but doesn't block the session.
+    async fn run_session_setup(&mut self) {
+        if self.setup_done {
+            return;
+        }
+        self.setup_done = true;
+        // Subagents share the parent's container/toolchain — only the top-level
+        // session does setup.
+        if self.subagent_depth > 0 || !self.runtime.has_mise_config() {
+            return;
+        }
+        self.ui
+            .notice("setting up project toolchain (mise install)…");
+        let args = ShellArgs {
+            command: "mise install".to_string(),
+            cwd: None,
+        };
+        self.ui.command_start(&args.command);
+        match self.run_shell_streaming(&args).await {
+            Ok((result, _)) => self.ui.command_end(result.exit_code, ""),
+            Err(e) => self.ui.notice(&format!("mise install did not run: {e}")),
+        }
     }
 
     /// Finalize the session log (diff + summary). Call once when the
