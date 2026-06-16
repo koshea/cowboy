@@ -120,6 +120,11 @@ pub struct AgentLoop<'a> {
     lifecycle_started: bool,
     /// One-shot latch for the per-session setup step (e.g. `mise install`).
     setup_done: bool,
+    /// Loop guard: signature of the last turn's tool calls and how many times in
+    /// a row it has repeated. A (sub)agent re-issuing the identical call makes no
+    /// progress and burns tokens, so we nudge then abort.
+    last_tool_sig: Option<String>,
+    tool_repeat: u32,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -258,6 +263,8 @@ impl<'a> AgentLoop<'a> {
             plan: Vec::new(),
             lifecycle_started: false,
             setup_done: false,
+            last_tool_sig: None,
+            tool_repeat: 0,
             messages: vec![Message::system(system)],
             ui,
             logger: None,
@@ -696,6 +703,46 @@ impl<'a> AgentLoop<'a> {
                 return Ok(None);
             }
 
+            // Loop guard: re-issuing the identical tool call(s) yields the same
+            // result and makes no progress (a degenerate model loop). Nudge after
+            // a few repeats, abort if it persists — so a runaway costs seconds,
+            // not a hundred API calls.
+            let sig = tool_signature(&response.tool_calls);
+            if self.last_tool_sig.as_deref() == Some(sig.as_str()) {
+                self.tool_repeat += 1;
+            } else {
+                self.tool_repeat = 0;
+                self.last_tool_sig = Some(sig);
+            }
+            const LOOP_NUDGE_AT: u32 = 3;
+            const LOOP_ABORT_AT: u32 = 6;
+            if self.tool_repeat >= LOOP_ABORT_AT {
+                let reps = self.tool_repeat + 1;
+                self.ui.notice(&format!(
+                    "loop detected: same action repeated {reps}× with no progress — stopping"
+                ));
+                for c in &response.tool_calls {
+                    self.push_tool_result(
+                        &c.id,
+                        "[loop guard] aborted: identical action repeated with no progress.",
+                    );
+                }
+                return Ok(None);
+            }
+            if self.tool_repeat >= LOOP_NUDGE_AT {
+                let reps = self.tool_repeat + 1;
+                self.ui
+                    .notice("loop guard: repeated identical action — nudging a change of approach");
+                for c in &response.tool_calls {
+                    self.push_tool_result(&c.id, &format!(
+                        "[loop guard] You have issued this exact command {reps}× and gotten the same \
+                         result. STOP repeating it — take a different approach, or call `final` if \
+                         the task is complete."
+                    ));
+                }
+                continue;
+            }
+
             if let Some(final_msg) = self.handle_tool_calls(&response).await? {
                 return Ok(Some(final_msg));
             }
@@ -706,6 +753,15 @@ impl<'a> AgentLoop<'a> {
             self.behavior.max_iterations
         ));
         Ok(None)
+    }
+
+    /// Push a tool-result message (logged + added to history).
+    fn push_tool_result(&mut self, tool_call_id: &str, content: &str) {
+        let msg = Message::tool_result(tool_call_id, content);
+        if let Some(l) = &mut self.logger {
+            l.log_message(&msg);
+        }
+        self.messages.push(msg);
     }
 
     /// Process this turn's tool calls. Returns `Some(message)` if `final` was
@@ -1679,6 +1735,18 @@ fn fileop_summary(action: &str, path: &str, exit: i32, output: &str) -> String {
 }
 
 /// Truncate `output` to at most `max_bytes`, on a char boundary, with a marker.
+/// A stable signature for a turn's tool calls (name + arguments), order-
+/// independent so parallel calls in a different order still compare equal. Used
+/// by the loop guard to detect an agent re-issuing the identical action.
+fn tool_signature(calls: &[cowboy_core::model::ToolCall]) -> String {
+    let mut parts: Vec<String> = calls
+        .iter()
+        .map(|c| format!("{}\u{0}{}", c.name, c.arguments))
+        .collect();
+    parts.sort();
+    parts.join("\u{1}")
+}
+
 fn truncate(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output.to_string();
@@ -2268,6 +2336,57 @@ mod tests {
         assert!(arts
             .iter()
             .any(|a| a.kind == cowboy_core::artifact::ArtifactKind::Handoff));
+    }
+
+    #[tokio::test]
+    async fn loop_guard_aborts_repeated_identical_action() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_exec_stream()
+            .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "same".into())));
+        // Model keeps issuing the SAME shell call (same name+args; ids differ).
+        let m = ScriptedModel::new(vec![]);
+        {
+            let mut q = m.responses.lock().unwrap();
+            for i in 0..12 {
+                q.push_back(ChatResponse {
+                    reasoning: None,
+                    content: None,
+                    tool_calls: vec![tool_call(
+                        &i.to_string(),
+                        "shell",
+                        r#"{"command":"grep -rn x ."}"#,
+                    )],
+                });
+            }
+        }
+        let behavior = cowboy_core::config::AgentBehavior::default(); // max_iterations 100
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(m),
+            runtime_with(docker),
+            behavior,
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("loop on a grep").await.unwrap();
+        assert!(res.is_none());
+        // Aborted by the loop guard, not run to max_iterations.
+        assert!(
+            ui.notices.iter().any(|n| n.contains("loop detected")),
+            "notices: {:?}",
+            ui.notices
+        );
+        // Only the first few identical commands ran before the guard kicked in.
+        assert!(
+            ui.commands.len() <= 3,
+            "ran {} commands (guard should stop execution)",
+            ui.commands.len()
+        );
     }
 
     #[test]
