@@ -1268,21 +1268,25 @@ fn activity_line(e: &ActivityEntry) -> Line<'static> {
 }
 
 fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
-    let inner = area.height.saturating_sub(2) as usize;
+    let inner_w = area.width.saturating_sub(2).max(1) as u16;
+    let inner_h = area.height.saturating_sub(2) as usize;
     let lines: Vec<Line> = if app.activity.is_empty() {
         vec![Line::from(Span::styled(
             "no network activity yet",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        // Show the most recent rows (one per distinct destination).
-        let start = app.activity.len().saturating_sub(inner);
-        app.activity[start..].iter().map(activity_line).collect()
+        app.activity.iter().map(activity_line).collect()
     };
     let para = Paragraph::new(lines)
         .block(panel("network"))
         .wrap(Wrap { trim: true });
-    f.render_widget(para, area);
+    // Pin to the bottom: scroll past everything above the last `inner_h` wrapped
+    // rows so the newest activity is always visible (rows can wrap). line_count
+    // includes the block's 2 border rows, so subtract them.
+    let total = para.line_count(inner_w).saturating_sub(2);
+    let scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
+    f.render_widget(para.scroll((scroll, 0)), area);
 }
 
 fn draw_plan(f: &mut Frame, app: &App, area: Rect) {
