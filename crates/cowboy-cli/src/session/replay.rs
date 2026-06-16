@@ -141,6 +141,7 @@ mod tests {
         let mut log = SessionLogger::create(tmp.path()).unwrap();
         log.log_message(&Message::user("inspect repo"));
         log.log_message(&Message {
+            reasoning: None,
             role: Role::Assistant,
             content: String::new(),
             tool_call_id: None,

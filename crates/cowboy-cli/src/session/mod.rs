@@ -341,6 +341,7 @@ mod tests {
         let mut msgs = vec![
             Message::user("go"),
             Message {
+                reasoning: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -370,6 +371,7 @@ mod tests {
         let mut msgs = vec![
             Message::user("go"),
             Message {
+                reasoning: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,

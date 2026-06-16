@@ -78,6 +78,12 @@ pub struct Message {
     /// For `Assistant` messages: tool calls the model requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// For `Assistant` turns from reasoning models: the model's thinking for this
+    /// turn. Round-tripped back to the model as `reasoning_content` so agentic
+    /// reasoning models (minimax, GLM, DeepSeek, …) keep their plan across
+    /// tool-use turns — without it they re-derive the same step and loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 impl Message {
@@ -93,6 +99,7 @@ impl Message {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning: None,
         }
     }
     /// A tool-result message answering `tool_call_id`.
@@ -102,6 +109,7 @@ impl Message {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            reasoning: None,
         }
     }
 }
@@ -129,6 +137,9 @@ pub struct ToolCall {
 pub struct ChatResponse {
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// The model's reasoning ("thinking") for this turn, if it emitted any.
+    /// Preserved so it can be sent back on the next turn (see [`Message::reasoning`]).
+    pub reasoning: Option<String>,
 }
 
 /// A streamed piece of a model response: visible answer text, or the model's
@@ -351,6 +362,24 @@ fn oa_err<E: std::fmt::Display>(e: E) -> Error {
     Error::Model(e.to_string())
 }
 
+/// Inject each message's preserved reasoning back into the request body as a
+/// `reasoning_content` field (1:1 with `messages` by index — `to_openai_messages`
+/// emits one body message per input). Agentic reasoning models need their own
+/// thinking returned across tool-use turns or they re-derive the same step and
+/// loop. Harmless on providers that ignore the field.
+fn inject_reasoning_content(body: &mut serde_json::Value, messages: &[Message]) {
+    let Some(arr) = body["messages"].as_array_mut() else {
+        return;
+    };
+    for (i, m) in messages.iter().enumerate() {
+        if let (Some(r), Some(bm)) = (m.reasoning.as_deref(), arr.get_mut(i)) {
+            if !r.is_empty() {
+                bm["reasoning_content"] = serde_json::Value::String(r.to_string());
+            }
+        }
+    }
+}
+
 /// Accumulates streamed tool-call chunks by index into complete [`ToolCall`]s.
 #[derive(Default)]
 struct ToolCallAccumulator {
@@ -495,6 +524,10 @@ impl ModelClient for OpenAiClient {
         if !self.stop.is_empty() {
             body["stop"] = serde_json::json!(self.stop);
         }
+        // Round-trip each reasoning model's own thinking back as `reasoning_content`
+        // so agentic reasoning models keep their plan across tool-use turns —
+        // without it they re-derive the same step and loop.
+        inject_reasoning_content(&mut body, messages);
         // Anthropic prompt caching (opt-in): mark the static system prompt and the
         // latest message with `cache_control` so a compatible gateway caches the
         // prefix. Harmless on gateways that ignore unknown fields; only enable for
@@ -565,6 +598,7 @@ impl ModelClient for OpenAiClient {
         };
 
         let mut content = String::new();
+        let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
@@ -585,6 +619,7 @@ impl ModelClient for OpenAiClient {
                     return Ok(ChatResponse {
                         content: (!content.is_empty()).then_some(content),
                         tool_calls: acc.finish(),
+                        reasoning: (!reasoning.is_empty()).then_some(reasoning),
                     });
                 }
                 let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
@@ -594,6 +629,7 @@ impl ModelClient for OpenAiClient {
                     continue;
                 };
                 if let Some(r) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
+                    reasoning.push_str(&r);
                     if let Some(tx) = &deltas {
                         let _ = tx.send(Delta::Reasoning(r));
                     }
@@ -619,6 +655,7 @@ impl ModelClient for OpenAiClient {
         Ok(ChatResponse {
             content: (!content.is_empty()).then_some(content),
             tool_calls: acc.finish(),
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
         })
     }
 }
@@ -626,6 +663,41 @@ impl ModelClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_is_round_tripped_into_the_request_body() {
+        let mut assistant = Message::new(Role::Assistant, "");
+        assistant.tool_calls = vec![ToolCall {
+            id: "1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        assistant.reasoning = Some("plan: grep then summarize".into());
+        let messages = vec![Message::user("review the PR"), assistant];
+
+        // Body messages line up 1:1 with `messages` by index.
+        let body_msgs = to_openai_messages(&messages).unwrap();
+        let mut body = serde_json::json!({ "messages": serde_json::to_value(&body_msgs).unwrap() });
+        inject_reasoning_content(&mut body, &messages);
+
+        let arr = body["messages"].as_array().unwrap();
+        assert!(arr[0].get("reasoning_content").is_none()); // user turn: none
+        assert_eq!(
+            arr[1]["reasoning_content"],
+            serde_json::json!("plan: grep then summarize")
+        );
+    }
+
+    #[test]
+    fn reasoning_survives_message_serde_roundtrip() {
+        let mut m = Message::new(Role::Assistant, "");
+        m.reasoning = Some("thinking".into());
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.reasoning.as_deref(), Some("thinking"));
+        // Absent in older logs → None (backward compatible).
+        let old: Message = serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!(old.reasoning, None);
+    }
 
     #[test]
     fn tool_call_accumulator_assembles_streamed_chunks() {

@@ -669,12 +669,16 @@ impl<'a> AgentLoop<'a> {
             };
             self.account_tokens(prompt_est, &response);
 
-            // Record the assistant turn (content + any tool calls).
+            // Record the assistant turn (content + reasoning + any tool calls).
+            // Preserving reasoning is what lets agentic reasoning models keep
+            // their plan across tool-use turns instead of re-deriving (and
+            // looping on) the same step.
             let assistant = Message {
                 role: Role::Assistant,
                 content: response.content.clone().unwrap_or_default(),
                 tool_call_id: None,
                 tool_calls: response.tool_calls.clone(),
+                reasoning: response.reasoning.clone(),
             };
             if let Some(l) = &mut self.logger {
                 l.log_message(&assistant);
@@ -1816,10 +1820,12 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: Some("inspecting".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done; tests pass"}"#)],
             },
@@ -1859,10 +1865,12 @@ mod tests {
         // The model keeps asking for shell (never finals); only the budget stops it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: Some("working".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                reasoning: None,
                 content: Some("still working".into()),
                 tool_calls: vec![tool_call("2", "shell", r#"{"command":"ls"}"#)],
             },
@@ -1909,6 +1917,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -1919,6 +1928,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
             },
@@ -1985,6 +1995,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -1994,6 +2005,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
             },
@@ -2033,6 +2045,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -2041,6 +2054,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
             },
@@ -2089,6 +2103,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -2097,10 +2112,12 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "unblock", "{}")],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
             },
@@ -2146,6 +2163,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -2154,6 +2172,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "2",
@@ -2162,6 +2181,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
             },
@@ -2207,6 +2227,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -2216,6 +2237,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
             },
@@ -2295,6 +2317,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
                     "1",
@@ -2303,6 +2326,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
             },
@@ -2339,6 +2363,7 @@ mod tests {
             let mut q = looping.responses.lock().unwrap();
             for i in 0..10 {
                 q.push_back(ChatResponse {
+                    reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
                         &i.to_string(),
@@ -2376,10 +2401,12 @@ mod tests {
             .returning(|_| Ok(ContainerState::Running));
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("1", "final", r#"{"message":"done 1"}"#)],
             },
             ChatResponse {
+                reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done 2"}"#)],
             },
@@ -2506,6 +2533,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         // The model serves the compaction summary.
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning: None,
             content: Some("SUMMARY: earlier turns did X and Y".into()),
             tool_calls: vec![],
         }]);
