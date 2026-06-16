@@ -32,6 +32,9 @@ pub struct AgentRuntime {
     user: Option<String>,
     /// Present when network isolation is enabled (the default).
     gateway: Option<GatewayNetwork>,
+    /// TTL cache of resolved `source_command` secrets, so shell commands get a
+    /// fresh-ish token without re-running the host command every time.
+    secret_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, String)>)>>,
 }
 
 impl AgentRuntime {
@@ -53,6 +56,7 @@ impl AgentRuntime {
             container_name,
             user: Some(host_user()),
             gateway,
+            secret_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -134,9 +138,14 @@ impl AgentRuntime {
         // (CARGO_HOME/RUSTUP_HOME are world-writable in the image).
         let mut env: Vec<(String, String)> = vec![("HOME".into(), "/tmp".into())];
 
-        // Explicit, host-configured secret env injection. Values are read from
-        // the host env var named by `source_env` and never logged.
+        // Static secret env injected at container creation, sourced from a host
+        // env var. `source_command` secrets are NOT injected here — they're
+        // resolved fresh per shell command in `exec_stream` (so short-lived
+        // tokens refresh mid-session). Never logged.
         for secret in &self.security.secrets.env {
+            if secret.source_command.is_some() || secret.source_env.is_empty() {
+                continue;
+            }
             match std::env::var(&secret.source_env) {
                 Ok(value) => env.push((secret.name.clone(), value)),
                 Err(_) if secret.required => {
@@ -322,6 +331,18 @@ impl AgentRuntime {
     ) -> Result<(ExecResult, String)> {
         self.ensure_running().await?;
         let workdir = cwd.unwrap_or(&self.security.container.workdir);
+        // Inject `source_command` secrets fresh (TTL-cached) into shell commands
+        // — e.g. `GH_TOKEN` from `gh auth token` — so short-lived tokens refresh
+        // mid-session without recreating the container. Exported in the command's
+        // own shell (the agent is the intended recipient).
+        let prefixed;
+        let command = match self.dynamic_secret_exports() {
+            exports if exports.is_empty() => command,
+            exports => {
+                prefixed = format!("{exports}{command}");
+                &prefixed
+            }
+        };
         self.docker
             .exec_stream(
                 &self.container_name,
@@ -333,6 +354,42 @@ impl AgentRuntime {
                 chunks,
             )
             .await
+    }
+
+    /// `export NAME='value'; ` lines for every `source_command` secret, resolved
+    /// on the host and cached briefly. Empty when there are none.
+    fn dynamic_secret_exports(&self) -> String {
+        let mut out = String::new();
+        for (name, value) in self.dynamic_secret_env() {
+            out.push_str(&format!("export {name}={}; ", sh_quote(&value)));
+        }
+        out
+    }
+
+    /// Resolve `source_command` secrets (run their host commands), cached for a
+    /// short TTL so we don't re-run them on every shell command.
+    fn dynamic_secret_env(&self) -> Vec<(String, String)> {
+        const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut cache = self.secret_cache.lock().unwrap();
+        if let Some((at, vals)) = cache.as_ref() {
+            if at.elapsed() < TTL {
+                return vals.clone();
+            }
+        }
+        let vals: Vec<(String, String)> = self
+            .security
+            .secrets
+            .env
+            .iter()
+            .filter_map(|s| {
+                let cmd = s.source_command.as_deref()?.trim();
+                (!cmd.is_empty())
+                    .then(|| run_value_command(cmd).map(|v| (s.name.clone(), v)))
+                    .flatten()
+            })
+            .collect();
+        *cache = Some((std::time::Instant::now(), vals.clone()));
+        vals
     }
 
     /// Run a structured file operation inside the container via the in-container
@@ -438,6 +495,27 @@ pub fn project_hash(root: &Path) -> u32 {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
     hasher.finish() as u32
+}
+
+/// POSIX single-quote a value for safe `export VAR=<value>` in a shell.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run a host command and return its trimmed stdout as a secret value, or
+/// `None` if it fails / produces nothing. Used for keyring-backed tokens
+/// (`gh auth token`). The command comes from host-owned config; never logged.
+fn run_value_command(cmd: &str) -> Option<String> {
+    let out = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!v.is_empty()).then_some(v)
 }
 
 /// The repository root that's shared by every worktree: `git rev-parse
@@ -646,12 +724,14 @@ mod tests {
             SecretEnv {
                 name: "DB_URL".into(),
                 source_env: "COWBOY_TEST_SECRET_SRC".into(),
+                source_command: None,
                 required: false,
                 approval: None,
             },
             SecretEnv {
                 name: "MISSING".into(),
                 source_env: "COWBOY_TEST_SECRET_ABSENT".into(),
+                source_command: None,
                 required: false,
                 approval: None,
             },
@@ -660,6 +740,34 @@ mod tests {
         assert!(spec.env.iter().any(|(k, v)| k == "DB_URL" && v == "s3cr3t"));
         assert!(!spec.env.iter().any(|(k, _)| k == "MISSING"));
         std::env::remove_var("COWBOY_TEST_SECRET_SRC");
+    }
+
+    #[test]
+    fn source_command_secret_resolves_per_exec_not_at_creation() {
+        use cowboy_core::config::SecretEnv;
+        let (mut rt, _tmp) = fixture(false, MockDockerCli::new());
+        rt.security.secrets.env = vec![SecretEnv {
+            name: "TOK".into(),
+            source_env: String::new(),
+            source_command: Some("printf 'tok-123'".into()),
+            required: false,
+            approval: None,
+        }];
+        // Not injected at container creation (refreshed per shell command instead).
+        let spec = rt.build_spec().unwrap();
+        assert!(!spec.env.iter().any(|(k, _)| k == "TOK"));
+        // Resolved on demand, as a shell-safe export prefix.
+        assert_eq!(
+            rt.dynamic_secret_env(),
+            vec![("TOK".into(), "tok-123".into())]
+        );
+        assert_eq!(rt.dynamic_secret_exports(), "export TOK='tok-123'; ");
+    }
+
+    #[test]
+    fn sh_quote_escapes_single_quotes() {
+        assert_eq!(sh_quote("plain"), "'plain'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

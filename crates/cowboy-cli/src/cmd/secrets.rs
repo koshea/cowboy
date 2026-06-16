@@ -30,9 +30,12 @@ fn project_key() -> Result<String> {
     Ok(repo_key(&canon))
 }
 
-/// A known-tool preset: read-only file grants + the network it needs.
+/// A known-tool preset: read-only file grants, env vars sourced from a host
+/// command (for keyring-backed tokens), and the network it needs.
 struct Preset {
     files: &'static [(&'static str, &'static str)],
+    /// (container env name, host command whose stdout is the value).
+    env_cmd: &'static [(&'static str, &'static str)],
     domains: &'static [&'static str],
     note: &'static str,
 }
@@ -41,11 +44,15 @@ fn preset(name: &str) -> Option<Preset> {
     Some(match name {
         "gh" => Preset {
             files: &[("~/.config/gh", "/tmp/.config/gh")],
+            // gh keeps the token in the OS keyring (not hosts.yml), so mounting
+            // the config isn't enough — pull a fresh token from `gh auth token`.
+            env_cmd: &[("GH_TOKEN", "gh auth token")],
             domains: &["api.github.com", "github.com"],
-            note: "your GitHub CLI auth (read-only).",
+            note: "your GitHub CLI auth (config read-only + GH_TOKEN from the keyring).",
         },
         "gcloud" => Preset {
             files: &[("~/.config/gcloud", "/tmp/.config/gcloud")],
+            env_cmd: &[],
             domains: &[
                 "accounts.google.com",
                 "oauth2.googleapis.com",
@@ -56,11 +63,13 @@ fn preset(name: &str) -> Option<Preset> {
         },
         "kubectl" => Preset {
             files: &[("~/.kube", "/tmp/.kube")],
+            env_cmd: &[],
             domains: &[],
             note: "your kubeconfig (read-only). Also allow your cluster's API server host.",
         },
         "aws" => Preset {
             files: &[("~/.aws", "/tmp/.aws")],
+            env_cmd: &[],
             domains: &["*.amazonaws.com"],
             note: "your AWS credentials/config (read-only).",
         },
@@ -69,11 +78,13 @@ fn preset(name: &str) -> Option<Preset> {
                 ("~/.gitconfig", "/tmp/.gitconfig"),
                 ("~/.git-credentials", "/tmp/.git-credentials"),
             ],
+            env_cmd: &[],
             domains: &["github.com"],
             note: "your git config + stored credentials (read-only).",
         },
         "ssh" => Preset {
             files: &[("~/.ssh", "/tmp/.ssh")],
+            env_cmd: &[],
             domains: &[],
             note: "WARNING: exposes your SSH PRIVATE KEYS to the agent (read-only).",
         },
@@ -86,8 +97,9 @@ const PRESETS: &[&str] = &["gh", "gcloud", "kubectl", "aws", "git", "ssh"];
 /// Grants gathered from a preset and/or explicit flags.
 #[derive(Default)]
 struct Collected {
-    env: Vec<(String, String)>,   // (name, source_env)
-    files: Vec<(String, String)>, // (source, target)
+    env: Vec<(String, String)>,     // (name, source_env)
+    env_cmd: Vec<(String, String)>, // (name, source_command)
+    files: Vec<(String, String)>,   // (source, target)
     domains: Vec<String>,
     notes: Vec<String>,
 }
@@ -99,6 +111,11 @@ fn collect(args: &SecretsAddArgs) -> Result<Collected> {
             .with_context(|| format!("unknown preset {name:?}; try: {}", PRESETS.join(", ")))?;
         c.files
             .extend(p.files.iter().map(|(s, t)| (s.to_string(), t.to_string())));
+        c.env_cmd.extend(
+            p.env_cmd
+                .iter()
+                .map(|(n, cmd)| (n.to_string(), cmd.to_string())),
+        );
         c.domains.extend(p.domains.iter().map(|d| d.to_string()));
         c.notes.push(format!("{name}: {}", p.note));
     }
@@ -122,7 +139,7 @@ fn collect(args: &SecretsAddArgs) -> Result<Collected> {
         };
         c.env.push((name, src));
     }
-    if c.env.is_empty() && c.files.is_empty() {
+    if c.env.is_empty() && c.env_cmd.is_empty() && c.files.is_empty() {
         anyhow::bail!(
             "nothing to add; give a preset ({}) or --env/--file",
             PRESETS.join(", ")
@@ -153,6 +170,18 @@ fn add(args: SecretsAddArgs) -> Result<()> {
             us.env.push(SecretEnv {
                 name,
                 source_env,
+                source_command: None,
+                required: false,
+                approval: None,
+            });
+        }
+    }
+    for (name, cmd) in c.env_cmd {
+        if !us.env.iter().any(|e| e.name == name) {
+            us.env.push(SecretEnv {
+                name,
+                source_env: String::new(),
+                source_command: Some(cmd),
                 required: false,
                 approval: None,
             });
@@ -197,11 +226,15 @@ fn add(args: SecretsAddArgs) -> Result<()> {
 fn print_repo_snippet(c: &Collected) {
     println!("# Add the following to .cowboy/security.yaml (host-owned, never mounted).\n");
     println!("# Under `secrets:` —");
-    if !c.env.is_empty() {
+    if !c.env.is_empty() || !c.env_cmd.is_empty() {
         println!("  env:");
         for (name, src) in &c.env {
             println!("    - name: {name}");
             println!("      source_env: {src}");
+        }
+        for (name, cmd) in &c.env_cmd {
+            println!("    - name: {name}");
+            println!("      source_command: {cmd:?}");
         }
     }
     if !c.files.is_empty() {
@@ -252,12 +285,23 @@ fn list() -> Result<()> {
     for (label, envs, files) in sources {
         for e in envs {
             any = true;
-            let mark = if std::env::var(&e.source_env).is_ok() {
-                "set"
+            if let Some(cmd) = &e.source_command {
+                let ok = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(cmd)
+                    .output()
+                    .map(|o| o.status.success() && !o.stdout.is_empty())
+                    .unwrap_or(false);
+                let mark = if ok { "ok" } else { "FAILED on host" };
+                println!("  env   {} ← `{cmd}`  [{label}] [{mark}]", e.name);
             } else {
-                "MISSING on host"
-            };
-            println!("  env   {} ← ${}  [{label}] [{mark}]", e.name, e.source_env);
+                let mark = if std::env::var(&e.source_env).is_ok() {
+                    "set"
+                } else {
+                    "MISSING on host"
+                };
+                println!("  env   {} ← ${}  [{label}] [{mark}]", e.name, e.source_env);
+            }
         }
         for f in files {
             any = true;

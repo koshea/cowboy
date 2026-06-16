@@ -285,6 +285,7 @@ mod tests {
             env: vec![SecretEnv {
                 name: "GH_TOKEN".into(),
                 source_env: "GH_TOKEN".into(),
+                source_command: None,
                 required: false,
                 approval: None,
             }],

@@ -183,14 +183,23 @@ pub fn approval_required(approval: &Option<String>) -> bool {
     )
 }
 
-/// A single secret env var injected into the container from a host env var.
-/// The agent cannot edit this; values are never logged.
+/// A single secret env var injected into the container. The value comes from a
+/// host env var (`source_env`) or, for keyring-backed tools, the trimmed stdout
+/// of a host command (`source_command`, e.g. `gh auth token`). The agent cannot
+/// edit this; values are never logged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SecretEnv {
     /// Name of the env var as seen inside the container.
     pub name: String,
-    /// Name of the host env var to read the value from.
+    /// Name of the host env var to read the value from (empty if using
+    /// `source_command`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_env: String,
+    /// Host command whose stdout (trimmed) is the value. Run at session start on
+    /// the host — handy for keyring-backed tokens (`gh auth token`,
+    /// `gcloud auth print-access-token`). Takes precedence over `source_env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_command: Option<String>,
     #[serde(default)]
     pub required: bool,
     /// If `Some("required")`, injecting this secret needs explicit approval.
