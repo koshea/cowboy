@@ -585,6 +585,17 @@ impl App {
             kind,
             text: text.into(),
         });
+        // Bound the scrollback: every frame re-wraps and re-parses the whole
+        // transcript, so an unbounded buffer (e.g. a noisy command) tanks
+        // performance. Keep the most recent `TRANSCRIPT_CAP` lines, trimming in
+        // batches (drop only when we exceed the cap by a slack) so trimming is
+        // amortized O(1) rather than O(n) on every push.
+        const TRANSCRIPT_CAP: usize = 5000;
+        const SLACK: usize = 512;
+        if self.transcript.len() > TRANSCRIPT_CAP + SLACK {
+            let excess = self.transcript.len() - TRANSCRIPT_CAP;
+            self.transcript.drain(0..excess);
+        }
     }
 
     /// Mark the start of a streamed shell command (for the live indicator).
@@ -1948,6 +1959,23 @@ mod tests {
         assert_eq!(app.running.as_ref().unwrap().elapsed_secs, 3);
         app.end_command();
         assert!(app.running.is_none());
+    }
+
+    #[test]
+    fn transcript_buffer_is_bounded() {
+        let mut app = App::new("t");
+        for i in 0..8000 {
+            app.push(LineKind::Output, format!("line {i}"));
+        }
+        // Bounded (cap + slack), oldest dropped, newest kept.
+        assert!(
+            app.transcript.len() <= 5000 + 512,
+            "len {}",
+            app.transcript.len()
+        );
+        assert!(app.transcript.len() >= 5000);
+        assert_eq!(app.transcript.last().unwrap().text, "line 7999");
+        assert!(!app.transcript.iter().any(|l| l.text == "line 0"));
     }
 
     #[test]

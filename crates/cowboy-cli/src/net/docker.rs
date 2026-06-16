@@ -537,9 +537,11 @@ impl DockerCli for CliDocker {
             format!("setsid sh -c 'echo $$ > {pidfile}; exec sh -c \"$COWBOY_CMD\"' 2>&1");
         let mut cmd = Command::new("docker");
         cmd.arg("exec");
-        // `-t` allocates a PTY so the command sees a terminal and flushes output
-        // line-by-line; a plain pipe block-buffers, hiding output until exit.
-        cmd.arg("-t");
+        // No `-t` (PTY): with a real terminal, tools like mise/cargo/docker draw
+        // multi-line progress with cursor-movement escapes (cursor-up + reprint)
+        // that we'd need a terminal emulator to render — they tiled down the
+        // screen. Over a plain pipe those tools detect "not a TTY" and emit plain,
+        // streamable log lines instead, which our line splitter handles.
         push_exec_flags(&mut cmd, workdir, user);
         cmd.args([
             "-e",
@@ -550,17 +552,17 @@ impl DockerCli for CliDocker {
             &wrapper,
         ]);
         cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null()); // merged into stdout by the PTY
+        cmd.stderr(Stdio::null()); // merged into stdout by the wrapper's 2>&1
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().context("spawning streaming docker exec")?;
         let mut stdout = child.stdout.take().context("exec stdout")?;
         let mut output = String::new();
-        // Split the PTY byte stream ourselves: `\n` (and `\r\n`) commits a line;
-        // a bare `\r` is a progress overwrite (transient). `line_start` marks
-        // where the current line begins in `output` so transient updates replace
-        // it in place. (UTF-8 multibyte never contains 0x0A/0x0D, so splitting on
-        // those bytes is safe.)
+        // Split the byte stream ourselves: `\n` (and `\r\n`) commits a line; a
+        // bare `\r` is a single-line progress overwrite (transient). `line_start`
+        // marks where the current line begins in `output` so transient updates
+        // replace it in place. (UTF-8 multibyte never contains 0x0A/0x0D, so
+        // splitting on those bytes is safe.)
         let mut line: Vec<u8> = Vec::new();
         let mut line_start = 0usize;
         let mut pending_cr = false;
