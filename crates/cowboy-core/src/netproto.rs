@@ -12,8 +12,15 @@ use serde::{Deserialize, Serialize};
 /// How long (seconds) either end waits for a network-approval verdict before
 /// failing closed. Shared so the gateway (waiting on the host control socket)
 /// and the host worker (waiting on the user) use the *same* budget — if they
-/// disagreed, one could give up while the other still waited.
-pub const APPROVAL_TIMEOUT_SECS: u64 = 120;
+/// disagreed, one could give up while the other still waited (leaving a stale
+/// modal while the agent moves on).
+///
+/// This is a *human* gate, so the window is generous: with a client attached the
+/// agent's command simply blocks on the prompt until you decide (or you interrupt
+/// the turn). It is NOT a liveness timeout — a headless run with no client
+/// attached is denied immediately by the host (it never waits), so this long
+/// budget only ever applies when someone is actually there to answer.
+pub const APPROVAL_TIMEOUT_SECS: u64 = 1800;
 
 /// Transport-layer protocol of an outbound attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
