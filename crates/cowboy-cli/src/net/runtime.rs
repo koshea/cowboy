@@ -336,11 +336,34 @@ impl AgentRuntime {
     }
 
     /// Ensure a long-lived agent container is running, creating or starting it.
+    /// Restarting a container that idle-teardown stopped re-pins its egress route
+    /// through the gateway (the entrypoint does this too, but we re-force it so a
+    /// restarted container is never briefly unrouted).
     pub async fn ensure_running(&self) -> Result<()> {
         match self.docker.container_state(&self.container_name).await? {
             ContainerState::Running => Ok(()),
-            ContainerState::Stopped => self.docker.start(&self.container_name).await,
+            ContainerState::Stopped => {
+                self.docker.start(&self.container_name).await?;
+                if let Some(gw) = &self.gateway {
+                    gw.force_agent_route(&*self.docker, &self.container_name)
+                        .await?;
+                }
+                Ok(())
+            }
             ContainerState::Absent => self.create().await,
+        }
+    }
+
+    /// Stop the agent container (idle teardown) to free its RAM; the gateway is
+    /// left running (it's tiny) so the next command restarts only the agent via
+    /// [`ensure_running`]. Best-effort.
+    pub async fn stop(&self) {
+        if matches!(
+            self.docker.container_state(&self.container_name).await,
+            Ok(ContainerState::Running)
+        ) {
+            tracing::info!(container = %self.container_name, "stopping idle agent container");
+            let _ = self.docker.stop(&self.container_name).await;
         }
     }
 

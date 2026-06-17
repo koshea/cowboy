@@ -42,6 +42,7 @@ fn arb_agent_config() -> impl Strategy<Value = AgentConfig> {
                 agent: AgentBehavior {
                     command_timeout_seconds,
                     model_timeout_seconds,
+                    idle_container_timeout_seconds: 1800,
                     max_iterations,
                     max_command_output_bytes,
                     token_budget: 0,

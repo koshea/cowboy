@@ -42,6 +42,21 @@ jobs and OOM a small container. Cowboy therefore injects `MAKEFLAGS=-j{cpus}` (a
 comfortable; raise both (or use `auto`) for heavier builds. If a build OOMs
 (`exit 137`), give it more `cpus`/`memory`.
 
+**Container lifecycle & memory.** There's one agent container per worktree, but
+they don't pile up or hold much RAM:
+
+- An **idle container costs almost nothing** — it runs only `tail -f /dev/null`,
+  toolchains live in a shared on-disk cache (not RAM), and `cpus`/`memory` are
+  *caps*, not reservations. The RAM you actually pay for is the dev processes the
+  agent runs (servers, builds, language servers).
+- **Ended sessions are reaped automatically** — when a session ends, its agent
+  container, gateway, and networks are removed (a crashed session's are cleaned up
+  by the daemon shortly after). No more lingering containers to `cowboy down`.
+- **Idle detached sessions free their RAM** — a detached session with no attached
+  client stops its container after `agent.idle_container_timeout_seconds`
+  (default 30 min; `0` disables); the next command restarts it. The session stays
+  resumable.
+
 ## `agent.yaml` (mounted, agent-editable)
 
 Non-security behavior only.
@@ -51,6 +66,7 @@ version: 1
 agent:
   command_timeout_seconds: 600
   model_timeout_seconds: 120
+  idle_container_timeout_seconds: 1800   # stop an idle detached session's container (0 = off)
   max_iterations: 100
   max_command_output_bytes: 60000
 processes:

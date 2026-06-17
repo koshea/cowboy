@@ -223,6 +223,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     gate_credential_grants(&mut security, &emitter).await;
 
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
+    // Captured before the runtime moves into the agent loop, so we can reap this
+    // session's container + gateway on clean shutdown below.
+    let container_name = runtime.container_name().to_string();
 
     // Network approvals + gateway events flow over the TCP control channel. Route
     // approvals to attached clients (fail closed with none); log + surface
@@ -355,9 +358,27 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             Some(m) => m,
             None => {
                 // Idle: wait for the next client message, or shut down if orphaned.
-                let msg = tokio::select! {
-                    _ = orphan.cancelled() => break 'serve,
-                    m = cmd_rx.recv() => m,
+                // If we sit idle with no client attached past the configured
+                // timeout, stop the container to free its RAM (the next command
+                // restarts it); keep waiting so the session itself stays resumable.
+                let idle_secs = agent.idle_container_timeout_seconds();
+                let msg = loop {
+                    let idle_tick = async {
+                        if idle_secs == 0 {
+                            std::future::pending::<()>().await
+                        } else {
+                            tokio::time::sleep(std::time::Duration::from_secs(idle_secs)).await
+                        }
+                    };
+                    tokio::select! {
+                        _ = orphan.cancelled() => break 'serve,
+                        m = cmd_rx.recv() => break m,
+                        _ = idle_tick => {
+                            if emitter.attached() == 0 {
+                                agent.stop_container().await;
+                            }
+                        }
+                    }
                 };
                 match msg {
                     None => break,
@@ -471,6 +492,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if args.register {
         let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
     }
+    // Reap this session's container + gateway + networks now that it has ended.
+    // We held the exclusive worktree lease, so we're the sole user; a *crashed*
+    // worker's containers are instead reaped by the daemon's vacuum. (A detach
+    // never reaches here — the worker keeps serving — so detached sessions live.)
+    crate::cmd::down::teardown_project(&CliDocker::new(), &root, &container_name).await;
     Ok(())
 }
 

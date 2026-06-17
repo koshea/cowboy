@@ -104,6 +104,8 @@ pub trait DockerCli: Send + Sync {
     /// exit code. Used for the route-setup helper.
     async fn run_oneshot(&self, spec: &ContainerSpec) -> Result<ExecResult>;
     async fn start(&self, name: &str) -> Result<()>;
+    /// Stop a running container (it can be `start`ed again). Used by idle teardown.
+    async fn stop(&self, name: &str) -> Result<()>;
     /// Remove a container. Used by teardown paths (Slice C/G).
     #[allow(dead_code)]
     async fn remove(&self, name: &str, force: bool) -> Result<()>;
@@ -434,6 +436,11 @@ impl DockerCli for CliDocker {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        Ok(())
+    }
+
+    async fn stop(&self, name: &str) -> Result<()> {
+        let _ = run_quiet(&["stop", name]).await?;
         Ok(())
     }
 

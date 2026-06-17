@@ -356,6 +356,11 @@ pub struct AgentBehavior {
     pub command_timeout_seconds: u64,
     #[serde(default = "default_model_timeout")]
     pub model_timeout_seconds: u64,
+    /// Stop a detached, idle session's container after this many seconds with no
+    /// running turn and no attached client, to free its RAM (the next command
+    /// restarts it). `0` disables idle teardown.
+    #[serde(default = "default_idle_container_timeout")]
+    pub idle_container_timeout_seconds: u64,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
     #[serde(default = "default_max_output")]
@@ -581,6 +586,9 @@ fn default_command_timeout() -> u64 {
 fn default_model_timeout() -> u64 {
     120
 }
+fn default_idle_container_timeout() -> u64 {
+    1800 // 30 min: free a detached, idle session's container RAM (restarts on use)
+}
 fn default_max_iterations() -> u32 {
     100
 }
@@ -688,6 +696,7 @@ impl Default for AgentBehavior {
         Self {
             command_timeout_seconds: default_command_timeout(),
             model_timeout_seconds: default_model_timeout(),
+            idle_container_timeout_seconds: default_idle_container_timeout(),
             max_iterations: default_max_iterations(),
             max_command_output_bytes: default_max_output(),
             token_budget: 0,
@@ -1173,6 +1182,10 @@ const AGENT_TEMPLATE: &str = r#"version: 1
 agent:
   command_timeout_seconds: 600
   model_timeout_seconds: 120
+  # Stop a detached, idle session's container after this many seconds (no running
+  # turn, no attached client) to free its RAM; the next command restarts it.
+  # 0 disables. The container is *removed* outright when the session ends.
+  idle_container_timeout_seconds: 1800
   max_iterations: 100
   max_command_output_bytes: 60000
   # Optional usage budgets (0 = no limit). The session stops once a budget is

@@ -1202,6 +1202,18 @@ impl<'a> AgentLoop<'a> {
         let _ = self.runtime.stop_all_processes().await;
     }
 
+    /// Idle teardown: stop the agent container to free its RAM. The next command
+    /// restarts it (via the runtime's `ensure_running`). Used by the worker when a
+    /// detached session sits idle past the configured timeout.
+    pub async fn stop_container(&self) {
+        self.runtime.stop().await;
+    }
+
+    /// The configured idle-container timeout (0 = disabled).
+    pub fn idle_container_timeout_seconds(&self) -> u64 {
+        self.behavior.idle_container_timeout_seconds
+    }
+
     /// Plan every `subagent` call in this turn, announce them, then execute them
     /// concurrently (capped by `delegation.max_parallel`). Returns call id →
     /// result. Parse / depth errors become the result for that call.

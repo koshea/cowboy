@@ -119,6 +119,29 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Result of a [`Daemon::vacuum`] pass: the session ids removed from the
+/// registry, plus the `(root, container_name)` of crashed sessions whose
+/// container no live session still uses — for the async caller to tear down.
+struct VacuumOutcome {
+    reaped: Vec<SessionId>,
+    containers: Vec<(PathBuf, String)>,
+}
+
+/// Tear down the agent container + gateway + networks for each crashed session
+/// the vacuum surfaced. Best-effort; runs outside the daemon lock (it shells out
+/// to Docker). This is what finally cleans up containers a crashed worker left
+/// behind — the clean-exit path reaps its own in the worker.
+async fn reap_containers(containers: Vec<(PathBuf, String)>) {
+    if containers.is_empty() {
+        return;
+    }
+    let docker = crate::net::docker::CliDocker::new();
+    for (root, name) in containers {
+        tracing::info!(container = %name, "reaping crashed session's container");
+        crate::cmd::down::teardown_project(&docker, &root, &name).await;
+    }
+}
+
 impl Daemon {
     fn load(state_path: PathBuf) -> Self {
         let state = std::fs::read_to_string(&state_path)
@@ -282,15 +305,23 @@ impl Daemon {
     /// sessions, nor unbounded record/socket buildup. Caller sweeps first (so
     /// ranch coordination can see the just-stale records before they're reaped).
     /// Returns the reaped session ids.
-    fn vacuum(&mut self) -> Vec<SessionId> {
-        // 1. Reap crashed sessions (already marked Stale by a prior sweep).
-        let reaped: Vec<SessionId> = self
+    fn vacuum(&mut self) -> VacuumOutcome {
+        // 1. Reap crashed sessions (already marked Stale by a prior sweep),
+        //    capturing each one's container coordinates before it's removed.
+        let stale: Vec<(SessionId, PathBuf, String)> = self
             .state
             .sessions
             .iter()
             .filter(|(_, s)| s.status == SessionStatus::Stale)
-            .map(|(id, _)| id.clone())
+            .map(|(id, s)| {
+                let name = s
+                    .container_name
+                    .clone()
+                    .unwrap_or_else(|| crate::net::runtime::container_name_for(&s.root));
+                (id.clone(), s.root.clone(), name)
+            })
             .collect();
+        let reaped: Vec<SessionId> = stale.iter().map(|(id, _, _)| id.clone()).collect();
         self.state.sessions.retain(|id, _| !reaped.contains(id));
 
         // 2. Drop leases whose holder no longer exists (reaped now, or orphaned by
@@ -319,7 +350,30 @@ impl Daemon {
         }
 
         self.save();
-        reaped
+
+        // 4. Of the reaped sessions' containers, return those NO live session still
+        //    uses, so the (async) caller can tear them down. A live session's
+        //    container name is its registered name, or the one it would derive — so
+        //    a just-started session that hasn't registered yet is still protected.
+        let live_names: std::collections::HashSet<String> = self
+            .state
+            .sessions
+            .values()
+            .filter(|s| !s.status.is_terminal())
+            .map(|s| {
+                s.container_name
+                    .clone()
+                    .unwrap_or_else(|| crate::net::runtime::container_name_for(&s.root))
+            })
+            .collect();
+        let mut seen = std::collections::HashSet::new();
+        let containers: Vec<(PathBuf, String)> = stale
+            .into_iter()
+            .filter(|(_, _, name)| !live_names.contains(name) && seen.insert(name.clone()))
+            .map(|(_, root, name)| (root, name))
+            .collect();
+
+        VacuumOutcome { reaped, containers }
     }
 
     /// Remove per-session socket files (`s-<id>.sock`) that don't belong to a
@@ -418,14 +472,14 @@ pub async fn serve() -> Result<()> {
     // recover. Heartbeat age is ignored here (on-disk timestamps are old).
     {
         let mut d = daemon.lock().await;
-        d.sweep_stale(false);
-        let reaped = d.vacuum();
+        let newly = d.sweep_stale(false);
         d.prune_sockets();
-        if !reaped.is_empty() {
-            tracing::info!(
-                ?reaped,
-                "reaped dead sessions (+released leases) on startup"
-            );
+        if !newly.is_empty() {
+            // Mark only; the periodic vacuum (below) reaps + tears down their
+            // containers a tick later, giving any worker that survived the daemon
+            // restart a chance to re-heartbeat and recover first.
+            tracing::info!(?newly, "marked dead sessions stale on startup");
+            d.save();
         }
     }
 
@@ -434,6 +488,10 @@ pub async fn serve() -> Result<()> {
     let sweeper = daemon.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        // `interval` fires the first tick immediately; consume it so the first
+        // sweep+reap runs a full period after startup, giving workers that
+        // survived a daemon restart a window to re-heartbeat before being reaped.
+        tick.tick().await;
         loop {
             tick.tick().await;
             let newly = {
@@ -452,11 +510,20 @@ pub async fn serve() -> Result<()> {
             }
             // Reap stale records + release dangling leases, prune sockets, bound
             // history. Idempotent; runs every tick so crashes self-heal.
-            {
+            let containers = {
                 let mut d = sweeper.lock().await;
-                d.vacuum();
+                let outcome = d.vacuum();
                 d.prune_sockets();
-            }
+                if !outcome.reaped.is_empty() {
+                    tracing::info!(
+                        reaped = ?outcome.reaped,
+                        "reaped stale sessions (+released leases)"
+                    );
+                }
+                outcome.containers
+            };
+            // Tear down the crashed sessions' containers (Docker; lock released).
+            reap_containers(containers).await;
         }
     });
 
@@ -1302,17 +1369,46 @@ mod tests {
                 updated_ms: 0,
             },
         );
-        // A live session is left untouched.
+        // A live session on the SAME root (→ same container) is left untouched.
         put_session(&mut d, "live", SessionStatus::Running);
 
-        let reaped = d.vacuum();
+        let outcome = d.vacuum();
 
-        assert_eq!(reaped, vec!["crashed".to_string()]);
+        assert_eq!(outcome.reaped, vec!["crashed".to_string()]);
         assert!(!d.state.sessions.contains_key("crashed"), "stale reaped");
         assert!(d.state.sessions.contains_key("live"), "live kept");
         assert!(
             !d.state.leases.contains_key("/w"),
             "dangling lease freed so a new session can start"
+        );
+        // Refcount: the container is NOT torn down because a live session shares it.
+        assert!(
+            outcome.containers.is_empty(),
+            "shared container must not be reaped while a live session uses it"
+        );
+    }
+
+    #[test]
+    fn vacuum_reaps_lone_crashed_container() {
+        let mut d = daemon();
+        put_session(&mut d, "crashed", SessionStatus::Stale);
+        // Distinct root + explicit container name, no other session sharing it.
+        {
+            let s = d.state.sessions.get_mut("crashed").unwrap();
+            s.root = PathBuf::from("/repo-a");
+            s.container_name = Some("cowboy-agent-a".into());
+        }
+        // An unrelated live session on a different container — must not be touched.
+        put_session(&mut d, "other", SessionStatus::Running);
+        d.state.sessions.get_mut("other").unwrap().root = PathBuf::from("/repo-b");
+
+        let outcome = d.vacuum();
+
+        assert_eq!(outcome.reaped, vec!["crashed".to_string()]);
+        assert_eq!(
+            outcome.containers,
+            vec![(PathBuf::from("/repo-a"), "cowboy-agent-a".to_string())],
+            "the lone crashed container is surfaced for teardown"
         );
     }
 
