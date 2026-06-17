@@ -36,20 +36,17 @@ credentials); set the default with `cowboy models use [-g] <name>` and review wi
 
 ## Docs
 
-Full documentation is an [mdBook](https://rust-lang.github.io/mdBook/) site under
-[`docs/`](docs/src/SUMMARY.md). Build/read it locally:
+Full documentation lives at **[cowboycode.io](https://cowboycode.io)**.
 
-```sh
-cargo install mdbook        # once
-mdbook serve docs           # live preview at http://localhost:3000 (or: mdbook build docs)
-```
+Highlights: [Quick start](https://cowboycode.io/getting-started/quickstart.html) ·
+[Security model](https://cowboycode.io/security/model.html) ·
+[Network gateway](https://cowboycode.io/security/network.html) ·
+[Configuration](https://cowboycode.io/getting-started/configuration.html) ·
+[Ranch Plans](https://cowboycode.io/ranch/overview.html) ·
+[CLI reference](https://cowboycode.io/reference/cli.html).
 
-Highlights: [Quick start](docs/src/getting-started/quickstart.md) ·
-[Security model](docs/src/security/model.md) ·
-[Network gateway](docs/src/security/network.md) ·
-[Configuration](docs/src/getting-started/configuration.md) ·
-[Ranch Plans](docs/src/ranch/overview.md) ·
-[CLI reference](docs/src/reference/cli.md).
+The site is an [mdBook](https://rust-lang.github.io/mdBook/) built from
+[`docs/`](docs/src/SUMMARY.md) and published on every push to `main`.
 
 ## Workspace layout
 
@@ -88,6 +85,9 @@ LLVM_COV=/usr/lib/llvm/<v>/bin/llvm-cov \
 LLVM_PROFDATA=/usr/lib/llvm/<v>/bin/llvm-profdata \
   cargo llvm-cov nextest --summary-only
 ```
+
+Preview the docs locally with `mdbook serve docs` (`cargo install mdbook` once) —
+live at <http://localhost:3000>.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor guide and
 [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
