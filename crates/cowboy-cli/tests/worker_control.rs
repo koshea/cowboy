@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use assert_fs::prelude::*;
 use cowboy_core::daemonproto::{
     ClientMsg, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, InterruptKind, LeaseMode,
-    ServerMsg, UiEventMsg,
+    ServerMsg, SessionStatus, UiEventMsg,
 };
 use cowboy_core::netproto::encode_line;
 
@@ -220,6 +220,105 @@ fn interrupt_cancels_a_running_turn() {
 
     c.send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(300));
+}
+
+/// `End` must terminate the worker: an idle session that receives `End` finalizes
+/// and exits, so the daemon stops reporting it `Running`. (Reproduces the "press
+/// e, session stays Running" bug at the protocol level — no TUI involved.)
+#[test]
+fn end_terminates_the_worker() {
+    let fx = setup();
+    let ws = start(&fx, None); // idle session (no task)
+    let id = ws
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("s-")
+        .trim_end_matches(".sock")
+        .to_string();
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+
+    c.send(&ClientMsg::End);
+
+    let started = Instant::now();
+    let mut ended = false;
+    while started.elapsed() < Duration::from_secs(8) {
+        match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+            Some(DaemonResp::Session { info }) if info.status != SessionStatus::Running => {
+                ended = true;
+                break;
+            }
+            // Reaped from the registry also counts as ended.
+            Some(DaemonResp::Err { .. }) => {
+                ended = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+    assert!(
+        ended,
+        "ClientMsg::End must terminate the worker; still Running after 8s"
+    );
+}
+
+/// End-to-end through the REAL client bridge (not raw protocol): connect the
+/// bridge to a live worker, then drop the task sender — exactly what the TUI's
+/// "end" does. The worker must terminate. This closes the gap between the
+/// protocol-level End test and the full TUI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn end_via_bridge_terminates_the_worker() {
+    use std::sync::{Arc, Mutex};
+
+    let fx = setup();
+    let ws = start(&fx, None); // idle session
+    let id = ws
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("s-")
+        .trim_end_matches(".sock")
+        .to_string();
+
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<cowboy_cli::agent::tui::AgentCmd>();
+    let (ui_tx, _ui_rx) = std::sync::mpsc::channel::<cowboy_cli::agent::tui::UiEvent>();
+    let turn_cancel: cowboy_cli::agent::tui::TurnCancel =
+        Arc::new(Mutex::new(Some(tokio_util::sync::CancellationToken::new())));
+    let stream = tokio::net::UnixStream::connect(&ws).await.unwrap();
+    let bridge_h = tokio::spawn(cowboy_cli::cmd::attach::bridge(
+        stream,
+        ui_tx,
+        task_rx,
+        turn_cancel,
+        false,
+    ));
+
+    // Let the bridge connect + send Hello, then simulate pressing "e" (end).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(task_tx);
+
+    let started = Instant::now();
+    let mut ended = false;
+    while started.elapsed() < Duration::from_secs(8) {
+        match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+            Some(DaemonResp::Session { info }) if info.status != SessionStatus::Running => {
+                ended = true;
+                break;
+            }
+            Some(DaemonResp::Err { .. }) => {
+                ended = true;
+                break;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(150)).await,
+        }
+    }
+    bridge_h.abort();
+    assert!(
+        ended,
+        "dropping the bridge's task sender (TUI 'end') must terminate the worker"
+    );
 }
 
 /// `Detach` closes *that* client's connection promptly but leaves the session

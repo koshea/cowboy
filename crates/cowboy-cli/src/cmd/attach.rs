@@ -407,6 +407,51 @@ mod tests {
     use std::time::Duration;
     use tokio::net::UnixListener;
 
+    /// The TUI's "end" drops `task_tx`; the bridge must then send `ClientMsg::End`
+    /// to the worker. (Isolates the client half of the "press e, session stays
+    /// Running" bug — no worker/daemon involved, just the bridge.)
+    #[tokio::test]
+    async fn dropping_task_tx_sends_end_to_worker() {
+        let dir = assert_fs::TempDir::new().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Fake worker: read the ClientMsgs the bridge sends until we see End.
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if matches!(
+                    serde_json::from_str::<ClientMsg>(line.trim()),
+                    Ok(ClientMsg::End)
+                ) {
+                    return true;
+                }
+            }
+            false
+        });
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
+        let turn_cancel: TurnCancel =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let bridge_h = tokio::spawn(bridge(stream, ui_tx, task_rx, turn_cancel, false));
+
+        // Simulate the pause-menu "end": drop the only task sender.
+        drop(task_tx);
+
+        let saw_end = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("timed out waiting for the bridge to send End")
+            .unwrap();
+        assert!(
+            saw_end,
+            "dropping task_tx must make the bridge send ClientMsg::End"
+        );
+        bridge_h.abort();
+    }
+
     fn info() -> SessionInfo {
         SessionInfo {
             id: "t".into(),
