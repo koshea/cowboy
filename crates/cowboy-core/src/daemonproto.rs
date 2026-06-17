@@ -292,6 +292,14 @@ pub enum DaemonReq {
         #[serde(default)]
         drain: bool,
     },
+    /// Sign off on the ranch workstream a session is running: mark it complete,
+    /// promote its artifacts, and advance the plan (launch newly-unblocked
+    /// workstreams). Sent by the worker when the user runs `/accept` in-session.
+    AcceptWorkstream {
+        session: SessionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -346,6 +354,8 @@ pub enum DaemonResp {
     Inbox {
         messages: Vec<BusMessage>,
     },
+    /// A workstream was signed off and the plan advanced.
+    Accepted,
     Err {
         message: String,
     },
@@ -373,6 +383,11 @@ pub enum UiEventMsg {
         output: String,
     },
     ToolUse(String),
+    /// A unified diff of a file the agent created or edited.
+    FileDiff {
+        path: String,
+        diff: String,
+    },
     Final(String),
     Notice(String),
     NetEvent(String),
@@ -465,6 +480,16 @@ pub enum ClientMsg {
         scope: ApprovalScope,
     },
     SwitchModel(String),
+    /// Turn plan mode on/off: while on, the agent proposes a plan and the loop
+    /// blocks file edits until it's turned off (the user approves with `/go`).
+    PlanMode(bool),
+    /// Sign off on the ranch workstream this session is running (the user typed
+    /// `/accept`): the worker asks the daemon to complete the workstream + advance
+    /// the plan, then ends the session.
+    Accept {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
     Interrupt {
         kind: InterruptKind,
     },
@@ -542,6 +567,17 @@ mod tests {
                 held_by: sample_info(),
             },
         });
+        roundtrip(&DaemonRequest {
+            id: 4,
+            req: DaemonReq::AcceptWorkstream {
+                session: "123-456".into(),
+                note: Some("looks good".into()),
+            },
+        });
+        roundtrip(&DaemonResponse {
+            id: 4,
+            resp: DaemonResp::Accepted,
+        });
     }
 
     #[test]
@@ -576,6 +612,10 @@ mod tests {
             dest: "example.com:443".into(),
         });
         roundtrip(&ServerMsg::ApprovalResolved { id: 2 });
+        roundtrip(&ClientMsg::Accept {
+            note: Some("ship it".into()),
+        });
+        roundtrip(&ClientMsg::Accept { note: None });
     }
 
     #[test]

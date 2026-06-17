@@ -9,6 +9,7 @@ pub mod daemonproto;
 pub mod decision;
 pub mod error;
 pub mod lifecycle;
+pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod model_defaults;
@@ -17,6 +18,7 @@ pub mod policy;
 pub mod ranch;
 pub mod scope;
 pub mod skills;
+pub mod time;
 pub mod tokens;
 pub mod usersecrets;
 

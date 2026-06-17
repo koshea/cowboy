@@ -9,12 +9,20 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{
     self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
-    MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs, SubagentArgs, WriteArgs,
+    McpArgs, MemoryArgs, PlanArgs, ProposeRanchArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs,
+    SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
 use crate::net::runtime::AgentRuntime;
 use crate::session::SessionLogger;
+
+mod handlers;
+mod support;
+use support::{
+    emit_delta, fileop_summary, parse_args, render_plan, render_transcript, self_exe,
+    tool_signature, truncate, unified_diff,
+};
 
 /// Default agent system prompt (see plan §10.3).
 pub const SYSTEM_PROMPT: &str = "\
@@ -125,6 +133,14 @@ pub struct AgentLoop<'a> {
     /// progress and burns tokens, so we nudge then abort.
     last_tool_sig: Option<String>,
     tool_repeat: u32,
+    /// Plan mode: while on, file-mutating tools (`edit`/`write`) are refused so
+    /// the agent proposes a plan and waits for the user to approve (`/go`). Host-
+    /// enforced — the agent can't edit during planning even if it tries.
+    planning: bool,
+    /// Connected MCP servers for this session (host-side). `None` when no servers
+    /// are enabled; set via [`AgentLoop::enable_mcp`], which also adds the `mcp`
+    /// tool and lists the servers in the system prompt.
+    mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
@@ -191,6 +207,7 @@ fn classify_subagent_result(result: &str) -> &'static str {
     if r.starts_with("subagent failed to start")
         || r.starts_with("error:")
         || r.starts_with("subagent error")
+        || r.starts_with("[incomplete]")
     {
         "error"
     } else if r.is_empty() || r == "subagent produced no final answer" {
@@ -265,10 +282,40 @@ impl<'a> AgentLoop<'a> {
             setup_done: false,
             last_tool_sig: None,
             tool_repeat: 0,
+            planning: false,
+            mcp: None,
             messages: vec![Message::system(system)],
             ui,
             logger: None,
         }
+    }
+
+    /// Connect this session to the configured MCP servers: list them (name +
+    /// purpose) in the system prompt so the agent knows what's available, and add
+    /// the `mcp` discovery/call tool. No-op if no servers are enabled.
+    pub fn enable_mcp(&mut self, manager: std::sync::Arc<crate::mcp::McpManager>) {
+        let servers = manager.connected_servers();
+        if servers.is_empty() {
+            return;
+        }
+        let mut block = String::from(
+            "\n\n## Connected MCP servers\n\
+             You have access to these external MCP servers (host-managed integrations). \
+             Use the `mcp` tool to discover their tools (`list_tools`) and call them (`call`); \
+             discover a server's tools before calling them:\n",
+        );
+        for (name, desc) in &servers {
+            if desc.is_empty() {
+                block.push_str(&format!("- {name}\n"));
+            } else {
+                block.push_str(&format!("- {name}: {desc}\n"));
+            }
+        }
+        if let Some(Message { content, .. }) = self.messages.first_mut() {
+            content.push_str(&block);
+        }
+        self.tools.push(tools::mcp_definition());
+        self.mcp = Some(manager);
     }
 
     /// Accumulate per-call token estimates (prompt sent + completion received)
@@ -554,6 +601,12 @@ impl<'a> AgentLoop<'a> {
         self.price_out = price_out;
     }
 
+    /// Toggle plan mode. While on, `edit`/`write` are refused (the agent must
+    /// propose a plan and wait for the user to approve). Used by `/plan` / `/go`.
+    pub fn set_planning(&mut self, on: bool) {
+        self.planning = on;
+    }
+
     /// Run one conversational turn for `task`, keeping the conversation (and the
     /// session logger) alive for subsequent turns. `turn_cancel` interrupts just
     /// this turn. Does NOT finalize the session.
@@ -699,7 +752,21 @@ impl<'a> AgentLoop<'a> {
                     self.ui.final_message(&msg);
                     return Ok(Some(msg));
                 }
-                self.ui.notice("model produced no action; stopping");
+                // Truncated mid-generation with nothing usable: a reasoning model
+                // can spend its entire output budget thinking and never emit an
+                // answer or tool call. Report it explicitly so the caller (a
+                // foreman reading a subagent's stdout, or the user) sees the
+                // cause instead of a silent empty result.
+                if response.truncated {
+                    let note = "model hit its output-token limit while reasoning \
+                                and produced no answer (no content, no tool call)";
+                    self.ui.notice(note);
+                    return Ok(Some(format!("[incomplete] {note}")));
+                }
+                self.ui.notice(
+                    "the model didn't return anything to do — rephrase your request, \
+                     or try a different model with /model",
+                );
                 return Ok(None);
             }
 
@@ -774,14 +841,21 @@ impl<'a> AgentLoop<'a> {
         let sub_results = self.run_subagents(&response.tool_calls).await;
 
         for call in &response.tool_calls {
+            // Plan mode gate: refuse file-mutating tools so the agent proposes a
+            // plan instead of editing. Host-enforced — independent of the prompt.
+            if self.planning && matches!(call.name.as_str(), tools::TOOL_EDIT | tools::TOOL_WRITE) {
+                self.push_tool_result(
+                    &call.id,
+                    "blocked: plan mode is on — do not modify files yet. Present your plan \
+                     (use the `plan` tool to list the steps), then stop; the user will \
+                     approve with /go before you make changes.",
+                );
+                continue;
+            }
             match call.name.as_str() {
                 tools::TOOL_FINAL => {
-                    let args: FinalArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<FinalArgs>(call) else {
+                        continue;
                     };
                     if let Some(l) = &self.logger {
                         l.write_final(&args.message);
@@ -790,12 +864,8 @@ impl<'a> AgentLoop<'a> {
                     return Ok(Some(args.message));
                 }
                 tools::TOOL_SHELL => {
-                    let args: ShellArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<ShellArgs>(call) else {
+                        continue;
                     };
                     self.ui.command_start(&args.command);
                     let started = std::time::Instant::now();
@@ -814,12 +884,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_READ => {
-                    let args: ReadArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<ReadArgs>(call) else {
+                        continue;
                     };
                     self.ui.tool_use(&format!("read {}", args.path));
                     let payload = serde_json::json!({
@@ -829,13 +895,10 @@ impl<'a> AgentLoop<'a> {
                     self.run_fileop(&call.id, &payload).await?;
                 }
                 tools::TOOL_EDIT => {
-                    let args: EditArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<EditArgs>(call) else {
+                        continue;
                     };
+                    let before = self.read_workspace_file(&args.path);
                     let payload = serde_json::json!({
                         "op": "edit", "path": args.path,
                         "old": args.old, "new": args.new, "replace_all": args.replace_all,
@@ -843,29 +906,28 @@ impl<'a> AgentLoop<'a> {
                     let (exit, out) = self.run_fileop(&call.id, &payload).await?;
                     self.ui
                         .tool_use(&fileop_summary("edit", &args.path, exit, &out));
+                    if exit == 0 {
+                        self.emit_file_diff(&args.path, before.as_deref());
+                    }
                 }
                 tools::TOOL_WRITE => {
-                    let args: WriteArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<WriteArgs>(call) else {
+                        continue;
                     };
+                    let before = self.read_workspace_file(&args.path);
                     let payload = serde_json::json!({
                         "op": "write", "path": args.path, "content": args.content,
                     });
                     let (exit, out) = self.run_fileop(&call.id, &payload).await?;
                     self.ui
                         .tool_use(&fileop_summary("write", &args.path, exit, &out));
+                    if exit == 0 {
+                        self.emit_file_diff(&args.path, before.as_deref());
+                    }
                 }
                 tools::TOOL_MEMORY => {
-                    let args: MemoryArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<MemoryArgs>(call) else {
+                        continue;
                     };
                     self.ui.tool_use(&format!("memory {}", args.action));
                     let observation = self.run_memory(&args);
@@ -876,12 +938,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_PLAN => {
-                    let args: PlanArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<PlanArgs>(call) else {
+                        continue;
                     };
                     let observation = self.run_plan(args);
                     let tool_msg = Message::tool_result(&call.id, observation);
@@ -891,12 +949,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_ARTIFACT => {
-                    let args: ArtifactArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<ArtifactArgs>(call) else {
+                        continue;
                     };
                     self.ui.tool_use(&format!("artifact {}", args.action));
                     let observation = self.run_artifact(&args);
@@ -907,12 +961,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_HANDOFF => {
-                    let args: HandoffArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<HandoffArgs>(call) else {
+                        continue;
                     };
                     self.ui.tool_use("handoff");
                     let observation = self.run_handoff(&args);
@@ -923,12 +973,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_BLOCKED => {
-                    let args: BlockedArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<BlockedArgs>(call) else {
+                        continue;
                     };
                     self.ui.blocked(Some(&args.reason));
                     self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::Blocked {
@@ -943,12 +989,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_DECISION => {
-                    let args: DecisionArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<DecisionArgs>(call) else {
+                        continue;
                     };
                     let observation = self.run_decision(&args);
                     let tool_msg = Message::tool_result(&call.id, observation);
@@ -967,12 +1009,8 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 tools::TOOL_PROPOSE_SCOPE_CHANGE => {
-                    let args: ProposeScopeChangeArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
-                        }
+                    let Some(args) = self.parse_or_report::<ProposeScopeChangeArgs>(call) else {
+                        continue;
                     };
                     let observation = self.run_propose_scope_change(&args);
                     let tool_msg = Message::tool_result(&call.id, observation);
@@ -981,13 +1019,36 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
-                tools::TOOL_ASK_USER => {
-                    let args: AskUserArgs = match parse_args(&call.arguments) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            self.tool_error(&call.id, &call.name, &e.to_string());
-                            continue;
+                tools::TOOL_PROPOSE_RANCH => {
+                    let Some(args) = self.parse_or_report::<ProposeRanchArgs>(call) else {
+                        continue;
+                    };
+                    self.ui.tool_use(&format!(
+                        "propose_ranch: {} ({} workstreams)",
+                        args.title,
+                        args.workstreams.len()
+                    ));
+                    let observation = self.run_propose_ranch(&args);
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_MCP => {
+                    let Some(args) = self.parse_or_report::<McpArgs>(call) else {
+                        continue;
+                    };
+                    let label = match (args.action.as_str(), args.server.as_deref()) {
+                        ("call", Some(s)) => {
+                            format!("mcp call {s}.{}", args.tool.as_deref().unwrap_or("?"))
                         }
+                        (a, Some(s)) => format!("mcp {a} {s}"),
+                        (a, None) => format!("mcp {a}"),
+                    };
+                    self.ui.tool_use(&label);
+                    let observation = self.run_mcp(&args).await;
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_ASK_USER => {
+                    let Some(args) = self.parse_or_report::<AskUserArgs>(call) else {
+                        continue;
                     };
                     let answer = self
                         .ui
@@ -1021,311 +1082,6 @@ impl<'a> AgentLoop<'a> {
         Ok(None)
     }
 
-    /// Handle a `memory` tool call host-side (the agent can't reach the home
-    /// dir; the loop runs on the host, so it reads/writes it directly). Returns
-    /// the observation text.
-    fn run_memory(&self, args: &MemoryArgs) -> String {
-        use cowboy_core::memory::{self, Scope};
-        let key = format!(
-            "{:08x}",
-            crate::net::runtime::project_hash(self.runtime.root())
-        );
-        match args.action.as_str() {
-            "save" => {
-                let (Some(title), Some(content)) = (&args.title, &args.content) else {
-                    return "error: `save` requires `title` and `content`".into();
-                };
-                let scope = match args.scope.as_deref() {
-                    Some("global") => Scope::Global,
-                    _ => Scope::Project,
-                };
-                match memory::save(&key, title, content, scope, args.kind.as_deref()) {
-                    Ok(name) => format!("saved memory `{name}` [{}]", scope.as_str()),
-                    Err(e) => format!("error: {e}"),
-                }
-            }
-            "recall" => {
-                let Some(name) = &args.name else {
-                    return "error: `recall` requires `name`".into();
-                };
-                match memory::recall(&key, name) {
-                    Ok(Some(body)) => body,
-                    Ok(None) => format!("no memory named `{name}`"),
-                    Err(e) => format!("error: {e}"),
-                }
-            }
-            "list" => {
-                let idx = memory::index(&key);
-                if idx.is_empty() {
-                    "no memories stored".into()
-                } else {
-                    idx
-                }
-            }
-            "delete" => {
-                let Some(name) = &args.name else {
-                    return "error: `delete` requires `name`".into();
-                };
-                match memory::delete(&key, name) {
-                    Ok(true) => format!("deleted memory `{name}`"),
-                    Ok(false) => format!("no memory named `{name}`"),
-                    Err(e) => format!("error: {e}"),
-                }
-            }
-            other => {
-                format!("error: unknown memory action `{other}` (save|recall|list|delete)")
-            }
-        }
-    }
-
-    /// Host-side `artifact` tool: publish a typed output under the session dir,
-    /// or list this session's artifacts. Requires an active session log.
-    fn run_artifact(&self, args: &ArtifactArgs) -> String {
-        use cowboy_core::artifact::{self, ArtifactKind};
-        let Some(logger) = &self.logger else {
-            return "error: artifacts require an active session log".into();
-        };
-        let dir = logger.dir();
-        match args.action.as_str() {
-            "list" => {
-                let arts = artifact::list_in(dir);
-                if arts.is_empty() {
-                    return "no artifacts published".into();
-                }
-                arts.iter()
-                    .map(|a| {
-                        format!(
-                            "{} [{}] {} — {}",
-                            a.id,
-                            a.kind.as_str(),
-                            a.title,
-                            a.path.display()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            }
-            "publish" | "add" => {
-                let content = match (&args.content, &args.path) {
-                    (Some(c), _) => c.clone(),
-                    (None, Some(p)) => match std::fs::read_to_string(self.runtime.root().join(p)) {
-                        Ok(s) => s,
-                        Err(e) => return format!("error: cannot read {p}: {e}"),
-                    },
-                    (None, None) => return "error: `publish` requires `path` or `content`".into(),
-                };
-                let title = args
-                    .title
-                    .clone()
-                    .or_else(|| {
-                        args.path.as_ref().and_then(|p| {
-                            std::path::Path::new(p)
-                                .file_stem()
-                                .map(|s| s.to_string_lossy().into_owned())
-                        })
-                    })
-                    .unwrap_or_else(|| "artifact".into());
-                let kind = args
-                    .kind
-                    .as_deref()
-                    .map(ArtifactKind::parse)
-                    .unwrap_or(ArtifactKind::Notes);
-                match artifact::add_in(
-                    dir,
-                    logger.id(),
-                    kind,
-                    &title,
-                    &content,
-                    args.summary.clone(),
-                    now_ms(),
-                ) {
-                    Ok(a) => {
-                        self.emit_lifecycle(
-                            cowboy_core::lifecycle::LifecycleEvent::ArtifactPublished {
-                                artifact_id: a.id.clone(),
-                                kind: a.kind.as_str().to_string(),
-                            },
-                        );
-                        format!(
-                            "published artifact {} [{}] {} → {}",
-                            a.id,
-                            a.kind.as_str(),
-                            a.title,
-                            a.path.display()
-                        )
-                    }
-                    Err(e) => format!("error: {e}"),
-                }
-            }
-            other => format!("error: unknown artifact action `{other}` (publish|list)"),
-        }
-    }
-
-    /// Host-side `propose_scope_change` tool: the agent can't (and must not) edit
-    /// the committed ranch plan, so it files a *pending* proposal into the ranch's
-    /// proposals store. The user reviews it (`cowboy ranch proposals`) and approves
-    /// or rejects it; the plan changes only on approval. Available only inside a
-    /// ranch workstream (the daemon sets `COWBOY_RANCH_ID` for those workers).
-    fn run_propose_scope_change(&self, args: &ProposeScopeChangeArgs) -> String {
-        use cowboy_core::scope::{self, ProposalStatus, ScopeChange, ScopeProposal};
-        let ranch_id = match std::env::var("COWBOY_RANCH_ID") {
-            Ok(s) if !s.is_empty() => s,
-            _ => {
-                return "error: not running inside a ranch workstream — there is no plan to \
-                        propose changes to"
-                    .into()
-            }
-        };
-        // The plan lives in the main repo; this worker is in a linked worktree.
-        let main = match crate::net::worktree::main_repo_root(self.runtime.root()) {
-            Ok(p) => p,
-            Err(e) => return format!("error: cannot locate the ranch's main repository: {e}"),
-        };
-        let change = match args.change.as_str() {
-            "add_workstream" | "add" => {
-                let Some(ws_id) = args.workstream_id.clone() else {
-                    return "error: add_workstream requires `workstream_id`".into();
-                };
-                ScopeChange::AddWorkstream {
-                    workstream: cowboy_core::ranch::Workstream {
-                        title: args.title.clone().unwrap_or_else(|| ws_id.clone()),
-                        goal: args.goal.clone().unwrap_or_default(),
-                        depends_on: args.depends_on.clone().unwrap_or_default(),
-                        id: ws_id,
-                        status: cowboy_core::ranch::WorkstreamStatus::Planned,
-                        session_id: None,
-                        branch: None,
-                        worktree_path: None,
-                        expected_artifacts: vec![],
-                        acceptance: vec![],
-                    },
-                }
-            }
-            "remove_workstream" | "remove" => {
-                let Some(ws_id) = args.workstream_id.clone() else {
-                    return "error: remove_workstream requires `workstream_id`".into();
-                };
-                ScopeChange::RemoveWorkstream { id: ws_id }
-            }
-            "note" => ScopeChange::Note,
-            other => {
-                return format!(
-                    "error: unknown change `{other}` (add_workstream|remove_workstream|note)"
-                )
-            }
-        };
-        let from = std::env::var("COWBOY_WORKSTREAM_ID")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| self.logger.as_ref().map(|l| l.id().to_string()))
-            .unwrap_or_else(|| "workstream".into());
-        let p = ScopeProposal {
-            id: scope::fresh_id(&main, &ranch_id),
-            ranch_id: ranch_id.clone(),
-            from,
-            summary: args.summary.clone(),
-            rationale: args.rationale.clone(),
-            change,
-            status: ProposalStatus::Pending,
-            created_ms: now_ms(),
-            decided_ms: None,
-            decision_reason: None,
-        };
-        let label = p.change.label();
-        match scope::save(&main, &p) {
-            Ok(()) => {
-                self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRequested {
-                    question: format!("scope change: {} — {}", label, p.summary),
-                });
-                format!(
-                    "filed scope proposal {} ({label}) — PENDING the user's approval. The plan is \
-                     unchanged until they run `cowboy ranch approve {ranch_id} {}`. Continue with \
-                     your current workstream or `blocked` if you can't proceed without it.",
-                    p.id, p.id
-                )
-            }
-            Err(e) => format!("error: filing proposal: {e}"),
-        }
-    }
-
-    /// Host-side `handoff` tool: render the structured summary to `handoff.md`
-    /// (the well-known path `cowboy handoff` reads) and register it as a Handoff
-    /// artifact so it shows up in the artifact index.
-    fn run_handoff(&self, args: &HandoffArgs) -> String {
-        use cowboy_core::artifact::{self, ArtifactKind};
-        let Some(logger) = &self.logger else {
-            return "error: handoff requires an active session log".into();
-        };
-        let dir = logger.dir();
-        let md = render_handoff_md(args);
-        if let Err(e) = std::fs::write(dir.join("handoff.md"), &md) {
-            return format!("error: writing handoff.md: {e}");
-        }
-        match artifact::add_in(
-            dir,
-            logger.id(),
-            ArtifactKind::Handoff,
-            "Handoff",
-            &md,
-            None,
-            now_ms(),
-        ) {
-            Ok(a) => {
-                self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::HandoffCreated {
-                    artifact_id: a.id.clone(),
-                });
-                format!("handoff written ({})", a.id)
-            }
-            Err(e) => format!("handoff written to handoff.md, but indexing failed: {e}"),
-        }
-    }
-
-    /// Host-side `decision` tool: ask the user, then record the decision durably
-    /// (decisions.jsonl + a DecisionRecord artifact) with lifecycle events.
-    fn run_decision(&mut self, args: &DecisionArgs) -> String {
-        let options = args.options.clone().unwrap_or_default();
-        self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRequested {
-            question: args.question.clone(),
-        });
-        let answer = self.ui.ask_user(&args.question, &options);
-
-        let Some(logger) = &self.logger else {
-            return format!("decision (unrecorded — no session log): {answer}");
-        };
-        let dir = logger.dir();
-        let selected = (!answer.trim().is_empty()).then(|| answer.clone());
-        let d = cowboy_core::decision::record_in(
-            dir,
-            logger.id(),
-            &args.question,
-            options.clone(),
-            selected,
-            args.rationale.clone(),
-            now_ms(),
-        );
-        // Also surface it as a DecisionRecord artifact.
-        let body = format!(
-            "# Decision\n\n## Question\n{}\n\n## Options\n{}\n\n## Selected\n{}\n\n## Rationale\n{}\n",
-            args.question,
-            if options.is_empty() { "(free-form)".into() } else { options.join(", ") },
-            if answer.trim().is_empty() { "(no answer)" } else { answer.trim() },
-            args.rationale.as_deref().unwrap_or("(none)"),
-        );
-        let _ = cowboy_core::artifact::add_in(
-            dir,
-            logger.id(),
-            cowboy_core::artifact::ArtifactKind::DecisionRecord,
-            &format!("Decision {}", d.id),
-            &body,
-            None,
-            now_ms(),
-        );
-        self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRecorded {
-            decision_id: d.id.clone(),
-        });
-        format!("decision {} recorded: {}", d.id, answer)
-    }
-
     /// Record a tool error as an observation so the model can self-correct.
     fn tool_error(&mut self, id: &str, name: &str, err: &str) {
         let msg = Message::tool_result(
@@ -1338,8 +1094,53 @@ impl<'a> AgentLoop<'a> {
         self.messages.push(msg);
     }
 
+    /// Parse a tool call's arguments, or record a tool error and return `None`
+    /// (the caller `continue`s to the next call). Collapses the parse-or-bail
+    /// boilerplate that every tool-dispatch arm would otherwise repeat.
+    fn parse_or_report<T: serde::de::DeserializeOwned>(
+        &mut self,
+        call: &cowboy_core::model::ToolCall,
+    ) -> Option<T> {
+        match parse_args::<T>(&call.arguments) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                self.tool_error(&call.id, &call.name, &e.to_string());
+                None
+            }
+        }
+    }
+
     /// Run a structured file operation in the container, record the observation
     /// for the model, and log it. Returns (exit_code, helper output).
+    /// Read a workspace-relative file from the host. The workspace is bind-
+    /// mounted into the container, so the host sees exactly what the agent edits
+    /// — letting us snapshot the before/after for a diff without a container
+    /// round-trip. `None` if the path doesn't exist or isn't valid UTF-8.
+    fn read_workspace_file(&self, path: &str) -> Option<String> {
+        // Use the same hardened resolver as the in-container fileop: it rejects
+        // absolute paths and `..` escapes (a lexical `starts_with` does NOT, so a
+        // path like `../../etc/passwd` would otherwise read host files).
+        let full = crate::cmd::fileop::resolve(self.root(), path).ok()?;
+        std::fs::read_to_string(full).ok()
+    }
+
+    /// Compute a unified diff of a just-edited file (host-side) and report it to
+    /// the UI for +/- rendering. Best-effort: skips binary/oversized changes.
+    fn emit_file_diff(&mut self, path: &str, before: Option<&str>) {
+        let after = self.read_workspace_file(path).unwrap_or_default();
+        let before = before.unwrap_or("");
+        if before == after {
+            return;
+        }
+        // Cap the rendered diff so a huge file rewrite doesn't flood the pane;
+        // the full change is still in the session log / on disk.
+        const MAX_DIFF_LINES: usize = 200;
+        let diff = unified_diff(path, before, &after, MAX_DIFF_LINES);
+        if !diff.is_empty() {
+            self.ui.file_diff(path, &diff);
+        }
+    }
+
     async fn run_fileop(
         &mut self,
         call_id: &str,
@@ -1516,8 +1317,7 @@ impl<'a> AgentLoop<'a> {
                 "error: delegation depth limit ({max_depth}) reached; do this work directly"
             ));
         }
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("subagent error: cannot locate cowboy binary: {e}"))?;
+        let exe = self_exe().map_err(|e| format!("subagent error: {e}"))?;
 
         // The planner requests a KIND of work; Cowboy owns the model choice.
         let category = args
@@ -1648,131 +1448,8 @@ impl<'a> AgentLoop<'a> {
 
 /// Route a streamed delta to the UI (answer text vs. dimmed reasoning). A free
 /// function so it borrows only the UI, not all of `self` (the in-flight chat
-/// future holds an immutable borrow of the loop).
-fn emit_delta(ui: &mut dyn AgentUi, piece: Delta) {
-    match piece {
-        Delta::Content(t) => ui.model_delta(&t),
-        Delta::Reasoning(t) => ui.model_reasoning(&t),
-    }
-}
-
-/// Render a span of messages as plain text for the compaction summarizer.
-fn render_transcript(messages: &[Message]) -> String {
-    let mut s = String::new();
-    for m in messages {
-        let role = match m.role {
-            Role::System => "system",
-            Role::User => "user",
-            Role::Assistant => "assistant",
-            Role::Tool => "tool",
-        };
-        s.push_str(&format!("[{role}]\n"));
-        if !m.content.is_empty() {
-            s.push_str(&m.content);
-            s.push('\n');
-        }
-        for tc in &m.tool_calls {
-            s.push_str(&format!("(tool call {}: {})\n", tc.name, tc.arguments));
-        }
-        s.push('\n');
-    }
-    s
-}
-
-fn parse_args<T: serde::de::DeserializeOwned>(arguments: &str) -> Result<T> {
-    let args = if arguments.trim().is_empty() {
-        "{}"
-    } else {
-        arguments
-    };
-    serde_json::from_str(args).map_err(|e| anyhow::anyhow!("invalid tool arguments: {e}"))
-}
-
-/// Render a [`HandoffArgs`] into the canonical `handoff.md` markdown.
-fn render_handoff_md(a: &HandoffArgs) -> String {
-    let mut s = String::from("# Handoff\n\n");
-    s.push_str(&format!("## Goal\n{}\n\n", a.goal.trim()));
-    s.push_str(&format!("## Status\n{}\n", a.status.trim()));
-    let section = |title: &str, body: &Option<String>| -> String {
-        match body {
-            Some(b) if !b.trim().is_empty() => format!("\n## {title}\n{}\n", b.trim()),
-            _ => String::new(),
-        }
-    };
-    s.push_str(&section("Changed files", &a.changed_files));
-    s.push_str(&section("Decisions", &a.decisions));
-    s.push_str(&section("Contracts / interfaces", &a.contracts));
-    s.push_str(&section("Validation", &a.validation));
-    s.push_str(&section("Risks", &a.risks));
-    s.push_str(&section("Next steps", &a.next_steps));
-    s
-}
-
-/// Milliseconds since the Unix epoch (artifact/lifecycle timestamps).
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
-/// Render a plan as check-boxed lines (for the model observation / console).
-fn render_plan(plan: &[(String, String)]) -> String {
-    plan.iter()
-        .map(|(step, status)| {
-            let mark = match status.as_str() {
-                "done" => "[x]",
-                "in_progress" => "[~]",
-                _ => "[ ]",
-            };
-            format!("{mark} {step}")
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// A concise one-line summary of a file op for the UI: the helper's status line
-/// on success, or `"<action> <path> — failed"` otherwise.
-fn fileop_summary(action: &str, path: &str, exit: i32, output: &str) -> String {
-    if exit == 0 {
-        let line = output.trim();
-        if line.is_empty() {
-            format!("{action} {path}")
-        } else {
-            line.to_string()
-        }
-    } else {
-        format!("{action} {path} — failed")
-    }
-}
-
-/// Truncate `output` to at most `max_bytes`, on a char boundary, with a marker.
-/// A stable signature for a turn's tool calls (name + arguments), order-
-/// independent so parallel calls in a different order still compare equal. Used
-/// by the loop guard to detect an agent re-issuing the identical action.
-fn tool_signature(calls: &[cowboy_core::model::ToolCall]) -> String {
-    let mut parts: Vec<String> = calls
-        .iter()
-        .map(|c| format!("{}\u{0}{}", c.name, c.arguments))
-        .collect();
-    parts.sort();
-    parts.join("\u{1}")
-}
-
-fn truncate(output: &str, max_bytes: usize) -> String {
-    if output.len() <= max_bytes {
-        return output.to_string();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !output.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n[... output truncated at {} bytes ...]",
-        &output[..end],
-        max_bytes
-    )
-}
+/// future holds an immutable borrow of the loop). See `support` / `handlers`.
+use cowboy_core::time::now_ms;
 
 #[cfg(test)]
 mod tests {
@@ -1881,6 +1558,7 @@ mod tests {
         let root = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         AgentRuntime::new(Box::new(docker), root, security)
+            .expect("runtime (isolation off in tests)")
     }
 
     #[tokio::test]
@@ -1900,11 +1578,13 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: Some("inspecting".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done; tests pass"}"#)],
@@ -1945,11 +1625,13 @@ mod tests {
         // The model keeps asking for shell (never finals); only the budget stops it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: Some("working".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: Some("still working".into()),
                 tool_calls: vec![tool_call("2", "shell", r#"{"command":"ls"}"#)],
@@ -1997,6 +1679,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2008,6 +1691,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -2075,6 +1759,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2085,6 +1770,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -2125,6 +1811,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2134,6 +1821,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -2183,6 +1871,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2192,11 +1881,13 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "unblock", "{}")],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
@@ -2243,6 +1934,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2252,6 +1944,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2261,6 +1954,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
@@ -2307,6 +2001,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2317,6 +2012,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -2365,6 +2061,7 @@ mod tests {
             let mut q = m.responses.lock().unwrap();
             for i in 0..12 {
                 q.push_back(ChatResponse {
+                    truncated: false,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
@@ -2448,6 +2145,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -2457,6 +2155,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -2478,6 +2177,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plan_mode_blocks_edits_until_approved() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        // Deliberately set NO `expect_exec_stdin`: if the edit reached the file
+        // op, mockall would panic on the unexpected call — so this asserts the
+        // gate actually prevents the mutation, not just discourages it.
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "edit",
+                    r#"{"path":"main.rs","old":"a","new":"b"}"#,
+                )],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"here is the plan"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.set_planning(true);
+        let out = agent.run("plan it").await.unwrap();
+        assert_eq!(out.as_deref(), Some("here is the plan"));
+        // The agent got a plan-mode refusal observation instead of editing.
+        let blocked = agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("blocked: plan mode"));
+        assert!(blocked, "edit should be refused with a plan-mode message");
+        // No edit ran (no tool_use surfaced; the fileop mock was never called).
+        assert!(ui.tool_uses.is_empty(), "no edit should run in plan mode");
+    }
+
+    #[tokio::test]
+    async fn propose_ranch_drafts_a_plan_and_rejects_a_bad_graph() {
+        // A valid decomposition is written and confirmed.
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        let good = r#"{"title":"Billing","goal":"stripe + invoicing","workstreams":[
+            {"id":"schema","goal":"tables"},
+            {"id":"api","goal":"api","depends_on":["schema"]}]}"#;
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "propose_ranch", good)],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"drafted"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("plan it").await.unwrap();
+        let drafted = agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("drafted ranch"));
+        assert!(drafted, "a valid decomposition should draft a ranch");
+
+        // A cyclic graph is refused (the agent is told to fix and retry).
+        let cyclic = r#"{"title":"X","goal":"y","workstreams":[
+            {"id":"a","goal":"a","depends_on":["b"]},
+            {"id":"b","goal":"b","depends_on":["a"]}]}"#;
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "propose_ranch", cyclic)],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("plan it").await.unwrap();
+        let rejected = agent.messages.iter().any(|m| m.content.contains("invalid"));
+        assert!(rejected, "a cyclic decomposition must be rejected");
+    }
+
+    #[tokio::test]
     async fn stops_at_max_iterations() {
         let mut docker = MockDockerCli::new();
         docker
@@ -2494,6 +2318,7 @@ mod tests {
             let mut q = looping.responses.lock().unwrap();
             for i in 0..10 {
                 q.push_back(ChatResponse {
+                    truncated: false,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
@@ -2532,11 +2357,13 @@ mod tests {
             .returning(|_| Ok(ContainerState::Running));
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("1", "final", r#"{"message":"done 1"}"#)],
             },
             ChatResponse {
+                truncated: false,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done 2"}"#)],
@@ -2664,6 +2491,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         // The model serves the compaction summary.
         let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
             reasoning: None,
             content: Some("SUMMARY: earlier turns did X and Y".into()),
             tool_calls: vec![],
@@ -2698,6 +2526,61 @@ mod tests {
         let last = agent.messages.last().unwrap();
         assert!(last.content.contains("did task 11"));
         assert!(ui.notices.iter().any(|n| n.contains("compacted")));
+    }
+
+    #[tokio::test]
+    async fn truncated_empty_turn_reports_incomplete_instead_of_silence() {
+        // A reasoning model that burns its whole output budget thinking returns
+        // no content and no tool call with finish_reason=length. The loop must
+        // surface that explicitly (so a foreman reading a subagent's stdout sees
+        // the cause) rather than returning an empty/None result.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: true,
+            reasoning: Some("thinking ".repeat(100)),
+            content: None,
+            tool_calls: vec![],
+        }]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("review the diff").await.unwrap();
+        let msg = res.expect("truncation should yield a descriptive result, not None");
+        assert!(msg.starts_with("[incomplete]"), "got: {msg}");
+        assert_eq!(classify_subagent_result(&msg), "error");
+    }
+
+    #[test]
+    fn unified_diff_renders_changes_and_caps_length() {
+        let before = "fn a() {}\nfn b() {}\n";
+        let after = "fn a() {}\nfn c() {}\n";
+        let d = unified_diff("src/x.rs", before, after, 200);
+        assert!(d.contains("--- a/src/x.rs"));
+        assert!(d.contains("+++ b/src/x.rs"));
+        assert!(d.contains("-fn b() {}"));
+        assert!(d.contains("+fn c() {}"));
+
+        // No change → empty.
+        assert!(unified_diff("x", "same\n", "same\n", 200).is_empty());
+
+        // Binary-looking content is skipped.
+        assert!(unified_diff("x", "a", "b\u{0}c", 200).is_empty());
+
+        // A huge change is capped with a marker.
+        let big_before = String::new();
+        let big_after = (0..500)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = unified_diff("x", &big_before, &big_after, 50);
+        assert!(capped.lines().count() <= 51);
+        assert!(capped.contains("more diff lines"));
     }
 
     #[test]

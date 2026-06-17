@@ -60,3 +60,19 @@ jobs:
       # guard runs as a normal test in the `check` job.
       - name: Build the book
         run: mdbook build docs
+
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan the full commit history, not just the tip
+
+      # Fails the build if any credential-shaped string is found in the tree or
+      # history. Free for public repos (no GITLEAKS_LICENSE needed). Config +
+      # allowlist of known test placeholders live in `.gitleaks.toml`.
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

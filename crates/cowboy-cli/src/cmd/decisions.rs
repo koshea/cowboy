@@ -22,7 +22,7 @@ fn session_dir(root: &Path, session: Option<&str>) -> Result<PathBuf> {
             crate::session::latest_session_id(root).context("no sessions yet in this worktree")?
         }
     };
-    let dir = root.join(".cowboy").join("sessions").join(&id);
+    let dir = crate::session::session_dir(root, &id);
     if !dir.is_dir() {
         bail!("no such session: {id}");
     }

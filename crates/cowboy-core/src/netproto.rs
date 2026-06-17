@@ -9,6 +9,12 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 
+/// How long (seconds) either end waits for a network-approval verdict before
+/// failing closed. Shared so the gateway (waiting on the host control socket)
+/// and the host worker (waiting on the user) use the *same* budget — if they
+/// disagreed, one could give up while the other still waited.
+pub const APPROVAL_TIMEOUT_SECS: u64 = 120;
+
 /// Transport-layer protocol of an outbound attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -19,6 +25,9 @@ pub enum Protocol {
     Http,
     /// Raw TCP with no recovered hostname.
     Tcp,
+    /// A DNS query (resolution gated at the gateway's resolver, port 53). The
+    /// `host` is the queried name.
+    Dns,
 }
 
 /// A single outbound connection attempt observed by the gateway.
@@ -67,8 +76,21 @@ pub enum ApprovalScope {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum GatewayMessage {
+    /// Authentication handshake: the FIRST line the gateway sends after connecting.
+    /// The host validates the token (passed to the gateway out-of-band via its
+    /// container env) and drops the connection if it doesn't match. This gates the
+    /// TCP control channel — anything else that can route to the port (e.g. the
+    /// agent container) can't authenticate, since it never sees the token.
+    Hello { token: String },
     /// Request a decision for an attempt the policy classified as `ask`.
-    Ask { id: u64, attempt: NetworkAttempt },
+    /// `reason` (when present) explains *why* — e.g. a new domain vs a suspected
+    /// DNS tunnel — so the host can render a clearer prompt.
+    Ask {
+        id: u64,
+        attempt: NetworkAttempt,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Informational: a decision the gateway already made (for the activity log).
     Event {
         attempt: NetworkAttempt,
@@ -112,16 +134,26 @@ mod tests {
     fn ask_roundtrips() {
         let msg = GatewayMessage::Ask {
             id: 7,
+            reason: Some("dns tunnel suspected".into()),
             attempt: NetworkAttempt {
-                protocol: Protocol::Tls,
+                protocol: Protocol::Dns,
                 host: Some("github.com".into()),
                 ip: None,
-                port: 443,
+                port: 53,
             },
         };
         let line = encode_line(&msg);
         assert!(line.ends_with('\n'));
         let back: GatewayMessage = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(msg, back);
+    }
+
+    #[test]
+    fn hello_roundtrips() {
+        let msg = GatewayMessage::Hello {
+            token: "abc123".into(),
+        };
+        let back: GatewayMessage = serde_json::from_str(encode_line(&msg).trim()).unwrap();
         assert_eq!(msg, back);
     }
 

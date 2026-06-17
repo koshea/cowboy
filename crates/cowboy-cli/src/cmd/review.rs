@@ -27,7 +27,7 @@ pub fn run(session: Option<String>, branch: Option<String>) -> Result<()> {
         None => crate::session::latest_session_id(&root)
             .context("no session given and no recent session in this worktree")?,
     };
-    let dir = root.join(".cowboy").join("sessions").join(&id);
+    let dir = crate::session::session_dir(&root, &id);
     if !dir.is_dir() {
         bail!("no such session: {id}");
     }
@@ -115,19 +115,14 @@ fn render_session(dir: &Path, id: &str) -> String {
     out
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use cowboy_core::time::now_ms;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn session_path(root: &Path, id: &str) -> std::path::PathBuf {
-        root.join(".cowboy").join("sessions").join(id)
+        crate::session::session_dir(root, id)
     }
 
     #[test]

@@ -140,6 +140,11 @@ pub struct ChatResponse {
     /// The model's reasoning ("thinking") for this turn, if it emitted any.
     /// Preserved so it can be sent back on the next turn (see [`Message::reasoning`]).
     pub reasoning: Option<String>,
+    /// True when the provider stopped the turn at the output-token limit
+    /// (`finish_reason == "length"`) — the answer/tool call is cut off. Lets the
+    /// agent loop report a truncation instead of silently treating it as "no
+    /// action" (a reasoning model can burn the whole budget on thinking).
+    pub truncated: bool,
 }
 
 /// A streamed piece of a model response: visible answer text, or the model's
@@ -439,6 +444,8 @@ struct StreamChunk {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct StreamDelta {
@@ -515,6 +522,15 @@ impl ModelClient for OpenAiClient {
         let request = builder.build().map_err(oa_err)?;
         let mut body = serde_json::to_value(&request).map_err(|e| Error::Model(e.to_string()))?;
         body["stream"] = serde_json::Value::Bool(true);
+        // Reasoning models ignore the legacy `max_tokens` for the thinking phase
+        // (it bounds only the visible answer), so a model can spend an unbounded
+        // number of tokens reasoning and never produce an answer — observed:
+        // minimax-m3 burning ~65k tokens and getting truncated with no output.
+        // `max_completion_tokens` is the modern field that caps reasoning + answer
+        // together; send it (mirroring `max_tokens`) so our configured budget is
+        // actually enforced. Gateways targeting providers that only understand
+        // `max_tokens` (e.g. Anthropic) ignore the extra field.
+        body["max_completion_tokens"] = serde_json::json!(self.max_tokens);
         if let Some(effort) = self.reasoning_effort {
             body["reasoning_effort"] = serde_json::Value::String(effort.as_str().into());
         }
@@ -600,6 +616,7 @@ impl ModelClient for OpenAiClient {
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
+        let mut truncated = false;
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
@@ -620,6 +637,7 @@ impl ModelClient for OpenAiClient {
                         content: (!content.is_empty()).then_some(content),
                         tool_calls: acc.finish(),
                         reasoning: (!reasoning.is_empty()).then_some(reasoning),
+                        truncated,
                     });
                 }
                 let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
@@ -628,6 +646,9 @@ impl ModelClient for OpenAiClient {
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
+                if choice.finish_reason.as_deref() == Some("length") {
+                    truncated = true;
+                }
                 if let Some(r) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
                     reasoning.push_str(&r);
                     if let Some(tx) = &deltas {
@@ -656,6 +677,7 @@ impl ModelClient for OpenAiClient {
             content: (!content.is_empty()).then_some(content),
             tool_calls: acc.finish(),
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            truncated,
         })
     }
 }

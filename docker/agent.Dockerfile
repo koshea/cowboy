@@ -79,6 +79,15 @@ RUN printf 'export PATH=/usr/local/cargo/bin:/usr/local/go/bin:$PATH\n' \
 # it as safe so `cowboy patch` works without "dubious ownership" errors.
 RUN git config --system --add safe.directory '*'
 
+# HOME=/tmp at runtime and the agent runs as the (dynamic) host uid, with no
+# passwd entry. Credential grants bind-mount into /tmp/.config/<tool>; Docker
+# would otherwise synthesize the missing /tmp/.config parent as root:root 0755,
+# locking the agent out of writing sibling configs there (e.g. gcloud failing to
+# create /tmp/.config/gcloud). Pre-create the XDG base dirs world-writable so any
+# runtime uid can populate them and credential mounts land in an existing parent.
+RUN mkdir -p /tmp/.config /tmp/.cache /tmp/.local/share /tmp/.local/state \
+    && chmod -R 1777 /tmp/.config /tmp/.cache /tmp/.local
+
 # Unprivileged user the agent runs as (network caps are dropped at the runtime layer).
 RUN useradd -m -s /bin/bash agent
 

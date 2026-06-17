@@ -1,22 +1,22 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
-╭ ~/dev/cowboy  ⎇ main ─────────────────────────╮╭ network ────────────╮
-│› refactor the parser                          ││no network activity  │
+╭ cowboy · 20260614-abcd ───────────────────────╮╭ plan 1/3 ───────────╮
+│› refactor the parser                          ││✓ read the existing  │
+│                                               ││parser               │
+│                                               ││▸ extract the        │
+│                                               │╰─────────────────────╯
+│                                               │╭ network ────────────╮
+│                                               ││no network activity  │
 │                                               ││yet                  │
-│✓ Done.                                        ││                     │
-│                                               ││                     │
-│                                               ││                     │
 │                                               ││                     │
 │                                               │╰─────────────────────╯
 │                                               │╭ background ─────────╮
 │                                               ││no background activit│
 │                                               ││                     │
-│                                               ││                     │
-│                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   ready — ready                             ~128k↑ 9.1k↓   Δ 2f +30 -4
-╭ Enter send · Shift+Enter newline · ↑↓ history · /help · Ctrl-C menu ─╮
+⠷  thinking 0s…
+╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

@@ -40,6 +40,15 @@ async-openai = { version = "0.41", features = ["chat-completion"] }
 tiktoken-rs = "0.6"
 reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 
+# MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess
+# transport for local servers + streamable-HTTP (over reqwest) for remote ones. No
+# server/macros features (we never expose an MCP server).
+rmcp = { version = "1", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
+
 # tui
 # `unstable-rendered-line-info` enables Paragraph::line_count, used to scroll the
 # transcript by exact wrapped-line counts (so following never cuts off the tail).
@@ -53,6 +62,16 @@ throbber-widgets-tui = "0.11"
 # heavy `image` crate — we only copy text. OSC 52 stays as the SSH/remote
 # fallback. x11rb is always compiled on Linux; `wayland` adds wl-clipboard-rs.
 clipboard-rs = { version = "0.3", default-features = false, features = ["wayland"] }
+# Rich transcript rendering: markdown → styled ratatui lines, with syntect for
+# fenced code-block syntax highlighting. `default-fancy` uses the pure-Rust
+# fancy-regex engine (no oniguruma C build dep).
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# Unified diffs of agent file edits (computed host-side; the workspace is
+# bind-mounted, so the host sees the before/after content).
+similar = "2"
+# Display-width of strings (wide CJK / emoji) for aligning Markdown table columns.
+unicode-width = "0.2"
 
 # Note: process-group termination is done in-container (proc supervisor uses
 # `setsid` + `kill -<pgid>`), and `cowboy shell` uses `docker exec -it` for the

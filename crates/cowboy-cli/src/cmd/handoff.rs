@@ -13,11 +13,7 @@ pub fn run(session: Option<String>) -> Result<()> {
             crate::session::latest_session_id(&root).context("no sessions yet in this worktree")?
         }
     };
-    let path = root
-        .join(".cowboy")
-        .join("sessions")
-        .join(&id)
-        .join("handoff.md");
+    let path = crate::session::session_dir(&root, &id).join("handoff.md");
     match std::fs::read_to_string(&path) {
         Ok(body) => {
             print!("{body}");

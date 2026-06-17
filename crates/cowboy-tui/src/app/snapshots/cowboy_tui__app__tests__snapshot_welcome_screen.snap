@@ -1,5 +1,5 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
@@ -17,6 +17,6 @@ expression: render(&app)
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    ready — ready
-╭ Enter send · Shift+Enter newline · ↑↓ history · /help · Ctrl-C menu ─╮
+╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

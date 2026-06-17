@@ -2,7 +2,6 @@
 //! variables and a bind-mounted policy file.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use cowboy_core::config::NetworkPolicy;
@@ -22,8 +21,12 @@ pub struct GatewayConfig {
     pub agent_subnet: String,
     /// Upstream DNS resolver to forward queries to.
     pub dns_upstream: SocketAddr,
-    /// Path to the host control socket, if available (None => fail-closed asks).
-    pub control_sock: Option<PathBuf>,
+    /// Host control address (`host:port`) to dial for `ask` decisions, if
+    /// available (None => fail-closed asks).
+    pub control_addr: Option<String>,
+    /// Per-session token presented to the host control server (must match, or the
+    /// host drops the connection).
+    pub control_token: Option<String>,
     /// Additional subnets (approved Docker/Compose networks) to allow in forward.
     pub allow_subnets: Vec<String>,
 }
@@ -44,7 +47,8 @@ impl GatewayConfig {
             .unwrap_or_else(|_| "1.1.1.1:53".to_string())
             .parse()
             .context("parsing COWBOY_DNS_UPSTREAM")?;
-        let control_sock = std::env::var("COWBOY_CONTROL_SOCK").ok().map(PathBuf::from);
+        let control_addr = std::env::var("COWBOY_CONTROL_ADDR").ok();
+        let control_token = std::env::var("COWBOY_CONTROL_TOKEN").ok();
         let allow_subnets = std::env::var("COWBOY_ALLOW_SUBNETS")
             .ok()
             .map(|s| {
@@ -59,7 +63,8 @@ impl GatewayConfig {
             policy,
             agent_subnet,
             dns_upstream,
-            control_sock,
+            control_addr,
+            control_token,
             allow_subnets,
         })
     }

@@ -17,6 +17,10 @@ use super::docker::{BindMount, ContainerSpec, ContainerState, DockerCli, ExecRes
 use super::gateway::GatewayNetwork;
 
 const DEFAULT_IMAGE: &str = "cowboy/agent:local";
+/// The image's `MISE_DATA_DIR` (toolchain store). Keep in sync with
+/// `docker/agent.Dockerfile`; a host cache is bind-mounted here to persist
+/// installs across container recreations.
+const MISE_DATA_DIR: &str = "/usr/local/share/mise";
 /// Repo root baked in at build time; the default source root for building the
 /// bundled images when `COWBOY_SRC` is not set.
 const COMPILE_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -34,22 +38,38 @@ pub struct AgentRuntime {
     gateway: Option<GatewayNetwork>,
     /// TTL cache of resolved `source_command` secrets, so shell commands get a
     /// fresh-ish token without re-running the host command every time.
-    secret_cache: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, String)>)>>,
+    secret_cache: std::sync::Mutex<Option<SecretCache>>,
 }
 
+/// Cached `source_command` secrets with the instant they were resolved (for TTL).
+type SecretCache = (std::time::Instant, Vec<(String, String)>);
+
 impl AgentRuntime {
-    pub fn new(docker: Box<dyn DockerCli>, root: PathBuf, security: SecurityConfig) -> Self {
+    pub fn new(
+        docker: Box<dyn DockerCli>,
+        root: PathBuf,
+        security: SecurityConfig,
+    ) -> Result<Self> {
         // Allow pinning the container name (used by tests and advanced setups).
         let container_name = std::env::var("COWBOY_CONTAINER_NAME")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| container_name_for(&root));
+        // Fail CLOSED: if network isolation is requested but the gateway can't be
+        // built, refuse to run rather than silently dropping to an unsandboxed
+        // container (default bridge, full egress, caps intact). `None` means
+        // isolation was not requested, never "we gave up".
         let gateway = if security.networks.isolated.enabled {
-            GatewayNetwork::for_project(project_hash(&root), &security, &root).ok()
+            Some(
+                GatewayNetwork::for_project(project_hash(&root), &security, &root).context(
+                    "network isolation is enabled but the gateway could not be built; \
+                     refusing to run the agent unsandboxed",
+                )?,
+            )
         } else {
             None
         };
-        Self {
+        Ok(Self {
             docker,
             root,
             security,
@@ -57,7 +77,7 @@ impl AgentRuntime {
             user: Some(host_user()),
             gateway,
             secret_cache: std::sync::Mutex::new(None),
-        }
+        })
     }
 
     fn user(&self) -> &str {
@@ -70,11 +90,12 @@ impl AgentRuntime {
         &self.container_name
     }
 
-    /// The host control socket path, when network isolation is enabled.
-    pub fn control_sock(&self) -> Option<std::path::PathBuf> {
+    /// The host control address + token (`bridge_gateway:port`, token) the host
+    /// binds its TCP control server on, when network isolation is enabled.
+    pub fn control_endpoint(&self) -> Option<(String, String)> {
         self.gateway
             .as_ref()
-            .map(|g| g.control_sock().to_path_buf())
+            .map(|g| (g.control_addr().to_string(), g.control_token().to_string()))
     }
 
     /// The project root (for approval persistence).
@@ -179,6 +200,23 @@ impl AgentRuntime {
             } else {
                 BindMount::rw(src, grant.target.clone())
             });
+        }
+
+        // Persist mise's toolchain store (downloads/installs/shims) across
+        // container recreations: bind-mount a host cache dir over the image's
+        // MISE_DATA_DIR so `mise install` doesn't re-download the project's
+        // toolchain on every fresh container. Shared across projects — mise's
+        // store is version-keyed, so toolchains dedupe and a repeated version is
+        // reused. Host-owned (so the non-root agent can write it; a docker named
+        // volume would be root-owned and unwritable). Best-effort: if the cache
+        // dir can't be resolved/created, fall back to the ephemeral image dir.
+        if let Some(cache) = config::global_cache_dir().map(|c| c.join("mise")) {
+            if std::fs::create_dir_all(&cache).is_ok() {
+                mounts.push(BindMount::rw(
+                    cache.to_string_lossy().into_owned(),
+                    MISE_DATA_DIR.to_string(),
+                ));
+            }
         }
 
         // When isolation is enabled, attach the agent to the internal-only
@@ -503,19 +541,39 @@ fn sh_quote(s: &str) -> String {
 }
 
 /// Run a host command and return its trimmed stdout as a secret value, or
-/// `None` if it fails / produces nothing. Used for keyring-backed tokens
-/// (`gh auth token`). The command comes from host-owned config; never logged.
+/// `None` if it fails / produces nothing / exceeds the timeout. Used for
+/// keyring-backed tokens (`gh auth token`). The command comes from host-owned
+/// config; never logged.
+///
+/// stdin is `/dev/null` so a credential helper that would otherwise prompt
+/// interactively fails fast instead of blocking, and a bounded timeout backstops
+/// anything that still hangs — this runs (cached) on every shell exec, so a hang
+/// here would otherwise deadlock the whole session.
 fn run_value_command(cmd: &str) -> Option<String> {
-    let out = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .output()
-        .ok()?;
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let cmd = cmd.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .stdin(std::process::Stdio::null())
+            .output();
+        let _ = tx.send(out);
+    });
+    let out = rx.recv_timeout(TIMEOUT).ok()?.ok()?;
     if !out.status.success() {
         return None;
     }
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (!v.is_empty()).then_some(v)
+}
+
+/// Whether a `source_command` produces a value on the host, using the same
+/// bounded/`stdin`-null execution as the live path (so `cowboy secrets list`
+/// can't hang on an interactive credential helper). Does not expose the value.
+pub(crate) fn source_command_ok(cmd: &str) -> bool {
+    run_value_command(cmd).is_some()
 }
 
 /// The repository root that's shared by every worktree: `git rev-parse
@@ -662,7 +720,8 @@ mod tests {
             ..Default::default()
         };
         security.networks.isolated.enabled = isolated;
-        let rt = AgentRuntime::new(Box::new(docker), tmp.path().to_path_buf(), security);
+        let rt = AgentRuntime::new(Box::new(docker), tmp.path().to_path_buf(), security)
+            .expect("runtime fixture");
         (rt, tmp)
     }
 
@@ -692,6 +751,17 @@ mod tests {
 
         // agent.yaml is NOT masked — the agent may read/edit it.
         assert!(!spec.mounts.iter().any(|m| m.target.ends_with("agent.yaml")));
+
+        // The mise toolchain store is persisted via a writable host cache mount
+        // (when a home cache dir is resolvable — true in the test environment).
+        if cowboy_core::config::global_cache_dir().is_some() {
+            assert!(
+                spec.mounts
+                    .iter()
+                    .any(|m| m.target == MISE_DATA_DIR && !m.read_only),
+                "mise data dir should be a writable cache mount"
+            );
+        }
     }
 
     #[test]
@@ -768,6 +838,19 @@ mod tests {
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("plain"), "'plain'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn run_value_command_trims_success_and_drops_failures() {
+        assert_eq!(
+            run_value_command("printf '  tok-123  '").as_deref(),
+            Some("tok-123")
+        );
+        assert_eq!(run_value_command("exit 1"), None); // nonzero exit
+        assert_eq!(run_value_command("true"), None); // success, no output
+                                                     // stdin is /dev/null, so a helper that reads stdin gets EOF and returns
+                                                     // empty instead of hanging the session (fast — no timeout wait).
+        assert_eq!(run_value_command("cat"), None);
     }
 
     #[test]
@@ -894,8 +977,8 @@ mod tests {
 
     #[test]
     fn container_name_is_stable_and_sanitized() {
-        let a = container_name_for(Path::new("/home/kevin/dev/My App"));
-        let b = container_name_for(Path::new("/home/kevin/dev/My App"));
+        let a = container_name_for(Path::new("/home/dev/projects/My App"));
+        let b = container_name_for(Path::new("/home/dev/projects/My App"));
         assert_eq!(a, b, "name must be stable for a path");
         assert!(a.starts_with("cowboy-agent-myapp-"));
         // No spaces or uppercase leak into the docker name.

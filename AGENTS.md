@@ -60,7 +60,7 @@ crates/
     src/agent/       the agent loop (run.rs), tool defs (tools.rs), UI impls (ui.rs/tui.rs/socket_ui.rs)
     src/net/         docker (docker.rs), runtime spec (runtime.rs), gateway, worktree, control socket
     src/session/     session logging / replay
-  cowboy-core/     shared types + logic (no I/O orchestration)
+  cowboy-core/     shared types, pure logic, + the model transport
     config.rs daemonproto.rs model.rs policy.rs ranch.rs scope.rs artifact.rs
     lifecycle.rs decision.rs memory.rs tokens.rs usersecrets.rs error.rs
   cowboy-tui/      ratatui rendering (snapshot-tested)
@@ -69,9 +69,12 @@ docker/  docs/
 ```
 
 Rough split: **`cowboy-core`** = data types + pure logic (serde structs, policy,
-the wire protocols). **`cowboy-cli`** = orchestration (Docker, the daemon, the
-agent loop, CLI). The **agent loop runs host-side** in the worker process; the
-Docker container is the sandbox for the agent's *shell commands*, not for the loop.
+the wire protocols) **plus the model transport** — the `ModelClient` trait and
+the streaming OpenAI-compatible `OpenAiClient` live here (`model.rs`), since the
+HTTP/SSE client is shared and has no CLI/daemon dependencies. **`cowboy-cli`** =
+everything else: Docker, the daemon, the agent loop, the CLI. The **agent loop
+runs host-side** in the worker process; the Docker container is the sandbox for
+the agent's *shell commands*, not for the loop.
 
 ## Conventions
 
@@ -103,6 +106,11 @@ Docker container is the sandbox for the agent's *shell commands*, not for the lo
   `SecurityConfig::validate` refuses mounts that expose `.cowboy`/`security.yaml`.
 - Network egress is route-enforced through the gateway; default policy `ask`
   **fails closed** with no approver. Never substitute prompting for enforcement.
+- The gateway↔host control channel is **TCP + a per-session token** (gated:
+  unauthenticated connections are dropped), bound to the docker bridge IP — never
+  `0.0.0.0`. TCP (not a bind-mounted unix socket) so it works inside the macOS
+  Docker VM. The token reaches only the gateway's env; the agent container never
+  sees it, so it can't authenticate even though it shares the bridge.
 - Don't widen the boundary silently — `privileged`/`docker_socket` are surfaced by
   `cowboy doctor` as warnings on purpose.
 

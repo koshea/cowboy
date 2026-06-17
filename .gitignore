@@ -15,3 +15,6 @@
 
 # OS / editor cruft
 .DS_Store
+
+# local agent/tooling state (not project source)
+.claude/

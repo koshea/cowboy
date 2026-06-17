@@ -22,6 +22,9 @@ pub trait AgentUi {
     fn tool_use(&mut self, summary: &str) {
         self.notice(summary);
     }
+    /// A file was created or edited: `diff` is a unified diff of the change,
+    /// shown with +/- coloring beneath the tool summary. Default: ignored.
+    fn file_diff(&mut self, _path: &str, _diff: &str) {}
     /// Running session token estimate (input/output). Default: ignored.
     fn tokens(&mut self, _input: u64, _output: u64) {}
     /// Running estimated session spend in USD. Default: ignored.
@@ -134,6 +137,21 @@ impl AgentUi for ConsoleUi {
             return;
         }
         println!("\x1b[35m✎ {summary}\x1b[0m");
+    }
+
+    fn file_diff(&mut self, _path: &str, diff: &str) {
+        if self.final_only {
+            return;
+        }
+        for line in diff.lines() {
+            let color = match line.as_bytes().first() {
+                Some(b'+') => "\x1b[32m",                  // green
+                Some(b'-') => "\x1b[31m",                  // red
+                _ if line.starts_with("@@") => "\x1b[36m", // cyan
+                _ => "\x1b[2m",                            // dim context
+            };
+            println!("{color}{line}\x1b[0m");
+        }
     }
 
     fn plan(&mut self, steps: &[(String, String)]) {

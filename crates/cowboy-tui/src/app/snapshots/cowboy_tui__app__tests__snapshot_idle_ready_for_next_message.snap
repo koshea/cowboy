@@ -1,22 +1,22 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
-│› do work                                      ││no network activity  │
+│› create a hello world                         ││no network activity  │
 │                                               ││yet                  │
+│✓ Done — created main.rs.                      ││                     │
 │                                               ││                     │
 │                                               ││                     │
-│   ╭ Paused ──────────────────────────────────────────────────────╮   │
-│   │Agent paused.                                                 │   │
-│   │                                                              │───╯
-│   │[r]esume  [i]nstruct  [k]ill command  [d]etach  [e]nd session │───╮
-│   │                                                              │vit│
-│   │                                                              │   │
-│   ╰──────────────────────────────────────────────────────────────╯   │
+│                                               ││                     │
+│                                               │╰─────────────────────╯
+│                                               │╭ background ─────────╮
+│                                               ││no background activit│
+│                                               ││                     │
+│                                               ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   paused — ready
-╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+   ready — ready
+╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

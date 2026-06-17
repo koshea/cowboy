@@ -192,6 +192,58 @@ impl Ranch {
     pub fn workstream_mut(&mut self, id: &str) -> Option<&mut Workstream> {
         self.workstreams.iter_mut().find(|w| w.id == id)
     }
+
+    /// Validate the dependency graph: every `depends_on` must reference a real
+    /// workstream, ids must be unique, and there must be no cycle. Without this,
+    /// a typo'd dep or a cycle (`a→b, b→a`) silently blocks workstreams forever
+    /// (`deps_satisfied` is never true) with no error — a confusing deadlock.
+    /// Call before starting a ranch.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let ids: HashSet<&str> = self.workstreams.iter().map(|w| w.id.as_str()).collect();
+        if ids.len() != self.workstreams.len() {
+            return Err("duplicate workstream ids".into());
+        }
+        for w in &self.workstreams {
+            for d in &w.depends_on {
+                if !ids.contains(d.as_str()) {
+                    return Err(format!(
+                        "workstream {:?} depends on unknown workstream {:?}",
+                        w.id, d
+                    ));
+                }
+            }
+        }
+        // Cycle detection via DFS over the dependency edges.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark {
+            Visiting,
+            Done,
+        }
+        fn visit<'a>(
+            id: &'a str,
+            ranch: &'a Ranch,
+            state: &mut std::collections::HashMap<&'a str, Mark>,
+        ) -> std::result::Result<(), String> {
+            match state.get(id) {
+                Some(Mark::Done) => return Ok(()),
+                Some(Mark::Visiting) => return Err(format!("dependency cycle through {id:?}")),
+                None => {}
+            }
+            state.insert(id, Mark::Visiting);
+            if let Some(w) = ranch.workstream(id) {
+                for d in &w.depends_on {
+                    visit(d, ranch, state)?;
+                }
+            }
+            state.insert(id, Mark::Done);
+            Ok(())
+        }
+        let mut state = std::collections::HashMap::new();
+        for w in &self.workstreams {
+            visit(&w.id, self, &mut state)?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -328,6 +380,38 @@ mod tests {
         );
         let ready: Vec<_> = r.ready_workstreams().iter().map(|w| w.id.clone()).collect();
         assert_eq!(ready, vec!["api"]);
+    }
+
+    #[test]
+    fn validate_catches_cycles_dangling_and_dupes() {
+        // A valid linear graph passes.
+        assert!(ranch(vec![
+            ws("a", &[], WorkstreamStatus::Planned),
+            ws("b", &["a"], WorkstreamStatus::Planned),
+        ])
+        .validate()
+        .is_ok());
+
+        // Dangling dependency id.
+        assert!(ranch(vec![ws("a", &["nope"], WorkstreamStatus::Planned)])
+            .validate()
+            .is_err());
+
+        // Cycle a -> b -> a (would otherwise silently block both forever).
+        assert!(ranch(vec![
+            ws("a", &["b"], WorkstreamStatus::Planned),
+            ws("b", &["a"], WorkstreamStatus::Planned),
+        ])
+        .validate()
+        .is_err());
+
+        // Duplicate ids.
+        assert!(ranch(vec![
+            ws("a", &[], WorkstreamStatus::Planned),
+            ws("a", &[], WorkstreamStatus::Planned),
+        ])
+        .validate()
+        .is_err());
     }
 
     #[test]

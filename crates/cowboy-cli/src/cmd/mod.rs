@@ -13,6 +13,7 @@ pub mod fileop;
 pub mod handoff;
 pub mod init;
 pub mod logs;
+pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod patch;

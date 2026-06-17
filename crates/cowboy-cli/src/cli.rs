@@ -150,6 +150,9 @@ pub enum Command {
     /// Grant host credentials (gh, gcloud, kubectl, …) into the container.
     Secrets(SecretsCmdArgs),
 
+    /// Configure MCP servers the agent can discover and call (host-owned).
+    Mcp(McpCmdArgs),
+
     /// Inspect or publish session artifacts (contracts, summaries, handoffs, …).
     Artifact(ArtifactCmdArgs),
 
@@ -392,6 +395,67 @@ pub struct SecretsAddArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct McpCmdArgs {
+    #[command(subcommand)]
+    pub command: McpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum McpCommand {
+    /// List configured MCP servers (name, transport, enabled).
+    List,
+    /// Show one server's full configuration.
+    Show { name: String },
+    /// Add or replace an MCP server in ~/.config/cowboy/mcp.yaml.
+    Add(McpAddArgs),
+    /// Remove an MCP server.
+    Remove { name: String },
+    /// Enable a configured server.
+    Enable { name: String },
+    /// Disable a server (kept in config, not connected).
+    Disable { name: String },
+    /// Connect to a server and list its tools (a connectivity check).
+    Test { name: String },
+    /// Trust this repo's `.mcp.json` servers (review + approve them; required
+    /// before the agent can use repo-defined servers). Re-run if the file changes.
+    Trust,
+    /// Revoke trust for this repo's `.mcp.json` servers.
+    Untrust,
+}
+
+#[derive(Debug, Args)]
+pub struct McpAddArgs {
+    /// Local name for the server (e.g. `linear`, `filesystem`).
+    pub name: String,
+    /// Transport: `stdio` (local subprocess) or `http` (remote endpoint).
+    #[arg(long, value_name = "stdio|http")]
+    pub transport: String,
+    /// One-line description shown to the agent (e.g. "issue tracking").
+    #[arg(long)]
+    pub description: Option<String>,
+    /// stdio: the command to run (e.g. `npx`).
+    #[arg(long)]
+    pub command: Option<String>,
+    /// stdio: an argument to the command (repeatable, in order). Leading-dash
+    /// values are fine (e.g. `--arg -y`).
+    #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub args: Vec<String>,
+    /// stdio: an environment variable, `KEY=VALUE` (repeatable). Use `${VAR}` in
+    /// VALUE to reference host env; never inline secret literals.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    pub env: Vec<String>,
+    /// http: the server URL.
+    #[arg(long)]
+    pub url: Option<String>,
+    /// http: a request header, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE.
+    #[arg(long = "header", value_name = "KEY=VALUE")]
+    pub header: Vec<String>,
+    /// Restrict to these tool names (repeatable). Omit to expose all tools.
+    #[arg(long = "tool", value_name = "NAME")]
+    pub tools: Vec<String>,
+}
+
+#[derive(Debug, Args)]
 pub struct ArtifactCmdArgs {
     #[command(subcommand)]
     pub command: ArtifactCommand,
@@ -469,6 +533,37 @@ pub enum RanchCommand {
         /// The overall goal.
         #[arg(long)]
         goal: Option<String>,
+    },
+    /// Add a workstream to a ranch (no hand-editing ranch.yaml). Rejects a
+    /// dependency cycle or an unknown `--depends-on` id.
+    Add {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        /// Workstream id (short, unique within the ranch).
+        #[arg(value_name = "WORKSTREAM_ID")]
+        workstream: String,
+        /// What this workstream should accomplish.
+        #[arg(long)]
+        goal: String,
+        /// Display title (defaults to the workstream id).
+        #[arg(long)]
+        title: Option<String>,
+        /// Workstream ids this one depends on (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        depends_on: Vec<String>,
+        /// Acceptance criteria, human-readable (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        acceptance: Vec<String>,
+        /// Expected artifact name(s) this workstream should publish (repeatable).
+        #[arg(long = "expects", value_name = "ARTIFACT")]
+        expects: Vec<String>,
+    },
+    /// Decompose a goal into a ranch plan with the agent: it researches the
+    /// codebase read-only and proposes workstreams + dependencies for you to
+    /// review (writes a draft ranch.yaml; starts nothing).
+    Plan {
+        /// The overall goal to decompose into workstreams.
+        goal: String,
     },
     /// Show ranch status: all ranches, or one with its workstreams.
     Status {

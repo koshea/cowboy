@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         },
         Some(Command::Memory(args)) => cmd::memory::run(args),
         Some(Command::Secrets(args)) => cmd::secrets::run(args.command),
+        Some(Command::Mcp(args)) => cmd::mcp::run(args.command).await,
         Some(Command::Artifact(args)) => cmd::artifact::run(args.command),
         Some(Command::Handoff { session }) => cmd::handoff::run(session),
         Some(Command::Decisions(args)) => cmd::decisions::run(args.command),
@@ -76,7 +77,9 @@ async fn main() -> Result<()> {
 
 fn init_tracing(verbose: bool) {
     use tracing_subscriber::{fmt, EnvFilter};
-    let default = if verbose { "debug" } else { "info" };
+    // Quiet rmcp's per-request INFO chatter by default (the MCP client logs each
+    // handshake/notification); override with COWBOY_LOG for full detail.
+    let default = if verbose { "debug" } else { "info,rmcp=warn" };
     let filter = EnvFilter::try_from_env("COWBOY_LOG").unwrap_or_else(|_| EnvFilter::new(default));
     // Logs go to stderr so they never pollute command/stdout capture.
     fmt()

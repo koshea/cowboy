@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use clipboard_rs::{Clipboard, ClipboardContext};
+use cowboy_core::daemonproto::UiEventMsg;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 use cowboy_tui::{draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, REASONING_OPTS};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -30,23 +31,25 @@ pub enum AgentCmd {
     Message(String),
     /// Switch the active model to this name (applies from the next turn).
     SwitchModel(String),
+    /// Turn plan mode on/off (file edits are blocked while on).
+    PlanMode(bool),
+    /// Sign off on this session's ranch workstream (the user typed `/accept`):
+    /// complete the workstream, advance the plan, and end the session.
+    Accept { note: Option<String> },
     /// Detach this client, leaving the session running for later re-attach.
     Detach,
 }
 
 /// Events the agent loop / control server send to the TUI event loop.
+///
+/// Most events are the journaled display events shared with the daemon wire
+/// protocol — they ride inside [`UiEvent::Wire`] rather than being restated
+/// here, so the two enums can't drift. The remaining variants are client-only:
+/// they carry non-serializable reply channels or are synthesized by the client.
 #[derive(Debug)]
 pub enum UiEvent {
-    Delta(String),
-    /// Streamed "thinking" (reasoning) text, rendered dimmed.
-    Reasoning(String),
-    ModelDone,
-    CommandStart(String),
-    CommandOutput(String),
-    CommandEnd(i32, String),
-    ToolUse(String),
-    Final(String),
-    Notice(String),
+    /// A journaled display event (the shared [`UiEventMsg`] payload).
+    Wire(UiEventMsg),
     /// A question for the user: prompt, suggested options (possibly empty), and
     /// the reply channel.
     Ask(String, Vec<String>, Sender<String>),
@@ -60,34 +63,7 @@ pub enum UiEvent {
     ApprovalResolved,
     /// The `/models` catalogue finished loading; open the picker.
     ModelsFetched(Vec<ModelChoice>),
-    /// A network decision the gateway made, for the activity log.
-    NetEvent(String),
-    /// Working-tree diff summary for the status bar.
-    DiffStat(String),
-    /// Running session token estimate (input, output).
-    Tokens(u64, u64),
-    /// Running estimated session spend in USD.
-    Cost(f64),
-    /// The agent's working plan: ordered (step, status) pairs.
-    Plan(Vec<(String, String)>),
-    /// The session is blocked (`Some(reason)`) or unblocked (`None`).
-    Blocked(Option<String>),
-    /// Update the transcript title (cwd + branch context).
-    Title(String),
-    /// Managed processes (name, status) for the background pane.
-    Processes(Vec<(String, String)>),
-    /// A crew subagent was dispatched (routing label + resolved model).
-    SubagentStarted {
-        label: String,
-        model: String,
-    },
-    /// A crew subagent finished (`ok` = produced a result).
-    SubagentDone {
-        label: String,
-        ok: bool,
-    },
-    /// The agent finished a turn; ready for the next user message.
-    TurnDone,
+    /// The session ended.
     Done,
 }
 
@@ -96,44 +72,57 @@ pub struct TuiUi {
     pub tx: Sender<UiEvent>,
 }
 
+impl TuiUi {
+    fn wire(&self, e: UiEventMsg) {
+        let _ = self.tx.send(UiEvent::Wire(e));
+    }
+}
+
 impl AgentUi for TuiUi {
     fn model_delta(&mut self, text: &str) {
-        let _ = self.tx.send(UiEvent::Delta(text.to_string()));
+        self.wire(UiEventMsg::Delta(text.to_string()));
     }
     fn model_reasoning(&mut self, text: &str) {
-        let _ = self.tx.send(UiEvent::Reasoning(text.to_string()));
+        self.wire(UiEventMsg::Reasoning(text.to_string()));
     }
     fn model_done(&mut self) {
-        let _ = self.tx.send(UiEvent::ModelDone);
+        self.wire(UiEventMsg::ModelDone);
     }
     fn command_start(&mut self, command: &str) {
-        let _ = self.tx.send(UiEvent::CommandStart(command.to_string()));
+        self.wire(UiEventMsg::CommandStart(command.to_string()));
     }
     fn command_output(&mut self, chunk: &str) {
-        let _ = self.tx.send(UiEvent::CommandOutput(chunk.to_string()));
+        self.wire(UiEventMsg::CommandOutput(chunk.to_string()));
     }
     fn command_end(&mut self, exit_code: i32, output: &str) {
-        let _ = self
-            .tx
-            .send(UiEvent::CommandEnd(exit_code, output.to_string()));
+        self.wire(UiEventMsg::CommandEnd {
+            code: exit_code,
+            output: output.to_string(),
+        });
     }
     fn tool_use(&mut self, summary: &str) {
-        let _ = self.tx.send(UiEvent::ToolUse(summary.to_string()));
+        self.wire(UiEventMsg::ToolUse(summary.to_string()));
+    }
+    fn file_diff(&mut self, path: &str, diff: &str) {
+        self.wire(UiEventMsg::FileDiff {
+            path: path.to_string(),
+            diff: diff.to_string(),
+        });
     }
     fn tokens(&mut self, input: u64, output: u64) {
-        let _ = self.tx.send(UiEvent::Tokens(input, output));
+        self.wire(UiEventMsg::Tokens { input, output });
     }
     fn cost(&mut self, usd: f64) {
-        let _ = self.tx.send(UiEvent::Cost(usd));
+        self.wire(UiEventMsg::Cost(usd));
     }
     fn plan(&mut self, steps: &[(String, String)]) {
-        let _ = self.tx.send(UiEvent::Plan(steps.to_vec()));
+        self.wire(UiEventMsg::Plan(steps.to_vec()));
     }
     fn blocked(&mut self, reason: Option<&str>) {
-        let _ = self.tx.send(UiEvent::Blocked(reason.map(str::to_string)));
+        self.wire(UiEventMsg::Blocked(reason.map(str::to_string)));
     }
     fn final_message(&mut self, message: &str) {
-        let _ = self.tx.send(UiEvent::Final(message.to_string()));
+        self.wire(UiEventMsg::Final(message.to_string()));
     }
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
         let (rtx, rrx) = std::sync::mpsc::channel();
@@ -147,7 +136,69 @@ impl AgentUi for TuiUi {
         rrx.recv().unwrap_or_default()
     }
     fn notice(&mut self, msg: &str) {
-        let _ = self.tx.send(UiEvent::Notice(msg.to_string()));
+        self.wire(UiEventMsg::Notice(msg.to_string()));
+    }
+}
+
+/// Apply a journaled (wire) display event to the view state. Pure view-state
+/// mutation; control-flow events (Ask/Approval/TurnDone/Done) stay in the loop.
+fn apply_wire(app: &mut App, msg: UiEventMsg) {
+    match msg {
+        UiEventMsg::Delta(t) => app.stream(&t),
+        UiEventMsg::Reasoning(t) => app.stream_reasoning(&t),
+        UiEventMsg::ModelDone => app.commit_stream(),
+        UiEventMsg::CommandStart(c) => {
+            app.commit_stream();
+            app.push(LineKind::Command, c.clone());
+            app.start_command(c, now_ms());
+        }
+        UiEventMsg::CommandOutput(chunk) => {
+            // A committed line carries a trailing newline; a transient
+            // (carriage-return progress) update doesn't — it overwrites the
+            // previous line in place.
+            let committed = chunk.ends_with('\n');
+            app.command_output_line(chunk.trim_end_matches('\n'), committed);
+        }
+        UiEventMsg::CommandEnd { code, .. } => {
+            if code != 0 {
+                app.push(LineKind::Error, format!("[exit {code}]"));
+            }
+            app.end_command();
+            app.status = "running".into();
+        }
+        UiEventMsg::ToolUse(s) => {
+            app.commit_stream();
+            app.push(LineKind::Tool, s);
+        }
+        UiEventMsg::FileDiff { diff, .. } => {
+            app.commit_stream();
+            app.push(LineKind::Diff, diff);
+        }
+        UiEventMsg::Final(m) => {
+            // `final` ends the turn, not the session. ModelDone may have already
+            // committed an implicit final's streamed content as an Agent line;
+            // `push_final` re-tags it instead of duplicating.
+            app.commit_stream();
+            app.push_final(m);
+        }
+        UiEventMsg::Notice(m) => app.push(LineKind::Notice, m),
+        UiEventMsg::NetEvent(line) => app.activity(line),
+        UiEventMsg::DiffStat(s) => app.diff = s,
+        UiEventMsg::Tokens { input, output } => {
+            app.tokens_in = input;
+            app.tokens_out = output;
+        }
+        UiEventMsg::Cost(usd) => app.cost_usd = usd,
+        UiEventMsg::Plan(steps) => app.plan = steps,
+        UiEventMsg::Blocked(reason) => app.set_blocked(reason),
+        UiEventMsg::Title(t) => app.title = t,
+        UiEventMsg::Processes(procs) => app.processes = procs,
+        UiEventMsg::SubagentStarted { label, model } => {
+            app.subagent_started(label, model, now_ms())
+        }
+        UiEventMsg::SubagentDone { label, ok } => app.subagent_done(&label, ok),
+        // Handled in the event loop (needs loop-local turn bookkeeping).
+        UiEventMsg::TurnDone => {}
     }
 }
 
@@ -197,6 +248,10 @@ pub struct SessionCtx {
     pub models: Vec<String>,
     /// The currently active model name.
     pub current_model: String,
+    /// The ranch this session belongs to, if it's a workstream (enables `/accept`).
+    pub ranch_id: Option<String>,
+    /// The workstream id within the ranch, if any.
+    pub workstream_id: Option<String>,
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -395,38 +450,18 @@ fn event_loop(
     loop {
         while let Ok(ev) = events.try_recv() {
             match ev {
-                UiEvent::Delta(t) => app.stream(&t),
-                UiEvent::Reasoning(t) => app.stream_reasoning(&t),
-                UiEvent::ModelDone => app.commit_stream(),
-                UiEvent::CommandStart(c) => {
+                // TurnDone needs loop-local turn bookkeeping, so it's handled
+                // here; every other journaled (wire) event is pure view-state.
+                UiEvent::Wire(UiEventMsg::TurnDone) => {
+                    pending_turns = pending_turns.saturating_sub(1);
                     app.commit_stream();
-                    app.push(LineKind::Command, c.clone());
-                    app.start_command(c, now_ms());
-                }
-                UiEvent::CommandOutput(chunk) => {
-                    // A committed line carries a trailing newline; a transient
-                    // (carriage-return progress) update doesn't — it overwrites
-                    // the previous line in place.
-                    let committed = chunk.ends_with('\n');
-                    app.command_output_line(chunk.trim_end_matches('\n'), committed);
-                }
-                UiEvent::CommandEnd(code, _out) => {
-                    if code != 0 {
-                        app.push(LineKind::Error, format!("[exit {code}]"));
+                    // Back to idle once all queued turns are processed.
+                    if pending_turns == 0 && matches!(app.mode, Mode::Running) {
+                        app.mode = Mode::Idle;
+                        app.status = "ready".into();
                     }
-                    app.end_command();
-                    app.status = "running".into();
                 }
-                UiEvent::ToolUse(s) => {
-                    app.commit_stream();
-                    app.push(LineKind::Tool, s);
-                }
-                UiEvent::Final(m) => {
-                    // `final` ends the turn, not the session.
-                    app.commit_stream();
-                    app.push(LineKind::Final, m);
-                }
-                UiEvent::Notice(m) => app.push(LineKind::Notice, m),
+                UiEvent::Wire(msg) => apply_wire(&mut app, msg),
                 UiEvent::Ask(q, options, reply) => {
                     app.commit_stream();
                     if options.is_empty() {
@@ -465,30 +500,6 @@ fn event_loop(
                         app.mode = Mode::ModelPicker;
                     }
                 }
-                UiEvent::NetEvent(line) => app.activity(line),
-                UiEvent::DiffStat(s) => app.diff = s,
-                UiEvent::Tokens(i, o) => {
-                    app.tokens_in = i;
-                    app.tokens_out = o;
-                }
-                UiEvent::Cost(usd) => app.cost_usd = usd,
-                UiEvent::Plan(steps) => app.plan = steps,
-                UiEvent::Blocked(reason) => app.set_blocked(reason),
-                UiEvent::Title(t) => app.title = t,
-                UiEvent::Processes(procs) => app.processes = procs,
-                UiEvent::SubagentStarted { label, model } => {
-                    app.subagent_started(label, model, now_ms())
-                }
-                UiEvent::SubagentDone { label, ok } => app.subagent_done(&label, ok),
-                UiEvent::TurnDone => {
-                    pending_turns = pending_turns.saturating_sub(1);
-                    app.commit_stream();
-                    // Back to idle once all queued turns are processed.
-                    if pending_turns == 0 && matches!(app.mode, Mode::Running) {
-                        app.mode = Mode::Idle;
-                        app.status = "ready".into();
-                    }
-                }
                 UiEvent::Done => {
                     app.mode = Mode::Done;
                     app.status = "session ended".into();
@@ -499,6 +510,7 @@ fn event_loop(
         app.tick();
         app.tick_command(now_ms());
         app.tick_crew(now_ms());
+        app.tick_turn(now_ms());
         terminal.draw(|f| draw(f, &app))?;
 
         // Flush any queued clipboard copy. Prefer the direct OS clipboard
@@ -596,7 +608,17 @@ const COMMAND_COMPLETIONS: &[(&str, &str)] = &[
     ("skills", "list skills"),
     ("model", "[name] show/switch model"),
     ("models", "browse the model catalogue"),
+    (
+        "plan",
+        "<task> propose a plan first (edits blocked until /go)",
+    ),
+    ("go", "[note] approve the plan and start editing"),
+    (
+        "ranch",
+        "[note] promote the discussion into a multi-workstream ranch",
+    ),
     ("crew", "[usage] show the crew roster"),
+    ("mcp", "list connected MCP servers"),
     ("diff", "working-tree diff"),
     ("copy", "copy the last answer"),
     ("clear", "clear the view"),
@@ -613,6 +635,13 @@ fn build_completion_catalog(session: &SessionCtx) -> Vec<cowboy_tui::Completion>
             hint: h.to_string(),
         })
         .collect();
+    // `/accept` only makes sense inside a ranch workstream session.
+    if session.workstream_id.is_some() {
+        out.push(cowboy_tui::Completion {
+            value: "accept".to_string(),
+            hint: "[note] sign off this workstream and advance the plan".to_string(),
+        });
+    }
     for s in cowboy_core::skills::discover(&session.root) {
         let hint = s.argument_hint.clone().unwrap_or_else(|| {
             s.description
@@ -684,13 +713,7 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
     }
 }
 
-/// Milliseconds since the Unix epoch (for the running-command elapsed timer).
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use cowboy_core::time::now_ms;
 
 /// Mutable context handed to the key handler.
 struct KeyCtx<'a> {
@@ -974,9 +997,14 @@ const HELP_LINES: &[&str] = &[
     "  /help          show this help",
     "  /skills        list available skills",
     "  /<skill> [args]  run a skill (e.g. /github:review-pr 162)",
+    "  /plan <task>   propose a plan first — edits are blocked until you approve",
+    "  /go [note]     approve the plan and let the agent start editing",
+    "  /ranch [note]  promote the discussion into a multi-workstream ranch plan",
+    "  /accept [note] sign off this ranch workstream → advance the plan (workstreams only)",
     "  /model [name]  show or switch the active model",
     "  /models        browse the provider catalogue and add/select a model",
     "  /crew [usage]  show the crew roster (model routing) or its usage",
+    "  /mcp           list connected MCP servers (manage with `cowboy mcp`)",
     "  /diff          show the working-tree diff",
     "  /copy          copy the last answer to the system clipboard",
     "  /clear         clear the view (conversation memory is kept)",
@@ -984,8 +1012,65 @@ const HELP_LINES: &[&str] = &[
     "  /quit          end the session",
     "copy: drag to select (drag to the top/bottom edge to extend across scrollback),",
     "      then `y` to copy (Esc clears) · or /copy for the whole last answer",
-    "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · PgUp/PgDn scroll · Ctrl-C menu",
+    "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · Ctrl-C menu",
+    "scroll: PgUp/PgDn · Shift+Up/Down line · Shift+End jump to tail & follow",
+    "Ctrl-C menu: r resume · i instruct (redirect) · k kill turn · d detach · e end",
 ];
+
+/// `/mcp`: list the configured MCP servers (host + this repo's trust-gated
+/// `.mcp.json`) as notices. Read-only — manage servers with the `cowboy mcp` CLI.
+fn mcp_command(app: &mut App, root: &std::path::Path) {
+    let cfg = match cowboy_core::mcp::load_or_default() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            app.push(LineKind::Error, format!("MCP config error: {e}"));
+            return;
+        }
+    };
+    if cfg.servers.is_empty() {
+        app.push(LineKind::Notice, "no host MCP servers configured");
+    } else {
+        app.push(LineKind::Notice, "MCP servers (host):");
+        for (name, s) in &cfg.servers {
+            let state = if s.enabled { "enabled" } else { "disabled" };
+            let desc = if s.description.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", s.description)
+            };
+            app.push(
+                LineKind::Notice,
+                format!("  {name} [{state}] {}{desc}", s.transport_label()),
+            );
+        }
+    }
+    // This repo's `.mcp.json`, if any (trust-gated).
+    let state = crate::mcp::trust::project_trust(root);
+    if state != crate::mcp::trust::TrustState::NoFile {
+        if let Ok(Some(servers)) = cowboy_core::mcp::load_project_mcp(root) {
+            app.push(
+                LineKind::Notice,
+                format!("MCP servers (.mcp.json) — {}:", state.label()),
+            );
+            for (name, s) in &servers {
+                app.push(
+                    LineKind::Notice,
+                    format!("  {name} {}", s.transport_label()),
+                );
+            }
+            if matches!(
+                state,
+                crate::mcp::trust::TrustState::Untrusted | crate::mcp::trust::TrustState::Stale
+            ) {
+                app.push(LineKind::Notice, "  → enable with `cowboy mcp trust`");
+            }
+        }
+    }
+    app.push(
+        LineKind::Notice,
+        "manage with `cowboy mcp add/trust/remove/test`",
+    );
+}
 
 /// `/crew` (and `/crew usage`): show the crew roster matrix or usage summary as
 /// notices. Read-only — manage the roster with the `cowboy crew` CLI.
@@ -1139,7 +1224,91 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             app.push(LineKind::Notice, "fetching models…");
             spawn_model_fetch(ctx.ui_tx.clone(), ctx.session.current_model.clone());
         }
+        "plan" => {
+            let task = input.strip_prefix("plan").unwrap_or("").trim();
+            if task.is_empty() {
+                app.push(
+                    LineKind::Notice,
+                    "usage: /plan <task> — the agent proposes a plan first; \
+                     file edits stay blocked until you approve with /go",
+                );
+            } else if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::PlanMode(true));
+                app.plan_mode = true;
+                let prompt = format!(
+                    "Plan mode is ON. Research the codebase READ-ONLY (read/grep/ls — do not \
+                     modify files or run state-changing commands), then present a concise, \
+                     numbered plan of the steps you'll take. Use the `plan` tool to list the \
+                     steps. Then stop and wait — I'll review and run /go to approve.\n\nTask: {task}"
+                );
+                app.push(LineKind::User, format!("/{input}"));
+                let _ = tx.send(AgentCmd::Message(prompt));
+                *ctx.pending_turns += 1;
+                app.mode = Mode::Running;
+                app.status = "planning…".into();
+            }
+        }
+        "go" => {
+            let note = input.strip_prefix("go").unwrap_or("").trim();
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::PlanMode(false));
+                app.plan_mode = false;
+                let extra = if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Also: {note}")
+                };
+                app.push(LineKind::User, format!("/{input}"));
+                let _ = tx.send(AgentCmd::Message(format!(
+                    "Approved — implement the plan now.{extra}"
+                )));
+                *ctx.pending_turns += 1;
+                app.mode = Mode::Running;
+                app.status = "executing…".into();
+            }
+        }
+        "accept" => {
+            // Sign off on this ranch workstream: complete it, advance the plan, and
+            // end the session. Only valid inside a workstream session.
+            if ctx.session.workstream_id.is_none() {
+                app.push(
+                    LineKind::Notice,
+                    "/accept only applies to a ranch workstream session",
+                );
+            } else if let Some(tx) = ctx.task_tx.as_ref() {
+                let note = input.strip_prefix("accept").unwrap_or("").trim();
+                let note = (!note.is_empty()).then(|| note.to_string());
+                app.push(LineKind::User, format!("/{input}"));
+                let _ = tx.send(AgentCmd::Accept { note });
+                app.status = "signing off…".into();
+            }
+        }
+        "ranch" => {
+            // Bridge: turn the current (single-session) discussion into a
+            // multi-workstream ranch using the context already built — no need
+            // to re-run `cowboy ranch plan`.
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let note = input.strip_prefix("ranch").unwrap_or("").trim();
+                let extra = if note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Emphasis: {note}.")
+                };
+                app.push(LineKind::User, format!("/{input}"));
+                let _ = tx.send(AgentCmd::Message(format!(
+                    "This is bigger than one session — promote it into a multi-workstream Ranch \
+                     Plan. Using what we've already discussed (don't re-research from scratch), \
+                     decompose the work into independent, parallelizable workstreams wired by \
+                     dependencies and call the `propose_ranch` tool ONCE with the full \
+                     decomposition. Do not implement anything.{extra}"
+                )));
+                *ctx.pending_turns += 1;
+                app.mode = Mode::Running;
+                app.status = "drafting a ranch…".into();
+            }
+        }
         "crew" => crew_command(arg, app),
+        "mcp" => mcp_command(app, &ctx.session.root),
         "quit" | "exit" | "q" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
@@ -1212,7 +1381,9 @@ fn spawn_model_fetch(ui_tx: Sender<UiEvent>, current_name: String) {
             let _ = ui_tx.send(UiEvent::ModelsFetched(choices));
         }
         Err(e) => {
-            let _ = ui_tx.send(UiEvent::Notice(format!("model list failed: {e}")));
+            let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(format!(
+                "model list failed: {e}"
+            ))));
         }
     });
 }

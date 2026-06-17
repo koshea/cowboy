@@ -103,12 +103,7 @@ struct Daemon {
     coordinating: std::collections::HashMap<String, bool>,
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use cowboy_core::time::now_ms;
 
 /// A session is heartbeat-stale after this long without an update. Workers
 /// heartbeat every 5s, so this tolerates several missed beats.
@@ -683,6 +678,9 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             }
             DaemonResp::Inbox { messages }
         }
+        DaemonReq::AcceptWorkstream { session, note: _ } => {
+            accept_workstream(daemon, &session).await
+        }
         // Worktree create/list are pure git/fs — no registry lock needed. List
         // is annotated with any session that holds each worktree's lease.
         DaemonReq::CreateWorktree { repo, branch, path } => {
@@ -717,6 +715,68 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
 // ---------------------------------------------------------------------------
 // Ranch coordinator (background auto-advance)
 // ---------------------------------------------------------------------------
+
+/// Sign off on the ranch workstream a session is running (the user typed
+/// `/accept`): mark the workstream complete + promote its artifacts via the exact
+/// `cowboy ranch accept` CLI path, then advance the plan (launch newly-unblocked
+/// workstreams, honoring `auto_advance`). The worker ends the session afterwards.
+async fn accept_workstream(daemon: &Arc<Mutex<Daemon>>, session: &SessionId) -> DaemonResp {
+    // Resolve the session's ranch + workstream + worktree from the registry.
+    let (ranch_id, ws_id, worktree) = {
+        let d = daemon.lock().await;
+        match d.state.sessions.get(session) {
+            Some(s) => match (s.ranch_id.clone(), s.workstream_id.clone()) {
+                (Some(r), Some(w)) => (r, w, s.root.clone()),
+                _ => {
+                    return DaemonResp::Err {
+                        message: "this session isn't a ranch workstream".into(),
+                    }
+                }
+            },
+            None => {
+                return DaemonResp::Err {
+                    message: format!("unknown session {session}"),
+                }
+            }
+        }
+    };
+    let Ok(main_root) = crate::net::worktree::main_repo_root(&worktree) else {
+        return DaemonResp::Err {
+            message: "can't resolve the ranch's main repo".into(),
+        };
+    };
+    // Mark the workstream complete + promote its artifacts (reuses `ranch accept`).
+    let out = tokio::process::Command::new(worker_binary())
+        .arg("ranch")
+        .arg("accept")
+        .arg(&ranch_id)
+        .arg(&ws_id)
+        .current_dir(&main_root)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            return DaemonResp::Err {
+                message: format!(
+                    "ranch accept failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+            }
+        }
+        Err(e) => {
+            return DaemonResp::Err {
+                message: format!("running ranch accept: {e}"),
+            }
+        }
+    }
+    // Advance the plan: launch any newly-unblocked workstreams. Reuses the same
+    // background coordinator the terminal-state path uses (claim guard + the
+    // ranch's `auto_advance` preference).
+    coordinate_after_terminal(daemon, session).await;
+    DaemonResp::Accepted
+}
 
 /// When a ranch workstream's session reaches a terminal state, advance the plan
 /// in the background: reconcile finished workstreams, promote their outputs, and

@@ -33,6 +33,8 @@ pub async fn run(target: String) -> Result<()> {
             root: std::env::current_dir().unwrap_or_default(),
             models: Vec::new(),
             current_model: String::new(),
+            ranch_id: None,
+            workstream_id: None,
         };
         return attach_socket(&p, "cowboy", Vec::new(), ctx);
     }
@@ -55,6 +57,8 @@ pub async fn run(target: String) -> Result<()> {
         root: info.root.clone(),
         models: Vec::new(),
         current_model: String::new(),
+        ranch_id: info.ranch_id.clone(),
+        workstream_id: info.workstream_id.clone(),
     };
     let title = title_for(&info);
     match target {
@@ -102,7 +106,7 @@ pub fn replay_journal(
     let loop_tx = ui_tx.clone();
     let feeder = std::thread::spawn(move || {
         for event in events {
-            if ui_tx.send(to_ui_event(event)).is_err() {
+            if ui_tx.send(UiEvent::Wire(event)).is_err() {
                 return;
             }
         }
@@ -179,7 +183,9 @@ pub fn attach_socket_ro(
                     let _ = bridge(stream, ui_tx.clone(), task_rx, bridge_cancel, read_only).await;
                 }
                 Err(e) => {
-                    let _ = ui_tx.send(UiEvent::Notice(format!("attach failed: {e}")));
+                    let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(format!(
+                        "attach failed: {e}"
+                    ))));
                 }
             }
             let _ = ui_tx.send(UiEvent::Done);
@@ -250,6 +256,8 @@ pub async fn bridge(
             let msg = match cmd {
                 AgentCmd::Message(m) => ClientMsg::Message(m),
                 AgentCmd::SwitchModel(n) => ClientMsg::SwitchModel(n),
+                AgentCmd::PlanMode(b) => ClientMsg::PlanMode(b),
+                AgentCmd::Accept { note } => ClientMsg::Accept { note },
                 AgentCmd::Detach => unreachable!("handled above"),
             };
             if cmd_out.send(msg).is_err() {
@@ -318,10 +326,10 @@ fn handle_server_msg(
 ) -> bool {
     match msg {
         ServerMsg::Snapshot { info, .. } => {
-            let _ = ui_tx.send(UiEvent::Title(title_for(&info)));
+            let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Title(title_for(&info))));
         }
         ServerMsg::Event { event, .. } => {
-            let _ = ui_tx.send(to_ui_event(event));
+            let _ = ui_tx.send(UiEvent::Wire(event));
         }
         ServerMsg::Ask {
             id,
@@ -352,7 +360,7 @@ fn handle_server_msg(
         ServerMsg::Status(_) => {}
         ServerMsg::Ended { reason } => {
             if !reason.is_empty() {
-                let _ = ui_tx.send(UiEvent::Notice(reason));
+                let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(reason)));
             }
             return false;
         }
@@ -365,31 +373,6 @@ fn title_for(info: &SessionInfo) -> String {
     match &info.branch {
         Some(b) => format!("{cwd}  ⎇ {b}"),
         None => cwd.to_string(),
-    }
-}
-
-fn to_ui_event(e: UiEventMsg) -> UiEvent {
-    match e {
-        UiEventMsg::Delta(t) => UiEvent::Delta(t),
-        UiEventMsg::Reasoning(t) => UiEvent::Reasoning(t),
-        UiEventMsg::ModelDone => UiEvent::ModelDone,
-        UiEventMsg::CommandStart(c) => UiEvent::CommandStart(c),
-        UiEventMsg::CommandOutput(c) => UiEvent::CommandOutput(c),
-        UiEventMsg::CommandEnd { code, output } => UiEvent::CommandEnd(code, output),
-        UiEventMsg::ToolUse(s) => UiEvent::ToolUse(s),
-        UiEventMsg::Final(m) => UiEvent::Final(m),
-        UiEventMsg::Notice(m) => UiEvent::Notice(m),
-        UiEventMsg::NetEvent(l) => UiEvent::NetEvent(l),
-        UiEventMsg::DiffStat(s) => UiEvent::DiffStat(s),
-        UiEventMsg::Tokens { input, output } => UiEvent::Tokens(input, output),
-        UiEventMsg::Cost(usd) => UiEvent::Cost(usd),
-        UiEventMsg::Blocked(reason) => UiEvent::Blocked(reason),
-        UiEventMsg::Plan(steps) => UiEvent::Plan(steps),
-        UiEventMsg::Title(t) => UiEvent::Title(t),
-        UiEventMsg::Processes(p) => UiEvent::Processes(p),
-        UiEventMsg::SubagentStarted { label, model } => UiEvent::SubagentStarted { label, model },
-        UiEventMsg::SubagentDone { label, ok } => UiEvent::SubagentDone { label, ok },
-        UiEventMsg::TurnDone => UiEvent::TurnDone,
     }
 }
 
@@ -496,9 +479,9 @@ mod tests {
         let bridge = tokio::spawn(bridge(stream, ui_tx, task_rx, cancel, false));
 
         let title = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(title, UiEvent::Title(t) if t.contains("main")));
+        assert!(matches!(title, UiEvent::Wire(UiEventMsg::Title(t)) if t.contains("main")));
         let delta = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert!(matches!(delta, UiEvent::Delta(t) if t == "hi"));
+        assert!(matches!(delta, UiEvent::Wire(UiEventMsg::Delta(t)) if t == "hi"));
 
         task_tx.send(AgentCmd::Message("go".into())).unwrap();
 

@@ -83,10 +83,14 @@ pub async fn run(
         // thin client that starts (or reuses) the session and attaches.
         let (model_names, current_model) = models_and_default(&user_models, &project_models);
         daemon::ensure_running().await?;
+        // A direct `cowboy` session is never a ranch workstream (those are launched
+        // by `cowboy ranch start` and picked up via `cowboy ranch attach`).
         let ctx_for = |root: PathBuf| SessionCtx {
             root,
             models: model_names.clone(),
             current_model: current_model.clone(),
+            ranch_id: None,
+            workstream_id: None,
         };
         let mut root = root;
         let mut force = flags.force;
@@ -195,7 +199,7 @@ pub async fn run(
             }),
             None => Vec::new(),
         };
-        let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security);
+        let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security)?;
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -203,10 +207,10 @@ pub async fn run(
                 signal_cancel.cancel();
             }
         });
-        let sock = runtime.control_sock();
+        let control = runtime.control_endpoint();
         let session_dir = logger.as_ref().map(|l| l.dir().to_path_buf());
-        if let Some(sock) = sock {
-            tokio::spawn(run_control_autodeny(sock, session_dir));
+        if let Some((addr, token)) = control {
+            tokio::spawn(run_control_autodeny(addr, token, session_dir));
         }
         let mut ui = ConsoleUi::new();
         let mut agent = AgentLoop::new(
@@ -663,12 +667,16 @@ pub(crate) fn verdict_str(v: Verdict) -> &'static str {
 }
 
 /// Non-interactive control pipeline: deny all asks (fail closed), log events.
-async fn run_control_autodeny(sock: PathBuf, session_dir: Option<PathBuf>) {
+async fn run_control_autodeny(addr: String, token: String, session_dir: Option<PathBuf>) {
     let (approvals_tx, mut approvals_rx) = tokio::sync::mpsc::unbounded_channel();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-    let serve_sock = sock.clone();
     tokio::spawn(async move {
-        let _ = control::serve(serve_sock, approvals_tx, events_tx).await;
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                let _ = control::serve_on(listener, token, approvals_tx, events_tx).await;
+            }
+            Err(e) => tracing::error!(%addr, error = %e, "control server bind failed"),
+        }
     });
     let ev_dir = session_dir.clone();
     tokio::spawn(async move {

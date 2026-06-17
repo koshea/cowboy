@@ -30,6 +30,25 @@ pub async fn run(command: RanchCommand) -> Result<()> {
     let root = crate::cmd::project_root()?;
     match command {
         RanchCommand::Create { title, goal } => create(&root, &title, goal),
+        RanchCommand::Add {
+            id,
+            workstream,
+            goal,
+            title,
+            depends_on,
+            acceptance,
+            expects,
+        } => add_workstream(
+            &root,
+            &id,
+            &workstream,
+            &goal,
+            title,
+            depends_on,
+            acceptance,
+            expects,
+        ),
+        RanchCommand::Plan { goal } => plan(goal).await,
         RanchCommand::Status { id } => status(&root, id),
         RanchCommand::Start { id } => start(&root, &id).await,
         RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
@@ -353,8 +372,81 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
     // Validate it parses.
     ranch::load(root, &id).context("the new ranch.yaml should parse")?;
     println!("✓ created ranch `{id}` at {}", path.display());
-    println!("  edit it to add workstreams (id, goal, depends_on, acceptance),");
+    println!("  add workstreams: `cowboy ranch add {id} <ws-id> --goal \"…\" [--depends-on a,b]`");
     println!("  then check it with `cowboy ranch status {id}`.");
+    Ok(())
+}
+
+/// `cowboy ranch plan "<goal>"` — let the agent decompose a goal into a ranch.
+/// Starts an interactive session seeded to research read-only and call the
+/// `propose_ranch` tool, which writes a draft ranch.yaml for the user to review.
+async fn plan(goal: String) -> Result<()> {
+    let task = format!(
+        "Plan a multi-workstream Ranch Plan for the goal below — DO NOT implement anything or \
+         edit files. Research the codebase READ-ONLY (read/grep/ls) to find the natural seams, \
+         then decompose the goal into independent, parallelizable workstreams wired by \
+         dependencies (a DAG), and call the `propose_ranch` tool ONCE with the full decomposition \
+         (ids, goals, depends_on, expected artifacts, acceptance criteria). Keep workstreams \
+         coarse-grained. After it's drafted, summarize the plan and tell me to review it with \
+         `cowboy ranch status`.\n\nGoal: {goal}"
+    );
+    let flags = crate::cli::StartFlags {
+        attach_if_active: false,
+        read_only: false,
+        new_worktree: false,
+        force: false,
+    };
+    crate::cmd::session::run(Some(task), flags, None).await
+}
+
+/// Add a workstream to an existing ranch, validating the dependency graph
+/// (rejects a cycle, an unknown `depends_on`, or a duplicate id) before saving —
+/// so building a ranch never silently produces an unrunnable plan.
+#[allow(clippy::too_many_arguments)]
+fn add_workstream(
+    root: &std::path::Path,
+    ranch_id: &str,
+    ws_id: &str,
+    goal: &str,
+    title: Option<String>,
+    depends_on: Vec<String>,
+    acceptance: Vec<String>,
+    expects: Vec<String>,
+) -> Result<()> {
+    let mut ranch = ranch::load(root, ranch_id)?;
+    if ranch.workstreams.iter().any(|w| w.id == ws_id) {
+        bail!("workstream `{ws_id}` already exists in ranch `{ranch_id}`");
+    }
+    ranch.workstreams.push(Workstream {
+        id: ws_id.to_string(),
+        title: title.unwrap_or_else(|| ws_id.to_string()),
+        goal: goal.to_string(),
+        depends_on,
+        status: WorkstreamStatus::Planned,
+        session_id: None,
+        branch: None,
+        worktree_path: None,
+        expected_artifacts: expects,
+        acceptance,
+    });
+    // Reuse the graph validator: a typo'd dependency or a cycle is caught here,
+    // not at `ranch start` (where it would silently deadlock).
+    ranch
+        .validate()
+        .map_err(|e| anyhow::anyhow!("adding `{ws_id}` would break the plan: {e}"))?;
+    ranch.updated_ms = now_ms();
+    ranch::save(root, &ranch)?;
+
+    let ws = ranch.workstream(ws_id).expect("just added");
+    let deps = if ws.depends_on.is_empty() {
+        "none (ready to start)".to_string()
+    } else {
+        ws.depends_on.join(", ")
+    };
+    println!("✓ added workstream `{ws_id}` to ranch `{ranch_id}` (depends on: {deps})");
+    println!(
+        "  next: `cowboy ranch status {ranch_id}` · start with `cowboy ranch start {ranch_id}`"
+    );
     Ok(())
 }
 
@@ -398,24 +490,90 @@ fn show_one(root: &std::path::Path, id: &str) -> Result<()> {
         );
         return Ok(());
     }
-    println!(
-        "\n{:<16} {:<12} {:<16} DEPENDS ON",
-        "WORKSTREAM", "STATUS", "SESSION"
-    );
-    for w in &r.workstreams {
+    // Dependency tree: lay workstreams out by dependency depth (deepest chain),
+    // indented so the execution order and what-waits-on-what read at a glance.
+    println!("\n  ✓ done · ⟳ running · ◷ ready · ⊘ blocked · ⏸ waiting · · planned");
+    println!("\nworkstreams (top runs first):");
+    let depths = dep_depths(&r);
+    let mut order: Vec<&Workstream> = r.workstreams.iter().collect();
+    order.sort_by(|a, b| {
+        let (da, db) = (depths.get(&a.id).copied(), depths.get(&b.id).copied());
+        da.cmp(&db).then_with(|| a.id.cmp(&b.id))
+    });
+    for w in order {
+        let indent = "  ".repeat(depths.get(&w.id).copied().unwrap_or(0) + 1);
+        let sess = w
+            .session_id
+            .as_deref()
+            .map(|s| format!(" · {s}"))
+            .unwrap_or_default();
+        let after = if w.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!("   ← {}", w.depends_on.join(", "))
+        };
         println!(
-            "{:<16} {:<12} {:<16} {}",
+            "{indent}{} {} — {}{sess}{after}",
+            ws_glyph(w.status),
             w.id,
-            ws_status(w.status),
-            w.session_id.as_deref().unwrap_or("-"),
-            w.depends_on.join(", ")
+            ws_status(w.status)
         );
     }
     let ready: Vec<_> = r.ready_workstreams().iter().map(|w| w.id.clone()).collect();
     if !ready.is_empty() {
         println!("\nready to start: {}", ready.join(", "));
+        println!("launch with `cowboy ranch start {}`", r.id);
     }
     Ok(())
+}
+
+/// A glyph per workstream status, matching the dashboard's vocabulary.
+fn ws_glyph(s: WorkstreamStatus) -> &'static str {
+    match s {
+        WorkstreamStatus::Complete | WorkstreamStatus::Integrated => "✓",
+        WorkstreamStatus::MergeReady => "⇧",
+        WorkstreamStatus::Running | WorkstreamStatus::Starting => "⟳",
+        WorkstreamStatus::Ready => "◷",
+        WorkstreamStatus::WaitingForUser => "⏸",
+        WorkstreamStatus::Blocked => "⊘",
+        WorkstreamStatus::Failed | WorkstreamStatus::Cancelled => "✗",
+        WorkstreamStatus::Planned => "·",
+    }
+}
+
+/// Dependency depth of each workstream = the longest chain of `depends_on`
+/// beneath it (0 for a root). Used to lay the tree out in execution order.
+/// Assumes a DAG (the caller validates first); a stray cycle just yields 0s.
+fn dep_depths(r: &Ranch) -> HashMap<String, usize> {
+    let by_id: HashMap<&str, &Workstream> =
+        r.workstreams.iter().map(|w| (w.id.as_str(), w)).collect();
+    fn depth(
+        id: &str,
+        by_id: &HashMap<&str, &Workstream>,
+        memo: &mut HashMap<String, usize>,
+    ) -> usize {
+        if let Some(&v) = memo.get(id) {
+            return v;
+        }
+        memo.insert(id.to_string(), 0); // cycle guard (DAG expected)
+        let v = by_id
+            .get(id)
+            .map(|w| {
+                w.depends_on
+                    .iter()
+                    .map(|d| 1 + depth(d, by_id, memo))
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        memo.insert(id.to_string(), v);
+        v
+    }
+    let mut memo = HashMap::new();
+    for w in &r.workstreams {
+        depth(&w.id, &by_id, &mut memo);
+    }
+    memo
 }
 
 /// `cowboy ranch start <id>` — reconcile finished workstreams, then launch every
@@ -437,6 +595,11 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
 async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
     let mut log: Vec<String> = Vec::new();
     let mut ranch = ranch::load(root, id)?;
+    // Reject a broken dependency graph up front: a cycle or a typo'd `depends_on`
+    // would otherwise silently leave workstreams blocked forever with no error.
+    ranch
+        .validate()
+        .map_err(|e| anyhow::anyhow!("invalid ranch {id}: {e}"))?;
 
     // Look up the live status of each already-started workstream's session.
     let mut session_status: std::collections::HashMap<String, SessionStatus> = Default::default();
@@ -449,49 +612,21 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
             }
         }
     }
-    let reconciled = reconcile_and_pick(
-        &mut ranch,
-        &|sid| session_status.get(sid).copied(),
-        &published_artifact_names,
-    );
+    let reconciled = reconcile_and_pick(&mut ranch, &|sid| session_status.get(sid).copied());
 
-    // Promote the outputs of workstreams that just finished into the ranch store
-    // (committed, shareable) so downstream workstreams + reviewers can use them.
-    for ws_id in &reconciled.newly_complete {
-        if let Some(ws) = ranch.workstream(ws_id).cloned() {
-            let n = promote_artifacts(root, &ranch, &ws);
-            log.push(format!("{ws_id} complete — promoted {n} artifact(s)"));
-        }
-    }
-
-    // Workstreams held at the acceptance gate: promote their outputs for review,
-    // but they do NOT unblock dependents until the user signs off.
+    // Workstreams whose session finished: promote their outputs for review, but
+    // they do NOT unblock dependents until the user signs off. Each is an
+    // interactive session you attach to, refine, and `/accept` when happy.
     for ws_id in &reconciled.awaiting_acceptance {
         if let Some(ws) = ranch.workstream(ws_id).cloned() {
             let n = promote_artifacts(root, &ranch, &ws);
-            let why = if !ws.acceptance.is_empty() {
-                format!("{} acceptance criteria to verify", ws.acceptance.len())
-            } else {
-                let missing: Vec<_> = {
-                    let published = published_artifact_names(&ws);
-                    ws.expected_artifacts
-                        .iter()
-                        .filter(|want| {
-                            !published
-                                .iter()
-                                .any(|g| g == *want || g.ends_with(*want) || g.contains(*want))
-                        })
-                        .cloned()
-                        .collect()
-                };
-                format!("missing expected artifacts: {}", missing.join(", "))
-            };
             log.push(format!(
-                "{ws_id} finished but needs sign-off ({why}) — promoted {n} artifact(s) for review"
+                "{ws_id} finished a first attempt — promoted {n} artifact(s) for review"
             ));
             log.push(format!(
-                "  review, then `cowboy ranch accept {} {ws_id}` to unblock dependents",
-                ranch.id
+                "  attach with `cowboy ranch attach {} {ws_id}`, then `/accept` in-session \
+                 (or `cowboy ranch accept {} {ws_id}`) to sign off and unblock dependents",
+                ranch.id, ranch.id
             ));
         }
     }
@@ -633,11 +768,7 @@ async fn live_view(root: &Path, id: &str) -> Result<(Ranch, HashMap<String, Sess
         }
     }
     // Reflect readiness/finished transitions for display only (result discarded).
-    reconcile_and_pick(
-        &mut ranch,
-        &|sid| session_status.get(sid).copied(),
-        &published_artifact_names,
-    );
+    reconcile_and_pick(&mut ranch, &|sid| session_status.get(sid).copied());
     Ok((ranch, session_status))
 }
 
@@ -835,46 +966,20 @@ fn session_status_str(s: SessionStatus) -> &'static str {
 struct Reconciled {
     /// Ids ready to launch now (deps complete).
     ready: Vec<String>,
-    /// Ids that just auto-completed (gate satisfied; artifacts to promote, deps
-    /// unblocked).
-    newly_complete: Vec<String>,
-    /// Ids whose session finished but the acceptance gate held them back: they're
-    /// now `WaitingForUser`. Their artifacts are still promoted for review, but
-    /// dependents stay blocked until the user signs off (`ranch accept`).
+    /// Ids whose session finished without an explicit sign-off: they're now
+    /// `WaitingForUser`. Their artifacts are promoted for review, but dependents
+    /// stay blocked until the user signs off (`/accept` in-session, or the
+    /// `cowboy ranch accept` CLI fallback). A workstream is never auto-completed.
     awaiting_acceptance: Vec<String>,
 }
 
-/// Does a finished workstream pass the acceptance gate? It does NOT (and so needs
-/// human sign-off) if it declared acceptance criteria, or if it declared expected
-/// artifacts it didn't actually publish. A workstream with neither auto-completes.
-/// `artifacts_published` is injected so this stays unit-testable without a session
-/// dir on disk.
-fn acceptance_gate_open(
-    ws: &cowboy_core::ranch::Workstream,
-    artifacts_published: &[String],
-) -> bool {
-    if !ws.acceptance.is_empty() {
-        return false; // criteria to verify → always needs sign-off
-    }
-    // Every expected artifact must be among the published ones (loose match on
-    // file name / title so "schema-contract.md" matches however it was titled).
-    ws.expected_artifacts.iter().all(|want| {
-        artifacts_published
-            .iter()
-            .any(|got| got == want || got.ends_with(want) || got.contains(want))
-    })
-}
-
 /// Reconcile already-started workstreams from their session status, recompute
-/// readiness, and report what's ready, what auto-completed, and what is awaiting
-/// acceptance sign-off. Pure (status + published-artifacts lookups injected), so
-/// it's unit-testable without a daemon or session dir.
+/// readiness, and report what's ready and what is awaiting acceptance sign-off.
+/// Pure (status lookup injected), so it's unit-testable without a daemon.
 fn reconcile_and_pick(
     ranch: &mut Ranch,
     session_status: &dyn Fn(&str) -> Option<SessionStatus>,
-    published_artifacts: &dyn Fn(&cowboy_core::ranch::Workstream) -> Vec<String>,
 ) -> Reconciled {
-    let mut newly_complete = Vec::new();
     let mut awaiting_acceptance = Vec::new();
     for w in &mut ranch.workstreams {
         if matches!(
@@ -883,17 +988,15 @@ fn reconcile_and_pick(
         ) {
             if let Some(sid) = &w.session_id {
                 match session_status(sid) {
+                    // A workstream is interactive: it's never auto-completed. A
+                    // session that ended without an explicit sign-off (the user
+                    // quit, or it crashed clean) parks here for the user to attach,
+                    // review, and `/accept` — dependents stay blocked until then.
+                    // Explicit sign-off (`/accept` / `ranch accept`) sets `Complete`
+                    // directly via `mark_done`, never through this path.
                     Some(SessionStatus::Completed) => {
-                        let published = published_artifacts(w);
-                        if acceptance_gate_open(w, &published) {
-                            w.status = WorkstreamStatus::Complete;
-                            newly_complete.push(w.id.clone());
-                        } else {
-                            // Finished, but needs sign-off: hold here so dependents
-                            // stay blocked until the user accepts.
-                            w.status = WorkstreamStatus::WaitingForUser;
-                            awaiting_acceptance.push(w.id.clone());
-                        }
+                        w.status = WorkstreamStatus::WaitingForUser;
+                        awaiting_acceptance.push(w.id.clone());
                     }
                     Some(SessionStatus::Failed) | Some(SessionStatus::Stale) => {
                         w.status = WorkstreamStatus::Failed
@@ -912,26 +1015,8 @@ fn reconcile_and_pick(
         .collect();
     Reconciled {
         ready,
-        newly_complete,
         awaiting_acceptance,
     }
-}
-
-/// The published-artifact file names for a workstream's session (names only, for
-/// gate matching). Empty if it has no recorded worktree/session yet.
-fn published_artifact_names(ws: &cowboy_core::ranch::Workstream) -> Vec<String> {
-    let (Some(wt), Some(sid)) = (&ws.worktree_path, &ws.session_id) else {
-        return Vec::new();
-    };
-    let session_dir = wt.join(".cowboy").join("sessions").join(sid);
-    cowboy_core::artifact::list_in(&session_dir)
-        .into_iter()
-        .flat_map(|a| {
-            // Match on both the file name and the human title.
-            let name = a.path.file_name().map(|n| n.to_string_lossy().into_owned());
-            [name, Some(a.title)].into_iter().flatten()
-        })
-        .collect()
 }
 
 /// Promote a completed workstream's published artifacts (+ handoff) from its
@@ -945,7 +1030,7 @@ fn promote_artifacts(
     let (Some(wt), Some(sid)) = (&ws.worktree_path, &ws.session_id) else {
         return 0;
     };
-    let session_dir = wt.join(".cowboy").join("sessions").join(sid);
+    let session_dir = crate::session::session_dir(wt, sid);
     let dest = ranch::ranch_artifact_dir(root, &ranch.id, &ws.id);
     if std::fs::create_dir_all(&dest).is_err() {
         return 0;
@@ -1035,7 +1120,10 @@ fn compose_task(
          - Do NOT edit the ranch plan. If it looks wrong (a workstream is missing, \
            unnecessary, or misscoped), use `propose_scope_change` to file a proposal \
            for the user to approve — never change scope on your own.\n\
-         - When done, publish the expected artifacts and a handoff, then finish.\n",
+         - Make a solid first attempt now: publish the expected artifacts and a handoff, \
+           then stop. This is an interactive workstream — the user will attach, review \
+           your work, refine it with you, and sign off with `/accept` when satisfied. \
+           Do NOT consider the workstream complete yourself; wait for their direction.\n",
     );
     s
 }
@@ -1082,12 +1170,7 @@ fn ws_status(s: WorkstreamStatus) -> &'static str {
     }
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use cowboy_core::time::now_ms;
 
 #[cfg(test)]
 mod tests {
@@ -1138,6 +1221,82 @@ mod tests {
         assert!(!text.contains(" log ")); // no log pane title when empty
     }
 
+    #[test]
+    fn dep_depths_layer_the_graph_in_execution_order() {
+        let r = ranch(vec![
+            ws("schema", &[], WorkstreamStatus::Planned, None),
+            ws("api", &["schema"], WorkstreamStatus::Planned, None),
+            ws("ui", &["api"], WorkstreamStatus::Planned, None),
+            ws(
+                "integration",
+                &["api", "ui"],
+                WorkstreamStatus::Planned,
+                None,
+            ),
+        ]);
+        let d = dep_depths(&r);
+        assert_eq!(d["schema"], 0);
+        assert_eq!(d["api"], 1);
+        assert_eq!(d["ui"], 2);
+        assert_eq!(d["integration"], 3); // max(api=1, ui=2) + 1
+    }
+
+    #[test]
+    fn add_workstream_appends_and_validates_the_graph() {
+        let dir = std::env::temp_dir().join(format!("cowboy-ranch-add-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        ranch::save(
+            &dir,
+            &ranch(vec![ws("schema", &[], WorkstreamStatus::Planned, None)]),
+        )
+        .unwrap();
+
+        // Add a dependent workstream from the CLI path.
+        add_workstream(
+            &dir,
+            "r",
+            "api",
+            "build the api",
+            None,
+            vec!["schema".into()],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let r = ranch::load(&dir, "r").unwrap();
+        let api = r.workstream("api").expect("api was added");
+        assert_eq!(api.depends_on, vec!["schema".to_string()]);
+        assert_eq!(api.goal, "build the api");
+        assert_eq!(api.title, "api"); // defaults to the id
+
+        // A duplicate id is rejected.
+        assert!(
+            add_workstream(&dir, "r", "api", "dup", None, vec![], vec![], vec![]).is_err(),
+            "duplicate workstream id must be rejected"
+        );
+        // An unknown dependency is rejected by graph validation (not silently saved).
+        assert!(
+            add_workstream(
+                &dir,
+                "r",
+                "ui",
+                "ui",
+                None,
+                vec!["nope".into()],
+                vec![],
+                vec![]
+            )
+            .is_err(),
+            "unknown depends_on must be rejected"
+        );
+        // The bad adds didn't persist.
+        let r = ranch::load(&dir, "r").unwrap();
+        assert_eq!(r.workstreams.len(), 2, "only schema + api persisted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn ws(id: &str, deps: &[&str], status: WorkstreamStatus, session: Option<&str>) -> Workstream {
         Workstream {
             id: id.into(),
@@ -1168,26 +1327,27 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_marks_finished_and_picks_newly_ready() {
+    fn reconcile_holds_finished_workstream_for_signoff() {
         // schema is Running on session s1; api waits on schema; ui waits on api.
         let mut r = ranch(vec![
             ws("schema", &[], WorkstreamStatus::Running, Some("s1")),
             ws("api", &["schema"], WorkstreamStatus::Planned, None),
             ws("ui", &["api"], WorkstreamStatus::Planned, None),
         ]);
-        // s1 has Completed → schema becomes Complete, api unblocks. schema has no
-        // acceptance/expected artifacts, so the gate auto-completes it.
-        let rec = reconcile_and_pick(
-            &mut r,
-            &|sid| (sid == "s1").then_some(SessionStatus::Completed),
-            &|_| Vec::new(),
-        );
-        assert_eq!(rec.ready, vec!["api"]);
-        assert_eq!(rec.newly_complete, vec!["schema"]);
-        assert!(rec.awaiting_acceptance.is_empty());
+        // s1 has Completed → a workstream is never auto-completed, so schema parks
+        // at WaitingForUser and api stays blocked until the user signs off.
+        let rec = reconcile_and_pick(&mut r, &|sid| {
+            (sid == "s1").then_some(SessionStatus::Completed)
+        });
+        assert!(rec.ready.is_empty());
+        assert_eq!(rec.awaiting_acceptance, vec!["schema"]);
         assert_eq!(
             r.workstream("schema").unwrap().status,
-            WorkstreamStatus::Complete
+            WorkstreamStatus::WaitingForUser
+        );
+        assert_eq!(
+            r.workstream("api").unwrap().status,
+            WorkstreamStatus::Blocked
         );
         assert_eq!(
             r.workstream("ui").unwrap().status,
@@ -1282,74 +1442,33 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_criteria_hold_a_finished_workstream_for_signoff() {
-        // schema declares acceptance criteria; api depends on it.
-        let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("s1"));
-        schema.acceptance = vec!["migrations apply cleanly".into()];
-        let mut r = ranch(vec![
-            schema,
-            ws("api", &["schema"], WorkstreamStatus::Planned, None),
-        ]);
-        let rec = reconcile_and_pick(
-            &mut r,
-            &|sid| (sid == "s1").then_some(SessionStatus::Completed),
-            &|_| Vec::new(),
-        );
-        // schema finished but is gated → WaitingForUser, NOT Complete.
-        assert_eq!(rec.awaiting_acceptance, vec!["schema"]);
-        assert!(rec.newly_complete.is_empty());
-        assert_eq!(
-            r.workstream("schema").unwrap().status,
-            WorkstreamStatus::WaitingForUser
-        );
-        // api stays blocked (its dep isn't done) and nothing is ready.
-        assert!(rec.ready.is_empty());
-        assert_eq!(
-            r.workstream("api").unwrap().status,
-            WorkstreamStatus::Blocked
-        );
-    }
-
-    #[test]
-    fn missing_expected_artifact_holds_for_signoff_but_present_one_completes() {
-        // declares an expected artifact; with it published → auto-complete.
-        let mk = || {
-            let mut w = ws("schema", &[], WorkstreamStatus::Running, Some("s1"));
-            w.expected_artifacts = vec!["schema-contract.md".into()];
-            ranch(vec![
-                w,
+    fn finished_workstream_holds_for_signoff_regardless_of_criteria() {
+        // Whether or not it declares acceptance criteria or expected artifacts, a
+        // finished workstream parks for sign-off — sign-off is always explicit.
+        for with_criteria in [false, true] {
+            let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("s1"));
+            if with_criteria {
+                schema.acceptance = vec!["migrations apply cleanly".into()];
+            }
+            let mut r = ranch(vec![
+                schema,
                 ws("api", &["schema"], WorkstreamStatus::Planned, None),
-            ])
-        };
-
-        // Published the expected artifact (loose match on file name) → complete.
-        let mut r = mk();
-        let rec = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Completed), &|_| {
-            vec!["a0001-schema-contract.md".into()]
-        });
-        assert_eq!(rec.newly_complete, vec!["schema"]);
-        assert_eq!(rec.ready, vec!["api"]); // dependent unblocked
-
-        // Published nothing → gated for sign-off.
-        let mut r = mk();
-        let rec = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Completed), &|_| Vec::new());
-        assert_eq!(rec.awaiting_acceptance, vec!["schema"]);
-        assert!(rec.ready.is_empty());
-    }
-
-    #[test]
-    fn acceptance_gate_open_logic() {
-        let mut w = ws("x", &[], WorkstreamStatus::Running, None);
-        // No criteria, no expected artifacts → open (auto-complete).
-        assert!(acceptance_gate_open(&w, &[]));
-        // Acceptance criteria always close the gate.
-        w.acceptance = vec!["it works".into()];
-        assert!(!acceptance_gate_open(&w, &[]));
-        // Expected artifact present (loose match) opens it; absent closes it.
-        w.acceptance.clear();
-        w.expected_artifacts = vec!["contract.md".into()];
-        assert!(acceptance_gate_open(&w, &["a1-contract.md".into()]));
-        assert!(!acceptance_gate_open(&w, &["unrelated.md".into()]));
+            ]);
+            let rec = reconcile_and_pick(&mut r, &|sid| {
+                (sid == "s1").then_some(SessionStatus::Completed)
+            });
+            assert_eq!(rec.awaiting_acceptance, vec!["schema"]);
+            assert_eq!(
+                r.workstream("schema").unwrap().status,
+                WorkstreamStatus::WaitingForUser
+            );
+            // api stays blocked (its dep isn't signed off) and nothing is ready.
+            assert!(rec.ready.is_empty());
+            assert_eq!(
+                r.workstream("api").unwrap().status,
+                WorkstreamStatus::Blocked
+            );
+        }
     }
 
     #[test]
@@ -1361,9 +1480,9 @@ mod tests {
             Some("s1"),
         )]);
         // Session still running → no change, nothing new to start.
-        let rec = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Running), &|_| Vec::new());
+        let rec = reconcile_and_pick(&mut r, &|_| Some(SessionStatus::Running));
         assert!(rec.ready.is_empty());
-        assert!(rec.newly_complete.is_empty());
+        assert!(rec.awaiting_acceptance.is_empty());
         assert_eq!(
             r.workstream("schema").unwrap().status,
             WorkstreamStatus::Running

@@ -5,11 +5,12 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Mutex;
 
-use cowboy_core::netproto::{NetworkAttempt, Verdict};
+use cowboy_core::netproto::{NetworkAttempt, Protocol, Verdict};
 use cowboy_core::policy;
 
 use crate::control::ControlClient;
 use crate::dns::DnsMap;
+use crate::dns_policy::{self, RateTracker};
 
 /// Shared gateway state.
 pub struct GatewayState {
@@ -18,6 +19,8 @@ pub struct GatewayState {
     control: ControlClient,
     /// Cache of approved/denied destinations from prior `ask` decisions.
     cache: Mutex<HashMap<String, Verdict>>,
+    /// Per-parent DNS query-rate tracker (tunnel signal).
+    dns_rate: RateTracker,
 }
 
 impl GatewayState {
@@ -26,16 +29,17 @@ impl GatewayState {
         dns: DnsMap,
         control: ControlClient,
     ) -> Self {
+        let dns_rate = RateTracker::new(policy.dns.max_subdomains_per_min);
         Self {
             policy,
             dns,
             control,
             cache: Mutex::new(HashMap::new()),
+            dns_rate,
         }
     }
 
     /// Access the DNS map (used by the resolver task and tests).
-    #[allow(dead_code)]
     pub fn dns(&self) -> &DnsMap {
         &self.dns
     }
@@ -53,8 +57,11 @@ impl GatewayState {
     }
 
     fn cache_key(attempt: &NetworkAttempt) -> String {
+        // Key by host (not host:port) so one approval covers a host across the DNS
+        // resolution (port 53) and the subsequent connection (443/80) — no double
+        // prompt. IP-only attempts still key by ip:port.
         match &attempt.host {
-            Some(h) => format!("host:{h}:{}", attempt.port),
+            Some(h) => format!("host:{}", h.trim_end_matches('.').to_ascii_lowercase()),
             None => match attempt.ip {
                 Some(ip) => format!("ip:{ip}:{}", attempt.port),
                 None => format!("port:{}", attempt.port),
@@ -66,6 +73,19 @@ impl GatewayState {
     /// result, then the host (which may persist a new scope).
     pub async fn decide(&self, attempt: &NetworkAttempt) -> Verdict {
         let (verdict, reason) = policy::evaluate(&self.policy, attempt);
+        self.run_decision(attempt, verdict, reason).await
+    }
+
+    /// Apply a precomputed (verdict, reason) for an attempt: log allow/deny as an
+    /// event, or run the cached/`ask` flow with the host. Shared by `decide`
+    /// (connect layer) and `decide_dns` (resolver). `reason` is also shown in the
+    /// host's `ask` prompt.
+    pub(crate) async fn run_decision(
+        &self,
+        attempt: &NetworkAttempt,
+        verdict: Verdict,
+        reason: String,
+    ) -> Verdict {
         match verdict {
             Verdict::Allow | Verdict::Deny => {
                 self.control.event(attempt, verdict, reason).await;
@@ -73,13 +93,22 @@ impl GatewayState {
             }
             Verdict::Ask => {
                 let key = Self::cache_key(attempt);
-                if let Some(cached) = self.cache.lock().unwrap().get(&key).copied() {
+                if let Some(cached) = self
+                    .cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&key)
+                    .copied()
+                {
                     return cached;
                 }
-                let decided = self.control.ask(attempt).await;
+                let decided = self.control.ask(attempt, Some(&reason)).await;
                 // Cache concrete decisions (not a re-ask).
                 if decided != Verdict::Ask {
-                    self.cache.lock().unwrap().insert(key, decided);
+                    self.cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(key, decided);
                 }
                 decided
             }
@@ -91,6 +120,58 @@ impl GatewayState {
     pub fn record_dns(&self, ip: IpAddr, host: String) {
         self.dns.record(ip, host);
     }
+
+    /// Decide whether to resolve a DNS query for `qname`/`qtype`. Order: refuse
+    /// disallowed record types; compute the name verdict (strict allowlist when
+    /// `enforce`, else deny-list only); escalate to `ask` on a tunnel signal.
+    /// Runs through the shared cache/`ask`/event machinery (so approvals persist).
+    pub async fn decide_dns(&self, qname: &str, qtype: &str) -> Verdict {
+        let dns = &self.policy.dns;
+        let attempt = NetworkAttempt {
+            protocol: Protocol::Dns,
+            host: Some(qname.trim_end_matches('.').to_string()),
+            ip: None,
+            port: 53,
+        };
+
+        // 1. Record-type gate.
+        if !dns_policy::qtype_allowed(qtype, dns) {
+            return self
+                .run_decision(
+                    &attempt,
+                    Verdict::Deny,
+                    format!("dns: record type {qtype} not allowed"),
+                )
+                .await;
+        }
+
+        // 2. Name verdict.
+        let (mut verdict, mut reason) = if dns.enforce {
+            policy::evaluate_name(&self.policy, qname)
+        } else {
+            // Permissive: only the deny-list gates resolution; otherwise allow.
+            match policy::evaluate_name(&self.policy, qname) {
+                (Verdict::Deny, r) => (Verdict::Deny, r),
+                (_, r) => (Verdict::Allow, r),
+            }
+        };
+
+        // 3. Tunnel detection escalates a non-deny verdict to `ask`.
+        if dns.tunnel_detection && verdict != Verdict::Deny {
+            let why = dns_policy::tunnel_reason(qname, dns).or_else(|| {
+                let parent = dns_policy::registrable_parent(qname);
+                self.dns_rate
+                    .over_limit(&parent)
+                    .then(|| format!("high query rate for {parent}"))
+            });
+            if let Some(why) = why {
+                verdict = Verdict::Ask;
+                reason = format!("dns tunnel suspected: {why}");
+            }
+        }
+
+        self.run_decision(&attempt, verdict, reason).await
+    }
 }
 
 #[cfg(test)]
@@ -100,7 +181,7 @@ mod tests {
     use cowboy_core::netproto::Protocol;
 
     fn state(policy: NetworkPolicy) -> GatewayState {
-        GatewayState::new(policy, DnsMap::new(), ControlClient::new(None))
+        GatewayState::new(policy, DnsMap::new(), ControlClient::new(None, None))
     }
 
     fn attempt(host: Option<&str>, ip: Option<&str>, port: u16) -> NetworkAttempt {
@@ -163,5 +244,75 @@ mod tests {
             .record("1.2.3.4".parse().unwrap(), "host.test".into());
         let enriched = s.enrich(attempt(None, Some("1.2.3.4"), 443));
         assert_eq!(enriched.host.as_deref(), Some("host.test"));
+    }
+
+    // --- DNS policy ---
+
+    #[tokio::test]
+    async fn dns_allow_listed_name_resolves() {
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("github.com".into());
+        let s = state(p);
+        // Allowed by name regardless of the allow port-list (resolution != connect).
+        assert_eq!(s.decide_dns("api.github.com", "A").await, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn dns_unknown_name_refused_when_strict() {
+        // default_external = ask + no approver -> deny (refused), strict resolution.
+        let s = state(NetworkPolicy::default());
+        assert_eq!(s.decide_dns("evil.test", "A").await, Verdict::Deny);
+    }
+
+    #[tokio::test]
+    async fn dns_denied_name_refused() {
+        let s = state(NetworkPolicy::default()); // denies metadata.google.internal
+        assert_eq!(
+            s.decide_dns("metadata.google.internal", "A").await,
+            Verdict::Deny
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_risky_qtype_refused_even_when_allowed() {
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("github.com".into());
+        let s = state(p);
+        // A is fine; TXT is refused by the default qtype allowlist.
+        assert_eq!(s.decide_dns("github.com", "A").await, Verdict::Allow);
+        assert_eq!(s.decide_dns("github.com", "TXT").await, Verdict::Deny);
+    }
+
+    #[tokio::test]
+    async fn dns_tunnel_on_allowed_parent_escalates_to_ask() {
+        // Allow the parent, but a high-entropy/long label under it is suspicious →
+        // escalated to ask; with no approver that fails closed to deny.
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("evil.com".into());
+        let s = state(p);
+        let tunnel = "mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dzpiztgmzr.evil.com";
+        assert_eq!(s.decide_dns(tunnel, "A").await, Verdict::Deny); // ask → fail-closed
+                                                                    // A normal name under the same allowed parent still resolves.
+        assert_eq!(s.decide_dns("api.evil.com", "A").await, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn dns_permissive_resolves_non_denied() {
+        let mut p = NetworkPolicy {
+            dns: cowboy_core::config::DnsPolicy {
+                enforce: false,
+                tunnel_detection: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // metadata is denied; anything else resolves under permissive mode.
+        p.allow.domains.clear();
+        let s = state(p);
+        assert_eq!(s.decide_dns("whatever.test", "A").await, Verdict::Allow);
+        assert_eq!(
+            s.decide_dns("metadata.google.internal", "A").await,
+            Verdict::Deny
+        );
     }
 }

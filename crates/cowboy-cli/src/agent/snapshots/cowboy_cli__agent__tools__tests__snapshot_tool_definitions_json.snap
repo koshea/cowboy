@@ -506,6 +506,90 @@ expression: defs
     }
   },
   {
+    "description": "Propose a multi-workstream Ranch Plan: decompose a large goal into independent, parallelizable workstreams wired by `depends_on` into a DAG, each with a goal, expected artifacts, and acceptance criteria. Use ONLY when explicitly asked to plan/decompose a ranch — it writes a draft ranch.yaml for the user to review and does NOT start any work or edit code. Call it once with the full decomposition.",
+    "name": "propose_ranch",
+    "parameters": {
+      "$defs": {
+        "RanchWorkstreamArg": {
+          "description": "One workstream in a proposed Ranch Plan (see [`ProposeRanchArgs`]).",
+          "properties": {
+            "acceptance": {
+              "default": [],
+              "description": "Human-readable acceptance criteria.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "depends_on": {
+              "default": [],
+              "description": "Ids of workstreams that must finish before this one starts (forms a DAG).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "expected_artifacts": {
+              "default": [],
+              "description": "Artifacts this workstream is expected to publish (names, not paths).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "goal": {
+              "description": "What this workstream should accomplish.",
+              "type": "string"
+            },
+            "id": {
+              "description": "Short, unique slug id (e.g. `schema`, `api`).",
+              "type": "string"
+            },
+            "title": {
+              "default": null,
+              "description": "Display title (defaults to the id).",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "id",
+            "goal"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `propose_ranch` tool: a full multi-workstream decomposition.",
+      "properties": {
+        "goal": {
+          "description": "The overall goal the ranch achieves.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Title for the ranch plan.",
+          "type": "string"
+        },
+        "workstreams": {
+          "description": "The workstreams, with `depends_on` wiring them into a dependency DAG.",
+          "items": {
+            "$ref": "#/$defs/RanchWorkstreamArg"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "title",
+        "goal",
+        "workstreams"
+      ],
+      "title": "ProposeRanchArgs",
+      "type": "object"
+    }
+  },
+  {
     "description": "Finish the task. Provide a summary of what changed, what was validated, and any remaining risks or follow-up work.",
     "name": "final",
     "parameters": {

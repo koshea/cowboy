@@ -1,22 +1,22 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
-╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
-│› fix the failing test                         ││ask example.com:443  │
+╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
+│› start the dev server                         ││no network activity  │
+│                                               ││yet                  │
+│✓ Server running on :3000.                     ││                     │
 │                                               ││                     │
-│$ cargo test                                   ││                     │
-│  test result: FAILED                          ││                     │
 │                                               ││                     │
-│Looking at the failure...                      ││                     │
+│                                               ││                     │
 │                                               │╰─────────────────────╯
 │                                               │╭ background ─────────╮
-│                                               ││no background activit│
+│                                               ││web          running │
 │                                               ││                     │
 │                                               ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-⠷  running — exec: cargo test
-╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+   ready · /diff to review, then commit                     Δ 2f +30 -4
+╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

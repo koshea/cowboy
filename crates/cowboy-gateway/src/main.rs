@@ -8,6 +8,7 @@
 mod config;
 mod control;
 mod dns;
+mod dns_policy;
 mod http;
 mod nft;
 mod proxy;
@@ -37,27 +38,27 @@ async fn main() -> Result<()> {
     tracing::info!(
         subnet = %cfg.agent_subnet,
         upstream = %cfg.dns_upstream,
-        control = ?cfg.control_sock,
+        control = ?cfg.control_addr,
         "cowboy-gateway starting"
     );
 
     // Load-bearing enforcement. Fail closed if this errors.
     nft::apply(&cfg).await?;
 
-    let dns_map = DnsMap::new();
-    let control = ControlClient::new(cfg.control_sock.clone());
+    let control = ControlClient::new(cfg.control_addr.clone(), cfg.control_token.clone());
     let state = Arc::new(GatewayState::new(
         cfg.policy.clone(),
-        dns_map.clone(),
+        DnsMap::new(),
         control,
     ));
 
-    // DNS forwarder.
+    // DNS resolver (policy-enforced).
     let dns_bind: SocketAddr = ([0, 0, 0, 0], PORT_DNS).into();
     let upstream = cfg.dns_upstream;
+    let dns_state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = dns::serve(dns_bind, upstream, dns_map).await {
-            tracing::error!(error = %e, "dns forwarder exited");
+        if let Err(e) = dns::serve(dns_bind, upstream, dns_state).await {
+            tracing::error!(error = %e, "dns resolver exited");
         }
     });
 

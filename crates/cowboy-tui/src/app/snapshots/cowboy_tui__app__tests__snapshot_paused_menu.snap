@@ -1,22 +1,22 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
-│I need a decision.                             ││no network activity  │
+│› do work                                      ││no network activity  │
 │                                               ││yet                  │
 │                                               ││                     │
-│   ╭ Question ────────────────────────────────────────────────────╮   │
-│   │Which database should we use?                                 │   │
+│   ╭ Paused ──────────────────────────────────────────────────────╮   │
+│   │r  resume                                                     │   │
+│   │i  instruct — stop this turn and redirect (history kept)      │   │
+│   │k  kill — stop the running command/turn only                  │───╯
+│   │d  detach — leave it running in the background, exit          │───╮
+│   │e  end — finish the session                                   │vit│
 │   │                                                              │   │
-│   │  1. PostgreSQL                                               │───╯
-│   │▸ 2. SQLite                                                   │───╮
-│   │  3. MySQL                                                    │vit│
-│   │  (or type a custom answer)                                   │   │
-│   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
+│   │press a key  ·  Esc = resume                                  │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   awaiting choice — ready
+   paused — ready
 ╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

@@ -181,3 +181,82 @@ fn network_boundary_is_enforced() {
         "agent must not be able to change its network config (NET_ADMIN dropped)"
     );
 }
+
+/// DNS resolution is policy-gated (strict): a name the policy allows resolves and
+/// connects through the gateway; an un-allowed name is REFUSED at the resolver and
+/// can't even be looked up — closing DNS as an exfiltration channel. Needs Docker
+/// + internet egress (resolves the allowed name upstream).
+#[test]
+#[ignore = "builds gateway image and runs multiple containers + needs internet"]
+fn dns_resolution_is_policy_gated() {
+    if !docker_available() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    ensure_gateway_image();
+
+    let (containers_before, networks_before) = cowboy_objects();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    // Allow the cloudflare.com domain (name + 443); everything else asks → with no
+    // approver, fails closed. DNS policy defaults (strict enforce + tunnel
+    // detection + risky-qtype refusal) apply.
+    tmp.child(".cowboy/security.yaml")
+        .write_str(
+            "version: 1\n\
+             container:\n\
+             \x20 image: busybox:latest\n\
+             \x20 workdir: /workspace\n\
+             \x20 mounts:\n\
+             \x20   - source: .\n\
+             \x20     target: /workspace\n\
+             \x20     mode: rw\n\
+             network_policy:\n\
+             \x20 default_external: ask\n\
+             \x20 allow:\n\
+             \x20   domains: [\"cloudflare.com\"]\n\
+             \x20   ports: [443]\n",
+        )
+        .unwrap();
+    tmp.child(".cowboy/agent.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+    tmp.child(".cowboy/models.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+
+    let agent_name = format!("cowboy-e2e-dns-{}", std::process::id());
+    let cowboy = |args: &[&str]| -> std::process::Output {
+        Command::cargo_bin("cowboy")
+            .unwrap()
+            .current_dir(tmp.path())
+            .env("COWBOY_CONTAINER_NAME", &agent_name)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // wget completes only if the name RESOLVES (DNS allowed) and the connection is
+    // allowed. An un-allowed name fails at resolution.
+    let wget = |url: &str| -> bool {
+        cowboy(&["run", "wget", "-q", "-T", "10", "-O", "/dev/null", url])
+            .status
+            .success()
+    };
+
+    let allowed = wget("https://cloudflare.com"); // name allowed → resolves + connects
+    let refused = wget("https://example.com"); // not allowed → DNS REFUSED
+
+    let _ = Std::new("docker").args(["rm", "-f", &agent_name]).output();
+    let (containers_after, networks_after) = cowboy_objects();
+    for id in containers_after.difference(&containers_before) {
+        let _ = Std::new("docker").args(["rm", "-f", id]).output();
+    }
+    for id in networks_after.difference(&networks_before) {
+        let _ = Std::new("docker").args(["network", "rm", id]).output();
+    }
+
+    assert!(allowed, "allow-listed cloudflare.com should resolve + connect");
+    assert!(
+        !refused,
+        "un-allowed example.com must be REFUSED at the resolver (no exfil channel)"
+    );
+}

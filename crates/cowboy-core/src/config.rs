@@ -125,6 +125,70 @@ pub struct NetworkPolicy {
     pub allow: RuleSet,
     #[serde(default = "default_deny_rules")]
     pub deny: RuleSet,
+    /// DNS resolution policy (strict allowlist gating + tunnel detection). Serde
+    /// default keeps older configs/policy.json parsing.
+    #[serde(default)]
+    pub dns: DnsPolicy,
+}
+
+/// Policy for the gateway's DNS resolver. Defaults are the secure posture: strict
+/// allowlist-gated resolution (only Allowed/approved names leave the gateway),
+/// risky record types refused, and tunnel detection on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DnsPolicy {
+    /// Apply the full allow/deny/default policy to each query name (resolve only
+    /// Allowed/approved; REFUSE the rest locally). When false, the resolver only
+    /// enforces the deny-list + tunnel detection and otherwise resolves freely.
+    #[serde(default = "default_true")]
+    pub enforce: bool,
+    /// Record types allowed to resolve. Default omits the classic tunnel/C2
+    /// carriers (TXT/NULL/ANY/AXFR/IXFR); add them here to opt in.
+    #[serde(default = "default_allowed_qtypes")]
+    pub allowed_qtypes: Vec<String>,
+    /// Run tunnel-detection heuristics (high-entropy/long labels, query rate).
+    #[serde(default = "default_true")]
+    pub tunnel_detection: bool,
+    /// Heuristic thresholds (sane defaults; rarely changed).
+    #[serde(default = "default_max_label_len")]
+    pub max_label_len: u8,
+    #[serde(default = "default_max_qname_len")]
+    pub max_qname_len: u16,
+    /// Distinct subdomains per registrable parent per minute before a query is
+    /// treated as suspicious (the strongest tunnel signal).
+    #[serde(default = "default_max_subdomains_per_min")]
+    pub max_subdomains_per_min: u32,
+}
+
+impl Default for DnsPolicy {
+    fn default() -> Self {
+        Self {
+            enforce: true,
+            allowed_qtypes: default_allowed_qtypes(),
+            tunnel_detection: true,
+            max_label_len: default_max_label_len(),
+            max_qname_len: default_max_qname_len(),
+            max_subdomains_per_min: default_max_subdomains_per_min(),
+        }
+    }
+}
+
+/// The default safe record-type allowlist (excludes TXT/NULL/ANY/AXFR/IXFR).
+fn default_allowed_qtypes() -> Vec<String> {
+    [
+        "A", "AAAA", "CNAME", "MX", "NS", "PTR", "SOA", "SRV", "CAA", "HTTPS", "SVCB",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+fn default_max_label_len() -> u8 {
+    40
+}
+fn default_max_qname_len() -> u16 {
+    150
+}
+fn default_max_subdomains_per_min() -> u32 {
+    40
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -547,6 +611,7 @@ impl Default for NetworkPolicy {
             default_host: DefaultVerdict::Ask,
             allow: default_allow_rules(),
             deny: default_deny_rules(),
+            dns: DnsPolicy::default(),
         }
     }
 }
@@ -646,10 +711,10 @@ impl SecurityConfig {
     /// than silently honoring a dangerous configuration.
     pub fn validate(&self) -> Result<()> {
         for mount in &self.container.mounts {
-            if mount_targets_security_file(&mount.source) {
+            if mount_targets_host_secret(&mount.source) {
                 return Err(Error::SecurityInvariant(format!(
-                    "mount source {:?} would expose the host-owned security config to the agent; \
-                     security.yaml must never be mounted into the container",
+                    "mount source {:?} would expose host-owned secrets to the agent; \
+                     security.yaml/providers.yaml and the cowboy config dir must never be mounted",
                     mount.source
                 )));
             }
@@ -658,9 +723,10 @@ impl SecurityConfig {
         // workspace or the masked `.cowboy/` config with a mount target.
         let workdir = self.container.workdir.trim_end_matches('/');
         for grant in &self.secrets.files {
-            if mount_targets_security_file(&grant.source) {
+            if mount_targets_host_secret(&grant.source) {
                 return Err(Error::SecurityInvariant(format!(
-                    "credential grant source {:?} would expose the host-owned security config",
+                    "credential grant source {:?} would expose host-owned secrets \
+                     (security.yaml/providers.yaml or the cowboy config dir)",
                     grant.source
                 )));
             }
@@ -711,13 +777,17 @@ impl SecurityConfig {
 }
 
 /// True if a mount source path points at the host-owned security config.
-fn mount_targets_security_file(source: &str) -> bool {
-    let p = Path::new(source);
-    if p.file_name().and_then(|n| n.to_str()) == Some(SECURITY_FILE) {
-        return true;
-    }
-    // Also reject mounting the whole `.cowboy` dir, which would include it.
-    p.file_name().and_then(|n| n.to_str()) == Some(COWBOY_DIR)
+/// True if `source` points at a host-owned secret/config the agent must never
+/// see: `security.yaml`, `providers.yaml` (API keys!), the project `.cowboy` dir,
+/// or the home `cowboy` config dir (which contains providers.yaml). Defense in
+/// depth — the agent can't author `security.yaml`, but a user must not be able to
+/// foot-gun their keys into the container via a mount/grant either.
+fn mount_targets_host_secret(source: &str) -> bool {
+    let name = Path::new(source).file_name().and_then(|n| n.to_str());
+    matches!(
+        name,
+        Some(SECURITY_FILE) | Some(PROVIDERS_FILE) | Some(COWBOY_DIR) | Some("cowboy")
+    )
 }
 
 impl AgentConfig {
@@ -730,6 +800,13 @@ impl AgentConfig {
 /// skills crate's use of `directories::BaseDirs`.
 pub fn global_config_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|b| b.config_dir().join("cowboy"))
+}
+
+/// The home cache directory (`~/.cache/cowboy`), if resolvable. For data that's
+/// expensive to rebuild but safe to lose — e.g. the mise toolchain store
+/// persisted across agent-container recreations.
+pub fn global_cache_dir() -> Option<PathBuf> {
+    directories::BaseDirs::new().map(|b| b.cache_dir().join("cowboy"))
 }
 
 fn write_yaml<T: Serialize>(value: &T, path: &Path) -> Result<()> {
@@ -991,6 +1068,19 @@ network_policy:
     cidrs:
       - 169.254.169.254/32
       - 100.100.100.200/32
+  # DNS resolution policy. Defaults (shown) are the secure posture: the resolver
+  # only forwards names the policy above Allows or you approve, refuses the rest
+  # locally, blocks tunnel-prone record types, and prompts on suspected tunneling.
+  dns:
+    enforce: true              # apply the allow/deny/default policy to query names
+    tunnel_detection: true     # prompt on high-entropy/long names or high query rate
+    # Record types allowed to resolve (TXT/NULL/ANY/AXFR/IXFR are excluded by
+    # default — the classic DNS-tunnel/C2 carriers; add them here to opt in).
+    allowed_qtypes: [A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, CAA, HTTPS, SVCB]
+    # Heuristic thresholds (rarely changed):
+    # max_label_len: 40
+    # max_qname_len: 150
+    # max_subdomains_per_min: 40
 
 secrets:
   # Env vars injected from the host (values read at runtime, never stored here).

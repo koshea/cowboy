@@ -286,13 +286,11 @@ fn list() -> Result<()> {
         for e in envs {
             any = true;
             if let Some(cmd) = &e.source_command {
-                let ok = std::process::Command::new("sh")
-                    .arg("-c")
-                    .arg(cmd)
-                    .output()
-                    .map(|o| o.status.success() && !o.stdout.is_empty())
-                    .unwrap_or(false);
-                let mark = if ok { "ok" } else { "FAILED on host" };
+                let mark = if crate::net::runtime::source_command_ok(cmd) {
+                    "ok"
+                } else {
+                    "FAILED on host"
+                };
                 println!("  env   {} ← `{cmd}`  [{label}] [{mark}]", e.name);
             } else {
                 let mark = if std::env::var(&e.source_env).is_ok() {

@@ -28,7 +28,8 @@ use super::ui::AgentUi;
 /// Hard cap on how long a parked gateway connection waits for a verdict before
 /// failing closed. A gateway connection is blocked awaiting this answer, so it
 /// must never hang indefinitely.
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+const APPROVAL_TIMEOUT: Duration =
+    Duration::from_secs(cowboy_core::netproto::APPROVAL_TIMEOUT_SECS);
 
 /// How long `ask_user` waits for a human answer before giving up (returns "").
 const ASK_TIMEOUT: Duration = Duration::from_secs(600);
@@ -140,14 +141,22 @@ impl SocketUi {
 
     /// Update the snapshot metadata new clients receive.
     pub fn set_info(&self, info: SessionInfo) {
-        *self.inner.info.lock().unwrap() = info;
+        *self
+            .inner
+            .info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = info;
     }
 
     /// Journal + broadcast a display event (worker-originated events like
     /// `DiffStat`/`Title`/`Processes`/`TurnDone` use this directly).
     pub fn emit(&self, event: UiEventMsg) {
         self.track(&event);
-        let mut j = self.inner.journal.lock().unwrap();
+        let mut j = self
+            .inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seq = j.len;
         let line = serde_json::to_string(&event).unwrap_or_default();
         let _ = writeln!(j.file, "{line}");
@@ -159,7 +168,11 @@ impl SocketUi {
 
     /// Mirror progress-bearing events into `stats` for the daemon registry.
     fn track(&self, event: &UiEventMsg) {
-        let mut s = self.inner.stats.lock().unwrap();
+        let mut s = self
+            .inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match event {
             UiEventMsg::Tokens { input, output } => s.tokens = (*input, *output),
             UiEventMsg::Blocked(reason) => s.blocked_reason = reason.clone(),
@@ -176,7 +189,11 @@ impl SocketUi {
 
     /// A snapshot of live progress for the daemon registry.
     pub fn stats(&self) -> SessionStats {
-        self.inner.stats.lock().unwrap().clone()
+        self.inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Broadcast a terminal `Ended` to attached clients (worker shutting down).
@@ -211,7 +228,11 @@ impl SocketUi {
         }
         let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.inner.pending_approvals.lock().unwrap().insert(id, tx);
+        self.inner
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
         let _ = self.inner.live.send(ServerMsg::Approval {
             id,
             dest: dest.clone(),
@@ -222,7 +243,11 @@ impl SocketUi {
             // Sender dropped (no reply) or timed out -> fail closed.
             _ => (Verdict::Deny, ApprovalScope::Once),
         };
-        self.inner.pending_approvals.lock().unwrap().remove(&id);
+        self.inner
+            .pending_approvals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
         // Tell any other clients still showing this approval to dismiss it.
         let _ = self.inner.live.send(ServerMsg::ApprovalResolved { id });
         verdict
@@ -253,6 +278,12 @@ impl AgentUi for SocketUi {
     }
     fn tool_use(&mut self, summary: &str) {
         self.emit(UiEventMsg::ToolUse(summary.to_string()));
+    }
+    fn file_diff(&mut self, path: &str, diff: &str) {
+        self.emit(UiEventMsg::FileDiff {
+            path: path.to_string(),
+            diff: diff.to_string(),
+        });
     }
     fn tokens(&mut self, input: u64, output: u64) {
         self.emit(UiEventMsg::Tokens { input, output });
@@ -292,7 +323,11 @@ impl AgentUi for SocketUi {
         }
         let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
-        self.inner.pending_asks.lock().unwrap().insert(id, tx);
+        self.inner
+            .pending_asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
         let _ = self.inner.live.send(ServerMsg::Ask {
             id,
             question: question.to_string(),
@@ -302,7 +337,11 @@ impl AgentUi for SocketUi {
         // socket-server task (separate runtime thread), so this does not
         // deadlock. First reply wins; timeout yields "".
         let answer = rx.recv_timeout(ASK_TIMEOUT).unwrap_or_default();
-        self.inner.pending_asks.lock().unwrap().remove(&id);
+        self.inner
+            .pending_asks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
         answer
     }
 }
@@ -357,14 +396,21 @@ async fn serve_client(
 
     // Atomically: subscribe to live, snapshot length, read the journal slice.
     let (mut rx, journal_len, replay) = {
-        let j = inner.journal.lock().unwrap();
+        let j = inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rx = inner.live.subscribe();
         let len = j.len;
         let replay = read_journal_slice(&j.path, since, len);
         (rx, len, replay)
     };
 
-    let info = inner.info.lock().unwrap().clone();
+    let info = inner
+        .info
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     send(&writer, &ServerMsg::Snapshot { info, journal_len }).await?;
     for (seq, event) in replay {
         send(&writer, &ServerMsg::Event { seq, event }).await?;
@@ -400,12 +446,22 @@ async fn serve_client(
                         // Approval/ask replies resolve a pending prompt here
                         // (first reply wins); they never reach the agent loop.
                         ClientMsg::ApprovalReply { id, verdict, scope } => {
-                            if let Some(tx) = inner.pending_approvals.lock().unwrap().remove(&id) {
+                            if let Some(tx) = inner
+                                .pending_approvals
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&id)
+                            {
                                 let _ = tx.send((verdict, scope));
                             }
                         }
                         ClientMsg::AskReply { id, answer } => {
-                            if let Some(tx) = inner.pending_asks.lock().unwrap().remove(&id) {
+                            if let Some(tx) = inner
+                                .pending_asks
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .remove(&id)
+                            {
                                 let _ = tx.send(answer);
                             }
                         }

@@ -137,7 +137,10 @@ fn write(root: &Path, path: &str, content: &str) -> Result<String> {
 /// Resolve `path` against the workspace `root`, confining it to the workspace
 /// (lexically — Docker already isolates the container filesystem). Accepts
 /// workspace-relative paths and `/workspace`-prefixed absolute paths.
-fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
+/// Resolve a workspace-relative (or `/workspace`-prefixed) path to a host path,
+/// rejecting absolute paths and any `..` that escapes `root`. Shared with the
+/// host-side diff reader so both confine identically.
+pub(crate) fn resolve(root: &Path, path: &str) -> Result<PathBuf> {
     let workspace = root.to_string_lossy();
     let rel = if let Some(r) = path.strip_prefix(&format!("{workspace}/")) {
         r

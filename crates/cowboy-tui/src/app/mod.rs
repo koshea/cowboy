@@ -2,6 +2,7 @@
 //! this `App`; here we keep state + a pure `draw` so rendering is
 //! snapshot-testable with `ratatui::backend::TestBackend`.
 
+use crate::markdown;
 use ansi_to_tui::IntoText;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -11,6 +12,10 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::Frame;
 use ratatui_textarea::TextArea;
 use throbber_widgets_tui::{Throbber, ThrobberState};
+
+mod render;
+pub use render::draw;
+use render::{transcript_lines, LinkHit};
 
 /// Kind of a transcript line (drives color/prefix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +28,9 @@ pub enum LineKind {
     /// A structured tool action (read/edit/write).
     Tool,
     Output,
+    /// A unified diff of a file the agent created or edited (rendered with
+    /// +/- coloring).
+    Diff,
     Final,
     Notice,
     Error,
@@ -280,10 +288,27 @@ pub struct App {
     /// True when the last transcript line is a transient (carriage-return)
     /// progress update, so the next output chunk overwrites it in place.
     pub last_output_transient: bool,
+    /// Number of visible output lines for the running command (its live tail in
+    /// the transcript). Bounded to `CMD_TAIL_LINES`.
+    cmd_out_visible: usize,
+    /// Output lines collapsed away from the running command's tail (shown as a
+    /// "⋯ N earlier lines hidden" marker just above the tail).
+    cmd_out_hidden: usize,
+    /// Whether the running command's output block has a "hidden lines" marker.
+    cmd_out_marker: bool,
     /// Input editor (multi-line, cursor) via ratatui-textarea.
     pub textarea: TextArea<'static>,
     pub mode: Mode,
     pub throbber: ThrobberState,
+    /// Plan mode is engaged (set by `/plan`, cleared by `/go`): the agent is
+    /// proposing a plan and file edits are blocked. Surfaced persistently in the
+    /// status bar so you always know edits are gated.
+    pub plan_mode: bool,
+    /// Wall-clock start of the current model turn (ms since epoch) and the
+    /// seconds elapsed, so a thinking turn shows a live "thinking Ns" heartbeat
+    /// instead of a silent spinner. Managed by `tick_turn`.
+    turn_started_ms: Option<u64>,
+    turn_elapsed_secs: u64,
     /// When true, the transcript follows the tail (newest output). When false,
     /// it stays anchored at `scroll_top` so new output doesn't move the view.
     pub follow: bool,
@@ -306,6 +331,16 @@ pub struct App {
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
+    /// Bumped whenever the transcript/streaming/reasoning content changes, so the
+    /// per-frame line build can be memoized: re-parsing Markdown + re-running
+    /// syntax highlighting on every throbber tick (when nothing changed) would be
+    /// wasteful. The cache holds the version it was built at + the built lines.
+    content_ver: std::cell::Cell<u64>,
+    line_cache: std::cell::RefCell<Option<(u64, Vec<Line<'static>>)>>,
+    /// OSC 8 hyperlink placements (absolute wrapped row + column span + URL),
+    /// computed by rendering the transcript off-screen and locating link cells.
+    /// Keyed by (content version, width) so it's reused across frames/scroll.
+    link_cache: std::cell::RefCell<Option<(u64, u16, Vec<LinkHit>)>>,
     /// Model-catalogue picker state (set while `mode == ModelPicker`).
     pub model_picker: Option<ModelPicker>,
     /// New-model config form state (set while `mode == ModelForm`).
@@ -377,9 +412,15 @@ impl App {
             blocked: None,
             running: None,
             last_output_transient: false,
+            cmd_out_visible: 0,
+            cmd_out_hidden: 0,
+            cmd_out_marker: false,
             textarea: TextArea::default(),
             mode: Mode::Running,
             throbber: ThrobberState::default(),
+            plan_mode: false,
+            turn_started_ms: None,
+            turn_elapsed_secs: 0,
             follow: true,
             scroll_top: 0,
             max_scroll: std::cell::Cell::new(0),
@@ -388,6 +429,9 @@ impl App {
             scroll_offset: std::cell::Cell::new(0),
             followed_before_select: false,
             transcript_area: std::cell::Cell::new(Rect::ZERO),
+            content_ver: std::cell::Cell::new(0),
+            line_cache: std::cell::RefCell::new(None),
+            link_cache: std::cell::RefCell::new(None),
             model_picker: None,
             model_form: None,
             choice: None,
@@ -545,7 +589,7 @@ impl App {
         // render `height` rows. Uses ratatui's own word-wrapper, so the wrapping
         // matches what's on screen exactly.
         let height = (end.0 - start.0 + 1).min(u16::MAX as usize) as u16;
-        let para = Paragraph::new(build_transcript_lines(self))
+        let para = Paragraph::new(transcript_lines(self))
             .wrap(Wrap { trim: false })
             .scroll((start.0.min(u16::MAX as usize) as u16, 0));
         let mut buf = Buffer::empty(Rect::new(0, 0, inner_w, height));
@@ -599,7 +643,13 @@ impl App {
         self.follow
     }
 
+    /// Invalidate the memoized transcript-line cache (content changed).
+    fn touch(&self) {
+        self.content_ver.set(self.content_ver.get().wrapping_add(1));
+    }
+
     pub fn push(&mut self, kind: LineKind, text: impl Into<String>) {
+        self.touch();
         // Any non-output line ends a transient progress run (the next output
         // chunk must append, not overwrite this line).
         if kind != LineKind::Output {
@@ -625,6 +675,9 @@ impl App {
     /// Mark the start of a streamed shell command (for the live indicator).
     pub fn start_command(&mut self, cmd: impl Into<String>, now_ms: u64) {
         self.last_output_transient = false;
+        self.cmd_out_visible = 0;
+        self.cmd_out_hidden = 0;
+        self.cmd_out_marker = false;
         self.running = Some(RunningCmd {
             cmd: cmd.into(),
             started_ms: now_ms,
@@ -691,9 +744,36 @@ impl App {
         }
     }
 
+    /// Track how long the current model turn has been running, so a thinking
+    /// turn shows a live "thinking Ns" instead of a silent spinner. Self-managing
+    /// off the mode: starts the clock when Running, resets otherwise.
+    pub fn tick_turn(&mut self, now_ms: u64) {
+        if self.mode == Mode::Running {
+            let start = *self.turn_started_ms.get_or_insert(now_ms);
+            self.turn_elapsed_secs = now_ms.saturating_sub(start) / 1000;
+        } else {
+            self.turn_started_ms = None;
+            self.turn_elapsed_secs = 0;
+        }
+    }
+
+    /// Seconds the current model turn has been running (0 when not Running).
+    pub fn turn_elapsed_secs(&self) -> u64 {
+        self.turn_elapsed_secs
+    }
+
     /// Append (or, for a transient carriage-return update, overwrite-in-place) a
     /// line of streamed command output, and update the live tail.
+    ///
+    /// A command's visible output is bounded to `CMD_TAIL_LINES`: once it grows
+    /// past that, the oldest lines are collapsed into a single "⋯ N earlier lines
+    /// hidden" marker above the tail. A verbose command (a `mise install`, a
+    /// gcloud stack trace) shows a live tail instead of scrolling the whole pane
+    /// away — the full output still reaches the model and the session log.
     pub fn command_output_line(&mut self, text: impl Into<String>, committed: bool) {
+        /// Live-tail size for a single running command's output.
+        const CMD_TAIL_LINES: usize = 12;
+        self.touch();
         let text = text.into();
         let replace = self.last_output_transient
             && self
@@ -701,11 +781,41 @@ impl App {
                 .last()
                 .is_some_and(|l| l.kind == LineKind::Output);
         if replace {
+            // In-place overwrite of a transient progress line — count unchanged.
             if let Some(last) = self.transcript.last_mut() {
                 last.text = text.clone();
             }
         } else {
             self.push(LineKind::Output, text.clone());
+            self.cmd_out_visible += 1;
+            // Collapse the oldest line(s) of this command's block into a marker
+            // so the tail stays bounded. Output streams contiguously, so the
+            // command's visible lines are the trailing `cmd_out_visible` entries
+            // (with the marker, if any, immediately above them).
+            if self.running.is_some() && self.cmd_out_visible > CMD_TAIL_LINES {
+                let oldest = self.transcript.len() - self.cmd_out_visible;
+                self.transcript.remove(oldest);
+                self.cmd_out_visible -= 1;
+                self.cmd_out_hidden += 1;
+                let marker = format!(
+                    "⋯ {} earlier line{} hidden",
+                    self.cmd_out_hidden,
+                    if self.cmd_out_hidden == 1 { "" } else { "s" }
+                );
+                let run_start = self.transcript.len() - self.cmd_out_visible;
+                if self.cmd_out_marker {
+                    self.transcript[run_start - 1].text = marker;
+                } else {
+                    self.transcript.insert(
+                        run_start,
+                        TranscriptLine {
+                            kind: LineKind::Notice,
+                            text: marker,
+                        },
+                    );
+                    self.cmd_out_marker = true;
+                }
+            }
         }
         self.last_output_transient = !committed;
         if let Some(r) = &mut self.running {
@@ -748,21 +858,45 @@ impl App {
 
     pub fn stream(&mut self, text: &str) {
         self.streaming.push_str(text);
+        self.touch();
     }
 
     /// Append streamed reasoning ("thinking") text, shown dimmed until the
     /// response commits.
     pub fn stream_reasoning(&mut self, text: &str) {
         self.reasoning.push_str(text);
+        self.touch();
     }
 
     /// Commit any streamed text to the transcript as an Agent line, and drop the
     /// transient "thinking" buffer.
     pub fn commit_stream(&mut self) {
+        self.touch();
         self.reasoning.clear();
         if !self.streaming.is_empty() {
             let text = std::mem::take(&mut self.streaming);
             self.push(LineKind::Agent, text);
+        }
+    }
+
+    /// Record a turn's final answer. An *implicit* final (the model answers in
+    /// plain text with no `final` tool call) streams that answer as content,
+    /// which `commit_stream` has just committed as an Agent line — so re-tag that
+    /// line as Final rather than appending an identical copy. An explicit `final`
+    /// tool call streams no content, so the last line won't match and we append.
+    pub fn push_final(&mut self, m: impl Into<String>) {
+        self.touch();
+        let m = m.into();
+        let dup = self
+            .transcript
+            .last()
+            .is_some_and(|l| l.kind == LineKind::Agent && l.text.trim() == m.trim());
+        if dup {
+            if let Some(last) = self.transcript.last_mut() {
+                last.kind = LineKind::Final;
+            }
+        } else {
+            self.push(LineKind::Final, m);
         }
     }
 
@@ -867,852 +1001,9 @@ impl App {
     }
 }
 
-fn style_for(kind: LineKind) -> (&'static str, Style) {
-    match kind {
-        LineKind::Banner => ("", Style::default().fg(Color::DarkGray)),
-        LineKind::User => (
-            "› ",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        LineKind::Agent => ("", Style::default().fg(Color::Cyan)),
-        LineKind::Command => (
-            "$ ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        LineKind::Tool => ("✎ ", Style::default().fg(Color::Magenta)),
-        LineKind::Output => ("  ", Style::default().fg(Color::Gray)),
-        LineKind::Final => (
-            "✓ ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        ),
-        LineKind::Notice => ("", Style::default().fg(Color::DarkGray)),
-        LineKind::Error => ("✗ ", Style::default().fg(Color::Red)),
-    }
-}
-
-/// Insert a blank spacer before this entry when it starts a new "block" so the
-/// transcript breathes (e.g. before a user turn or the final summary).
-fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
-    let Some(prev) = prev else { return false };
-    if prev == cur && matches!(cur, LineKind::Output | LineKind::Command | LineKind::Tool) {
-        return false;
-    }
-    matches!(
-        cur,
-        LineKind::User | LineKind::Final | LineKind::Command | LineKind::Tool | LineKind::Agent
-    ) && prev != LineKind::Banner
-}
-
-/// Draw the whole UI.
-pub fn draw(f: &mut Frame, app: &App) {
-    let area = f.area();
-    // The input box grows with its content, up to 5 visible lines (+2 borders).
-    let input_h = (app.input_lines().clamp(1, 5) as u16) + 2;
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(3),          // main
-            Constraint::Length(1),       // status bar
-            Constraint::Length(input_h), // input (grows to 5 lines)
-        ])
-        .split(area);
-
-    // Main row: transcript on the left, side panels on the right.
-    let main = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(68), Constraint::Percentage(32)])
-        .split(rows[0]);
-    draw_transcript(f, app, main[0]);
-
-    if app.plan.is_empty() {
-        let side = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-            .split(main[1]);
-        draw_activity(f, app, side[0]);
-        draw_background(f, app, side[1]);
-    } else {
-        // With a plan, give it the top third and split the rest as before.
-        let side = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(34),
-                Constraint::Percentage(40),
-                Constraint::Percentage(26),
-            ])
-            .split(main[1]);
-        draw_plan(f, app, side[0]);
-        draw_activity(f, app, side[1]);
-        draw_background(f, app, side[2]);
-    }
-
-    draw_status(f, app, rows[1]);
-    draw_input(f, app, rows[2]);
-    // Slash-command autocomplete floats just above the input.
-    if matches!(app.mode, Mode::Idle | Mode::Running) {
-        draw_completions(f, app, rows[2]);
-    }
-
-    match &app.mode {
-        Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, "type your answer · Enter"),
-        Mode::AwaitingChoice => {
-            if let Some(c) = &app.choice {
-                draw_choice(f, area, c, &app.input_text());
-            }
-        }
-        Mode::Approval(p) => draw_modal(
-            f,
-            area,
-            "Approval",
-            p,
-            "[o]nce [s]ession [p]roject [g]lobal [d]eny",
-        ),
-        Mode::Paused => draw_modal(
-            f,
-            area,
-            "Paused",
-            "Agent paused.",
-            "[r]esume  [i]nstruct  [k]ill command  [d]etach  [e]nd session",
-        ),
-        Mode::ModelPicker => {
-            if let Some(p) = &app.model_picker {
-                draw_model_picker(f, area, p);
-            }
-        }
-        Mode::ModelForm => {
-            if let Some(form) = &app.model_form {
-                draw_model_form(f, area, form);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Centered rect `w`×`h` (clamped to `area`), cleared for an overlay.
-fn centered(area: Rect, w: u16, h: u16) -> Rect {
-    let w = w.min(area.width.saturating_sub(2));
-    let h = h.min(area.height.saturating_sub(2));
-    Rect {
-        x: area.x + (area.width.saturating_sub(w)) / 2,
-        y: area.y + (area.height.saturating_sub(h)) / 2,
-        width: w,
-        height: h,
-    }
-}
-
-fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
-    let rect = centered(area, 76, 20);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(Span::styled(
-            " Select a model ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    // Layout: filter line, list, footer.
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    let filter = if p.filter.is_empty() {
-        Span::styled("type to filter…", Style::default().fg(Color::DarkGray))
-    } else {
-        Span::styled(format!("/{}", p.filter), Style::default().fg(Color::Yellow))
-    };
-    f.render_widget(Paragraph::new(Line::from(filter)), rows[0]);
-
-    let entries = p.filtered();
-    let view_h = rows[1].height as usize;
-    // Keep the selection in view.
-    let top = p.selected.saturating_sub(view_h.saturating_sub(1));
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, e) in entries.iter().enumerate().skip(top).take(view_h) {
-        let sel = i == p.selected;
-        let marker = if sel { "› " } else { "  " };
-        let mut tag = String::new();
-        if e.current {
-            tag.push_str(" ◉ current");
-        } else if e.configured {
-            tag.push_str(" • configured");
-        }
-        let base = if sel {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let line = format!("{marker}{:<46}{}", trunc(&e.id, 46), tag);
-        lines.push(Line::from(Span::styled(line, base)));
-    }
-    if entries.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no matches)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), rows[1]);
-
-    // Footer: navigation hints + the Solo/Crew mode toggle (Tab).
-    let (mode_label, mode_color) = if p.crew_mode {
-        ("crew (delegates)", Color::Magenta)
-    } else {
-        ("solo", Color::Cyan)
-    };
-    let footer = Line::from(vec![
-        Span::styled(
-            "↑/↓ move · Enter select · Esc cancel · ",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled("Tab", Style::default().fg(Color::White)),
-        Span::styled(" mode: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            mode_label,
-            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(footer), rows[2]);
-}
-
-fn draw_model_form(f: &mut Frame, area: Rect, form: &ModelForm) {
-    let rect = centered(area, 70, 13);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(Span::styled(
-            format!(" Configure {} ", trunc(&form.id, 40)),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(rect);
-    f.render_widget(block, rect);
-
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, label) in ModelForm::FIELD_LABELS.iter().enumerate() {
-        let focused = form.focus == i;
-        let val = &form.fields[i];
-        lines.push(field_line(label, val, focused));
-    }
-    // Reasoning effort (field index 4).
-    lines.push(field_line(
-        "Reasoning",
-        &format!("◂ {} ▸", form.reasoning()),
-        form.focus == 4,
-    ));
-    lines.push(Line::from(""));
-    if let Some(err) = &form.error {
-        lines.push(Line::from(Span::styled(
-            err.clone(),
-            Style::default().fg(Color::Red),
-        )));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Tab/↑↓ field · ◂▸ effort · Enter/Ctrl-S save · Esc back",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// One labeled form field; the focused field is highlighted with a caret.
-fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
-    let caret = if focused { "› " } else { "  " };
-    let label_style = if focused {
-        Style::default()
-            .fg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let val_style = if focused {
-        Style::default().add_modifier(Modifier::UNDERLINED)
-    } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::styled(format!("{caret}{label:<16}"), label_style),
-        Span::styled(value.to_string(), val_style),
-    ])
-}
-
-/// Truncate a string to `max` chars with an ellipsis.
-fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let head: String = s.chars().take(max.saturating_sub(1)).collect();
-        format!("{head}…")
-    }
-}
-
-/// Build the transcript as a flat list of (unwrapped) lines, exactly as
-/// rendered. Shared by `draw_transcript` and the off-screen selection
-/// extraction so both wrap identically.
-fn build_transcript_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut prev: Option<LineKind> = None;
-    for entry in &app.transcript {
-        if spacer_before(prev, entry.kind) {
-            lines.push(Line::from(""));
-        }
-        prev = Some(entry.kind);
-        let (prefix, style) = style_for(entry.kind);
-        // Render command output through the ANSI parser (preserves colors).
-        if entry.kind == LineKind::Output {
-            if let Ok(text) = entry.text.clone().into_text() {
-                for mut l in text.lines {
-                    l.spans.insert(0, Span::raw("  "));
-                    lines.push(l);
-                }
-                continue;
-            }
-        }
-        for (i, raw) in entry.text.lines().enumerate() {
-            let text = if i == 0 {
-                format!("{prefix}{raw}")
-            } else {
-                format!("{}{raw}", " ".repeat(prefix.chars().count()))
-            };
-            lines.push(Line::from(Span::styled(text, style)));
-        }
-    }
-    // Dimmed "thinking" (reasoning) stream, shown above the answer while it
-    // streams and cleared once the response commits.
-    if !app.reasoning.is_empty() {
-        if spacer_before(prev, LineKind::Agent) {
-            lines.push(Line::from(""));
-        }
-        let dim = Style::default()
-            .fg(Color::DarkGray)
-            .add_modifier(Modifier::ITALIC);
-        for (i, raw) in app.reasoning.lines().enumerate() {
-            let text = if i == 0 {
-                format!("💭 {raw}")
-            } else {
-                format!("   {raw}")
-            };
-            lines.push(Line::from(Span::styled(text, dim)));
-        }
-        prev = Some(LineKind::Agent);
-    }
-    if !app.streaming.is_empty() {
-        if spacer_before(prev, LineKind::Agent) {
-            lines.push(Line::from(""));
-        }
-        let style = style_for(LineKind::Agent).1;
-        for raw in app.streaming.lines() {
-            lines.push(Line::from(Span::styled(raw.to_string(), style)));
-        }
-    }
-    lines
-}
-
-fn draw_transcript(f: &mut Frame, app: &App, area: Rect) {
-    let lines = build_transcript_lines(app);
-
-    let inner_w = area.width.saturating_sub(2).max(1) as usize;
-    let inner_h = area.height.saturating_sub(2) as usize;
-    // Record the inner text rect so the event loop can hit-test mouse drags
-    // against the transcript only (not the borders or sidebars).
-    let text_rect = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(2),
-    };
-    app.transcript_area.set(text_rect);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray));
-    // Build the paragraph first so we can ask ratatui for the *exact* wrapped
-    // line count (its own word-wrapper) — a char-width estimate undercounts when
-    // lines wrap, which leaves `follow` short and hides the newest lines under
-    // the input. `line_count(inner_w)` wraps to that width and adds the block's
-    // 2 border rows, so subtract them to get content rows.
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    let total = para.line_count(inner_w as u16).saturating_sub(2);
-    let max_scroll = total.saturating_sub(inner_h);
-    app.max_scroll.set(max_scroll);
-    let offset_top = if app.follow {
-        max_scroll
-    } else {
-        app.scroll_top.min(max_scroll)
-    }
-    .min(u16::MAX as usize) as u16;
-    // Record the wrapped-line offset so the event loop can map screen rows to
-    // logical positions (and selections can span the scrollback).
-    app.scroll_offset.set(offset_top as usize);
-
-    let title = if !app.follow && (offset_top as usize) < max_scroll {
-        format!(" {}  ▲ scrollback · Shift+End to follow ", app.title)
-    } else {
-        format!(" {} ", app.title)
-    };
-    let para = para.block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(title),
-    );
-    f.render_widget(para.scroll((offset_top, 0)), area);
-
-    // Scrollbar on the right edge when content overflows. ratatui bottoms the
-    // thumb when position == content_length - 1, so content_length is the count
-    // of scroll *positions* (0..=max_scroll), not the total line count.
-    if max_scroll > 0 {
-        let mut sb_state = ratatui::widgets::ScrollbarState::new(max_scroll + 1)
-            .viewport_content_length(inner_h)
-            .position(offset_top as usize);
-        let sb =
-            ratatui::widgets::Scrollbar::new(ratatui::widgets::ScrollbarOrientation::VerticalRight)
-                .begin_symbol(None)
-                .end_symbol(None)
-                .thumb_style(Style::default().fg(Color::DarkGray));
-        f.render_stateful_widget(sb, area, &mut sb_state);
-    }
-
-    // Paint the selection highlight over the rendered text: for each visible
-    // screen row, map it to its logical wrapped-line and highlight the selected
-    // columns (if any).
-    if let Some(sel) = &app.selection {
-        let inner_w = text_rect.width;
-        let buf = f.buffer_mut();
-        for sy in 0..text_rect.height {
-            let line = offset_top as usize + sy as usize;
-            if let Some((x0, x1)) = sel.cols_on(line, inner_w) {
-                for x in x0..=x1 {
-                    let cell = &mut buf[(text_rect.x + x, text_rect.y + sy)];
-                    cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
-                }
-            }
-        }
-    }
-}
-
-/// A consistent rounded side/utility panel.
-fn panel(title: &str) -> Block<'_> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(Color::DarkGray))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(Color::Gray),
-        ))
-}
-
-/// Color a `verdict label (reason)` activity line by its leading verdict word.
-fn activity_line(e: &ActivityEntry) -> Line<'static> {
-    let vstyle = match e.verdict.as_str() {
-        "allow" => Style::default().fg(Color::Green),
-        "deny" => Style::default().fg(Color::Red),
-        "ask" => Style::default().fg(Color::Yellow),
-        _ => Style::default().fg(Color::DarkGray),
-    };
-    let mut spans = vec![
-        Span::styled(format!("{} ", e.verdict), vstyle),
-        Span::styled(e.host.clone(), Style::default().fg(Color::Gray)),
-    ];
-    if e.count > 1 {
-        spans.push(Span::styled(
-            format!(" ({}x)", e.count),
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn draw_activity(f: &mut Frame, app: &App, area: Rect) {
-    let inner_w = area.width.saturating_sub(2).max(1) as u16;
-    let inner_h = area.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = if app.activity.is_empty() {
-        vec![Line::from(Span::styled(
-            "no network activity yet",
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        app.activity.iter().map(activity_line).collect()
-    };
-    let para = Paragraph::new(lines)
-        .block(panel("network"))
-        .wrap(Wrap { trim: true });
-    // Pin to the bottom: scroll past everything above the last `inner_h` wrapped
-    // rows so the newest activity is always visible (rows can wrap). line_count
-    // includes the block's 2 border rows, so subtract them.
-    let total = para.line_count(inner_w).saturating_sub(2);
-    let scroll = total.saturating_sub(inner_h).min(u16::MAX as usize) as u16;
-    f.render_widget(para.scroll((scroll, 0)), area);
-}
-
-fn draw_plan(f: &mut Frame, app: &App, area: Rect) {
-    let lines: Vec<Line> = app
-        .plan
-        .iter()
-        .map(|(step, status)| {
-            let (mark, color) = match status.as_str() {
-                "done" => ("✓", Color::Green),
-                "in_progress" => ("▸", Color::Yellow),
-                _ => ("·", Color::DarkGray),
-            };
-            let step_style = match status.as_str() {
-                "done" => Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::CROSSED_OUT),
-                "in_progress" => Style::default().fg(Color::White),
-                _ => Style::default().fg(Color::Gray),
-            };
-            Line::from(vec![
-                Span::styled(format!("{mark} "), Style::default().fg(color)),
-                Span::styled(step.clone(), step_style),
-            ])
-        })
-        .collect();
-    let done = app.plan.iter().filter(|(_, s)| s == "done").count();
-    let title = format!("plan {done}/{}", app.plan.len());
-    let para = Paragraph::new(lines)
-        .block(panel(&title))
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, area);
-}
-
-/// One combined pane for background activity: spawned crew subagents and any
-/// managed (`cowboy proc`) processes.
-fn draw_background(f: &mut Frame, app: &App, area: Rect) {
-    let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
-    let mut lines: Vec<Line> = Vec::new();
-    // Crew subagents first (most active background work).
-    for m in &app.crew {
-        let (mark, color) = match m.status {
-            CrewStatus::Running => ("⟳", Color::Yellow),
-            CrewStatus::Done => ("✓", Color::Green),
-            CrewStatus::Failed => ("✗", Color::Red),
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{mark} "), Style::default().fg(color)),
-            Span::styled(
-                format!("{:<10} ", m.label),
-                Style::default().fg(Color::White),
-            ),
-            Span::styled(short(&m.model), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(" {}s", m.elapsed_secs),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
-    // Then managed processes.
-    for (n, s) in &app.processes {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{n:<12} "), Style::default().fg(Color::White)),
-            Span::styled(s.clone(), Style::default().fg(Color::Green)),
-        ]));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "no background activity",
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    let para = Paragraph::new(lines).block(panel("background"));
-    f.render_widget(para, area);
-}
-
-fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let mode = match &app.mode {
-        Mode::Running => "running",
-        Mode::Idle => "ready",
-        Mode::AwaitingInput(_) => "awaiting input",
-        Mode::AwaitingChoice => "awaiting choice",
-        Mode::Approval(_) => "approval",
-        Mode::Paused => "paused",
-        Mode::ModelPicker => "models",
-        Mode::ModelForm => "models",
-        Mode::Done => "done",
-    };
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(area);
-    if app.mode == Mode::Running {
-        // Animate via a throwaway clone (draw takes &App).
-        let mut ts = app.throbber.clone();
-        f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
-    }
-    let bar = Style::default().bg(Color::Blue).fg(Color::White);
-    // Right side: a blocked flag, the running token estimate, then the diff.
-    let mut segs: Vec<String> = Vec::new();
-    if app.blocked.is_some() {
-        segs.push("⏸ blocked".to_string());
-    }
-    if app.tokens_in > 0 || app.tokens_out > 0 {
-        let mut seg = format!(
-            "~{}↑ {}↓",
-            fmt_count(app.tokens_in),
-            fmt_count(app.tokens_out)
-        );
-        if app.cost_usd > 0.0 {
-            seg.push_str(&format!(" ${}", fmt_cost(app.cost_usd)));
-        }
-        segs.push(seg);
-    }
-    if !app.diff.is_empty() {
-        segs.push(app.diff.clone());
-    }
-    let right_text = segs.join("   ");
-    let (left, right) = if right_text.is_empty() {
-        (cols[1], None)
-    } else {
-        let w = right_text.chars().count() as u16 + 1;
-        let s = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(w)])
-            .split(cols[1]);
-        (s[0], Some(s[1]))
-    };
-    // While a shell command runs, the left segment becomes a live tail:
-    // elapsed time + the latest output line (the spinner is in cols[0]).
-    let text = match &app.running {
-        Some(r) => {
-            let tail = r.last.trim();
-            let body = if tail.is_empty() { &r.cmd } else { tail };
-            format!(" exec {}s › {body}", r.elapsed_secs)
-        }
-        None => format!(" {mode} — {}", app.status),
-    };
-    f.render_widget(Paragraph::new(text).style(bar), left);
-    if let Some(right) = right {
-        f.render_widget(Paragraph::new(format!("{right_text} ")).style(bar), right);
-    }
-}
-
-/// Compact human count: `980`, `12.3k`, `45k`, `1.2M`.
-fn fmt_count(n: u64) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 10_000 {
-        format!("{}k", n / 1000)
-    } else if n >= 1000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        n.to_string()
-    }
-}
-
-/// USD to two decimals, but a tiny nonzero spend shows `<0.01` rather than `0.00`.
-fn fmt_cost(usd: f64) -> String {
-    if usd > 0.0 && usd < 0.005 {
-        "<0.01".to_string()
-    } else {
-        format!("{usd:.2}")
-    }
-}
-
-/// The slash-command/skill autocomplete popup, anchored just above the input.
-fn draw_completions(f: &mut Frame, app: &App, input_area: Rect) {
-    let Some(cs) = &app.completion else { return };
-    if cs.items.is_empty() {
-        return;
-    }
-    const MAX_ROWS: usize = 8;
-    let shown = cs.items.len().min(MAX_ROWS);
-    // Scroll a window so the selected item stays visible.
-    let start = if cs.selected < MAX_ROWS {
-        0
-    } else {
-        cs.selected - MAX_ROWS + 1
-    };
-    let widest = cs
-        .items
-        .iter()
-        .map(|c| c.value.chars().count() + c.hint.chars().count() + 5)
-        .max()
-        .unwrap_or(24);
-    let width = (widest as u16)
-        .max(24)
-        .min(input_area.width.saturating_sub(2).max(24));
-    let height = shown as u16 + 2;
-    let rect = Rect {
-        x: input_area.x,
-        y: input_area.y.saturating_sub(height),
-        width,
-        height,
-    };
-    let lines: Vec<Line> = cs.items[start..start + shown]
-        .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let selected = start + i == cs.selected;
-            let name = Style::default().fg(if selected { Color::Black } else { Color::Cyan });
-            let hint = Style::default().fg(if selected {
-                Color::Black
-            } else {
-                Color::DarkGray
-            });
-            let row = Line::from(vec![
-                Span::styled(format!("/{}", c.value), name),
-                Span::styled(format!("  {}", c.hint), hint),
-            ]);
-            if selected {
-                row.style(Style::default().bg(Color::Cyan))
-            } else {
-                row
-            }
-        })
-        .collect();
-    let title = format!(
-        " {} match{} · Tab ",
-        cs.items.len(),
-        if cs.items.len() == 1 { "" } else { "es" }
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(title, Style::default().fg(Color::DarkGray)));
-    f.render_widget(Clear, rect);
-    f.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let hint = match &app.mode {
-        Mode::Done => "session finished — press q to quit",
-        Mode::AwaitingInput(_) => "type your answer · Enter submits",
-        Mode::Idle => "Enter send · Shift+Enter newline · ↑↓ history · /help · Ctrl-C menu",
-        _ => "Enter send · Shift+Enter newline · /help · Ctrl-C interrupt",
-    };
-    let accent = if app.mode == Mode::Idle {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(accent))
-        .title(Span::styled(
-            format!(" {hint} "),
-            Style::default().fg(Color::DarkGray),
-        ));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    f.render_widget(&app.textarea, inner);
-}
-
-/// A multiple-choice question: the prompt, a selectable option list, and a
-/// free-text "other" line reflecting what's been typed.
-fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
-    let w = area.width.saturating_sub(8).min(70);
-    let h = (c.options.len() as u16 + 6).min(area.height).max(7);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(Span::styled(
-            " Question ",
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().fg(Color::Magenta));
-
-    let typing = !typed.trim().is_empty();
-    let mut lines = vec![Line::from(c.question.clone()), Line::from("")];
-    for (i, opt) in c.options.iter().enumerate() {
-        let selected = !typing && i == c.selected;
-        let marker = if selected { "▸" } else { " " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{marker} {}. {opt}", i + 1),
-            style,
-        )));
-    }
-    let other = if typing {
-        Line::from(vec![
-            Span::styled("▸ other: ", Style::default().fg(Color::White)),
-            Span::styled(typed.to_string(), Style::default().fg(Color::White)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "  (or type a custom answer)",
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-    };
-    lines.push(other);
-    lines.push(Line::from(Span::styled(
-        "↑↓ select · 1-9 pick · Enter choose · type for other",
-        Style::default().add_modifier(Modifier::DIM),
-    )));
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, rect);
-}
-
-fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) {
-    let w = area.width.saturating_sub(8).min(70);
-    let h = 7u16.min(area.height);
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let rect = Rect::new(x, y, w, h);
-    f.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().fg(Color::Magenta));
-    let text = vec![
-        Line::from(body.to_string()),
-        Line::from(""),
-        Line::from(Span::styled(
-            footer.to_string(),
-            Style::default().add_modifier(Modifier::DIM),
-        )),
-    ];
-    let para = Paragraph::new(text).block(block).wrap(Wrap { trim: true });
-    f.render_widget(para, rect);
-}
-
 #[cfg(test)]
 mod tests {
+    use super::render::{compute_link_hits, fmt_cost, fmt_count, transcript_link_urls};
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1824,6 +1115,23 @@ mod tests {
         app.push(LineKind::Output, "test result: FAILED");
         app.activity("ask example.com:443");
         app.stream("Looking at the failure...");
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_markdown_and_diff_rendering() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
+        app.push(LineKind::User, "summarize the change");
+        app.push(
+            LineKind::Final,
+            "## Summary\n\nFixed the **guard** in `placeholders_util.rb`.\n\n| Case | Before | After |\n|---|---|---|\n| nil | leak | empty |\n\n```rust\nfn ok() -> bool { true }\n```",
+        );
+        app.push(
+            LineKind::Diff,
+            "--- a/foo.rs\n+++ b/foo.rs\n@@ -1,3 +1,3 @@\n fn ok() {\n-    old();\n+    new();\n }",
+        );
         insta::assert_snapshot!(render(&app));
     }
 
@@ -2049,6 +1357,128 @@ mod tests {
         assert_eq!(app.running.as_ref().unwrap().elapsed_secs, 3);
         app.end_command();
         assert!(app.running.is_none());
+    }
+
+    #[test]
+    fn verbose_command_output_collapses_to_a_bounded_tail() {
+        let mut app = App::new("t");
+        app.start_command("mise install", 1000);
+        for i in 0..40 {
+            app.command_output_line(format!("line {i}"), true);
+        }
+        let lines: Vec<&str> = app
+            .transcript
+            .iter()
+            .map(|l| l.text.as_str())
+            .filter(|t| t.starts_with("line ") || t.starts_with("⋯"))
+            .collect();
+        // At most one marker + the 12-line tail (the most recent lines).
+        let outputs: Vec<&&str> = lines.iter().filter(|t| t.starts_with("line ")).collect();
+        assert_eq!(outputs.len(), 12, "tail bounded to 12 output lines");
+        assert_eq!(*outputs.first().unwrap(), &"line 28");
+        assert_eq!(*outputs.last().unwrap(), &"line 39");
+        // The marker sits immediately above the tail and counts the hidden lines.
+        let marker = lines.iter().find(|t| t.starts_with("⋯")).unwrap();
+        assert_eq!(*marker, "⋯ 28 earlier lines hidden");
+        assert_eq!(
+            lines[0], "⋯ 28 earlier lines hidden",
+            "marker is above the tail"
+        );
+        // The live indicator still reflects the newest line.
+        assert_eq!(app.running.as_ref().unwrap().last, "line 39");
+    }
+
+    #[test]
+    fn implicit_final_is_not_rendered_twice() {
+        // Implicit final: the model streams its answer as content (committed as an
+        // Agent line by commit_stream), then signals Final with the same text.
+        let mut app = App::new("t");
+        app.stream("the full PR review report");
+        app.commit_stream();
+        app.push_final("the full PR review report");
+        let lines: Vec<(&LineKind, &str)> = app
+            .transcript
+            .iter()
+            .map(|l| (&l.kind, l.text.as_str()))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![(&LineKind::Final, "the full PR review report")],
+            "the answer is shown once, tagged Final"
+        );
+
+        // Explicit final tool call: no streamed content, so the final is appended.
+        let mut app = App::new("t");
+        app.commit_stream(); // nothing streamed
+        app.push_final("done; tests pass");
+        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.transcript[0].kind, LineKind::Final);
+
+        // Explicit final after a distinct preamble keeps both lines.
+        let mut app = App::new("t");
+        app.stream("Let me summarize:");
+        app.commit_stream();
+        app.push_final("## Summary\n...");
+        assert_eq!(app.transcript.len(), 2);
+        assert_eq!(app.transcript[0].kind, LineKind::Agent);
+        assert_eq!(app.transcript[1].kind, LineKind::Final);
+    }
+
+    #[test]
+    fn streaming_buffer_renders_markdown_live() {
+        // The in-progress (uncommitted) answer formats as it streams, not only
+        // once committed — so a heading/bold/list resolves live.
+        let mut app = App::new("t");
+        app.stream("## Plan\n\n- step **one**");
+        let lines = transcript_lines(&app);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("Plan")));
+        assert!(texts.iter().any(|t| t.contains("• step")));
+        assert!(texts.iter().any(|t| t.contains("one")));
+    }
+
+    #[test]
+    fn osc8_hyperlink_is_overlaid_on_link_cells() {
+        // A rendered link's cells get rewritten to carry the OSC 8 escape with
+        // the hidden URL, so the label is clickable without showing the URL.
+        let mut app = App::new("t");
+        app.push(LineKind::Agent, "see [the spec](https://example.com/x)");
+        let width = 60u16;
+        let lines = transcript_lines(&app);
+        let hits = compute_link_hits(&lines, width, &transcript_link_urls(&app));
+        assert_eq!(hits.len(), 1, "one link found");
+        assert_eq!(hits[0].url, "https://example.com/x");
+
+        // Render + overlay into a buffer; a cell on the link row carries the escape.
+        let mut term = Terminal::new(TestBackend::new(width + 2, 10)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let found = (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
+            .any(|(x, y)| {
+                buf[(x, y)]
+                    .symbol()
+                    .contains("\x1b]8;;https://example.com/x\x07")
+            });
+        assert!(
+            found,
+            "an OSC 8 escape with the URL is present in the buffer"
+        );
+    }
+
+    #[test]
+    fn line_cache_reuses_until_content_changes() {
+        let mut app = App::new("t");
+        app.push(LineKind::Agent, "hi");
+        let v1 = app.content_ver.get();
+        let _ = transcript_lines(&app);
+        let _ = transcript_lines(&app); // repeated renders don't bump the version
+        assert_eq!(app.content_ver.get(), v1, "drawing must not invalidate");
+        app.stream("more");
+        assert_ne!(app.content_ver.get(), v1, "a content change invalidates");
     }
 
     #[test]

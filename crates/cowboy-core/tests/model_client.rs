@@ -208,6 +208,56 @@ async fn sends_reasoning_effort_top_p_and_extra() {
 }
 
 #[tokio::test]
+async fn sends_max_completion_tokens() {
+    // Reasoning models ignore the legacy `max_tokens` for the thinking phase, so
+    // we send `max_completion_tokens` to actually bound output (the minimax-m3
+    // runaway fix). The mock only matches if the field is present at the budget.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "max_completion_tokens": 256,
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(resp.content.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn finish_reason_length_marks_the_response_truncated() {
+    // A reasoning model that hits its output budget mid-stream ends with
+    // finish_reason "length"; the parser must flag `truncated` so the agent loop
+    // reports it instead of treating an empty turn as silent "no action".
+    let server = MockServer::start().await;
+    let cut = serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "test-model",
+        "choices": [{"index": 0, "delta": {"content": "partial"}, "finish_reason": "length"}]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse(&[cut]), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert!(resp.truncated, "finish_reason=length should set truncated");
+}
+
+#[tokio::test]
 async fn list_models_parses_the_catalogue() {
     let server = MockServer::start().await;
     let body = serde_json::json!({

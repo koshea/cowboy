@@ -1,15 +1,11 @@
 //! Listing and read-only replay of past sessions.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::model::{Message, Role};
 
-use super::CommandRecord;
-
-fn sessions_dir(root: &Path) -> PathBuf {
-    root.join(".cowboy").join("sessions")
-}
+use super::{sessions_dir, CommandRecord};
 
 /// List sessions newest-first with a one-line summary.
 pub fn list(root: &Path) -> Result<()> {

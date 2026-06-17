@@ -11,6 +11,9 @@ anyhow.workspace = true
 ratatui-textarea.workspace = true
 ansi-to-tui.workspace = true
 throbber-widgets-tui.workspace = true
+pulldown-cmark.workspace = true
+syntect.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

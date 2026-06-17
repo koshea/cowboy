@@ -55,6 +55,19 @@ network_policy:
     cidrs:
       - 169.254.169.254/32
       - 100.100.100.200/32
+  # DNS resolution policy. Defaults (shown) are the secure posture: the resolver
+  # only forwards names the policy above Allows or you approve, refuses the rest
+  # locally, blocks tunnel-prone record types, and prompts on suspected tunneling.
+  dns:
+    enforce: true              # apply the allow/deny/default policy to query names
+    tunnel_detection: true     # prompt on high-entropy/long names or high query rate
+    # Record types allowed to resolve (TXT/NULL/ANY/AXFR/IXFR are excluded by
+    # default — the classic DNS-tunnel/C2 carriers; add them here to opt in).
+    allowed_qtypes: [A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, CAA, HTTPS, SVCB]
+    # Heuristic thresholds (rarely changed):
+    # max_label_len: 40
+    # max_qname_len: 150
+    # max_subdomains_per_min: 40
 
 secrets:
   # Env vars injected from the host (values read at runtime, never stored here).

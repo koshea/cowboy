@@ -15,6 +15,7 @@
 //! startup but, with no task, never calls it), so they supply a fake one.
 
 use std::io::{BufRead, BufReader, Write};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -145,13 +146,20 @@ impl Env {
     fn spawn_daemon(&self) -> Kill {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cowboyd"));
         cmd.env("XDG_RUNTIME_DIR", self.runtime.path())
-            .env("XDG_STATE_HOME", self.state.path());
+            .env("XDG_STATE_HOME", self.state.path())
+            // Pin the gateway control token so a faked gateway can authenticate
+            // over the TCP control channel (workers inherit the daemon's env).
+            .env("COWBOY_CONTROL_TOKEN", E2E_CONTROL_TOKEN);
         if let Some(c) = &self.config {
             cmd.env("XDG_CONFIG_HOME", c.path());
         }
         Kill(cmd.spawn().expect("spawn cowboyd"))
     }
 }
+
+/// Known control token the e2e daemon pins (see `spawn_daemon`) so a test can
+/// connect to the control channel as a faked gateway.
+const E2E_CONTROL_TOKEN: &str = "e2e-control-token";
 
 /// A fresh git project with `.cowboy/` config (via `cowboy init`).
 fn make_project() -> assert_fs::TempDir {
@@ -183,6 +191,27 @@ fn make_project() -> assert_fs::TempDir {
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
     dir
+}
+
+/// Select a model for live workstream workers and commit it. Ranch workstreams run
+/// in worktrees checked out from HEAD, so the model choice must be committed for the
+/// worker (rooted at the worktree) to resolve it — the home default may not be valid
+/// in every environment. Override the model with `COWBOY_E2E_MODEL`.
+fn commit_model(dir: &Path, env: &Env) {
+    let model = std::env::var("COWBOY_E2E_MODEL").unwrap_or_else(|_| "cerebras/zai-glm-4.7".into());
+    let ok = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(dir)
+        .env("XDG_RUNTIME_DIR", env.runtime.path())
+        .env("XDG_STATE_HOME", env.state.path())
+        .args(["models", "use", &model])
+        .output()
+        .expect("run models use")
+        .status
+        .success();
+    assert!(ok, "models use {model} should succeed");
+    for args in [&["add", "-A"][..], &["commit", "-qm", "model"][..]] {
+        let _ = Command::new("git").arg("-C").arg(dir).args(args).output();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,13 +327,14 @@ impl Client {
     }
 }
 
-/// Compute a worker's host control-socket path (matches the gateway).
-fn control_sock_for(root: &Path) -> PathBuf {
+/// Compute a worker's host control TCP address (matches the gateway's formula in
+/// `net::gateway`: bridge IP `10.88.{octet}.1`, port `9000 + hash%1000`).
+fn control_addr_for(root: &Path) -> String {
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let hash = cowboy_cli::net::runtime::project_hash(&canon);
-    std::env::temp_dir()
-        .join("cowboy-run")
-        .join(format!("control-{hash:08x}.sock"))
+    let octet = (hash % 200 + 20) as u8;
+    let port = 9000 + (hash % 1000) as u16;
+    format!("10.88.{octet}.1:{port}")
 }
 
 // ---------------------------------------------------------------------------
@@ -339,12 +369,19 @@ fn e2e_same_worktree_collision_is_denied() {
     std::thread::sleep(Duration::from_millis(500));
 }
 
-/// A network approval crosses the worker: the gateway asks over the control
-/// socket, the attached client allows, the gateway gets the verdict. With no
-/// client attached the same ask is denied (fail closed).
+/// A network approval crosses the worker: the gateway asks over the TCP control
+/// channel (authenticating with the session token), the attached client allows,
+/// the gateway gets the verdict. With no client attached the same ask is denied
+/// (fail closed). Needs Docker — the worker binds the control server on the
+/// gateway's bridge IP, which only exists once the gateway network is up.
 #[test]
-#[ignore = "spawns real worker processes"]
+#[ignore = "real Docker + worker: exercises the TCP control channel"]
 fn e2e_approval_routes_through_worker_and_fails_closed() {
+    if !docker_ok() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    let docker_before = cowboy_docker_objects();
     let env = Env::fake();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -356,20 +393,30 @@ fn e2e_approval_routes_through_worker_and_fails_closed() {
         other => panic!("expected Started, got {other:?}"),
     };
 
-    // The worker binds the host control socket shortly after starting.
-    let ctrl = control_sock_for(proj.path());
+    // The worker binds the TCP control server on the gateway bridge IP shortly
+    // after starting; connect as a faked gateway and authenticate with the token
+    // the e2e daemon pinned.
+    let ctrl = control_addr_for(proj.path());
     let mut gw = None;
-    for _ in 0..100 {
-        if let Ok(s) = UnixStream::connect(&ctrl) {
+    for _ in 0..200 {
+        if let Ok(s) = TcpStream::connect(&ctrl) {
             gw = Some(s);
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let gw = gw.expect("worker control socket should appear");
+    let gw = gw.expect("worker control server should appear");
     gw.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
     let mut gw_w = gw.try_clone().unwrap();
     let mut gw_r = BufReader::new(gw);
+    // Authenticate first (the host drops the connection otherwise).
+    gw_w.write_all(
+        encode_line(&GatewayMessage::Hello {
+            token: E2E_CONTROL_TOKEN.into(),
+        })
+        .as_bytes(),
+    )
+    .unwrap();
 
     let attempt = NetworkAttempt {
         protocol: Protocol::Tls,
@@ -385,6 +432,7 @@ fn e2e_approval_routes_through_worker_and_fails_closed() {
     gw_w.write_all(
         encode_line(&GatewayMessage::Ask {
             id: 1,
+            reason: None,
             attempt: attempt.clone(),
         })
         .as_bytes(),
@@ -420,8 +468,15 @@ fn e2e_approval_routes_through_worker_and_fails_closed() {
     // Drop the client; with zero approvers the next ask fails closed.
     drop(client);
     std::thread::sleep(Duration::from_millis(300));
-    gw_w.write_all(encode_line(&GatewayMessage::Ask { id: 2, attempt }).as_bytes())
-        .unwrap();
+    gw_w.write_all(
+        encode_line(&GatewayMessage::Ask {
+            id: 2,
+            reason: None,
+            attempt,
+        })
+        .as_bytes(),
+    )
+    .unwrap();
     line.clear();
     gw_r.read_line(&mut line).unwrap();
     match serde_json::from_str::<HostMessage>(line.trim()).unwrap() {
@@ -433,6 +488,7 @@ fn e2e_approval_routes_through_worker_and_fails_closed() {
 
     Client::connect(&ws).send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(500));
+    reap_new_docker(&docker_before);
 }
 
 /// Killing a worker out from under the daemon marks the session `Stale`; then
@@ -707,14 +763,16 @@ fn e2e_ranch_start_launches_ready_workstream() {
     reap_new_docker(&docker_before);
 }
 
-/// Ranch coordinator (auto-advance): start a ranch's first workstream, let it
-/// actually run to completion in Docker, and assert the daemon AUTO-launches the
-/// dependent workstream — without a second manual `ranch start`. This exercises
-/// the full loop: one-shot worker finishes → CompleteSession → coordinator spawns
-/// an advance → api launches. Needs Docker + a real model.
+/// Ranch workstream lifecycle (interactive model): start a ranch's first
+/// workstream, let it run its initial attempt in Docker, and assert it IDLES
+/// (stays `Running`, never auto-completes) and the dependent does NOT auto-launch.
+/// Then sign off the way the TUI's `/accept` does — send `ClientMsg::Accept` to
+/// the worker — and assert the full loop: worker → `AcceptWorkstream` → daemon
+/// completes schema + advances → api auto-launches, and the schema session ends.
+/// Needs Docker + a real model.
 #[test]
-#[ignore = "real Docker + model: exercises background auto-advance"]
-fn e2e_ranch_coordinator_auto_advances_to_dependent() {
+#[ignore = "real Docker + model: exercises idle workstream + in-session /accept"]
+fn e2e_ranch_workstream_idles_then_signoff_advances() {
     if !docker_ok() {
         eprintln!("skipping: docker not available");
         return;
@@ -730,9 +788,9 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
     assert!(wait_pong(&sock));
     let proj = make_project();
 
-    // schema does a trivial, quickly-completable task; api depends on it. No
-    // acceptance criteria / expected artifacts on schema, so it auto-completes
-    // (the acceptance gate would otherwise pause for sign-off).
+    // schema does a trivial first attempt; api depends on it. A workstream is
+    // never auto-completed — it idles after its first attempt until the user
+    // signs off, whatever its acceptance criteria.
     let ranch_dir = proj.path().join(".cowboy/ranches/billing");
     std::fs::create_dir_all(&ranch_dir).unwrap();
     std::fs::write(
@@ -743,8 +801,9 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
          \x20 - id: api\n    title: API\n    goal: Create a file api.txt containing the word api, then finish.\n    depends_on: [schema]\n",
     )
     .unwrap();
+    commit_model(proj.path(), &env);
 
-    // Launch only the ready workstream (schema). We never call start again.
+    // Launch only the ready workstream (schema).
     let out = Command::new(env!("CARGO_BIN_EXE_cowboy"))
         .current_dir(proj.path())
         .env("XDG_RUNTIME_DIR", env.runtime.path())
@@ -758,10 +817,49 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Wait (generously) for the coordinator to launch a session tagged
-    // workstream=api — proof the dependent advanced automatically.
-    let mut api = None;
+    // Wait for schema's first attempt to finish (one turn done) — it then idles.
+    let schema_sid = cowboy_core::ranch::load(proj.path(), "billing")
+        .unwrap()
+        .workstream("schema")
+        .and_then(|w| w.session_id.clone())
+        .expect("schema should have a session");
+    let mut first_attempt_done = false;
     for _ in 0..1200 {
+        if let Some(info) = get(&sock, &schema_sid) {
+            // First turn complete + still Running = idling, not auto-completed.
+            if info.turn >= 1 && info.status == SessionStatus::Running {
+                first_attempt_done = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        first_attempt_done,
+        "schema should finish a first attempt and idle (Running)"
+    );
+
+    // It must NOT have auto-completed, and api must NOT have auto-launched.
+    let info = get(&sock, &schema_sid).expect("schema session");
+    assert_eq!(
+        info.status,
+        SessionStatus::Running,
+        "workstream must idle, not auto-complete"
+    );
+    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
+    assert!(
+        r.workstream("api").unwrap().session_id.is_none(),
+        "api must not auto-launch before sign-off"
+    );
+
+    // Sign off exactly as the TUI's `/accept` does: send Accept to the worker.
+    let schema_ws_sock = info.worker_sock.clone().expect("schema worker sock");
+    Client::connect(&schema_ws_sock).send(&ClientMsg::Accept { note: None });
+
+    // The worker asks the daemon to complete schema + advance the plan, then ends.
+    // Wait for api to auto-launch — proof the in-session sign-off advanced the plan.
+    let mut api = None;
+    for _ in 0..600 {
         if let Some(DaemonResp::Sessions { sessions }) =
             dreq(&sock, DaemonReq::ListSessions { root: None })
         {
@@ -775,14 +873,13 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    let api = api.expect("coordinator should auto-launch the api workstream");
+    let api = api.expect("api should launch after in-session sign-off");
     assert_eq!(api.ranch_id.as_deref(), Some("billing"));
 
-    // ranch.yaml reflects schema done + api launched on its branch.
     let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
     assert!(
         r.workstream("schema").unwrap().status.is_done(),
-        "schema should be complete: {:?}",
+        "schema should be complete after sign-off: {:?}",
         r.workstream("schema").unwrap().status
     );
 
@@ -813,14 +910,13 @@ fn e2e_ranch_coordinator_auto_advances_to_dependent() {
     reap_new_docker(&docker_before);
 }
 
-/// Ranch acceptance gate: a workstream that declares acceptance criteria does NOT
-/// auto-complete when its session finishes — it pauses at `WaitingForUser`, the
-/// dependent stays blocked, and the coordinator does not launch it. After the
-/// user signs off (`ranch accept`), `ranch start` launches the dependent. Needs
-/// Docker + a real model.
+/// Ranch sign-off via the CLI fallback (`cowboy ranch accept`): the same as the
+/// in-session path, but signing off from the shell while the idle worker is not
+/// attached. After `ranch accept`, the dependent launches on the next advance.
+/// Needs Docker + a real model.
 #[test]
-#[ignore = "real Docker + model: exercises the acceptance gate + sign-off"]
-fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
+#[ignore = "real Docker + model: exercises `cowboy ranch accept` sign-off"]
+fn e2e_ranch_cli_accept_signoff_advances() {
     if !docker_ok() {
         eprintln!("skipping: docker not available");
         return;
@@ -836,18 +932,17 @@ fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
     assert!(wait_pong(&sock));
     let proj = make_project();
 
-    // schema declares acceptance criteria → it must pause for sign-off even after
-    // its session completes; api depends on it.
     let ranch_dir = proj.path().join(".cowboy/ranches/billing");
     std::fs::create_dir_all(&ranch_dir).unwrap();
     std::fs::write(
         ranch_dir.join("ranch.yaml"),
         "version: 1\nid: billing\ntitle: Billing\nstatus: planning\nauto_advance: true\n\
          created_ms: 1\nupdated_ms: 1\nworkstreams:\n\
-         \x20 - id: schema\n    title: Schema\n    goal: Create a file hello.txt containing the word hello, then finish.\n    depends_on: []\n    acceptance:\n      - a human confirms hello.txt is correct\n\
+         \x20 - id: schema\n    title: Schema\n    goal: Create a file hello.txt containing the word hello, then finish.\n    depends_on: []\n\
          \x20 - id: api\n    title: API\n    goal: Create a file api.txt containing the word api, then finish.\n    depends_on: [schema]\n",
     )
     .unwrap();
+    commit_model(proj.path(), &env);
 
     let run_cli = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_cowboy"))
@@ -861,39 +956,36 @@ fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
 
     assert!(run_cli(&["ranch", "start", "billing"]).status.success());
 
-    // Wait for schema's session to complete (it runs a trivial task).
+    // Wait for schema's first attempt to finish; it then idles (Running).
     let schema_sid = cowboy_core::ranch::load(proj.path(), "billing")
         .unwrap()
         .workstream("schema")
         .and_then(|w| w.session_id.clone())
         .expect("schema should have a session");
-    let mut completed = false;
+    let mut idling = false;
     for _ in 0..1200 {
         if let Some(info) = get(&sock, &schema_sid) {
-            if info.status == SessionStatus::Completed {
-                completed = true;
+            if info.turn >= 1 && info.status == SessionStatus::Running {
+                idling = true;
                 break;
             }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    assert!(completed, "schema session should complete");
+    assert!(idling, "schema should finish a first attempt and idle");
 
-    // Give the coordinator a moment to run its advance, then assert it PAUSED:
-    // schema is waiting for sign-off and api was NOT launched.
-    std::thread::sleep(Duration::from_secs(2));
-    let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();
-    assert_eq!(
-        r.workstream("schema").unwrap().status,
-        cowboy_core::ranch::WorkstreamStatus::WaitingForUser,
-        "schema should pause at the acceptance gate"
-    );
+    // api must not have auto-launched.
     assert!(
-        r.workstream("api").unwrap().session_id.is_none(),
-        "api must not launch before sign-off"
+        cowboy_core::ranch::load(proj.path(), "billing")
+            .unwrap()
+            .workstream("api")
+            .unwrap()
+            .session_id
+            .is_none(),
+        "api must not auto-launch before sign-off"
     );
 
-    // Sign off, then start: api now launches.
+    // Sign off from the shell, then advance: api launches.
     assert!(run_cli(&["ranch", "accept", "billing", "schema"])
         .status
         .success());
@@ -911,7 +1003,7 @@ fn e2e_ranch_acceptance_gate_pauses_until_signoff() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(api_launched, "api should launch after sign-off");
+    assert!(api_launched, "api should launch after CLI sign-off");
 
     // Cleanup: end any live workers, remove worktrees, reap containers.
     let r = cowboy_core::ranch::load(proj.path(), "billing").unwrap();

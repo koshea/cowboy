@@ -36,6 +36,10 @@ futures.workspace = true
 tokio-util.workspace = true
 libc.workspace = true
 rpassword.workspace = true
+similar.workspace = true
+rmcp.workspace = true
+reqwest.workspace = true  # default HTTP client for MCP streamable-HTTP transport
+uuid.workspace = true     # per-session control-channel token
 
 [dev-dependencies]
 assert_cmd.workspace = true

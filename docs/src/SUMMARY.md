@@ -7,6 +7,7 @@
 - [Installation](getting-started/installation.md)
 - [Quick start](getting-started/quickstart.md)
 - [Configuration](getting-started/configuration.md)
+- [How-to guides](how-to.md)
 
 # Security model
 

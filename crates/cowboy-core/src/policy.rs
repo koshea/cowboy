@@ -49,6 +49,28 @@ pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, S
     (default.into(), format!("{class} = {default:?}"))
 }
 
+/// Evaluate a bare DNS **name** against the policy (no port/CIDR/IP logic — a
+/// resolution isn't a connection). Precedence mirrors [`evaluate`]: a deny-domain
+/// match wins, then an allow-domain match, else `default_external`. Used by the
+/// gateway's resolver to gate which names it will resolve.
+pub fn evaluate_name(policy: &NetworkPolicy, name: &str) -> (Verdict, String) {
+    if let Some(rule) = policy.deny.domains.iter().find(|d| domain_matches(d, name)) {
+        return (Verdict::Deny, format!("denied by policy (domain {rule})"));
+    }
+    if let Some(rule) = policy
+        .allow
+        .domains
+        .iter()
+        .find(|d| domain_matches(d, name))
+    {
+        return (Verdict::Allow, format!("allowed by policy (domain {rule})"));
+    }
+    (
+        policy.default_external.into(),
+        format!("default_external = {:?}", policy.default_external),
+    )
+}
+
 /// Destination class for choosing which default verdict applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestClass {
@@ -149,6 +171,23 @@ mod tests {
     use crate::config::DefaultVerdict;
     use crate::netproto::Protocol;
 
+    #[test]
+    fn evaluate_name_gates_by_domain_only() {
+        let mut p = NetworkPolicy::default(); // denies metadata.google.internal
+        p.allow.domains = vec!["github.com".into()];
+        p.allow.ports = vec![443]; // must NOT affect name evaluation
+        p.default_external = DefaultVerdict::Ask;
+        // Allowed by name, ignoring ports.
+        assert_eq!(evaluate_name(&p, "api.github.com").0, Verdict::Allow);
+        // Denied wins.
+        assert_eq!(
+            evaluate_name(&p, "metadata.google.internal").0,
+            Verdict::Deny
+        );
+        // Unknown → default_external.
+        assert_eq!(evaluate_name(&p, "unknown.test").0, Verdict::Ask);
+    }
+
     fn attempt(host: Option<&str>, ip: Option<&str>, port: u16) -> NetworkAttempt {
         NetworkAttempt {
             protocol: Protocol::Tls,
@@ -189,6 +228,7 @@ mod tests {
             default_host: DefaultVerdict::Allow,
             allow: Default::default(),
             deny: Default::default(),
+            dns: Default::default(),
         };
         // loopback -> host
         assert_eq!(

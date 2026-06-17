@@ -55,11 +55,11 @@ impl SessionLogger {
     /// worker so the registry id and the session dir agree).
     pub fn create_with_id(root: &Path, id: &str) -> Result<Self> {
         let id = id.to_string();
-        let dir = root.join(".cowboy").join("sessions").join(&id);
+        let dir = session_dir(root, &id);
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("creating session dir {}", dir.display()))?;
         // Maintain a `current` symlink-like pointer file for convenience.
-        let _ = std::fs::write(root.join(".cowboy").join("sessions").join("LATEST"), &id);
+        let _ = std::fs::write(sessions_dir(root).join("LATEST"), &id);
         let transcript = create_file(&dir.join("transcript.jsonl"))?;
         let commands = create_file(&dir.join("commands.jsonl"))?;
         std::fs::create_dir_all(dir.join("commands")).ok();
@@ -122,6 +122,21 @@ impl SessionLogger {
 
     /// At session end: capture the workspace diff and a context summary.
     pub fn finalize(&self, final_message: Option<&str>) {
+        // final.md — the agent's answer. The explicit `final` tool writes it
+        // directly (via `write_final`), but a model that just answers in plain
+        // text (no tool call) ends the session through the implicit-final path,
+        // which never wrote the file. Backfill it from the final message so
+        // every finished session has a non-empty final.md for downstream readers
+        // (logs/replay/handoff, and a foreman reading a subagent result).
+        if let Some(msg) = final_message {
+            let final_path = self.dir.join("final.md");
+            let empty = std::fs::metadata(&final_path)
+                .map(|m| m.len() == 0)
+                .unwrap_or(true);
+            if empty {
+                let _ = std::fs::write(&final_path, msg);
+            }
+        }
         // diff.patch — git diff of the workspace (best-effort).
         if let Ok(out) = std::process::Command::new("git")
             .arg("diff")
@@ -164,22 +179,31 @@ impl SessionLogger {
     }
 }
 
+/// The `.cowboy/sessions` directory for a project.
+pub fn sessions_dir(root: &Path) -> PathBuf {
+    root.join(cowboy_core::config::COWBOY_DIR).join("sessions")
+}
+
+/// The directory for a specific session (`.cowboy/sessions/<id>`). Single source
+/// of truth for the on-disk session layout — readers must not rebuild this path
+/// by hand.
+pub fn session_dir(root: &Path, id: &str) -> PathBuf {
+    sessions_dir(root).join(id)
+}
+
 /// The most recent session directory for a project, if any (via the `LATEST`
 /// pointer). Used to attach out-of-session artifacts like `processes.jsonl`.
 pub fn latest_session_dir(root: &Path) -> Option<PathBuf> {
-    let sessions = root.join(".cowboy").join("sessions");
-    let id = std::fs::read_to_string(sessions.join("LATEST")).ok()?;
-    let dir = sessions.join(id.trim());
+    let dir = session_dir(root, latest_session_id(root)?.as_str());
     dir.is_dir().then_some(dir)
 }
 
 /// The id of the most recent session for a project (via the `LATEST` pointer),
 /// if its directory still exists.
 pub fn latest_session_id(root: &Path) -> Option<String> {
-    let sessions = root.join(".cowboy").join("sessions");
-    let id = std::fs::read_to_string(sessions.join("LATEST")).ok()?;
+    let id = std::fs::read_to_string(sessions_dir(root).join("LATEST")).ok()?;
     let id = id.trim().to_string();
-    sessions.join(&id).is_dir().then_some(id)
+    session_dir(root, &id).is_dir().then_some(id)
 }
 
 /// Load a prior session's conversation transcript so a new session can continue
@@ -188,11 +212,7 @@ pub fn latest_session_id(root: &Path) -> Option<String> {
 /// (e.g. from a crashed session) so the history is valid to resume from.
 pub fn load_history(root: &Path, id: &str) -> Result<Vec<Message>> {
     use std::io::BufRead;
-    let path = root
-        .join(".cowboy")
-        .join("sessions")
-        .join(id)
-        .join("transcript.jsonl");
+    let path = session_dir(root, id).join("transcript.jsonl");
     let file = File::open(&path)
         .with_context(|| format!("opening transcript {} (no such session?)", path.display()))?;
     let mut msgs: Vec<Message> = Vec::new();
@@ -311,6 +331,31 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("handoff.md")).unwrap(),
             "AGENT HANDOFF"
+        );
+    }
+
+    #[test]
+    fn finalize_backfills_final_md_from_implicit_final() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let log = SessionLogger::create(tmp.path()).unwrap();
+        let dir = log.dir().to_path_buf();
+        // No `final` tool was called: final.md does not exist yet. A model that
+        // answered in plain text reaches finalize with the message in hand.
+        assert!(!dir.join("final.md").exists());
+        log.finalize(Some("the plain-text answer"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("final.md")).unwrap(),
+            "the plain-text answer"
+        );
+
+        // An explicit final.md (from the `final` tool) is not clobbered.
+        let log2 = SessionLogger::create(tmp.path()).unwrap();
+        let dir2 = log2.dir().to_path_buf();
+        log2.write_final("tool-written final");
+        log2.finalize(Some("different last message"));
+        assert_eq!(
+            std::fs::read_to_string(dir2.join("final.md")).unwrap(),
+            "tool-written final"
         );
     }
 

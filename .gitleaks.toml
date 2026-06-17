@@ -1,0 +1,16 @@
+# gitleaks configuration for the secret-scan CI gate (.github/workflows/ci.yml).
+# Extends gitleaks' built-in rule set; the allowlist below covers strings that
+# look credential-ish but are deliberate, non-secret placeholders in tests/docs.
+title = "cowboy"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documented test/doc placeholders — not real credentials"
+regexes = [
+  # Fake API key used in CLI/config tests (see crates/cowboy-cli/tests/models.rs).
+  '''sk-secret-xyz''',
+  # Doc placeholder for where a real key would go.
+  '''sk-\.\.\.''',
+]

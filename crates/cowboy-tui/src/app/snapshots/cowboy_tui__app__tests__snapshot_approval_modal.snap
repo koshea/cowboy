@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│› build the project                            ││no network activity  │
+│                                               ││yet                  │
+│   ╭ Network request ─────────────────────────────────────────────╮   │
+│   │github.com:443                                                │   │
+│   │                                                              │   │
+│   │o  once — just this request                                   │   │
+│   │s  session — every request here until this session ends       │───╯
+│   │p  project — always allow here (saved for this repo)          │───╮
+│   │g  global — always allow everywhere                           │vit│
+│   │d  deny                                                       │   │
+│   │                                                              │   │
+│   │press a key  ·  Esc = deny                                    │   │
+╰───╰──────────────────────────────────────────────────────────────╯───╯
+   paused for you — your call — ready
+╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯

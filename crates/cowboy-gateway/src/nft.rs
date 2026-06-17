@@ -88,7 +88,8 @@ mod tests {
             policy: NetworkPolicy::default(),
             agent_subnet: "10.88.0.0/24".into(),
             dns_upstream: "1.1.1.1:53".parse().unwrap(),
-            control_sock: None,
+            control_addr: None,
+            control_token: None,
             allow_subnets: vec!["172.20.0.0/16".into()],
         }
     }

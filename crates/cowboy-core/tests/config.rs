@@ -69,6 +69,34 @@ fn security_invariant_rejects_mounting_cowboy_dir() {
     assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
 }
 
+#[test]
+fn security_invariant_rejects_mounting_providers_or_home_config() {
+    // providers.yaml holds host API keys and must never reach the agent, via a
+    // mount or a credential grant — directly or by mounting the home config dir.
+    for source in [
+        "~/.config/cowboy/providers.yaml",
+        "~/.config/cowboy", // home config dir (basename "cowboy")
+    ] {
+        let mut cfg = SecurityConfig::default();
+        cfg.container.mounts.push(Mount {
+            source: source.into(),
+            target: "/tmp/x".into(),
+            mode: "ro".into(),
+        });
+        assert!(
+            matches!(cfg.validate(), Err(Error::SecurityInvariant(_))),
+            "mount of {source:?} must be rejected"
+        );
+
+        let mut cfg = SecurityConfig::default();
+        cfg.secrets.files.push(grant(source, "/tmp/x"));
+        assert!(
+            matches!(cfg.validate(), Err(Error::SecurityInvariant(_))),
+            "grant of {source:?} must be rejected"
+        );
+    }
+}
+
 fn grant(source: &str, target: &str) -> SecretMount {
     SecretMount {
         source: source.into(),

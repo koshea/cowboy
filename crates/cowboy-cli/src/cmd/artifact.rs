@@ -35,7 +35,7 @@ fn session_dir(root: &Path, session: Option<&str>) -> Result<PathBuf> {
             crate::session::latest_session_id(root).context("no sessions yet in this worktree")?
         }
     };
-    let dir = root.join(".cowboy").join("sessions").join(&id);
+    let dir = crate::session::session_dir(root, &id);
     if !dir.is_dir() {
         bail!("no such session: {id}");
     }
@@ -117,12 +117,7 @@ fn add(
     Ok(())
 }
 
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
+use cowboy_core::time::now_ms;
 
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {

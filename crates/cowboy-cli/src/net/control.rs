@@ -1,47 +1,54 @@
-//! Host-side control socket server.
+//! Host-side control server (TCP + per-session token).
 //!
-//! The gateway connects to this unix socket and sends `ask` requests for
-//! destinations whose policy is `ask`, plus `event` notifications for decisions
-//! it made itself. The host routes asks to the UI and returns a verdict, and
-//! forwards events for logging/activity. The host — not the agent — owns these
-//! decisions.
+//! The gateway connects to this server and sends `ask` requests for destinations
+//! whose policy is `ask`, plus `event` notifications for decisions it made itself.
+//! The host routes asks to the UI and returns a verdict, and forwards events for
+//! logging/activity. The host — not the agent — owns these decisions.
+//!
+//! Transport: **TCP**, so it works the same on Linux and inside the macOS Docker
+//! VM (a bind-mounted unix socket can't cross the host↔VM file-share boundary).
+//! Because a TCP port is reachable by anything that can route to it — including the
+//! agent container, which shares the internal bridge with the host — the channel is
+//! gated by a **per-session token**: the gateway's first line must be a matching
+//! [`GatewayMessage::Hello`], or the host drops the connection. The token reaches
+//! the gateway only via its container env, which the (separate) agent container
+//! never sees, so the agent cannot authenticate even if it reaches the port. The
+//! listener is also bound to the docker bridge IP (never `0.0.0.0`), keeping the
+//! port off the LAN.
 
-use std::path::PathBuf;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use cowboy_core::netproto::{
     encode_line, ApprovalScope, GatewayMessage, HostMessage, NetworkAttempt, Verdict,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 /// A pending approval the UI must decide.
 pub struct ApprovalRequest {
     pub attempt: NetworkAttempt,
+    /// Why the gateway is asking (e.g. "DNS tunnel suspected"), for the prompt.
+    pub reason: Option<String>,
     pub reply: oneshot::Sender<(Verdict, ApprovalScope)>,
 }
 
 /// A decision the gateway reported (for the activity log / network.jsonl).
 pub type NetworkEvent = (NetworkAttempt, Verdict, String);
 
-/// Serve the control socket until cancelled. Asks are sent on `approvals`
-/// (each carries a reply channel); events are sent on `events`.
-pub async fn serve(
-    path: PathBuf,
+/// Serve the control channel on a pre-bound TCP listener until cancelled. Each
+/// connection must authenticate with `Hello { token }` first. Asks are sent on
+/// `approvals` (each carries a reply channel); events are sent on `events`.
+pub async fn serve_on(
+    listener: TcpListener,
+    token: String,
     approvals: mpsc::UnboundedSender<ApprovalRequest>,
     events: mpsc::UnboundedSender<NetworkEvent>,
 ) -> Result<()> {
-    let _ = std::fs::remove_file(&path);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!(%addr, "control server listening (tcp)");
     }
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("binding control socket {}", path.display()))?;
-    tracing::info!(sock = %path.display(), "control socket listening");
-
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(error = %e, "control accept error");
@@ -49,30 +56,54 @@ pub async fn serve(
             }
         };
         let (r, w) = stream.into_split();
-        if let Err(e) = handle_conn(r, w, &approvals, &events).await {
-            tracing::debug!(error = %e, "control connection ended");
+        if let Err(e) = handle_conn(BufReader::new(r), w, &token, &approvals, &events).await {
+            tracing::debug!(%peer, error = %e, "control connection ended");
         }
     }
 }
 
-async fn handle_conn(
-    r: tokio::net::unix::OwnedReadHalf,
-    mut w: tokio::net::unix::OwnedWriteHalf,
+/// Handle one control connection: authenticate, then bridge asks/events. Generic
+/// over the stream halves so it's transport-agnostic and unit-testable.
+async fn handle_conn<R, W>(
+    mut reader: BufReader<R>,
+    mut w: W,
+    token: &str,
     approvals: &mpsc::UnboundedSender<ApprovalRequest>,
     events: &mpsc::UnboundedSender<NetworkEvent>,
-) -> Result<()> {
-    let mut reader = BufReader::new(r);
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut line = String::new();
+
+    // First line MUST be a matching Hello, or we drop the connection.
+    if reader.read_line(&mut line).await? == 0 {
+        return Ok(());
+    }
+    match serde_json::from_str::<GatewayMessage>(line.trim()) {
+        Ok(GatewayMessage::Hello { token: t }) if t == token => {}
+        _ => {
+            tracing::warn!("control connection rejected (missing/invalid token)");
+            return Ok(()); // drop — no decisions for an unauthenticated peer
+        }
+    }
+
     loop {
         line.clear();
         if reader.read_line(&mut line).await? == 0 {
             return Ok(()); // gateway disconnected
         }
         match serde_json::from_str::<GatewayMessage>(line.trim()) {
-            Ok(GatewayMessage::Ask { id, attempt }) => {
+            Ok(GatewayMessage::Ask {
+                id,
+                attempt,
+                reason,
+            }) => {
                 let (rtx, rrx) = oneshot::channel();
                 let req = ApprovalRequest {
                     attempt,
+                    reason,
                     reply: rtx,
                 };
                 if approvals.send(req).is_err() {
@@ -90,13 +121,15 @@ async fn handle_conn(
             }) => {
                 let _ = events.send((attempt, verdict, reason));
             }
+            // A second Hello (or anything else) is ignored.
+            Ok(GatewayMessage::Hello { .. }) => {}
             Err(_) => { /* ignore malformed line */ }
         }
     }
 }
 
-async fn write_decision(
-    w: &mut tokio::net::unix::OwnedWriteHalf,
+async fn write_decision<W: AsyncWrite + Unpin>(
+    w: &mut W,
     id: u64,
     verdict: Verdict,
     scope: ApprovalScope,
@@ -111,7 +144,7 @@ async fn write_decision(
 mod tests {
     use super::*;
     use cowboy_core::netproto::Protocol;
-    use tokio::net::UnixStream;
+    use tokio::net::{TcpListener, TcpStream};
 
     fn attempt() -> NetworkAttempt {
         NetworkAttempt {
@@ -122,33 +155,39 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn ask_gets_routed_and_decision_returned() {
-        let tmp = assert_fs::TempDir::new().unwrap();
-        let sock = tmp.path().join("ctrl.sock");
-        let (atx, mut arx) = mpsc::unbounded_channel();
-        let (etx, mut erx) = mpsc::unbounded_channel();
-        let serve_sock = sock.clone();
+    async fn spawn_server(
+        token: &str,
+    ) -> (
+        std::net::SocketAddr,
+        mpsc::UnboundedReceiver<ApprovalRequest>,
+        mpsc::UnboundedReceiver<NetworkEvent>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (atx, arx) = mpsc::unbounded_channel();
+        let (etx, erx) = mpsc::unbounded_channel();
+        let token = token.to_string();
         tokio::spawn(async move {
-            let _ = serve(serve_sock, atx, etx).await;
+            let _ = serve_on(listener, token, atx, etx).await;
         });
+        (addr, arx, erx)
+    }
 
-        // Wait for the socket, then connect as the "gateway".
-        let mut stream = None;
-        for _ in 0..50 {
-            if let Ok(s) = UnixStream::connect(&sock).await {
-                stream = Some(s);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let stream = stream.expect("connect to control socket");
+    #[tokio::test]
+    async fn authenticated_ask_gets_routed_and_decision_returned() {
+        let (addr, mut arx, mut erx) = spawn_server("s3cret").await;
+        let stream = TcpStream::connect(addr).await.unwrap();
         let (r, mut w) = stream.into_split();
         let mut reader = BufReader::new(r);
 
-        // Send an Ask; an approval request should arrive, we approve it.
+        // Authenticate, then ask.
+        let hello = GatewayMessage::Hello {
+            token: "s3cret".into(),
+        };
+        w.write_all(encode_line(&hello).as_bytes()).await.unwrap();
         let ask = GatewayMessage::Ask {
             id: 42,
+            reason: None,
             attempt: attempt(),
         };
         w.write_all(encode_line(&ask).as_bytes()).await.unwrap();
@@ -159,7 +198,6 @@ mod tests {
             .send((Verdict::Allow, ApprovalScope::Session))
             .unwrap();
 
-        // The decision is written back for our id.
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         let decision: HostMessage = serde_json::from_str(line.trim()).unwrap();
@@ -172,7 +210,7 @@ mod tests {
             }
         );
 
-        // An event is forwarded.
+        // Events forward too.
         let ev = GatewayMessage::Event {
             attempt: attempt(),
             verdict: Verdict::Deny,
@@ -183,5 +221,35 @@ mod tests {
         assert_eq!(a.port, 443);
         assert_eq!(v, Verdict::Deny);
         assert_eq!(reason, "metadata");
+    }
+
+    #[tokio::test]
+    async fn wrong_token_is_dropped_without_a_decision() {
+        let (addr, mut arx, _erx) = spawn_server("right").await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+
+        // Bad token, then an Ask — the server should drop us, never route the ask.
+        let hello = GatewayMessage::Hello {
+            token: "wrong".into(),
+        };
+        w.write_all(encode_line(&hello).as_bytes()).await.unwrap();
+        let ask = GatewayMessage::Ask {
+            id: 1,
+            reason: None,
+            attempt: attempt(),
+        };
+        let _ = w.write_all(encode_line(&ask).as_bytes()).await;
+
+        // No approval request is ever routed.
+        assert!(
+            arx.try_recv().is_err(),
+            "an unauthenticated ask must not be routed"
+        );
+        // The connection is closed: our read returns EOF (0 bytes).
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).await.unwrap();
+        assert_eq!(n, 0, "server should close the unauthenticated connection");
     }
 }

@@ -22,6 +22,9 @@ pub const TOOL_BLOCKED: &str = "blocked";
 pub const TOOL_UNBLOCK: &str = "unblock";
 pub const TOOL_DECISION: &str = "decision";
 pub const TOOL_PROPOSE_SCOPE_CHANGE: &str = "propose_scope_change";
+pub const TOOL_PROPOSE_RANCH: &str = "propose_ranch";
+/// Conditional: added only when ≥1 MCP server is enabled (see [`mcp_definition`]).
+pub const TOOL_MCP: &str = "mcp";
 
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -159,6 +162,38 @@ pub struct PlanArgs {
     pub steps: Vec<PlanStep>,
 }
 
+/// One workstream in a proposed Ranch Plan (see [`ProposeRanchArgs`]).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RanchWorkstreamArg {
+    /// Short, unique slug id (e.g. `schema`, `api`).
+    pub id: String,
+    /// What this workstream should accomplish.
+    pub goal: String,
+    /// Display title (defaults to the id).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Ids of workstreams that must finish before this one starts (forms a DAG).
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+    /// Artifacts this workstream is expected to publish (names, not paths).
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    /// Human-readable acceptance criteria.
+    #[serde(default)]
+    pub acceptance: Vec<String>,
+}
+
+/// Arguments for the `propose_ranch` tool: a full multi-workstream decomposition.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProposeRanchArgs {
+    /// Title for the ranch plan.
+    pub title: String,
+    /// The overall goal the ranch achieves.
+    pub goal: String,
+    /// The workstreams, with `depends_on` wiring them into a dependency DAG.
+    pub workstreams: Vec<RanchWorkstreamArg>,
+}
+
 /// Arguments for the `handoff` tool — a structured end-of-session summary that
 /// the next worker (or a Ranch coordinator) can rely on.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -257,8 +292,43 @@ pub struct ArtifactArgs {
     pub summary: Option<String>,
 }
 
+/// Arguments for the `mcp` tool (present only when MCP servers are connected).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct McpArgs {
+    /// "list_tools" to discover a server's tools, or "call" to invoke one.
+    pub action: String,
+    /// The MCP server name (from the connected list in your context). For
+    /// `list_tools`, omit to get a compact listing across all servers, or pass a
+    /// name for that server's full tool schemas. Required for `call`.
+    #[serde(default)]
+    pub server: Option<String>,
+    /// For `call`: the tool name to invoke (as shown by `list_tools`).
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// For `call`: the tool's arguments as a JSON object matching its input schema.
+    #[serde(default)]
+    pub arguments: Option<serde_json::Value>,
+}
+
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// The `mcp` tool definition. Kept out of [`definitions`] and added to the surface
+/// by the agent loop only when ≥1 MCP server is enabled, so sessions without MCP
+/// don't carry it. The connected servers themselves are named in the system prompt.
+pub fn mcp_definition() -> ToolDef {
+    ToolDef {
+        name: TOOL_MCP.into(),
+        description: "Use a connected MCP server's tools. The servers available to you (and what \
+                      each is for) are listed in your context. Two actions: `list_tools` to \
+                      discover a server's tools — pass `server` for that server's full tool \
+                      schemas, or omit `server` for a compact listing across all servers — and \
+                      `call` to invoke a tool (`server` + `tool` + `arguments` matching its input \
+                      schema). Discover a server's tools with `list_tools` before calling them."
+            .into(),
+        parameters: schema_for::<McpArgs>(),
+    }
 }
 
 /// The tool definitions advertised to the model.
@@ -375,6 +445,17 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<ProposeScopeChangeArgs>(),
         },
         ToolDef {
+            name: TOOL_PROPOSE_RANCH.into(),
+            description: "Propose a multi-workstream Ranch Plan: decompose a large goal into \
+                          independent, parallelizable workstreams wired by `depends_on` into a \
+                          DAG, each with a goal, expected artifacts, and acceptance criteria. \
+                          Use ONLY when explicitly asked to plan/decompose a ranch — it writes a \
+                          draft ranch.yaml for the user to review and does NOT start any work or \
+                          edit code. Call it once with the full decomposition."
+                .into(),
+            parameters: schema_for::<ProposeRanchArgs>(),
+        },
+        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -430,11 +511,30 @@ mod tests {
                 "blocked",
                 "unblock",
                 "propose_scope_change",
+                "propose_ranch",
                 "final",
                 "ask_user",
                 "subagent"
             ]
         );
+    }
+
+    #[test]
+    fn mcp_tool_is_conditional_and_well_formed() {
+        // The `mcp` tool is NOT part of the always-on surface — it's added by the
+        // agent loop only when MCP servers are connected.
+        assert!(!definitions().iter().any(|d| d.name == TOOL_MCP));
+        let d = mcp_definition();
+        assert_eq!(d.name, "mcp");
+        let schema = d.parameters.to_string();
+        assert!(schema.contains("action"));
+        assert!(schema.contains("server"));
+        // Args parse as expected.
+        let a: McpArgs =
+            serde_json::from_str(r#"{"action":"call","server":"linear","tool":"create_issue","arguments":{"title":"x"}}"#)
+                .unwrap();
+        assert_eq!(a.action, "call");
+        assert_eq!(a.server.as_deref(), Some("linear"));
     }
 
     #[test]

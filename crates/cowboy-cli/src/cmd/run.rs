@@ -15,11 +15,7 @@ fn runtime() -> Result<AgentRuntime> {
     let paths = ConfigPaths::for_root(&root);
     let security = SecurityConfig::load(&paths.security)
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-    Ok(AgentRuntime::new(
-        Box::new(CliDocker::new()),
-        root,
-        security,
-    ))
+    AgentRuntime::new(Box::new(CliDocker::new()), root, security)
 }
 
 pub async fn run(command: Vec<String>) -> Result<()> {

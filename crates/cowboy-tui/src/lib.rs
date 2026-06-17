@@ -5,6 +5,7 @@
 //! the async agent integration.
 
 pub mod app;
+pub mod markdown;
 
 pub use app::{
     draw, App, Completion, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, TranscriptLine,

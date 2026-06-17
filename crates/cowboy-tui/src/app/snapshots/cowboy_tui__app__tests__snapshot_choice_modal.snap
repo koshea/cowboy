@@ -1,22 +1,22 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
-│› build the project                            ││no network activity  │
+│I need a decision.                             ││no network activity  │
 │                                               ││yet                  │
 │                                               ││                     │
-│                                               ││                     │
-│   ╭ Approval ────────────────────────────────────────────────────╮   │
-│   │github.com:443                                                │   │
-│   │                                                              │───╯
-│   │[o]nce [s]ession [p]roject [g]lobal [d]eny                    │───╮
-│   │                                                              │vit│
+│   ╭ Question ────────────────────────────────────────────────────╮   │
+│   │Which database should we use?                                 │   │
 │   │                                                              │   │
+│   │  1. PostgreSQL                                               │───╯
+│   │▸ 2. SQLite                                                   │───╮
+│   │  3. MySQL                                                    │vit│
+│   │  (or type a custom answer)                                   │   │
+│   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │
-│                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   approval — ready
+   your turn — pick above — ready
 ╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

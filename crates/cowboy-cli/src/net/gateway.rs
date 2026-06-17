@@ -42,8 +42,12 @@ pub struct GatewayNetwork {
     pub bridge_gateway: String,
     pub egress_subnet: String,
     policy_file: PathBuf,
-    /// Host control socket path the gateway connects to for `ask` decisions.
-    control_sock: PathBuf,
+    /// Host control address (`bridge_gateway:port`) the gateway dials over TCP for
+    /// `ask` decisions. TCP (not a bind-mounted unix socket) so it works the same
+    /// inside the macOS Docker VM; bound to the bridge IP, never the LAN.
+    control_addr: String,
+    /// Per-session token the gateway must present (the agent never sees it).
+    control_token: String,
 }
 
 impl GatewayNetwork {
@@ -71,11 +75,20 @@ impl GatewayNetwork {
         std::fs::write(&policy_file, json)
             .with_context(|| format!("writing policy file {}", policy_file.display()))?;
 
-        // Host-writable runtime dir for the control socket (mounted into the
-        // gateway). Avoids needing root-owned /run.
-        let run_dir = std::env::temp_dir().join("cowboy-run");
-        let _ = std::fs::create_dir_all(&run_dir);
-        let control_sock = run_dir.join(format!("control-{hash:08x}.sock"));
+        // Control channel: the gateway dials the host over TCP on the bridge IP.
+        // A deterministic per-project port (on a per-project bridge IP) avoids a
+        // bind-before-launch ordering dance; the gateway client retries to absorb
+        // the startup race. A fresh random token gates the port (the agent shares
+        // this bridge but never sees the token, so it can't authenticate).
+        let control_port = 9000 + (hash % 1000) as u16;
+        let control_addr = format!("{bridge_gateway}:{control_port}");
+        // Fresh random token per session. An explicit `COWBOY_CONTROL_TOKEN` env
+        // pins it instead (used by e2e tests that fake the gateway; also lets ops
+        // fix it if needed) — opt-in, so the default stays unguessable.
+        let control_token = std::env::var("COWBOY_CONTROL_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
         let (internal_net, egress_net, gateway_name) = network_names(hash);
         Ok(Self {
@@ -87,47 +100,38 @@ impl GatewayNetwork {
             bridge_gateway,
             egress_subnet,
             policy_file,
-            control_sock,
+            control_addr,
+            control_token,
         })
     }
 
-    /// The container path the control socket is mounted at.
-    fn control_sock_container_path(&self) -> String {
-        let name = self
-            .control_sock
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("control.sock");
-        format!("/run/cowboy/{name}")
+    /// The host control address (`bridge_gateway:port`) the gateway dials, and the
+    /// address the host binds its control server on.
+    pub fn control_addr(&self) -> &str {
+        &self.control_addr
+    }
+
+    /// The per-session control token (passed to the gateway via env).
+    pub fn control_token(&self) -> &str {
+        &self.control_token
     }
 
     /// Build the gateway container spec.
     fn gateway_spec(&self) -> ContainerSpec {
         let policy = self.policy_file.to_string_lossy().into_owned();
-        let sock_dir = self
-            .control_sock
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "/tmp".into());
         ContainerSpec {
             name: self.gateway_name.clone(),
             image: GATEWAY_IMAGE.to_string(),
             workdir: String::new(),
-            mounts: vec![
-                BindMount::ro(policy, "/etc/cowboy/policy.json"),
-                // Mount the runtime dir so the host-created socket is visible.
-                BindMount::rw(sock_dir, "/run/cowboy"),
-            ],
+            mounts: vec![BindMount::ro(policy, "/etc/cowboy/policy.json")],
             env: vec![
                 (
                     "COWBOY_POLICY_FILE".into(),
                     "/etc/cowboy/policy.json".into(),
                 ),
                 ("COWBOY_AGENT_SUBNET".into(), self.subnet.clone()),
-                (
-                    "COWBOY_CONTROL_SOCK".into(),
-                    self.control_sock_container_path(),
-                ),
+                ("COWBOY_CONTROL_ADDR".into(), self.control_addr.clone()),
+                ("COWBOY_CONTROL_TOKEN".into(), self.control_token.clone()),
             ],
             network: Some(self.internal_net.clone()),
             ip: Some(self.gateway_ip.clone()),
@@ -225,10 +229,5 @@ impl GatewayNetwork {
             anyhow::bail!("route helper exited with {}", res.exit_code);
         }
         Ok(())
-    }
-
-    /// Path to the host control socket.
-    pub fn control_sock(&self) -> &std::path::Path {
-        &self.control_sock
     }
 }

@@ -195,6 +195,88 @@ Create initial project config files under `.cowboy/`
 List session logs
 
 
+## `cowboy mcp`
+
+Configure MCP servers the agent can discover and call (host-owned)
+
+
+### `cowboy mcp add`
+
+Add or replace an MCP server in ~/.config/cowboy/mcp.yaml
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` | Local name for the server (e.g. `linear`, `filesystem`) |
+| `--transport` | Transport: `stdio` (local subprocess) or `http` (remote endpoint) |
+| `--description` | One-line description shown to the agent (e.g. "issue tracking") |
+| `--command` | stdio: the command to run (e.g. `npx`) |
+| `--arg` | stdio: an argument to the command (repeatable, in order). Leading-dash values are fine (e.g. `--arg -y`) |
+| `--env` | stdio: an environment variable, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE to reference host env; never inline secret literals |
+| `--url` | http: the server URL |
+| `--header` | http: a request header, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE |
+| `--tool` | Restrict to these tool names (repeatable). Omit to expose all tools |
+
+
+### `cowboy mcp disable`
+
+Disable a server (kept in config, not connected)
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy mcp enable`
+
+Enable a configured server
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy mcp list`
+
+List configured MCP servers (name, transport, enabled)
+
+
+### `cowboy mcp remove`
+
+Remove an MCP server
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy mcp show`
+
+Show one server's full configuration
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy mcp test`
+
+Connect to a server and list its tools (a connectivity check)
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy mcp trust`
+
+Trust this repo's `.mcp.json` servers (review + approve them; required before the agent can use repo-defined servers). Re-run if the file changes
+
+
+### `cowboy mcp untrust`
+
+Revoke trust for this repo's `.mcp.json` servers
+
+
 ## `cowboy memory`
 
 Inspect the agent's saved memory (project + global)
@@ -375,6 +457,21 @@ Sign off on a workstream waiting at its acceptance gate (unblocks deps)
 | `<WORKSTREAM>` |  |
 
 
+### `cowboy ranch add`
+
+Add a workstream to a ranch (no hand-editing ranch.yaml). Rejects a dependency cycle or an unknown `--depends-on` id
+
+| Arg | Description |
+|-----|-------------|
+| `<RANCH>` |  |
+| `<WORKSTREAM_ID>` | Workstream id (short, unique within the ranch) |
+| `--goal` | What this workstream should accomplish |
+| `--title` | Display title (defaults to the workstream id) |
+| `--depends-on` | Workstream ids this one depends on (comma-separated) |
+| `--acceptance` | Acceptance criteria, human-readable (comma-separated) |
+| `--expects` | Expected artifact name(s) this workstream should publish (repeatable) |
+
+
 ### `cowboy ranch approve`
 
 Approve a pending proposal: apply its change to the plan
@@ -413,6 +510,15 @@ Create a new ranch plan (writes a skeleton ranch.yaml to fill in)
 |-----|-------------|
 | `<TITLE>` | The ranch's title (also seeds its id) |
 | `--goal` | The overall goal |
+
+
+### `cowboy ranch plan`
+
+Decompose a goal into a ranch plan with the agent: it researches the codebase read-only and proposes workstreams + dependencies for you to review (writes a draft ranch.yaml; starts nothing)
+
+| Arg | Description |
+|-----|-------------|
+| `<GOAL>` | The overall goal to decompose into workstreams |
 
 
 ### `cowboy ranch proposals`
