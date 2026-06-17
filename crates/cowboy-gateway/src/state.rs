@@ -121,10 +121,19 @@ impl GatewayState {
         self.dns.record(ip, host);
     }
 
-    /// Decide whether to resolve a DNS query for `qname`/`qtype`. Order: refuse
-    /// disallowed record types; compute the name verdict (strict allowlist when
-    /// `enforce`, else deny-list only); escalate to `ask` on a tunnel signal.
-    /// Runs through the shared cache/`ask`/event machinery (so approvals persist).
+    /// Decide whether to resolve a DNS query for `qname`/`qtype`.
+    ///
+    /// Crucially, **resolution never blocks on a human**: a DNS resolver gives up
+    /// in seconds, so parking a query on an interactive `ask` just times it out
+    /// (and makes clients hot-retry). Resolution also isn't egress — the actual
+    /// connection is gated at connect-time, where prompting is safe and the
+    /// verdict is cached per-host. So a name that would be `ask` is *resolved*
+    /// here and approved (or denied) when it's connected to.
+    ///
+    /// The DNS layer therefore only ever **refuses** (fast, fail-closed) or
+    /// **allows** (resolve): disallowed record types, deny-listed names, and
+    /// suspected tunnels are refused — a tunnel's payload *is* the query, so there
+    /// is no later connection to gate — and everything else resolves.
     pub async fn decide_dns(&self, qname: &str, qtype: &str) -> Verdict {
         let dns = &self.policy.dns;
         let attempt = NetworkAttempt {
@@ -134,7 +143,7 @@ impl GatewayState {
             port: 53,
         };
 
-        // 1. Record-type gate.
+        // 1. Record-type gate (TXT/NULL/ANY/… carry tunnels/C2).
         if !dns_policy::qtype_allowed(qtype, dns) {
             return self
                 .run_decision(
@@ -146,7 +155,7 @@ impl GatewayState {
         }
 
         // 2. Name verdict.
-        let (mut verdict, mut reason) = if dns.enforce {
+        let (verdict, mut reason) = if dns.enforce {
             policy::evaluate_name(&self.policy, qname)
         } else {
             // Permissive: only the deny-list gates resolution; otherwise allow.
@@ -156,7 +165,9 @@ impl GatewayState {
             }
         };
 
-        // 3. Tunnel detection escalates a non-deny verdict to `ask`.
+        // 3. Tunnel detection refuses a non-deny verdict (no connection follows a
+        //    DNS-tunnel query, so this is the only place to stop it).
+        let mut verdict = verdict;
         if dns.tunnel_detection && verdict != Verdict::Deny {
             let why = dns_policy::tunnel_reason(qname, dns).or_else(|| {
                 let parent = dns_policy::registrable_parent(qname);
@@ -165,12 +176,18 @@ impl GatewayState {
                     .then(|| format!("high query rate for {parent}"))
             });
             if let Some(why) = why {
-                verdict = Verdict::Ask;
+                verdict = Verdict::Deny;
                 reason = format!("dns tunnel suspected: {why}");
             }
         }
 
-        self.run_decision(&attempt, verdict, reason).await
+        // Refuse denials (logged + surfaced); resolve everything else. An `ask`
+        // name resolves quietly — the connection layer prompts and caches it, so
+        // the resolver is never blocked.
+        match verdict {
+            Verdict::Deny => self.run_decision(&attempt, Verdict::Deny, reason).await,
+            _ => Verdict::Allow,
+        }
     }
 }
 
@@ -258,10 +275,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_unknown_name_refused_when_strict() {
-        // default_external = ask + no approver -> deny (refused), strict resolution.
+    async fn dns_unknown_name_resolves_and_is_gated_at_connect() {
+        // default_external = ask: the name RESOLVES (resolution can't block on a
+        // human); egress is gated at connect-time, not here.
         let s = state(NetworkPolicy::default());
-        assert_eq!(s.decide_dns("evil.test", "A").await, Verdict::Deny);
+        assert_eq!(s.decide_dns("evil.test", "A").await, Verdict::Allow);
     }
 
     #[tokio::test]
@@ -284,15 +302,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dns_tunnel_on_allowed_parent_escalates_to_ask() {
+    async fn dns_tunnel_on_allowed_parent_is_refused() {
         // Allow the parent, but a high-entropy/long label under it is suspicious →
-        // escalated to ask; with no approver that fails closed to deny.
+        // refused outright (a DNS tunnel has no later connection to gate).
         let mut p = NetworkPolicy::default();
         p.allow.domains.push("evil.com".into());
         let s = state(p);
         let tunnel = "mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dzpiztgmzr.evil.com";
-        assert_eq!(s.decide_dns(tunnel, "A").await, Verdict::Deny); // ask → fail-closed
-                                                                    // A normal name under the same allowed parent still resolves.
+        assert_eq!(s.decide_dns(tunnel, "A").await, Verdict::Deny);
+        // A normal name under the same allowed parent still resolves.
         assert_eq!(s.decide_dns("api.evil.com", "A").await, Verdict::Allow);
     }
 
