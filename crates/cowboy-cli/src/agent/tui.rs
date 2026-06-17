@@ -879,10 +879,17 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             }
             KeyCode::Char('e') => {
                 // End the session: drop the task sender so the agent finalizes.
+                // Dropping it hangs up the bridge's command channel, which sends
+                // `End` to the worker; the worker finalizes and broadcasts
+                // `Ended`, which arrives as `UiEvent::Done`. Close the overlay so
+                // the user sees the transcript + "ending session…" while that
+                // round-trip happens (otherwise the menu lingers and it looks like
+                // the key did nothing).
                 ctx.task_tx.take();
                 if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
                     tok.cancel();
                 }
+                app.mode = ctx.mode_before_overlay.clone();
                 app.status = "ending session…".into();
             }
             _ => {}

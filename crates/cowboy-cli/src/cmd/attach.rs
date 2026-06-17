@@ -237,6 +237,13 @@ pub async fn bridge(
         }
     });
 
+    // A local detach (the user chose "detach" in the pause menu) leaves the
+    // session running, so no `Ended` is coming. The reader would then block
+    // forever waiting for the worker to close the socket, hanging the client's
+    // `handle.join()`. cmd_pump signals this channel so the bridge tears itself
+    // down immediately instead.
+    let (detach_tx, detach_rx) = tokio::sync::oneshot::channel::<()>();
+
     // UI commands (blocking std recv) -> ClientMsg. On hangup, end the session.
     // A read-only client drops input but still drains the channel and ends on
     // hangup; it must never send `End` (that would stop a session it's only
@@ -244,10 +251,11 @@ pub async fn bridge(
     let cmd_out = out_tx.clone();
     let cmd_pump = tokio::task::spawn_blocking(move || {
         while let Ok(cmd) = task_rx.recv() {
-            // An explicit detach leaves the session running; stop the pump
-            // without sending End.
+            // An explicit detach leaves the session running; tell the worker, then
+            // signal the bridge to exit without waiting for an `Ended`.
             if let AgentCmd::Detach = cmd {
                 let _ = cmd_out.send(ClientMsg::Detach);
+                let _ = detach_tx.send(());
                 return;
             }
             if read_only {
@@ -294,23 +302,39 @@ pub async fn bridge(
         }
     });
 
-    // Reader: worker ServerMsg -> UiEvent (+ reply synthesis).
-    let mut reader = BufReader::new(r);
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+    // Reader: worker ServerMsg -> UiEvent (+ reply synthesis). Runs as a task so a
+    // local detach can tear the bridge down without waiting on it — otherwise it
+    // would block on `read_line` until the worker closes the socket, which never
+    // happens for a detach (the session stays up).
+    let read_out = out_tx.clone();
+    let mut reader_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(msg) = serde_json::from_str::<ServerMsg>(line.trim()) else {
+                continue;
+            };
+            if !handle_server_msg(msg, &ui_tx, &read_out) {
+                break; // Ended
+            }
         }
-        let Ok(msg) = serde_json::from_str::<ServerMsg>(line.trim()) else {
-            continue;
-        };
-        if !handle_server_msg(msg, &ui_tx, &out_tx) {
-            break; // Ended
-        }
+    });
+
+    // Exit when the worker ends/closes the socket, or when the user detaches.
+    tokio::select! {
+        _ = &mut reader_task => {}
+        _ = detach_rx => {}
     }
 
+    // Aborting the reader/writer drops both socket halves, closing the connection
+    // so the worker's client handler sees EOF and tears down its side too (the
+    // session keeps running; only the now-detached client goes away).
+    reader_task.abort();
     interrupts.abort();
     cmd_pump.abort();
     writer.abort();

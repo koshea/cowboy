@@ -222,6 +222,35 @@ fn interrupt_cancels_a_running_turn() {
     std::thread::sleep(Duration::from_millis(300));
 }
 
+/// `Detach` closes *that* client's connection promptly but leaves the session
+/// running: the worker breaks its per-client serve loop (so the client's read
+/// EOFs without waiting on a turn or an `Ended` that never comes), and a fresh
+/// client can still attach. This is the worker half of the pause-menu "detach".
+#[test]
+fn detach_closes_client_but_keeps_session_alive() {
+    let fx = setup();
+    let ws = start(&fx, None);
+    let mut a = Client::connect(&ws, Duration::from_secs(8));
+
+    // Detach: the worker should close this connection (EOF) well before the
+    // 8s read timeout — i.e. a real close, not a timeout.
+    let started = Instant::now();
+    a.send(&ClientMsg::Detach);
+    assert!(
+        a.recv().is_none(),
+        "detach should close the client connection (EOF)"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "detach close should be prompt, not the read timeout"
+    );
+
+    // The session is still alive: a new client attaches and gets a Snapshot.
+    let mut b = Client::connect(&ws, Duration::from_secs(8));
+    b.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 /// `SwitchModel` swaps the model when the name resolves and reports a failure
 /// (without crashing the session) when it doesn't. Exercised while idle (no
 /// turn), so no model call happens.
