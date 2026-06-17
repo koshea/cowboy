@@ -486,7 +486,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    agent.shutdown().await;
+    // Bounded: `shutdown` execs into the container to stop managed processes, and
+    // a wedged/unresponsive container must not keep the worker alive after End —
+    // the process has to exit so the daemon stops reporting the session Running.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
     agent.finalize_session();
     emitter.end("session ended");
     if args.register {
