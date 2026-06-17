@@ -1,5 +1,6 @@
 # cowboy-gateway image: the sole-egress network gateway.
-# Build from the repo root:  docker build -f docker/gateway.Dockerfile -t cowboy/gateway:local .
+# Build from the repo root (or `docker/build.sh gateway`):
+#   docker build -f docker/gateway.Dockerfile -t ghcr.io/koshea/cowboy/gateway:<version> .
 FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

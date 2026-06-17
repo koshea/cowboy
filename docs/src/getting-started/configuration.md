@@ -12,14 +12,14 @@ the agent cannot read it even though it lives under `.cowboy/`.
 ```yaml
 version: 1
 container:
-  image: cowboy/agent:local      # built locally on first run
+  # image: ghcr.io/koshea/cowboy/agent:0.1.0  # omit = version-pinned default (pulled from GHCR)
   workdir: /workspace
   mounts:
     - { source: ".", target: /workspace, mode: rw }
   privileged: false              # doctor warns if true
   docker_socket: false           # doctor warns if true
-  memory: 8g
-  cpus: 4
+  memory: 8g                     # or `auto` (¼ host RAM, 4g–16g); omit = unlimited
+  cpus: 2                        # number or `auto` (½ host cores, 2–8); omit = unlimited
 networks:
   isolated: { enabled: true }    # bring up the sole-egress gateway
   compose:  { approved: [] }     # Docker/Compose networks the agent may join
@@ -31,6 +31,16 @@ secrets:
   env:
     - { name: GITHUB_TOKEN, source_env: COWBOY_GITHUB_TOKEN, required: false }
 ```
+
+**Resource limits.** `cpus`/`memory` are cgroup limits (a number/size, or `auto` to
+size from the host, or omit for unlimited). `cpus` also **bounds build
+parallelism**: a CPU/memory limit doesn't change what `nproc` reports inside the
+container, so without help `make`/`ruby-build`/`cargo` would spawn host-`nproc`-many
+jobs and OOM a small container. Cowboy therefore injects `MAKEFLAGS=-j{cpus}` (and
+`MAKE_OPTS`, `CARGO_BUILD_JOBS`, `npm_config_jobs`, `CMAKE_BUILD_PARALLEL_LEVEL`,
+`MISE_JOBS`) so builds use the *allotted* CPUs. The default `cpus: 2` keeps `8g`
+comfortable; raise both (or use `auto`) for heavier builds. If a build OOMs
+(`exit 137`), give it more `cpus`/`memory`.
 
 ## `agent.yaml` (mounted, agent-editable)
 

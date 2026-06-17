@@ -224,6 +224,41 @@ Presets cover common tools (`gh`, `aws`, `gcloud`, `kubectl`, `git`, `ssh`) — 
 overlay); the credential is mounted read-only and its *value* never lands in
 config. See [Configuration](getting-started/configuration.md).
 
+## Customize the agent image (per repo)
+
+When a repo needs tools the base image lacks (system libraries, extra languages,
+build headers like `libpq-dev` for the `pg` gem), commit a **`.cowboy/Dockerfile`**
+that extends the base image:
+
+```dockerfile
+# .cowboy/Dockerfile
+FROM ghcr.io/koshea/cowboy/agent:0.1.0
+RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+That's it — commit it and **every contributor's next session automatically builds
+and uses it**; no flags or extra config. Cowboy builds the base first, then your
+image, tagged by the file's content so **editing the Dockerfile rebuilds it** (end
+the session / `cowboy down` first so the container is recreated on the new image).
+
+Notes:
+- Always `FROM` the cowboy base image (`ghcr.io/koshea/cowboy/agent:<version>`) so
+  you inherit the toolchains, `mise`, the in-container `cowboy` helper, and the
+  security wiring. Match the tag to your installed `cowboy --version` (contributors
+  building from source get that tag built locally); cowboy ensures the base exists
+  before building your image.
+- The build context is the repo root, so you can `COPY` project files; add a
+  `.dockerignore` if the repo is large.
+- Building runs the Dockerfile on each contributor's machine — the same trust as
+  the repo's other build scripts (it changes only what's *inside* the sandbox; the
+  network/credential boundary is unchanged).
+- For a fully custom or registry image instead, set `container.image` (and
+  optionally `container.dockerfile`) in `.cowboy/security.yaml`.
+- If a build is killed with `exit 137` (out of memory), raise `cpus`/`memory` in
+  `.cowboy/security.yaml` (build parallelism follows `cpus`) — see
+  [Configuration](getting-started/configuration.md).
+
 ## Use a skill
 
 Skills are reusable, named prompts. Type `/` in the TUI to autocomplete the

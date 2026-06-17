@@ -17,7 +17,9 @@ use std::process::Command as Std;
 use assert_cmd::Command;
 use assert_fs::prelude::*;
 
-const GATEWAY_IMAGE: &str = "cowboy/gateway:local";
+// Use the runtime's own image name so the locally-built tag matches what the
+// gateway expects (version-pinned GHCR name).
+use cowboy_cli::net::gateway::GATEWAY_IMAGE;
 
 fn docker_available() -> bool {
     Std::new("docker")
@@ -254,7 +256,10 @@ fn dns_resolution_is_policy_gated() {
         let _ = Std::new("docker").args(["network", "rm", id]).output();
     }
 
-    assert!(allowed, "allow-listed cloudflare.com should resolve + connect");
+    assert!(
+        allowed,
+        "allow-listed cloudflare.com should resolve + connect"
+    );
     assert!(
         !refused,
         "un-allowed example.com must be REFUSED at the resolver (no exfil channel)"

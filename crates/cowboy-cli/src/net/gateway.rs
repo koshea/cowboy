@@ -18,8 +18,10 @@ use cowboy_core::config::SecurityConfig;
 
 use super::docker::{BindMount, ContainerSpec, DockerCli, NetworkSpec};
 
-/// The gateway image (built from `docker/gateway.Dockerfile`).
-pub const GATEWAY_IMAGE: &str = "cowboy/gateway:local";
+/// The gateway image, version-pinned to this binary (built from
+/// `docker/gateway.Dockerfile` when developing, pulled from GHCR otherwise).
+pub const GATEWAY_IMAGE: &str =
+    concat!("ghcr.io/koshea/cowboy/gateway:", env!("CARGO_PKG_VERSION"));
 
 /// Per-project docker object names derived from the project hash:
 /// `(internal_net, egress_net, gateway_container)`.
@@ -169,12 +171,14 @@ impl GatewayNetwork {
                 .await?;
         }
 
-        if !docker.image_exists(GATEWAY_IMAGE).await? {
-            anyhow::bail!(
-                "gateway image {GATEWAY_IMAGE} not found; build it with:\n  \
-                 docker build -f docker/gateway.Dockerfile -t {GATEWAY_IMAGE} ."
-            );
-        }
+        super::runtime::ensure_image_available(
+            docker,
+            GATEWAY_IMAGE,
+            "gateway.Dockerfile",
+            super::runtime::default_image_source_root().as_deref(),
+        )
+        .await
+        .context("ensuring the gateway image (refusing to run the agent unsandboxed)")?;
 
         match docker.container_state(&self.gateway_name).await? {
             super::docker::ContainerState::Running => {}

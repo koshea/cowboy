@@ -13,8 +13,12 @@ cargo nextest run                          # unit + integration (Docker E2E auto
 cargo test --doc
 cargo clippy --workspace --all-targets     # must be clean
 cargo fmt --all                            # rustfmt defaults
-docker/build.sh                            # build the container images
+docker/build.sh                            # build the agent + gateway images from source
 ```
+
+A source checkout builds the agent/gateway images from your tree automatically
+(installed-from-git binaries pull from GHCR instead); `docker/build.sh` just does
+it eagerly. Set `COWBOY_SRC` to force source builds from any binary.
 
 The `#[ignore]` end-to-end tests are the **manually-run suite** for model-dependent
 behavior (run with `cargo test -p cowboy-cli --test daemon_e2e -- --ignored`).

@@ -86,8 +86,8 @@ pub async fn run() -> Result<()> {
     r.check(
         "gateway image",
         image_present(
-            "cowboy/gateway:local",
-            "not built; run `docker/build.sh gateway`",
+            crate::net::gateway::GATEWAY_IMAGE,
+            "missing; pulled from GHCR on first run (or `docker/build.sh gateway`)",
         ),
     );
 
@@ -318,10 +318,10 @@ fn image_present(image: &str, warn: &str) -> Status {
 fn check_image(security: &Path) -> Status {
     let image = SecurityConfig::load(security)
         .map(|c| c.container.image)
-        .unwrap_or_else(|_| "cowboy/agent:local".to_string());
+        .unwrap_or_else(|_| cowboy_core::config::ContainerConfig::default().image);
     image_present(
         &image,
-        &format!("{image} not built; run `docker/build.sh agent` (or it builds on first run)"),
+        &format!("{image} missing; pulled from GHCR on first run (or `docker/build.sh agent`)"),
     )
 }
 

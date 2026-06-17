@@ -1,8 +1,9 @@
 # Default cowboy agent image: batteries-included dev environment with the
 # in-container `cowboy` helper baked in.
 #
-# Build from the repo root:
-#   docker build -f docker/agent.Dockerfile -t cowboy/agent:local .
+# Build from the repo root (or just `docker/build.sh agent`, which tags it with
+# the version-pinned name the `cowboy` binary expects):
+#   docker build -f docker/agent.Dockerfile -t ghcr.io/koshea/cowboy/agent:<version> .
 
 # --- stage 1: build the in-container `cowboy` helper ---
 FROM rust:1-bookworm AS build
@@ -24,13 +25,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/share/mise/shims:/usr/local/cargo/bin:/usr/local/go/bin:$PATH
 
 # Core CLI tooling + language toolchains commonly needed by coding tasks.
+# The lib*-dev set is the standard ruby-build / native-extension dependency set so
+# `mise install` can compile language runtimes from source — notably Ruby, whose
+# psych (libyaml), fiddle (libffi), and zlib extensions otherwise fail to build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash git curl wget ca-certificates \
         ripgrep fd-find jq \
         python3 python3-pip python3-venv \
         nodejs npm \
-        build-essential make gcc pkg-config \
+        build-essential make gcc pkg-config autoconf bison \
         libssl-dev openssl \
+        libyaml-dev libffi-dev zlib1g-dev \
+        libreadline-dev libgmp-dev libncurses-dev libgdbm-dev libdb-dev uuid-dev \
         sqlite3 postgresql-client redis-tools \
         iproute2 util-linux \
     && ln -sf /usr/bin/fdfind /usr/local/bin/fd \

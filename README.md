@@ -15,14 +15,16 @@ never by prompting the model.
 ## Quick start
 
 ```sh
-cargo install --path crates/cowboy-cli   # installs `cowboy` to ~/.cargo/bin
-docker/build.sh                          # build the agent + gateway images
+cargo install --git https://github.com/koshea/cowboy cowboy-cli   # installs `cowboy` + `cowboyd`
 cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
 cd your-project
 cowboy init                              # writes .cowboy/{security,agent}.yaml
 cowboy doctor                            # check Docker, Linux, nft, model, Compose
 cowboy "run the tests and fix one simple failure"
 ```
+
+The agent + gateway images are **pulled from GHCR on first run**, pinned to your
+binary's version (`ghcr.io/koshea/cowboy/{agent,gateway}`) — no image build step.
 
 **Providers vs. models.** Provider credentials (endpoint URL + API key) are
 host-owned: `cowboy models setup` saves them to `~/.config/cowboy/providers.yaml`
@@ -69,6 +71,11 @@ docs/
 
 ## Development
 
+Install from a checkout (`cargo install --path crates/cowboy-cli`) and cowboy
+builds the agent/gateway images from *your* source instead of pulling, so local
+Dockerfile changes take effect automatically. `docker/build.sh` builds them
+explicitly; `COWBOY_SRC=/path/to/cowboy` forces source builds from any binary.
+
 ```sh
 cargo nextest run                   # unit + integration (Docker E2E auto-skips if absent)
 cargo test --doc                    # doctests (nextest doesn't run these)
@@ -81,8 +88,6 @@ LLVM_COV=/usr/lib/llvm/<v>/bin/llvm-cov \
 LLVM_PROFDATA=/usr/lib/llvm/<v>/bin/llvm-profdata \
   cargo llvm-cov nextest --summary-only
 ```
-
-Build the container images: `docker/build.sh` (or `docker/build.sh agent|gateway`).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor guide and
 [SECURITY.md](SECURITY.md) for reporting vulnerabilities.

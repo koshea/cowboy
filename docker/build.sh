@@ -10,8 +10,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-AGENT_IMAGE="${COWBOY_AGENT_IMAGE:-cowboy/agent:local}"
-GATEWAY_IMAGE="${COWBOY_GATEWAY_IMAGE:-cowboy/gateway:local}"
+# Tag with the same version-pinned GHCR names the `cowboy` binary expects, so a
+# local build is picked up directly (the binary uses an image that already
+# exists locally instead of pulling). Override with COWBOY_*_IMAGE for ad-hoc tags.
+VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+AGENT_IMAGE="${COWBOY_AGENT_IMAGE:-ghcr.io/koshea/cowboy/agent:${VERSION}}"
+GATEWAY_IMAGE="${COWBOY_GATEWAY_IMAGE:-ghcr.io/koshea/cowboy/gateway:${VERSION}}"
 
 build_agent() {
     echo "==> building $AGENT_IMAGE (batteries-included; this takes a few minutes)"

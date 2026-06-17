@@ -32,23 +32,43 @@ you want multiple models, budgets, or failover.
 
 ## Install the binaries
 
-```sh
-cargo install --path crates/cowboy-cli   # installs `cowboy` (and `cowboyd`) to ~/.cargo/bin
-```
-
-## Build the container images
-
-The agent and gateway run from local images:
+Install straight from GitHub (needs a Rust toolchain — [rustup](https://rustup.rs)):
 
 ```sh
-docker/build.sh                 # build both
-docker/build.sh agent           # or just one
-docker/build.sh gateway
+cargo install --git https://github.com/koshea/cowboy cowboy-cli
 ```
 
-The default agent image is `cowboy/agent:local`; the gateway is
-`cowboy/gateway:local`. The agent image is also built automatically on first run
-if missing.
+This builds and installs `cowboy` (and the `cowboyd` daemon) to `~/.cargo/bin`.
+
+## Container images
+
+You don't build anything. On first run, cowboy **pulls** its agent and gateway
+images from GHCR, **pinned to your binary's version** so they always match:
+
+- `ghcr.io/koshea/cowboy/agent:<version>` (multi-arch: amd64 + arm64)
+- `ghcr.io/koshea/cowboy/gateway:<version>`
+
+Upgrading the binary (`cargo install --git … --force`) moves you to the matching
+images automatically. To customize the agent image, commit a
+[`.cowboy/Dockerfile`](../how-to.md) (`FROM` the base) — it's built per-repo on top
+of the pulled base, so contributors share it without any local image work.
+
+## Developing cowboy
+
+If you've **cloned the repo**, cowboy builds the images from *your* source instead
+of pulling — so local Dockerfile changes take effect with no extra steps:
+
+```sh
+git clone https://github.com/koshea/cowboy && cd cowboy
+cargo install --path crates/cowboy-cli   # source-installed binary auto-builds local images
+```
+
+- `docker/build.sh [agent|gateway]` builds them explicitly (tagged with the
+  version-pinned names, so the binary picks them up without pulling).
+- `COWBOY_SRC=/path/to/cowboy` forces source builds from any binary.
+
+A binary installed via `cargo install --git` is treated as an *end user* (it pulls),
+even though cargo caches the checkout under `~/.cargo`.
 
 ## Configure a model provider
 

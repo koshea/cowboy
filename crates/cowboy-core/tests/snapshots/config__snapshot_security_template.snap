@@ -8,7 +8,12 @@ version: 1
 # mounted into the agent container. The agent cannot see or edit this file.
 
 container:
-  image: cowboy/agent:local
+  # The agent image. Omitted = the version-pinned default
+  # (ghcr.io/koshea/cowboy/agent:<version>), pulled from GHCR on first run so it
+  # tracks your `cowboy` binary on upgrade. Uncomment to pin or use your own.
+  # image: ghcr.io/koshea/cowboy/agent:0.1.0
+  # A committed .cowboy/Dockerfile (FROM the base) is auto-detected and built
+  # per-repo; or point `dockerfile:` at your own.
   # dockerfile: ./Dockerfile.cowboy
   build: false
   workdir: /workspace
@@ -18,8 +23,12 @@ container:
       mode: rw
   privileged: false
   docker_socket: false
+  # Resource limits. `cpus` also bounds build parallelism: the agent runs builds
+  # with `-j{cpus}` (make/ruby-build/cargo/npm/cmake) so a `make` can't spawn
+  # host-nproc-many jobs and OOM the container. Use `auto` to size from the host
+  # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
   memory: 8g
-  cpus: 4
+  cpus: 2
 
 networks:
   isolated:

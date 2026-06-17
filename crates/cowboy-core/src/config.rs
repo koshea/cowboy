@@ -68,10 +68,62 @@ pub struct ContainerConfig {
     pub privileged: bool,
     #[serde(default)]
     pub docker_socket: bool,
+    /// Container memory limit (e.g. `8g`), or `auto` to size from the host. None =
+    /// unlimited. See [`crate::config`] resolution in the runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
+    /// Container CPU limit: a number (e.g. `2`) or `auto` (sized from the host).
+    /// Also bounds build parallelism — the runtime injects `-j{cpus}` build env so
+    /// `make`/`ruby-build`/etc. don't run host-`nproc`-many jobs. None = unlimited.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpus: Option<f64>,
+    pub cpus: Option<CpuLimit>,
+}
+
+/// A CPU limit: an explicit core count, or `auto` (resolved from the host).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CpuLimit {
+    Auto,
+    Cores(f64),
+}
+
+impl Serialize for CpuLimit {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self {
+            CpuLimit::Auto => s.serialize_str("auto"),
+            CpuLimit::Cores(n) => s.serialize_f64(*n),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for CpuLimit {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        // Accept either a number or the string "auto".
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Num(f64),
+            Str(String),
+        }
+        match Repr::deserialize(d)? {
+            Repr::Num(n) => Ok(CpuLimit::Cores(n)),
+            Repr::Str(s) if s.eq_ignore_ascii_case("auto") => Ok(CpuLimit::Auto),
+            Repr::Str(s) => Err(serde::de::Error::custom(format!(
+                "cpus must be a number or \"auto\", got {s:?}"
+            ))),
+        }
+    }
+}
+
+/// `auto` CPU limit from the host's logical core count: half the cores, clamped to
+/// [2, 8] — leaves headroom and keeps build parallelism (and memory) bounded.
+pub fn auto_cpus(host_cores: usize) -> f64 {
+    ((host_cores / 2).clamp(2, 8)) as f64
+}
+
+/// `auto` memory limit (MiB) from the host's total RAM: a quarter, clamped to
+/// [4 GiB, 16 GiB].
+pub fn auto_mem_mib(host_total_mib: u64) -> u64 {
+    (host_total_mib / 4).clamp(4096, 16384)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -502,7 +554,10 @@ fn default_true() -> bool {
     true
 }
 fn default_image() -> String {
-    "cowboy/agent:local".to_string()
+    // Version-pinned to this binary; published to GHCR by the release workflow and
+    // pulled on first run (or built from source when developing). Keep the
+    // registry path in sync with `cowboy-cli`'s `DEFAULT_IMAGE`.
+    concat!("ghcr.io/koshea/cowboy/agent:", env!("CARGO_PKG_VERSION")).to_string()
 }
 fn default_workdir() -> String {
     "/workspace".to_string()
@@ -1021,7 +1076,12 @@ const SECURITY_TEMPLATE: &str = r#"version: 1
 # mounted into the agent container. The agent cannot see or edit this file.
 
 container:
-  image: cowboy/agent:local
+  # The agent image. Omitted = the version-pinned default
+  # (ghcr.io/koshea/cowboy/agent:<version>), pulled from GHCR on first run so it
+  # tracks your `cowboy` binary on upgrade. Uncomment to pin or use your own.
+  # image: ghcr.io/koshea/cowboy/agent:0.1.0
+  # A committed .cowboy/Dockerfile (FROM the base) is auto-detected and built
+  # per-repo; or point `dockerfile:` at your own.
   # dockerfile: ./Dockerfile.cowboy
   build: false
   workdir: /workspace
@@ -1031,8 +1091,12 @@ container:
       mode: rw
   privileged: false
   docker_socket: false
+  # Resource limits. `cpus` also bounds build parallelism: the agent runs builds
+  # with `-j{cpus}` (make/ruby-build/cargo/npm/cmake) so a `make` can't spawn
+  # host-nproc-many jobs and OOM the container. Use `auto` to size from the host
+  # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
   memory: 8g
-  cpus: 4
+  cpus: 2
 
 networks:
   isolated:

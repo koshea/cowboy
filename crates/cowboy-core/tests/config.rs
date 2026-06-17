@@ -308,6 +308,37 @@ fn partial_agent_yaml_uses_defaults() {
     assert!(a.processes.is_empty());
 }
 
+#[test]
+fn cpus_accepts_number_or_auto() {
+    // A bare number.
+    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\ncpus: 2\n").unwrap();
+    assert_eq!(c.cpus, Some(CpuLimit::Cores(2.0)));
+    // The `auto` keyword (case-insensitive).
+    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\ncpus: auto\n").unwrap();
+    assert_eq!(c.cpus, Some(CpuLimit::Auto));
+    // Absent → None (unlimited).
+    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\n").unwrap();
+    assert_eq!(c.cpus, None);
+    // Garbage is rejected.
+    assert!(serde_yaml_ng::from_str::<ContainerConfig>("image: x\ncpus: lots\n").is_err());
+    // Round-trips.
+    let yaml = serde_yaml_ng::to_string(&CpuLimit::Auto).unwrap();
+    assert_eq!(yaml.trim(), "auto");
+}
+
+#[test]
+fn auto_resource_clamps() {
+    // cpus = half the cores, clamped to [2, 8].
+    assert_eq!(auto_cpus(1), 2.0);
+    assert_eq!(auto_cpus(4), 2.0);
+    assert_eq!(auto_cpus(32), 8.0);
+    assert_eq!(auto_cpus(12), 6.0);
+    // memory = quarter of RAM, clamped to [4 GiB, 16 GiB] (MiB).
+    assert_eq!(auto_mem_mib(8 * 1024), 4096); // 8 GiB host → 2 GiB → clamp 4 GiB
+    assert_eq!(auto_mem_mib(64 * 1024), 16384); // 64 GiB → 16 GiB → clamp 16 GiB
+    assert_eq!(auto_mem_mib(32 * 1024), 8192); // 32 GiB → 8 GiB
+}
+
 // Snapshot the rendered templates so changes are reviewed deliberately.
 #[test]
 fn snapshot_security_template() {

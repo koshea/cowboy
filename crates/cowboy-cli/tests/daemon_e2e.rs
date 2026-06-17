@@ -10,7 +10,8 @@
 //!
 //! Each test self-skips (prints why, returns Ok) when its prerequisites are
 //! absent, so `--ignored` is safe to run anywhere. The "turn" test needs Docker,
-//! the `cowboy/agent:local` image, and a model provider in `~/.config/cowboy`;
+//! the default agent image (built from source on first run, or pulled), and a
+//! model provider in `~/.config/cowboy`;
 //! the rest only need a model *provider* to exist (the worker resolves one at
 //! startup but, with no task, never calls it), so they supply a fake one.
 
@@ -1306,7 +1307,7 @@ fn e2e_subagent_runs_in_held_worktree() {
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.
 #[test]
-#[ignore = "real Docker + model: needs docker, cowboy/agent:local, and ~/.config/cowboy"]
+#[ignore = "real Docker + model: needs docker, the agent image, and ~/.config/cowboy"]
 fn e2e_turn_streams_detach_keeps_running_then_reattach_replays() {
     if !docker_ok() {
         eprintln!("skipping: docker not available");

@@ -16,7 +16,9 @@ use cowboy_core::config::{self, SecurityConfig};
 use super::docker::{BindMount, ContainerSpec, ContainerState, DockerCli, ExecResult};
 use super::gateway::GatewayNetwork;
 
-const DEFAULT_IMAGE: &str = "cowboy/agent:local";
+/// The default agent image, version-pinned to this binary so a given `cowboy`
+/// always runs a matching image (published to GHCR by the release workflow).
+const DEFAULT_IMAGE: &str = concat!("ghcr.io/koshea/cowboy/agent:", env!("CARGO_PKG_VERSION"));
 /// The image's `MISE_DATA_DIR` (toolchain store). Keep in sync with
 /// `docker/agent.Dockerfile`; a host cache is bind-mounted here to persist
 /// installs across container recreations.
@@ -25,12 +27,28 @@ const MISE_DATA_DIR: &str = "/usr/local/share/mise";
 /// bundled images when `COWBOY_SRC` is not set.
 const COMPILE_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
+/// A locally-built agent image: which Dockerfile + build context to use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DerivedImage {
+    dockerfile: PathBuf,
+    context: PathBuf,
+    /// Ensure the bundled base ([`DEFAULT_IMAGE`]) first so a `FROM` of it in the
+    /// Dockerfile resolves (true for auto-detected `.cowboy/Dockerfile`; false for
+    /// an explicitly-configured dockerfile).
+    ensure_base: bool,
+}
+
 /// Orchestrates the agent container for a single project.
 pub struct AgentRuntime {
     docker: Box<dyn DockerCli>,
     root: PathBuf,
     security: SecurityConfig,
     container_name: String,
+    /// The resolved image this project runs (the configured image, or a per-repo
+    /// image built from `.cowboy/Dockerfile` — see [`resolve_image`]).
+    image: String,
+    /// Set when `image` must be built locally rather than pulled.
+    derived: Option<DerivedImage>,
     /// The agent runs as this `uid:gid` (the host user) so it isn't root and
     /// files it creates in the mounted workspace are owned by the user.
     user: Option<String>,
@@ -55,6 +73,9 @@ impl AgentRuntime {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| container_name_for(&root));
+        // Resolve the effective image: a committed `.cowboy/Dockerfile` produces a
+        // per-repo image built on demand; otherwise the configured image.
+        let (image, derived) = resolve_image(&root, &security.container);
         // Fail CLOSED: if network isolation is requested but the gateway can't be
         // built, refuse to run rather than silently dropping to an unsandboxed
         // container (default bridge, full egress, caps intact). `None` means
@@ -74,6 +95,8 @@ impl AgentRuntime {
             root,
             security,
             container_name,
+            image,
+            derived,
             user: Some(host_user()),
             gateway,
             secret_cache: std::sync::Mutex::new(None),
@@ -233,16 +256,31 @@ impl AgentRuntime {
             None => (None, None, Vec::new(), Vec::new(), Vec::new()),
         };
 
+        // Resolve cpu/memory limits (honoring `auto`) and, when a cpu limit applies,
+        // cap build parallelism: inject `-j{cpus}` build env so make/ruby-build/etc.
+        // size jobs from the allotted CPUs, not the host's `nproc` (which a cgroup
+        // cpu quota does NOT change) — preventing 32-way builds from OOMing the box.
+        let res = resolve_resources(c);
+        if let Some(jobs) = res.jobs {
+            let j = jobs.to_string();
+            env.push(("MAKEFLAGS".into(), format!("-j{j}")));
+            env.push(("MAKE_OPTS".into(), format!("-j{j}")));
+            env.push(("CARGO_BUILD_JOBS".into(), j.clone()));
+            env.push(("npm_config_jobs".into(), j.clone()));
+            env.push(("CMAKE_BUILD_PARALLEL_LEVEL".into(), j.clone()));
+            env.push(("MISE_JOBS".into(), j));
+        }
+
         Ok(ContainerSpec {
             name: self.container_name.clone(),
-            image: c.image.clone(),
+            image: self.image.clone(),
             workdir: c.workdir.clone(),
             mounts,
             env,
             network,
             ip,
-            memory: c.memory.clone(),
-            cpus: c.cpus,
+            memory: res.memory,
+            cpus: res.cpus,
             cap_drop,
             cap_add: Vec::new(),
             sysctls,
@@ -253,40 +291,48 @@ impl AgentRuntime {
         })
     }
 
-    /// Ensure the configured image is available, building or pulling as needed.
+    /// Ensure the resolved image is available, building or pulling as needed.
     pub async fn ensure_image(&self) -> Result<()> {
-        let image = &self.security.container.image;
+        let image = &self.image;
         if self.docker.image_exists(image).await? {
             return Ok(());
         }
 
-        // Explicit dockerfile in config wins.
-        if let Some(df) = &self.security.container.dockerfile {
-            let dockerfile = resolve_source(&self.root, df);
-            tracing::info!(%image, dockerfile = %dockerfile.display(), "building agent image");
+        // A locally-built image (explicit `container.dockerfile` or an auto-detected
+        // `.cowboy/Dockerfile`): build the base first when needed, then the image.
+        if let Some(d) = &self.derived {
+            if d.ensure_base {
+                self.ensure_base_image().await?;
+            }
+            tracing::info!(%image, dockerfile = %d.dockerfile.display(), "building agent image");
             return self
                 .docker
-                .build_image(&dockerfile, &self.root, image)
+                .build_image(&d.dockerfile, &d.context, image)
                 .await;
         }
 
-        // The bundled default image is built from the cowboy source tree.
+        // The default image: built from the cowboy source tree when developing,
+        // pulled from GHCR otherwise.
         if image == DEFAULT_IMAGE {
-            if let Some(src) = default_image_source_root() {
-                let dockerfile = src.join("docker").join("agent.Dockerfile");
-                tracing::info!(%image, src = %src.display(),
-                    "building bundled agent image (first run; this may take a few minutes)");
-                return self.docker.build_image(&dockerfile, &src, image).await;
-            }
-            anyhow::bail!(
-                "agent image {DEFAULT_IMAGE} not found and no source tree to build it from.\n\
-                 Build it with `docker/build.sh agent` (or set COWBOY_SRC to the cowboy repo)."
-            );
+            return self.ensure_base_image().await;
         }
 
         // Otherwise assume it's a registry image.
         tracing::info!(%image, "pulling agent image");
         self.docker.pull_image(image).await
+    }
+
+    /// Ensure the bundled base agent image exists — built from the cowboy source
+    /// tree when developing, pulled from GHCR otherwise (see
+    /// [`ensure_image_available`]). The base a `.cowboy/Dockerfile` extends.
+    async fn ensure_base_image(&self) -> Result<()> {
+        ensure_image_available(
+            &*self.docker,
+            DEFAULT_IMAGE,
+            "agent.Dockerfile",
+            default_image_source_root().as_deref(),
+        )
+        .await
     }
 
     /// Ensure a long-lived agent container is running, creating or starting it.
@@ -622,6 +668,97 @@ pub fn container_name_for(root: &Path) -> String {
     format!("cowboy-agent-{slug}-{:08x}", hash as u32)
 }
 
+/// Resolved container resource limits + the build job count derived from cpus.
+struct ResolvedResources {
+    cpus: Option<f64>,
+    memory: Option<String>,
+    /// `-j` for native builds (set only when a cpu limit applies).
+    jobs: Option<u32>,
+}
+
+/// Resolve `container.cpus`/`memory` (honoring `auto`) into concrete limits and the
+/// build job count. `jobs` is `None` when cpus is unlimited (keep host parallelism).
+fn resolve_resources(c: &config::ContainerConfig) -> ResolvedResources {
+    let cpus: Option<f64> = match c.cpus {
+        None => None,
+        Some(config::CpuLimit::Cores(n)) => Some(n),
+        Some(config::CpuLimit::Auto) => Some(config::auto_cpus(host_cores())),
+    };
+    let jobs = cpus.map(|n| (n.ceil() as u32).max(1));
+    let memory = match c.memory.as_deref() {
+        None => None,
+        // `auto`: a quarter of host RAM, clamped. Unknown host RAM → leave unset.
+        Some(m) if m.eq_ignore_ascii_case("auto") => {
+            host_total_mib().map(|t| format!("{}m", config::auto_mem_mib(t)))
+        }
+        Some(m) => Some(m.to_string()),
+    };
+    ResolvedResources { cpus, memory, jobs }
+}
+
+/// Host logical CPU count (for `cpus: auto`); 1 if it can't be determined.
+fn host_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Host total RAM in MiB from `/proc/meminfo` (Linux); `None` elsewhere.
+fn host_total_mib() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb / 1024);
+        }
+    }
+    None
+}
+
+/// Resolve which image a project runs and whether it must be built locally.
+///
+/// Precedence: an explicit `container.dockerfile` (power users) → build it as the
+/// configured image; else a committed `.cowboy/Dockerfile` (the per-repo, shared
+/// customization) → a derived image tagged by project + the Dockerfile's content
+/// hash (so editing it rebuilds), built `FROM` the base image; else the plain
+/// configured image (default base or a registry image).
+fn resolve_image(
+    root: &Path,
+    container: &config::ContainerConfig,
+) -> (String, Option<DerivedImage>) {
+    if let Some(df) = &container.dockerfile {
+        return (
+            container.image.clone(),
+            Some(DerivedImage {
+                dockerfile: resolve_source(root, df),
+                context: root.to_path_buf(),
+                ensure_base: false,
+            }),
+        );
+    }
+    let cowboy_dockerfile = root.join(config::COWBOY_DIR).join("Dockerfile");
+    if let Ok(bytes) = std::fs::read(&cowboy_dockerfile) {
+        let mut h = DefaultHasher::new();
+        bytes.hash(&mut h);
+        // Per-repo + content-hashed: distinct across repos, and a new tag on edit so
+        // the image rebuilds; an unchanged file reuses the cached image.
+        let tag = format!(
+            "cowboy/agent-{:08x}:{:08x}",
+            project_hash(root),
+            h.finish() as u32
+        );
+        return (
+            tag,
+            Some(DerivedImage {
+                dockerfile: cowboy_dockerfile,
+                context: root.to_path_buf(),
+                ensure_base: true,
+            }),
+        );
+    }
+    (container.image.clone(), None)
+}
+
 /// Resolve a mount source relative to the project root (`.` -> root).
 fn resolve_source(root: &Path, source: &str) -> PathBuf {
     let p = Path::new(source);
@@ -675,19 +812,67 @@ fn ensure_mask_file() -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Locate the cowboy source tree for building the bundled images: `COWBOY_SRC`
-/// if set, else the repo root baked in at compile time. Returns None if neither
-/// contains `docker/agent.Dockerfile`.
-fn default_image_source_root() -> Option<PathBuf> {
-    let candidates = [
-        std::env::var("COWBOY_SRC").ok().map(PathBuf::from),
-        Some(PathBuf::from(COMPILE_REPO_ROOT)),
-    ];
-    candidates
-        .into_iter()
-        .flatten()
-        .find(|p| p.join("docker").join("agent.Dockerfile").exists())
-        .and_then(|p| std::fs::canonicalize(p).ok())
+/// Ensure `image` is available locally: use it if it already exists, build it
+/// from `source_root/docker/<dockerfile>` when a cowboy source tree is present
+/// (the contributor path — picks up local Dockerfile changes), otherwise pull it
+/// from the registry (the end-user path). Fails closed: a pull/build error
+/// propagates so callers never silently proceed without the image.
+pub(crate) async fn ensure_image_available(
+    docker: &dyn DockerCli,
+    image: &str,
+    dockerfile: &str,
+    source_root: Option<&Path>,
+) -> Result<()> {
+    if docker.image_exists(image).await? {
+        return Ok(());
+    }
+    if let Some(src) = source_root {
+        let path = src.join("docker").join(dockerfile);
+        tracing::info!(%image, dockerfile = %path.display(),
+            "building cowboy image from source (this may take a few minutes)");
+        return docker.build_image(&path, src, image).await;
+    }
+    tracing::info!(%image, "pulling cowboy image");
+    docker.pull_image(image).await
+}
+
+/// The cowboy source tree to build bundled images from, or `None` when running as
+/// an installed binary with no checkout (then images are pulled). `COWBOY_SRC`
+/// wins; otherwise the compile-time repo root, but only if it still exists *and*
+/// is not the cargo cache: `cargo install --git` builds under `~/.cargo` and
+/// leaves that checkout around, which must not make an end-user binary try to
+/// build images locally.
+pub(crate) fn default_image_source_root() -> Option<PathBuf> {
+    // Only real source checkouts (containing the Dockerfiles) are candidates.
+    let has_dockerfile = |p: &Path| p.join("docker").join("agent.Dockerfile").exists();
+    let explicit = std::env::var_os("COWBOY_SRC")
+        .map(PathBuf::from)
+        .filter(|p| has_dockerfile(p))
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    let compile_root = std::fs::canonicalize(COMPILE_REPO_ROOT)
+        .ok()
+        .filter(|p| has_dockerfile(p));
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .and_then(|p| std::fs::canonicalize(p).ok());
+    pick_source_root(explicit, compile_root, cargo_home.as_deref())
+}
+
+/// Choose the source root from the (already validated/canonicalized) candidates:
+/// an explicit `COWBOY_SRC` always wins; otherwise the compile-time root, but
+/// only when it is *not* inside the cargo cache (a `cargo install --git` build
+/// leaves its checkout under `~/.cargo`, which must not turn an end-user binary
+/// into a "developer" that builds images locally).
+fn pick_source_root(
+    explicit: Option<PathBuf>,
+    compile_root: Option<PathBuf>,
+    cargo_home: Option<&Path>,
+) -> Option<PathBuf> {
+    if explicit.is_some() {
+        return explicit;
+    }
+    compile_root.filter(|p| cargo_home.is_none_or(|home| !p.starts_with(home)))
 }
 
 #[cfg(test)]
@@ -891,6 +1076,35 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_caps_build_jobs_to_cpus() {
+        use cowboy_core::config::CpuLimit;
+        let (mut rt, _tmp) = fixture(false, MockDockerCli::new());
+
+        // No cpu limit → no build-jobs env (keep host parallelism), no cpus on spec.
+        rt.security.container.cpus = None;
+        let spec = rt.build_spec().unwrap();
+        assert!(!spec.env.iter().any(|(k, _)| k == "MAKEFLAGS"));
+        assert!(spec.cpus.is_none());
+
+        // cpus: 2 → -j2 across the native-build env, and the spec carries cpus=2.
+        rt.security.container.cpus = Some(CpuLimit::Cores(2.0));
+        rt.security.container.memory = Some("8g".into());
+        let spec = rt.build_spec().unwrap();
+        let get = |k: &str| {
+            spec.env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("MAKEFLAGS").as_deref(), Some("-j2"));
+        assert_eq!(get("MAKE_OPTS").as_deref(), Some("-j2"));
+        assert_eq!(get("MISE_JOBS").as_deref(), Some("2"));
+        assert_eq!(get("CARGO_BUILD_JOBS").as_deref(), Some("2"));
+        assert_eq!(spec.cpus, Some(2.0));
+        assert_eq!(spec.memory.as_deref(), Some("8g")); // explicit value passes through
+    }
+
+    #[test]
     fn build_spec_errors_on_missing_required_credential() {
         use cowboy_core::config::SecretMount;
         let (mut rt, _tmp) = fixture(false, MockDockerCli::new());
@@ -926,6 +1140,86 @@ mod tests {
         docker.expect_run_detached().times(1).returning(|_| Ok(()));
         let (rt, _tmp) = fixture(false, docker);
         rt.ensure_running().await.unwrap();
+    }
+
+    #[test]
+    fn resolve_image_precedence_and_content_hash() {
+        use cowboy_core::config::ContainerConfig;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let base = ContainerConfig {
+            image: "cowboy/agent:local".into(),
+            ..Default::default()
+        };
+
+        // 1. Nothing custom → the configured image, no local build.
+        let (img, derived) = resolve_image(root, &base);
+        assert_eq!(img, "cowboy/agent:local");
+        assert!(derived.is_none());
+
+        // 2. A committed .cowboy/Dockerfile → a per-repo derived image (base-first).
+        std::fs::create_dir_all(root.join(".cowboy")).unwrap();
+        std::fs::write(root.join(".cowboy/Dockerfile"), "FROM cowboy/agent:local\n").unwrap();
+        let (img2, derived2) = resolve_image(root, &base);
+        assert!(img2.starts_with("cowboy/agent-"), "derived tag: {img2}");
+        let d2 = derived2.expect("derived build");
+        assert!(d2.ensure_base);
+        assert_eq!(d2.dockerfile, root.join(".cowboy/Dockerfile"));
+        assert_eq!(d2.context, root);
+
+        // 2b. Editing the Dockerfile changes the tag (→ rebuild); same content, same tag.
+        let (img2_again, _) = resolve_image(root, &base);
+        assert_eq!(img2, img2_again, "unchanged file → stable tag (cache hit)");
+        std::fs::write(
+            root.join(".cowboy/Dockerfile"),
+            "FROM cowboy/agent:local\nRUN true\n",
+        )
+        .unwrap();
+        let (img3, _) = resolve_image(root, &base);
+        assert_ne!(img2, img3, "edited file → new tag (rebuild)");
+
+        // 3. An explicit container.dockerfile wins over auto-detect, keeps the
+        //    configured image tag, and does NOT force a base build.
+        std::fs::write(root.join("Custom.Dockerfile"), "FROM scratch\n").unwrap();
+        let explicit = ContainerConfig {
+            image: "myorg/custom:dev".into(),
+            dockerfile: Some("Custom.Dockerfile".into()),
+            ..Default::default()
+        };
+        let (img4, derived4) = resolve_image(root, &explicit);
+        assert_eq!(img4, "myorg/custom:dev");
+        let d4 = derived4.expect("derived build");
+        assert!(!d4.ensure_base);
+    }
+
+    #[tokio::test]
+    async fn ensure_image_builds_derived_from_cowboy_dockerfile() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cowboy")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cowboy/Dockerfile"),
+            "FROM cowboy/agent:local\nRUN touch /opt/marker\n",
+        )
+        .unwrap();
+
+        let mut docker = MockDockerCli::new();
+        // Base present → ensure_base short-circuits; derived tag absent → build it.
+        docker
+            .expect_image_exists()
+            .returning(|img| Ok(img == DEFAULT_IMAGE));
+        docker.expect_build_image().times(1).returning(|_, _, tag| {
+            assert!(
+                tag.starts_with("cowboy/agent-"),
+                "builds the derived tag: {tag}"
+            );
+            Ok(())
+        });
+
+        let mut security = SecurityConfig::default();
+        security.networks.isolated.enabled = false; // image building only; skip gateway
+        let rt = AgentRuntime::new(Box::new(docker), tmp.path().to_path_buf(), security).unwrap();
+        assert!(rt.derived.as_ref().is_some_and(|d| d.ensure_base));
+        rt.ensure_image().await.unwrap();
     }
 
     #[tokio::test]
@@ -1047,5 +1341,100 @@ mod tests {
         assert!(common.is_dir());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn default_images_are_version_pinned_ghcr() {
+        let v = env!("CARGO_PKG_VERSION");
+        assert_eq!(DEFAULT_IMAGE, format!("ghcr.io/koshea/cowboy/agent:{v}"));
+        assert_eq!(
+            crate::net::gateway::GATEWAY_IMAGE,
+            format!("ghcr.io/koshea/cowboy/gateway:{v}")
+        );
+        // The cowboy-core config default must match the cli's runtime default.
+        assert_eq!(
+            cowboy_core::config::ContainerConfig::default().image,
+            DEFAULT_IMAGE
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_image_available_uses_existing_image() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_image_exists()
+            .times(1)
+            .returning(|_| Ok(true));
+        docker.expect_build_image().never();
+        docker.expect_pull_image().never();
+        ensure_image_available(&docker, "x:1", "agent.Dockerfile", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_image_available_builds_when_source_present() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_image_exists()
+            .times(1)
+            .returning(|_| Ok(false));
+        docker
+            .expect_build_image()
+            .times(1)
+            .withf(|dockerfile, context, tag| {
+                dockerfile.ends_with("docker/agent.Dockerfile")
+                    && context == Path::new("/src/cowboy")
+                    && tag == "x:1"
+            })
+            .returning(|_, _, _| Ok(()));
+        docker.expect_pull_image().never();
+        ensure_image_available(
+            &docker,
+            "x:1",
+            "agent.Dockerfile",
+            Some(Path::new("/src/cowboy")),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_image_available_pulls_when_no_source() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_image_exists()
+            .times(1)
+            .returning(|_| Ok(false));
+        docker.expect_build_image().never();
+        docker
+            .expect_pull_image()
+            .times(1)
+            .withf(|image| image == "x:1")
+            .returning(|_| Ok(()));
+        ensure_image_available(&docker, "x:1", "gateway.Dockerfile", None)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn pick_source_root_prefers_explicit_then_excludes_cargo_cache() {
+        let cargo = PathBuf::from("/home/u/.cargo");
+        let cached = cargo.join("git/checkouts/cowboy-abc/deadbeef");
+        let checkout = PathBuf::from("/home/u/dev/cowboy");
+
+        // Explicit COWBOY_SRC always wins, even under the cargo cache.
+        assert_eq!(
+            pick_source_root(Some(cached.clone()), None, Some(&cargo)),
+            Some(cached.clone())
+        );
+        // No explicit: a compile root inside the cargo cache is rejected (end user
+        // installed via `cargo install --git` → pull, don't build).
+        assert_eq!(pick_source_root(None, Some(cached), Some(&cargo)), None);
+        // A real checkout outside the cargo cache is trusted (contributor → build).
+        assert_eq!(
+            pick_source_root(None, Some(checkout.clone()), Some(&cargo)),
+            Some(checkout)
+        );
     }
 }
