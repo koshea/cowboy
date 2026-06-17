@@ -37,7 +37,7 @@ ipnet = { version = "2", features = ["serde"] }
 
 # model client
 async-openai = { version = "0.41", features = ["chat-completion"] }
-tiktoken-rs = "0.6"
+tiktoken-rs = "0.12"
 reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 
 # MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess
@@ -69,7 +69,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 # Unified diffs of agent file edits (computed host-side; the workspace is
 # bind-mounted, so the host sees the before/after content).
-similar = "2"
+similar = "3"
 # Display-width of strings (wide CJK / emoji) for aligning Markdown table columns.
 unicode-width = "0.2"
 

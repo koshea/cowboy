@@ -30,7 +30,7 @@ pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
         return text.to_string();
     }
     bpe()
-        .decode(toks[..max_tokens].to_vec())
+        .decode(&toks[..max_tokens])
         .unwrap_or_else(|_| text.chars().take(max_tokens * 4).collect())
 }
 
