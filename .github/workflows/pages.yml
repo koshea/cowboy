@@ -37,6 +37,11 @@ jobs:
       - name: Build the book
         run: mdbook build docs
 
+      # The published artifact is docs/book, so a repo-root CNAME (custom domain)
+      # must be copied in or the domain is dropped on each deploy.
+      - name: Add CNAME (custom domain) to the site
+        run: '[ -f CNAME ] && cp CNAME docs/book/CNAME || echo "no CNAME; skipping"'
+
       - uses: actions/configure-pages@v5
 
       - uses: actions/upload-pages-artifact@v3
