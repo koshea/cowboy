@@ -109,6 +109,10 @@ use cowboy_core::time::now_ms;
 /// heartbeat every 5s, so this tolerates several missed beats.
 const STALE_AFTER_MS: u64 = 30_000;
 
+/// How many terminal (completed/failed) session records the daemon retains before
+/// pruning the oldest. Bounds unbounded growth from a long-lived daemon.
+const MAX_TERMINAL_HISTORY: usize = 100;
+
 /// Is a process alive? `kill(pid, 0)` succeeds for a live process we can signal
 /// and fails with ESRCH if it's gone. Used for worker liveness.
 fn pid_alive(pid: u32) -> bool {
@@ -271,6 +275,80 @@ impl Daemon {
         (reap, released)
     }
 
+    /// Reap already-marked `Stale` sessions and release their leases, then drop
+    /// orphan leases (holder gone), bound terminal-session history, and remove
+    /// dead per-session socket files. Idempotent maintenance run on startup and
+    /// periodically so a crash never leaves a dangling lease that blocks new
+    /// sessions, nor unbounded record/socket buildup. Caller sweeps first (so
+    /// ranch coordination can see the just-stale records before they're reaped).
+    /// Returns the reaped session ids.
+    fn vacuum(&mut self) -> Vec<SessionId> {
+        // 1. Reap crashed sessions (already marked Stale by a prior sweep).
+        let reaped: Vec<SessionId> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.status == SessionStatus::Stale)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.state.sessions.retain(|id, _| !reaped.contains(id));
+
+        // 2. Drop leases whose holder no longer exists (reaped now, or orphaned by
+        //    an earlier partial cleanup) — this is what frees a worktree after a crash.
+        let live_ids: std::collections::HashSet<SessionId> =
+            self.state.sessions.keys().cloned().collect();
+        self.state
+            .leases
+            .retain(|_, l| live_ids.contains(&l.session));
+
+        // 3. Bound terminal-session history (ids are ms-timestamp-prefixed, so a
+        //    lexical sort is chronological — drop the oldest beyond the cap).
+        let mut terminal: Vec<SessionId> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(_, s)| s.status.is_terminal())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if terminal.len() > MAX_TERMINAL_HISTORY {
+            terminal.sort();
+            let drop_n = terminal.len() - MAX_TERMINAL_HISTORY;
+            for id in terminal.into_iter().take(drop_n) {
+                self.state.sessions.remove(&id);
+            }
+        }
+
+        self.save();
+        reaped
+    }
+
+    /// Remove per-session socket files (`s-<id>.sock`) that don't belong to a
+    /// currently-live session — leftovers from ended/crashed workers.
+    fn prune_sockets(&self) {
+        let live: std::collections::HashSet<&str> = self
+            .state
+            .sessions
+            .iter()
+            .filter(|(_, s)| !s.status.is_terminal())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let Ok(entries) = std::fs::read_dir(runtime_dir()) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name
+                .strip_prefix("s-")
+                .and_then(|n| n.strip_suffix(".sock"))
+            {
+                if !live.contains(id) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
     /// Claim the coordinator slot for a ranch. Returns true if the caller should
     /// run an advance now; false if one is already in flight (in which case the
     /// slot is marked dirty so the running advance re-runs once when it finishes).
@@ -340,10 +418,14 @@ pub async fn serve() -> Result<()> {
     // recover. Heartbeat age is ignored here (on-disk timestamps are old).
     {
         let mut d = daemon.lock().await;
-        let reaped = d.sweep_stale(false);
+        d.sweep_stale(false);
+        let reaped = d.vacuum();
+        d.prune_sockets();
         if !reaped.is_empty() {
-            tracing::info!(?reaped, "marked dead sessions stale on startup");
-            d.save();
+            tracing::info!(
+                ?reaped,
+                "reaped dead sessions (+released leases) on startup"
+            );
         }
     }
 
@@ -363,9 +445,17 @@ pub async fn serve() -> Result<()> {
                 }
                 newly
             };
-            // Advance any ranch whose workstream just went stale.
+            // Advance any ranch whose workstream just went stale — BEFORE the
+            // vacuum reaps the record (coordination reads the session's ranch ids).
             for id in &newly {
                 coordinate_after_terminal(&sweeper, id).await;
+            }
+            // Reap stale records + release dangling leases, prune sockets, bound
+            // history. Idempotent; runs every tick so crashes self-heal.
+            {
+                let mut d = sweeper.lock().await;
+                d.vacuum();
+                d.prune_sockets();
             }
         }
     });
@@ -385,6 +475,18 @@ pub async fn serve() -> Result<()> {
             }
         });
     }
+}
+
+/// Host-only path for a worker's captured stdout/stderr: `<state>/cowboy/logs/
+/// worker-<id>.log` (sibling of the daemon state dir — never under the workspace
+/// mount, so the agent can't read it).
+fn worker_log_path(id: &str) -> PathBuf {
+    state_path()
+        .parent() // .../cowboy/daemon
+        .and_then(Path::parent) // .../cowboy
+        .map(|p| p.join("logs"))
+        .unwrap_or_else(|| runtime_dir().join("logs"))
+        .join(format!("worker-{id}.log"))
 }
 
 /// Path to the `cowboy` client binary (sibling of this `cowboyd`).
@@ -899,6 +1001,32 @@ async fn start_session(
     let sock = runtime_dir().join(format!("s-{id}.sock"));
     let journal = root.join(".cowboy/sessions").join(&id).join("events.jsonl");
 
+    // Capture worker stdout/stderr to a host-only logfile (NOT under the workspace
+    // mount, so the agent can't read it) instead of discarding it — otherwise a
+    // worker that fails at startup (e.g. the control server can't bind) is
+    // completely silent. Falls back to /dev/null if the log can't be opened.
+    let log_path = worker_log_path(&id);
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let (out, err) = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => {
+            let err = f.try_clone().map(std::process::Stdio::from);
+            (
+                std::process::Stdio::from(f),
+                err.unwrap_or_else(|_| std::process::Stdio::null()),
+            )
+        }
+        Err(e) => {
+            tracing::warn!(path = %log_path.display(), error = %e, "worker log open failed; discarding output");
+            (std::process::Stdio::null(), std::process::Stdio::null())
+        }
+    };
+
     let mut cmd = tokio::process::Command::new(worker_binary());
     cmd.arg("x-session-worker")
         .arg("--root")
@@ -909,8 +1037,8 @@ async fn start_session(
         .arg(&sock)
         .arg("--register")
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stdout(out)
+        .stderr(err);
     if let Some(t) = &task {
         cmd.arg("--task").arg(t);
     }
@@ -1158,6 +1286,75 @@ mod tests {
             },
         );
         assert!(d2.acquire("/w", "s9", LeaseMode::Exclusive, false).is_ok());
+    }
+
+    #[test]
+    fn vacuum_reaps_stale_sessions_and_frees_their_leases() {
+        let mut d = daemon();
+        // A crashed session (Stale) holding an exclusive lease.
+        put_session(&mut d, "crashed", SessionStatus::Stale);
+        d.state.leases.insert(
+            "/w".into(),
+            Lease {
+                session: "crashed".into(),
+                mode: LeaseMode::Exclusive,
+                created_ms: 0,
+                updated_ms: 0,
+            },
+        );
+        // A live session is left untouched.
+        put_session(&mut d, "live", SessionStatus::Running);
+
+        let reaped = d.vacuum();
+
+        assert_eq!(reaped, vec!["crashed".to_string()]);
+        assert!(!d.state.sessions.contains_key("crashed"), "stale reaped");
+        assert!(d.state.sessions.contains_key("live"), "live kept");
+        assert!(
+            !d.state.leases.contains_key("/w"),
+            "dangling lease freed so a new session can start"
+        );
+    }
+
+    #[test]
+    fn vacuum_drops_orphan_leases_and_caps_history() {
+        let mut d = daemon();
+        // Orphan lease: holder session no longer exists.
+        d.state.leases.insert(
+            "/orphan".into(),
+            Lease {
+                session: "ghost".into(),
+                mode: LeaseMode::Exclusive,
+                created_ms: 0,
+                updated_ms: 0,
+            },
+        );
+        // More terminal records than the cap; oldest (lexically smallest id) prune.
+        for i in 0..(MAX_TERMINAL_HISTORY + 5) {
+            put_session(&mut d, &format!("{i:06}-done"), SessionStatus::Completed);
+        }
+
+        d.vacuum();
+
+        assert!(
+            !d.state.leases.contains_key("/orphan"),
+            "orphan lease dropped"
+        );
+        assert_eq!(
+            d.state.sessions.len(),
+            MAX_TERMINAL_HISTORY,
+            "history capped"
+        );
+        assert!(
+            !d.state.sessions.contains_key("000000-done"),
+            "oldest pruned"
+        );
+        assert!(
+            d.state
+                .sessions
+                .contains_key(&format!("{:06}-done", MAX_TERMINAL_HISTORY + 4)),
+            "newest kept"
+        );
     }
 
     #[test]
