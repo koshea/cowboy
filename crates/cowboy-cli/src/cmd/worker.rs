@@ -588,15 +588,23 @@ async fn run_control_pipeline(
     let (approvals_tx, mut approvals_rx) = tokio::sync::mpsc::unbounded_channel();
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
-        // Bind the TCP control server on the gateway's bridge IP (the gateway
-        // retries connecting until we're up). Fail-closed: if the bind fails, no
-        // control server runs, so `ask`s deny.
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                let _ = control::serve_on(listener, token, approvals_tx, events_tx).await;
+        // Bind the TCP control server on the gateway's bridge IP. That IP only
+        // exists once the gateway network is created (lazily, on the first
+        // command), so the address is initially unassignable — retry until it
+        // appears rather than failing closed forever (which silently denies every
+        // `ask`). The gateway itself retries connecting, so a brief gap is fine.
+        let listener = loop {
+            match tokio::net::TcpListener::bind(&addr).await {
+                Ok(l) => break l, // serve_on logs "listening" below
+                Err(e) => {
+                    // EADDRNOTAVAIL until the bridge is up; log the first failure
+                    // loudly, then quietly retry for the worker's lifetime.
+                    tracing::debug!(%addr, error = %e, "control bind not ready; retrying");
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
             }
-            Err(e) => tracing::error!(%addr, error = %e, "control server bind failed"),
-        }
+        };
+        let _ = control::serve_on(listener, token, approvals_tx, events_tx).await;
     });
 
     // Gateway-decided events: persist + show in the activity log.
