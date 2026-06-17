@@ -195,6 +195,19 @@ async fn run_quiet(args: &[&str]) -> Result<std::process::Output> {
         .context("failed to invoke `docker` (is it installed and running?)")
 }
 
+/// A `Stdio` pointing at our own stderr, so a child's stdout is merged into our
+/// stderr (where build/pull progress belongs) instead of leaking onto our stdout
+/// and polluting the output of the command we're about to run. Falls back to
+/// discarding rather than ever risking stdout contamination.
+fn stderr_stdio() -> Stdio {
+    use std::os::fd::AsFd;
+    std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
+}
+
 /// Append the common `docker run` flags for a [`ContainerSpec`] to `args`
 /// (everything after `run [-d|--rm]`). Shared by detached and one-shot runs.
 fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
@@ -282,6 +295,9 @@ impl DockerCli for CliDocker {
             .args(["build", "-t", tag, "-f"])
             .arg(dockerfile)
             .arg(context)
+            // Build progress is diagnostic: keep it off our stdout so it can't
+            // pollute a subsequent command's captured output.
+            .stdout(stderr_stdio())
             .status()
             .await
             .context("docker build")?;
@@ -294,6 +310,9 @@ impl DockerCli for CliDocker {
     async fn pull_image(&self, image: &str) -> Result<()> {
         let status = Command::new("docker")
             .args(["pull", image])
+            // `docker pull` writes its progress to stdout; route it to stderr so
+            // it never lands in the output of the command we're about to run.
+            .stdout(stderr_stdio())
             .status()
             .await
             .context("docker pull")?;
