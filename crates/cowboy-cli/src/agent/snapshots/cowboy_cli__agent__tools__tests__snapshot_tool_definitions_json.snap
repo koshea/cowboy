@@ -655,7 +655,7 @@ expression: defs
         },
         "category": {
           "default": null,
-          "description": "The KIND of work, so Cowboy routes it to the right crew model. One of:\ngeneral, exploration, backend, frontend, tests, review, docs, debugging,\nrefactor, e2e. Defaults to `general`. Do NOT name a model — routing is the\nuser's crew roster.",
+          "description": "The KIND of work, so Cowboy routes it to the right crew model. One of:\ngeneral, exploration, backend, frontend, tests, docs, debugging,\nrefactor, e2e. Defaults to `general`. Do NOT name a model — routing is the\nuser's crew roster.",
           "type": [
             "string",
             "null"

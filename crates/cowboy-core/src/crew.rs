@@ -352,7 +352,7 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
         (Effort::Small, standard),
         (Effort::Large, premium),
     ]);
-    // review/e2e: bias to stronger models, then the foreman for the hardest.
+    // e2e: bias to stronger models, then the foreman for the hardest.
     let strong = ramp(&[
         (Effort::Tiny, standard),
         (Effort::Medium, premium),
@@ -366,7 +366,6 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
     crew.insert("frontend".into(), build.clone());
     crew.insert("refactor".into(), build.clone());
     crew.insert("debugging".into(), build.clone());
-    crew.insert("review".into(), strong.clone());
     crew.insert("e2e".into(), strong);
     crew.insert(GENERAL.into(), build);
 
@@ -816,8 +815,8 @@ crew:
         // exploration ramps from cheap up to premium at deep.
         assert_eq!(c.resolve("exploration", Effort::Tiny, "f").model, "cheap");
         assert_eq!(c.resolve("exploration", Effort::Deep, "f").model, "opus");
-        // review's deep slot is <default> → inherits the foreman.
-        assert_eq!(c.resolve("review", Effort::Deep, "f").model, "f");
+        // e2e's deep slot is <default> → inherits the foreman.
+        assert_eq!(c.resolve("e2e", Effort::Deep, "f").model, "f");
         // every category expands to 5 concrete levels.
         assert_eq!(c.expanded("backend", "f").len(), 5);
     }

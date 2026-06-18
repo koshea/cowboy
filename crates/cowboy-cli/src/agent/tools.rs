@@ -64,7 +64,7 @@ pub struct SubagentArgs {
     #[serde(default)]
     pub context: Option<String>,
     /// The KIND of work, so Cowboy routes it to the right crew model. One of:
-    /// general, exploration, backend, frontend, tests, review, docs, debugging,
+    /// general, exploration, backend, frontend, tests, docs, debugging,
     /// refactor, e2e. Defaults to `general`. Do NOT name a model — routing is the
     /// user's crew roster.
     #[serde(default)]

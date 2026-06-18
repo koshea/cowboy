@@ -40,7 +40,7 @@ crew:
   tests:
     tiny: cheap          # tiny..medium → cheap
     large: opus          # large, deep  → opus
-  review:
+  e2e:
     small: cheap         # ≤ medium → cheap
     large: <default>     # large, deep → the foreman (whatever /model selects)
   general: sonnet        # required: the cross-category fallback
@@ -114,7 +114,7 @@ model:
 }
 ```
 
-Categories: `general exploration backend frontend tests review docs debugging
+Categories: `general exploration backend frontend tests docs debugging
 refactor e2e` (unknown → `general`). Effort defaults to `medium`. Each routed
 launch is recorded as a `SubagentRouted` lifecycle event.
 
@@ -129,3 +129,15 @@ shared container; isolated parallel *writers* compose with
 
 Once the roster is set up, delegation is frictionless — no per-task approvals, no
 budget gates. Configure the crew once, then let it work.
+
+## Partial results
+
+A subagent that does real work but ends without a clean final answer — e.g. it
+truncates a large output, errors out, or hits its iteration cap — doesn't return
+empty. Cowboy salvages a checkpoint and hands it back prefixed `[partial]`: the
+agent's latest narration, its plan progress, and the session id (whose
+`.cowboy/sessions/<id>/` directory holds the full transcript, scratchpad, and
+commands). The foreman is told to **resume from that checkpoint** — re-delegating
+with the prior work as `context` — rather than restarting the task from scratch.
+Subagents are also steered to stream large outputs to a file and publish them by
+path, so a single oversized tool call can't lose a turn's work to truncation.

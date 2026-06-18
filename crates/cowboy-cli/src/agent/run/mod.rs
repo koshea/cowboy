@@ -86,7 +86,7 @@ validated, and remaining risks or follow-up work.";
 pub const FOREMAN_PROMPT: &str =
     "\n\nYou are the foreman of a crew. For focused, separable work, delegate it with the \
 `subagent` tool instead of doing everything yourself: describe the work by \
-`category` (the kind — exploration, tests, frontend, backend, review, docs, \
+`category` (the kind — exploration, tests, frontend, backend, docs, \
 debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
 deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
 routes each request to the right crew model. To run work in parallel, emit \
@@ -96,7 +96,26 @@ passing `agent: <name>` to `subagent`. Delegate when work is scoped and separabl
 (exploration, test-writing, an independent component, a review pass); do it \
 yourself when the task is tiny, the hand-off costs more than the work, or it \
 needs continuous coordination with your current state. Prefer small, well-scoped \
-subagent tasks that return a concrete artifact.";
+subagent tasks that return a concrete artifact. If a subagent result comes back \
+prefixed `[partial]`, it ran but did not finish cleanly — the text is its work so \
+far plus a session id. Treat that as a checkpoint: re-delegate continuing from \
+what's there (pass the prior work as `context`) rather than starting the task over.";
+
+/// Extra guidance for a worker running *as* a subagent (depth > 0). Its result is
+/// captured from stdout by the foreman, so a single oversized tool call (e.g. a
+/// long findings list inlined into one `artifact`/`final`) is dangerous: the
+/// model's output-token limit can truncate the arguments mid-string, the call is
+/// rejected as malformed, and the whole turn's work is lost. Steer large outputs
+/// to a file instead.
+pub const SUBAGENT_PROMPT: &str =
+    "\n\nYou are running as a subagent: a parent agent dispatched this task and will \
+read your final answer. Keep that final answer concise. If your output is large \
+(a long list of findings, a big document, lots of structured data), do NOT inline \
+it all into a single tool call — model output-token limits can truncate the \
+arguments and lose everything. Instead `write` it to a file in the workspace as \
+you go, then `publish` it as an artifact by `path` and keep your final answer to a \
+short summary that points at the file. Save progress incrementally so partial work \
+survives even if you don't finish.";
 
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
@@ -208,6 +227,7 @@ fn classify_subagent_result(result: &str) -> &'static str {
         || r.starts_with("error:")
         || r.starts_with("subagent error")
         || r.starts_with("[incomplete]")
+        || r.starts_with("[partial]")
     {
         "error"
     } else if r.is_empty() || r == "subagent produced no final answer" {
@@ -245,11 +265,20 @@ impl<'a> AgentLoop<'a> {
         // Crew mode (roster + delegation enabled) gates the foreman guidance and
         // the `subagent` tool; in solo mode the selected model works alone.
         let crew_on = crate::cmd::crew::crew_enabled();
-        let system = if crew_on {
+        let subagent_depth = std::env::var("COWBOY_SUBAGENT_DEPTH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let mut system = if crew_on {
             format!("{SYSTEM_PROMPT}{FOREMAN_PROMPT}")
         } else {
             SYSTEM_PROMPT.to_string()
         };
+        // A worker spawned as a subagent gets extra guidance to stream large
+        // outputs to a file rather than risk losing them to a truncated tool call.
+        if subagent_depth > 0 {
+            system.push_str(SUBAGENT_PROMPT);
+        }
         let tools = if crew_on {
             tools::definitions()
         } else {
@@ -266,10 +295,7 @@ impl<'a> AgentLoop<'a> {
             cancel,
             context_window,
             pruned_notified: false,
-            subagent_depth: std::env::var("COWBOY_SUBAGENT_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0),
+            subagent_depth,
             last_final: None,
             tokens_in: 0,
             tokens_out: 0,
@@ -677,8 +703,73 @@ impl<'a> AgentLoop<'a> {
     pub async fn run(&mut self, task: &str) -> Result<Option<String>> {
         let cancel = self.cancel.clone();
         let outcome = self.run_turn(task, cancel).await;
+        // A subagent that ended without a clean final would otherwise hand the
+        // foreman an empty result, discarding everything it did this turn. Salvage
+        // the work into a `[partial]` checkpoint on stdout so the foreman can
+        // resume from it instead of restarting the task from scratch.
+        if self.subagent_depth > 0 && self.last_final.is_none() {
+            if let Some(partial) = self.build_partial_result() {
+                self.ui.final_message(&partial);
+            }
+        }
         self.finalize_session();
         outcome
+    }
+
+    /// Assemble whatever a non-finishing subagent managed to do this turn, as a
+    /// `[partial]` checkpoint the foreman can resume from: the agent's latest
+    /// substantive narration, its plan progress, and the session id (whose
+    /// `.cowboy/sessions/<id>/` dir holds the full transcript, scratchpad,
+    /// published artifacts, and commands for recovery). Returns `None` only when
+    /// there is genuinely nothing to report.
+    fn build_partial_result(&self) -> Option<String> {
+        let mut sections: Vec<String> = Vec::new();
+
+        // The most recent assistant message with real content — usually where the
+        // agent was summarizing its findings before the final emission failed.
+        if let Some(content) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant && !m.content.trim().is_empty())
+            .map(|m| m.content.trim().to_string())
+        {
+            sections.push(content);
+        }
+
+        // Plan progress: what got done vs. what's left, so resumption can skip
+        // completed steps.
+        if !self.plan.is_empty() {
+            let mut lines = String::from("Plan progress:");
+            for (step, status) in &self.plan {
+                let mark = match status.as_str() {
+                    "done" => "[x]",
+                    "in_progress" => "[~]",
+                    _ => "[ ]",
+                };
+                lines.push_str(&format!("\n  {mark} {step}"));
+            }
+            sections.push(lines);
+        }
+
+        // Where to recover the rest from (full transcript / scratchpad / commands).
+        if let Some(l) = &self.logger {
+            sections.push(format!(
+                "Checkpoint: session `{}` (.cowboy/sessions/{}/ has the transcript, \
+                 scratchpad, and commands run).",
+                l.id(),
+                l.id()
+            ));
+        }
+
+        if sections.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[partial] This subagent did not finish cleanly; work so far follows. \
+             Resume from this checkpoint rather than restarting.\n\n{}",
+            sections.join("\n\n")
+        ))
     }
 
     /// Run the loop for `task` until completion, cancellation, or the iteration
@@ -2612,5 +2703,49 @@ mod tests {
     fn parse_args_handles_empty() {
         let a: FinalArgs = parse_args(r#"{"message":"done"}"#).unwrap();
         assert_eq!(a.message, "done");
+    }
+
+    #[test]
+    fn partial_result_is_classified_as_error() {
+        // A salvaged checkpoint isn't a clean completion — crew history records it
+        // as a non-success so the route's success rate stays honest.
+        assert_eq!(
+            classify_subagent_result("[partial] did not finish; work so far…"),
+            "error"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_without_final_salvages_partial_work() {
+        // A subagent whose turn ends without a clean final must hand the foreman a
+        // `[partial]` checkpoint (latest narration + plan progress) instead of an
+        // empty result, so the work isn't discarded and can be resumed.
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.subagent_depth = 1; // running as a subagent
+        agent.messages.push(Message {
+            role: Role::Assistant,
+            content: "Found 2 real issues in the auth path.".into(),
+            tool_call_id: None,
+            tool_calls: vec![],
+            reasoning: None,
+        });
+        agent.plan = vec![
+            ("Review auth".into(), "done".into()),
+            ("Review export".into(), "pending".into()),
+        ];
+
+        let partial = agent.build_partial_result().expect("salvageable work");
+        assert!(partial.starts_with("[partial]"));
+        assert!(partial.contains("Found 2 real issues"));
+        assert!(partial.contains("[x] Review auth"));
+        assert!(partial.contains("[ ] Review export"));
     }
 }
