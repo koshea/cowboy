@@ -36,7 +36,7 @@ pub fn project_dir(root: &Path) -> PathBuf {
 
 /// The global (user) skills directory (`~/.config/cowboy/skills/`), if resolvable.
 pub fn global_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|b| b.config_dir().join("cowboy").join("skills"))
+    crate::config::global_config_dir().map(|d| d.join("skills"))
 }
 
 /// The home directory, for resolving `~/.claude/...`.

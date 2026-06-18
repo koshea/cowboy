@@ -36,8 +36,8 @@ fn search_dirs(root: &Path) -> Vec<(PathBuf, bool)> {
         (root.join(".cowboy").join("agents"), false),
         (root.join(".claude").join("agents"), false),
     ];
-    if let Some(b) = directories::BaseDirs::new() {
-        dirs.push((b.config_dir().join("cowboy").join("agents"), true));
+    if let Some(d) = crate::config::global_config_dir() {
+        dirs.push((d.join("agents"), true));
     }
     if let Some(h) = home_dir() {
         dirs.push((h.join(".claude").join("agents"), true));

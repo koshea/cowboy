@@ -2,14 +2,18 @@
 //!
 //! Topology (per project, to avoid cross-project clashes):
 //! ```text
-//! agent  ──(cowboy-int, --internal)──► gateway(.2) ──(cowboy-egr)──► internet
-//!         default route forced to .2          applies allow/deny/ask
+//! agent container ──(cowboy-net)──► internet
+//!   ▲ shares netns
+//! gateway sidecar (--network container:<agent>, NET_ADMIN)
+//!   installs nft REDIRECT in the shared netns → in-process proxy → allow/deny/ask
 //! ```
-//! The agent is attached to an internal-only network with its `NET_ADMIN`/
-//! `NET_RAW` capabilities dropped, and its default route is forced to the
-//! gateway by a short-lived privileged helper that shares the agent's netns.
-//! Because the agent never holds `NET_ADMIN`, it cannot undo the route — the
-//! only path out is the gateway, which fails closed.
+//! The gateway runs as a **sidecar in the agent's network namespace** rather than
+//! a separate routing hop. It applies an nft `nat output` REDIRECT (exempting its
+//! own root-uid sockets) that forces all agent egress through its policy proxy.
+//! The agent has its `NET_ADMIN`/`NET_RAW` dropped, so it can't undo the rules —
+//! the only path out is the proxy, which fails closed. Co-locating in the agent's
+//! netns means `SO_ORIGINAL_DST` works locally and there's no container-to-router
+//! L3 forwarding (which Docker Desktop's gvisor backend does not support).
 
 use std::path::PathBuf;
 
@@ -24,11 +28,10 @@ pub const GATEWAY_IMAGE: &str =
     concat!("ghcr.io/koshea/cowboy/gateway:", env!("CARGO_PKG_VERSION"));
 
 /// Per-project docker object names derived from the project hash:
-/// `(internal_net, egress_net, gateway_container)`.
-pub fn network_names(hash: u32) -> (String, String, String) {
+/// `(agent_net, gateway_container)`.
+pub fn network_names(hash: u32) -> (String, String) {
     (
-        format!("cowboy-int-{hash:08x}"),
-        format!("cowboy-egr-{hash:08x}"),
+        format!("cowboy-net-{hash:08x}"),
         format!("cowboy-gw-{hash:08x}"),
     )
 }
@@ -36,18 +39,24 @@ pub fn network_names(hash: u32) -> (String, String, String) {
 /// Per-project gateway networking parameters.
 #[derive(Debug, Clone)]
 pub struct GatewayNetwork {
-    pub internal_net: String,
-    pub egress_net: String,
+    /// The agent's egress-capable network (the gateway sidecar shares its netns).
+    pub agent_net: String,
     pub gateway_name: String,
     pub subnet: String,
-    pub gateway_ip: String,
+    /// Host-side gateway IP of `agent_net`; the host binds its control server here
+    /// on Linux (it owns the bridge). Unused as a bind address on Docker Desktop.
     pub bridge_gateway: String,
-    pub egress_subnet: String,
     policy_file: PathBuf,
-    /// Host control address (`bridge_gateway:port`) the gateway dials over TCP for
-    /// `ask` decisions. TCP (not a bind-mounted unix socket) so it works the same
-    /// inside the macOS Docker VM; bound to the bridge IP, never the LAN.
+    /// Address the gateway dials over TCP for `ask` decisions, from inside the
+    /// container. On Linux this is the bridge gateway IP (the host owns it); on
+    /// Docker Desktop (Mac/Windows) the host is a VM hop away, so the gateway
+    /// dials `host.docker.internal` (mapped via `--add-host`).
     control_addr: String,
+    /// Address the *host* binds its control server on. Same as `control_addr` on
+    /// Linux; on Docker Desktop the host has no bridge interface, so it binds
+    /// loopback (`127.0.0.1`) — reachable from the gateway via `control_addr`,
+    /// and not LAN-exposed, preserving the "never `0.0.0.0`" invariant.
+    control_bind_addr: String,
     /// Per-session token the gateway must present (the agent never sees it).
     control_token: String,
 }
@@ -65,8 +74,6 @@ impl GatewayNetwork {
         let octet = (hash % 200 + 20) as u8; // 20..=219
         let subnet = format!("10.88.{octet}.0/24");
         let bridge_gateway = format!("10.88.{octet}.1");
-        let gateway_ip = format!("10.88.{octet}.2");
-        let egress_subnet = format!("10.89.{octet}.0/24");
 
         // Merge previously persisted project/global approvals into the policy.
         let mut policy = security.network_policy.clone();
@@ -77,13 +84,25 @@ impl GatewayNetwork {
         std::fs::write(&policy_file, json)
             .with_context(|| format!("writing policy file {}", policy_file.display()))?;
 
-        // Control channel: the gateway dials the host over TCP on the bridge IP.
-        // A deterministic per-project port (on a per-project bridge IP) avoids a
-        // bind-before-launch ordering dance; the gateway client retries to absorb
-        // the startup race. A fresh random token gates the port (the agent shares
-        // this bridge but never sees the token, so it can't authenticate).
+        // Control channel: the gateway (sidecar, in the agent's netns) dials the
+        // host over TCP for `ask` decisions. A deterministic per-project port; the
+        // gateway client retries to absorb the startup race. A fresh random token
+        // gates the port (the agent shares the netns but never sees the token).
         let control_port = 9000 + (hash % 1000) as u16;
-        let control_addr = format!("{bridge_gateway}:{control_port}");
+        // On Linux the host owns the bridge gateway IP: the gateway dials it and
+        // the host binds the same address. On Docker Desktop (Mac/Windows) the
+        // host has no bridge interface, so the host binds loopback and the gateway
+        // reaches it via `host.docker.internal` (in the agent's inherited
+        // /etc/hosts). Loopback isn't LAN-exposed, so "never 0.0.0.0" holds.
+        let (control_addr, control_bind_addr) = if cfg!(target_os = "linux") {
+            let addr = format!("{bridge_gateway}:{control_port}");
+            (addr.clone(), addr)
+        } else {
+            (
+                format!("host.docker.internal:{control_port}"),
+                format!("127.0.0.1:{control_port}"),
+            )
+        };
         // Fresh random token per session. An explicit `COWBOY_CONTROL_TOKEN` env
         // pins it instead (used by e2e tests that fake the gateway; also lets ops
         // fix it if needed) — opt-in, so the default stays unguessable.
@@ -92,25 +111,40 @@ impl GatewayNetwork {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
-        let (internal_net, egress_net, gateway_name) = network_names(hash);
+        let (agent_net, gateway_name) = network_names(hash);
         Ok(Self {
-            internal_net,
-            egress_net,
+            agent_net,
             gateway_name,
             subnet,
-            gateway_ip,
             bridge_gateway,
-            egress_subnet,
             policy_file,
             control_addr,
+            control_bind_addr,
             control_token,
         })
     }
 
-    /// The host control address (`bridge_gateway:port`) the gateway dials, and the
-    /// address the host binds its control server on.
+    /// The agent's egress-capable network name (the sidecar shares its netns).
+    pub fn agent_net(&self) -> &str {
+        &self.agent_net
+    }
+
+    /// `--add-host` entries for the agent container; inherited by the sidecar's
+    /// /etc/hosts so it can dial the host control server via `host.docker.internal`
+    /// on Docker Desktop. Harmless on Linux (host-gateway maps to the bridge host).
+    pub fn agent_extra_hosts(&self) -> Vec<String> {
+        vec!["host.docker.internal:host-gateway".into()]
+    }
+
+    /// The address the gateway dials (its `COWBOY_CONTROL_ADDR`).
     pub fn control_addr(&self) -> &str {
         &self.control_addr
+    }
+
+    /// The address the host binds its control server on (loopback on Docker
+    /// Desktop, the bridge gateway IP on Linux).
+    pub fn control_bind_addr(&self) -> &str {
+        &self.control_bind_addr
     }
 
     /// The per-session control token (passed to the gateway via env).
@@ -118,13 +152,16 @@ impl GatewayNetwork {
         &self.control_token
     }
 
-    /// Build the gateway container spec.
-    fn gateway_spec(&self) -> ContainerSpec {
+    /// Build the gateway sidecar container spec. It joins the agent's netns
+    /// (`--network container:<agent>`), which forbids per-container network flags
+    /// (`--ip`, `--add-host`, `--dns`); those settings live on the agent and are
+    /// inherited here. The gateway runs as root (uid 0) so the nft rule can exempt
+    /// its own egress.
+    fn gateway_spec(&self, agent: &str) -> ContainerSpec {
         let policy = self.policy_file.to_string_lossy().into_owned();
         ContainerSpec {
             name: self.gateway_name.clone(),
             image: GATEWAY_IMAGE.to_string(),
-            workdir: String::new(),
             mounts: vec![BindMount::ro(policy, "/etc/cowboy/policy.json")],
             env: vec![
                 (
@@ -135,42 +172,29 @@ impl GatewayNetwork {
                 ("COWBOY_CONTROL_ADDR".into(), self.control_addr.clone()),
                 ("COWBOY_CONTROL_TOKEN".into(), self.control_token.clone()),
             ],
-            network: Some(self.internal_net.clone()),
-            ip: Some(self.gateway_ip.clone()),
+            network: Some(format!("container:{agent}")),
             cap_add: vec!["NET_ADMIN".into(), "NET_RAW".into()],
-            sysctls: vec![
-                ("net.ipv4.ip_forward".into(), "1".into()),
-                ("net.ipv4.conf.all.route_localnet".into(), "1".into()),
-            ],
             // Run the image ENTRYPOINT (cowboy-gateway) with no extra args.
             keep_alive: Some(vec![]),
             ..Default::default()
         }
     }
 
-    /// Ensure the networks and the gateway container are up.
-    pub async fn ensure(&self, docker: &dyn DockerCli) -> Result<()> {
-        if !docker.network_exists(&self.internal_net).await? {
+    /// Create the agent's egress network and verify the gateway image is present.
+    /// Called **before** the agent starts so it never runs un-sandboxed.
+    pub async fn ensure_network(&self, docker: &dyn DockerCli) -> Result<()> {
+        if !docker.network_exists(&self.agent_net).await? {
             docker
                 .create_network(&NetworkSpec {
-                    name: self.internal_net.clone(),
-                    internal: true,
+                    // Egress-capable: the agent has a route out, but the sidecar's
+                    // nft REDIRECT in the shared netns forces it through the proxy.
+                    name: self.agent_net.clone(),
+                    internal: false,
                     subnet: Some(self.subnet.clone()),
                     gateway: Some(self.bridge_gateway.clone()),
                 })
                 .await?;
         }
-        if !docker.network_exists(&self.egress_net).await? {
-            docker
-                .create_network(&NetworkSpec {
-                    name: self.egress_net.clone(),
-                    internal: false,
-                    subnet: Some(self.egress_subnet.clone()),
-                    gateway: None,
-                })
-                .await?;
-        }
-
         super::runtime::ensure_image_available(
             docker,
             GATEWAY_IMAGE,
@@ -178,60 +202,29 @@ impl GatewayNetwork {
             super::runtime::default_image_source_root().as_deref(),
         )
         .await
-        .context("ensuring the gateway image (refusing to run the agent unsandboxed)")?;
+        .context("ensuring the gateway image (refusing to run the agent unsandboxed)")
+    }
 
+    /// Start (or restart) the gateway sidecar in the agent's netns. Must be called
+    /// after the agent container exists. A sidecar from a prior agent lifetime has
+    /// exited (its netns is gone), so a non-running one is removed and recreated.
+    pub async fn start_sidecar(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
         match docker.container_state(&self.gateway_name).await? {
             super::docker::ContainerState::Running => {}
             super::docker::ContainerState::Stopped => {
                 docker.remove(&self.gateway_name, true).await?;
-                self.start_gateway(docker).await?;
+                docker.run_detached(&self.gateway_spec(agent)).await?;
             }
-            super::docker::ContainerState::Absent => self.start_gateway(docker).await?,
+            super::docker::ContainerState::Absent => {
+                docker.run_detached(&self.gateway_spec(agent)).await?;
+            }
         }
         Ok(())
     }
 
-    async fn start_gateway(&self, docker: &dyn DockerCli) -> Result<()> {
-        docker.run_detached(&self.gateway_spec()).await?;
-        // Add the egress NIC so the gateway can reach the internet.
-        docker
-            .connect_network(&self.egress_net, &self.gateway_name)
-            .await
-            .context("attaching egress network to gateway")?;
-        Ok(())
-    }
-
-    /// Capabilities and DNS settings the agent container must use.
+    /// Capabilities the agent container must **drop** (so it can't alter the nft
+    /// rules the sidecar installs in their shared netns).
     pub fn agent_caps(&self) -> Vec<String> {
         vec!["NET_ADMIN".into(), "NET_RAW".into()]
-    }
-
-    /// Force the agent's default route through the gateway, from a short-lived
-    /// privileged helper sharing the agent's network namespace. The agent
-    /// itself never holds `NET_ADMIN`, so it cannot reverse this.
-    pub async fn force_agent_route(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
-        let script = format!(
-            "ip route replace default via {gw} && \
-             (ip route add blackhole 169.254.169.254/32 2>/dev/null || true)",
-            gw = self.gateway_ip
-        );
-        let helper = ContainerSpec {
-            image: GATEWAY_IMAGE.to_string(),
-            network: Some(format!("container:{agent}")),
-            cap_add: vec!["NET_ADMIN".into()],
-            // Override the image ENTRYPOINT (cowboy-gateway) to run the route
-            // commands instead.
-            entrypoint: Some("sh".into()),
-            keep_alive: Some(vec!["-c".into(), script]),
-            ..Default::default()
-        };
-        let res = docker
-            .run_oneshot(&helper)
-            .await
-            .context("forcing agent default route via gateway")?;
-        if res.exit_code != 0 {
-            anyhow::bail!("route helper exited with {}", res.exit_code);
-        }
-        Ok(())
     }
 }

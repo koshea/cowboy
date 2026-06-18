@@ -1,39 +1,49 @@
 # Network gateway
 
-Outbound network access is enforced by **routing + dropped capabilities**, not by
-asking the model. This is the security thesis.
+Outbound network access is enforced by **in-namespace interception + dropped
+capabilities**, not by asking the model. This is the security thesis.
 
 ## Topology (per project)
 
 ```
-agent  ──(cowboy-int, --internal)──►  gateway(.2) ──(cowboy-egr)──►  internet
-        default route forced to .2            applies allow/deny/ask
-        NET_ADMIN / NET_RAW dropped           fails closed
+agent container ──(cowboy-net)──►  internet
+   ▲ shares network namespace
+gateway sidecar (--network container:<agent>, NET_ADMIN)
+   nft REDIRECT in the shared netns → in-process proxy → allow/deny/ask
+   agent has NET_ADMIN / NET_RAW dropped; fails closed
 ```
 
-- The agent container is attached to an **internal-only** Docker network (no
-  route to the outside). A separate gateway container is the only path out.
-- After the agent starts, a short-lived privileged helper (sharing the agent's
-  network namespace) sets the agent's default route to the gateway and
-  blackholes the cloud metadata IP. The agent never holds `NET_ADMIN`, so it
-  cannot undo this.
+- The gateway runs as a **sidecar inside the agent's network namespace**, not as a
+  separate routing hop. It installs an nftables `nat output` REDIRECT that captures
+  the agent's locally-generated TCP and DNS and hands it to the in-process
+  proxy/resolver. The gateway runs as root and exempts its own uid, so its relayed
+  (upstream) connections aren't re-intercepted; the agent runs unprivileged with
+  `NET_ADMIN`/`NET_RAW` dropped, so it cannot alter the rules.
+- Co-locating in the agent's netns means the proxy recovers the original
+  destination locally (`SO_ORIGINAL_DST`) and there is **no container-to-router
+  forwarding**. That is what lets the same design run on **macOS** (Docker Desktop),
+  whose gvisor network backend does not forward traffic through a container acting
+  as a router — see [installation](../getting-started/installation.md).
 
 ## What the gateway enforces (`cowboy-gateway`)
 
 Fail-closed: if the nftables ruleset cannot be applied, the gateway refuses to
-run rather than become an open router.
+run rather than leave the agent un-sandboxed.
 
-- **nftables**: the `forward` chain DROPs by default (the gateway is not a
-  router); only TCP 80/443 from the agent subnet are REDIRECTed to the in-process
-  proxy; DNS to the gateway resolver is allowed; everything else outbound is
-  dropped.
-- **Transparent TLS** (`:8443`): peeks the ClientHello **SNI** (no MITM, no
-  decryption), then splices the connection through.
-- **Transparent HTTP** (`:8080`): reads the `Host` header.
+- **nftables**: a `nat output` REDIRECT in the agent's netns sends **all** of the
+  agent's TCP to the in-process proxy and DNS (`:53`) to the resolver; a
+  `filter output` chain then **drops by default**, so the residue REDIRECT can't
+  carry (non-DNS UDP, ICMP) can't leak. The gateway's own root-uid egress is exempt
+  so it can reach upstream and the host control channel; approved Compose subnets
+  bypass the proxy.
+- **Transparent proxy** (`:8443`, every port): sniffs the first bytes — TLS
+  **SNI**, else HTTP **Host** — with a short timeout so server-speaks-first
+  protocols don't block. No MITM, no decryption. HTTP/HTTPS get hostname precision
+  on any port; opaque/encrypted-ClientHello traffic falls back to the DNS map
+  (`ip → domain`) or, lacking that, `ask` by `ip:port`.
 - **Explicit CONNECT proxy** for proxy-aware clients (convenience).
 - **DNS resolver** (`:53`): **policy-enforced** — see below. Records `ip → domain`
-  for resolved names so the transparent path can map a destination IP back to a
-  hostname for policy.
+  for resolved names so a connection's destination IP maps back to a hostname.
 - **Policy**: deny-list wins, then allow-list (domain via SNI/Host, or CIDR; with
   optional port restriction), else `default_external`. `ask` is sent to the host;
   with no approver it fails closed.
@@ -76,16 +86,17 @@ entirely — no prompt. Approve such networks deliberately.
 
 ## Honest scope
 
-- Outbound = TCP 80/443 through the gateway with allow/deny/ask by domain/CIDR.
+- **Every** outbound TCP port is intercepted and gated by domain/CIDR with
+  allow/deny/ask; HTTP/HTTPS are attributed by SNI/Host on any port, other
+  protocols by the DNS map (`ip → domain`) or `ask` by `ip:port`.
 - DNS only via the gateway resolver, **policy-gated** (strict allowlist + tunnel
   detection; risky record types refused).
-- Everything else outbound (other TCP ports, all UDP except DNS, ICMP, IPv6) is
-  deny-by-default.
-- Cloud metadata (`169.254.169.254`) is denied (route blackhole + policy).
+- Non-DNS UDP, ICMP, and IPv6 are deny-by-default (IPv6 disabled; the rest dropped
+  by the `filter output` chain).
+- Cloud metadata (`169.254.169.254`) is denied by policy on every port.
 - SNI-less / encrypted-ClientHello TLS → ask by IP:port.
 - No TLS MITM. DNS is UDP-only (no TCP/53 large-response fallback yet); tunnel
   detection is heuristic (entropy/length/rate), not a guarantee.
-
-Proven end-to-end by the `network_boundary_is_enforced` test: an allow-listed
-destination is reachable, an un-listed one is blocked, metadata is denied, and a
-non-80/443 port is dropped.
+- Attribution for non-TLS/HTTP relies on the DNS map, so it inherits its
+  limits (shared CDN IPs are coarse; an IP-literal with no prior lookup → `ask`).
+- Arbitrary **UDP is dropped, not proxied** — proxying it would need TPROXY.

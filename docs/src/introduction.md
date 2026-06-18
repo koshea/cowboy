@@ -43,6 +43,7 @@ docs (or the code).
 
 ## Platform support
 
-- **Linux** — supported (the current target).
-- **macOS** — planned (Docker Desktop networking for the gateway needs work).
-- **Windows** — out of scope.
+- **Linux** — supported.
+- **macOS** — supported (Docker Desktop). The gateway runs as a sidecar in the
+  agent's container netns, so it works under Docker Desktop's gvisor networking.
+- **Windows** — untested / out of scope.

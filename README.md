@@ -19,7 +19,7 @@ cargo install --git https://github.com/koshea/cowboy cowboy-cli   # installs `co
 cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
 cd your-project
 cowboy init                              # writes .cowboy/{security,agent}.yaml
-cowboy doctor                            # check Docker, Linux, nft, model, Compose
+cowboy doctor                            # check platform, Docker, model, gateway image, Compose
 cowboy "run the tests and fix one simple failure"
 ```
 
@@ -62,8 +62,9 @@ docs/
 
 ## Requirements
 
-- Linux (the MVP is Linux-only)
-- Docker, `docker compose`, and `nftables` (`cowboy doctor` checks these)
+- Linux or macOS (Docker Desktop) — the gateway runs as a sidecar in the agent's
+  container netns, so the host needs no `nftables` itself
+- Docker and `docker compose` (`cowboy doctor` checks these)
 - An OpenAI-compatible model endpoint
 
 ## Development

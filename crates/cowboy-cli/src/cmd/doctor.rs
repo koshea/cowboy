@@ -63,9 +63,8 @@ pub async fn run() -> Result<()> {
         check_command(&["docker", "compose", "version"]),
     );
 
-    // Network gateway prerequisites.
-    r.check("nftables (nft)", check_command(&["nft", "--version"]));
-    r.check("ip forwarding", check_ip_forward());
+    // Network gateway.
+    r.check("network enforcement", check_enforcement());
 
     // Config files.
     r.check("security.yaml", check_security(&paths.security));
@@ -122,13 +121,16 @@ async fn check_daemon() -> Status {
 }
 
 fn check_platform() -> Status {
-    if cfg!(target_os = "linux") {
-        Status::Ok(std::env::consts::OS.to_string())
-    } else {
-        Status::Fail(format!(
-            "{} is not supported; the MVP is Linux-only",
-            std::env::consts::OS
-        ))
+    match std::env::consts::OS {
+        "linux" => Status::Ok("linux".to_string()),
+        // The gateway runs as a sidecar in the agent's netns inside Docker
+        // Desktop's Linux VM, so macOS is fully supported (no host nft needed).
+        "macos" => {
+            Status::Ok("macos (via Docker Desktop; gateway runs as an in-VM sidecar)".to_string())
+        }
+        other => Status::Warn(format!(
+            "{other} is untested; supported hosts are Linux and macOS (Docker Desktop)"
+        )),
     }
 }
 
@@ -143,12 +145,12 @@ fn check_command(argv: &[&str]) -> Status {
     }
 }
 
-fn check_ip_forward() -> Status {
-    match std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward") {
-        Ok(v) if v.trim() == "1" => Status::Ok("enabled".to_string()),
-        Ok(_) => Status::Warn("disabled; the gateway will enable it for its container".to_string()),
-        Err(_) => Status::Warn("could not read /proc/sys/net/ipv4/ip_forward".to_string()),
-    }
+/// The nft REDIRECT that forces agent egress through the proxy runs *inside* the
+/// gateway sidecar (sharing the agent's netns), using the Docker VM kernel's
+/// netfilter — not the host. So there's no host `nft`/`ip_forward` requirement on
+/// either platform; the gateway image (checked separately) carries the tooling.
+fn check_enforcement() -> Status {
+    Status::Ok("in-netns gateway sidecar (no host nft/ip-forwarding needed)".to_string())
 }
 
 fn check_security(path: &Path) -> Status {

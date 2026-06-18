@@ -1,0 +1,93 @@
+version: 1
+
+# HOST-OWNED security config. The cowboy host process reads this; it is NEVER
+# mounted into the agent container. The agent cannot see or edit this file.
+
+container:
+  # The agent image. Omitted = the version-pinned default
+  # (ghcr.io/koshea/cowboy/agent:<version>), pulled from GHCR on first run so it
+  # tracks your `cowboy` binary on upgrade. Uncomment to pin or use your own.
+  # image: ghcr.io/koshea/cowboy/agent:0.1.0
+  # A committed .cowboy/Dockerfile (FROM the base) is auto-detected and built
+  # per-repo; or point `dockerfile:` at your own.
+  # dockerfile: ./Dockerfile.cowboy
+  build: false
+  workdir: /workspace
+  mounts:
+    - source: .
+      target: /workspace
+      mode: rw
+  privileged: false
+  docker_socket: false
+  # Resource limits. `cpus` also bounds build parallelism: the agent runs builds
+  # with `-j{cpus}` (make/ruby-build/cargo/npm/cmake) so a `make` can't spawn
+  # host-nproc-many jobs and OOM the container. Use `auto` to size from the host
+  # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
+  memory: 8g
+  cpus: 2
+
+networks:
+  isolated:
+    enabled: true
+  compose:
+    approved: []
+
+network_policy:
+  default_external: ask
+  default_private_lan: ask
+  default_host: ask
+  allow:
+    # Domains are suffix-matched (npmjs.org also matches registry.npmjs.org).
+    domains:
+      - github.com
+      - githubusercontent.com
+      - crates.io
+      - npmjs.org
+      - pypi.org
+      - pythonhosted.org
+      - golang.org
+      - go.dev
+      - rubygems.org
+      - debian.org
+      - ghcr.io
+    cidrs: []
+    ports:
+      - 80
+      - 443
+  deny:
+    domains:
+      - metadata.google.internal
+    cidrs:
+      - 169.254.169.254/32
+      - 100.100.100.200/32
+  # DNS resolution policy. Defaults (shown) are the secure posture: the resolver
+  # only forwards names the policy above Allows or you approve, refuses the rest
+  # locally, blocks tunnel-prone record types, and prompts on suspected tunneling.
+  dns:
+    enforce: true              # apply the allow/deny/default policy to query names
+    tunnel_detection: true     # prompt on high-entropy/long names or high query rate
+    # Record types allowed to resolve (TXT/NULL/ANY/AXFR/IXFR are excluded by
+    # default — the classic DNS-tunnel/C2 carriers; add them here to opt in).
+    allowed_qtypes: [A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, CAA, HTTPS, SVCB]
+    # Heuristic thresholds (rarely changed):
+    # max_label_len: 40
+    # max_qname_len: 150
+    # max_subdomains_per_min: 40
+
+secrets:
+  # Env vars injected from the host (values read at runtime, never stored here).
+  env: []
+    # - name: GITHUB_TOKEN
+    #   source_env: COWBOY_GITHUB_TOKEN
+    #   required: false
+    #   approval: required
+  # Host credential files/dirs granted (read-only by default) into the container
+  # so the agent can use CLIs like gh/gcloud/kubectl. The container HOME is /tmp,
+  # so mount under /tmp/... where the tools look. `cowboy secrets add <preset>`
+  # prints ready-to-paste entries. You must also allow the matching network host.
+  files: []
+    # - source: ~/.config/gh
+    #   target: /tmp/.config/gh
+    #   read_only: true
+    #   required: false
+    #   approval: required   # prompt for per-session approval before mounting

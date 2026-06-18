@@ -42,19 +42,18 @@ async fn live_sessions(root: Option<&Path>) -> Vec<SessionInfo> {
 }
 
 /// Remove a single project's cowboy objects: its agent container, its gateway
-/// container, and its internal/egress networks (all named deterministically from
-/// the worktree `root`). Best-effort — missing objects are ignored. Shared by
-/// `cowboy down`, the worker's clean-shutdown reap, and the daemon's crash reap,
-/// so they all tear down exactly the same set.
+/// sidecar, and its network (all named deterministically from the worktree
+/// `root`). Best-effort — missing objects are ignored. Shared by `cowboy down`,
+/// the worker's clean-shutdown reap, and the daemon's crash reap, so they all
+/// tear down exactly the same set. The gateway shares the agent's netns, so
+/// remove it first; the network removal then succeeds.
 pub async fn teardown_project(docker: &dyn DockerCli, root: &Path, container_name: &str) {
     let hash = runtime::project_hash(root);
-    let (internal, egress, gw) = gateway::network_names(hash);
-    for c in [container_name, &gw] {
+    let (agent_net, gw) = gateway::network_names(hash);
+    for c in [&gw, container_name] {
         let _ = docker.remove(c, true).await;
     }
-    for n in [&internal, &egress] {
-        let _ = docker.remove_network(n).await;
-    }
+    let _ = docker.remove_network(&agent_net).await;
 }
 
 pub async fn run(args: DownArgs) -> Result<()> {
@@ -102,9 +101,9 @@ mod tests {
     use crate::net::docker::MockDockerCli;
 
     #[tokio::test]
-    async fn teardown_removes_agent_gateway_and_both_networks() {
+    async fn teardown_removes_agent_gateway_and_network() {
         let root = std::path::Path::new("/tmp/cowboy-teardown-test");
-        let (internal, egress, gw) = gateway::network_names(runtime::project_hash(root));
+        let (agent_net, gw) = gateway::network_names(runtime::project_hash(root));
         let agent = "cowboy-agent-test".to_string();
 
         let mut docker = MockDockerCli::new();
@@ -114,11 +113,11 @@ mod tests {
             .times(2)
             .withf(move |name, force| *force && (name == a || name == g))
             .returning(|_, _| Ok(()));
-        let (i, e) = (internal.clone(), egress.clone());
+        let n = agent_net.clone();
         docker
             .expect_remove_network()
-            .times(2)
-            .withf(move |n| n == i || n == e)
+            .times(1)
+            .withf(move |x| x == n)
             .returning(|_| Ok(()));
 
         teardown_project(&docker, root, &agent).await;

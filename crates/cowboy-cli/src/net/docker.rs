@@ -67,6 +67,10 @@ pub struct ContainerSpec {
     pub sysctls: Vec<(String, String)>,
     /// DNS servers for the container (`--dns`).
     pub dns: Vec<String>,
+    /// Extra `host:ip` entries (`--add-host`). Used to map `host.docker.internal`
+    /// to the host gateway so the gateway can dial the host's control server on
+    /// Docker Desktop (Mac/Windows), where the host has no docker-bridge IP.
+    pub extra_hosts: Vec<String>,
     /// Run as this `uid:gid` (`--user`) — used to run the agent non-root.
     pub user: Option<String>,
     /// Override the image `ENTRYPOINT` (`--entrypoint`).
@@ -256,6 +260,10 @@ fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
     for d in &spec.dns {
         args.push("--dns".into());
         args.push(d.clone());
+    }
+    for h in &spec.extra_hosts {
+        args.push("--add-host".into());
+        args.push(h.clone());
     }
     if let Some(ep) = &spec.entrypoint {
         args.push("--entrypoint".into());

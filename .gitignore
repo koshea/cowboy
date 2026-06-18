@@ -18,3 +18,7 @@
 
 # local agent/tooling state (not project source)
 .claude/
+
+# cowboy
+.cowboy/ranches/*/events.jsonl
+.cowboy/ranches/*/workstreams/

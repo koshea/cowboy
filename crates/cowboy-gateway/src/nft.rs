@@ -1,35 +1,59 @@
-//! nftables ruleset for the gateway container.
+//! nftables ruleset for the gateway, running as a **sidecar in the agent's
+//! network namespace**.
 //!
-//! This is the load-bearing enforcement: the `forward` chain DROPs by default,
-//! so the gateway is **not** an open router. Only TCP 80/443 from the agent
-//! subnet are REDIRECTed to the in-process proxy (which applies policy); DNS is
-//! accepted to the gateway's own resolver; everything else outbound is dropped.
-//! Applying the ruleset is fatal on failure — we fail closed, never open.
+//! The gateway shares the agent's netns, so the agent's outbound traffic is
+//! *locally generated* and we intercept it in two hooks:
+//!
+//! - `nat output` REDIRECTs **all** of the agent's TCP to the in-process proxy
+//!   (DNS to the resolver), which applies policy. The proxy sniffs each connection
+//!   (SNI/Host on any port) and falls back to the DNS map for opaque traffic.
+//! - `filter output` then **drops by default**, so the residue the REDIRECT can't
+//!   carry — non-DNS UDP, ICMP — can't leak. This is what restores deny-by-default
+//!   on every port/protocol.
+//!
+//! The gateway's own egress (the proxy's upstream dials, DNS forwarding, the host
+//! control channel) is exempted by uid: it runs as root, the agent as the
+//! unprivileged host uid, so `skuid 0` is the gateway and is left untouched (else
+//! the proxy's own dial would be redirected back into itself). Approved Compose
+//! subnets bypass the proxy and are accepted directly. Applying the ruleset is
+//! fatal on failure — we fail closed, never open.
 
 use anyhow::{bail, Context, Result};
 
-use crate::config::{GatewayConfig, PORT_HTTP, PORT_TLS};
+use crate::config::{GatewayConfig, PORT_DNS, PORT_TLS};
+
+/// The uid the gateway process runs as (root). Its own sockets are exempt from
+/// the REDIRECT so relayed/upstream/control connections egress directly.
+const GATEWAY_UID: u32 = 0;
 
 /// Render the nft ruleset for the given config.
 pub fn ruleset(cfg: &GatewayConfig) -> String {
-    let subnet = &cfg.agent_subnet;
-    let mut allow_rules = String::new();
+    // Approved Compose/Docker networks bypass the proxy: not redirected in `nat`
+    // and accepted in `filter`. Everything else is gated.
+    let mut nat_exempt = String::new();
+    let mut filter_allow = String::new();
     for net in &cfg.allow_subnets {
-        // Approved Docker/Compose networks: allow forwarded traffic to them.
-        allow_rules.push_str(&format!("    ip daddr {net} accept\n"));
+        nat_exempt.push_str(&format!("    ip daddr {net} return\n"));
+        filter_allow.push_str(&format!("    ip daddr {net} accept\n"));
     }
-
     format!(
         "table ip cowboy {{
-  chain prerouting {{
-    type nat hook prerouting priority dstnat; policy accept;
-    ip saddr {subnet} tcp dport 443 redirect to :{PORT_TLS}
-    ip saddr {subnet} tcp dport 80 redirect to :{PORT_HTTP}
+  chain output {{
+    type nat hook output priority -100; policy accept;
+    meta skuid {GATEWAY_UID} return
+    ip daddr 127.0.0.0/8 return
+{nat_exempt}    udp dport 53 redirect to :{PORT_DNS}
+    tcp dport 53 redirect to :{PORT_DNS}
+    meta l4proto tcp redirect to :{PORT_TLS}
   }}
-  chain forward {{
-    type filter hook forward priority filter; policy drop;
+  chain filter_out {{
+    type filter hook output priority 0; policy drop;
+    meta skuid {GATEWAY_UID} accept
+    ip daddr 127.0.0.0/8 accept
     ct state established,related accept
-{allow_rules}  }}
+{filter_allow}    udp dport 53 accept
+    meta l4proto tcp accept
+  }}
 }}
 "
     )
@@ -95,25 +119,51 @@ mod tests {
     }
 
     #[test]
-    fn ruleset_forward_drops_by_default() {
+    fn ruleset_intercepts_locally_generated_traffic() {
         let r = ruleset(&cfg());
-        assert!(r.contains("chain forward"));
-        assert!(r.contains("policy drop"));
-        assert!(r.contains("ct state established,related accept"));
-    }
-
-    #[test]
-    fn ruleset_redirects_only_80_and_443_from_agent_subnet() {
-        let r = ruleset(&cfg());
-        assert!(r.contains("ip saddr 10.88.0.0/24 tcp dport 443 redirect to :8443"));
-        assert!(r.contains("ip saddr 10.88.0.0/24 tcp dport 80 redirect to :8081"));
-        // No blanket masquerade/accept that would turn it into an open router.
+        // Sidecar model: intercept in the nat output hook (agent traffic is
+        // locally generated in the shared netns), not a forwarding router.
+        assert!(r.contains("nat hook output"));
+        assert!(!r.contains("hook forward"));
         assert!(!r.contains("masquerade"));
     }
 
     #[test]
-    fn ruleset_allows_approved_subnets() {
+    fn ruleset_exempts_the_gateway_uid() {
         let r = ruleset(&cfg());
+        // The gateway's own egress (proxy upstream, DNS forward, control) must not
+        // be redirected back into the proxy.
+        assert!(r.contains("meta skuid 0 return"));
+        assert!(r.contains("ip daddr 127.0.0.0/8 return"));
+    }
+
+    #[test]
+    fn ruleset_redirects_all_tcp_and_dns() {
+        let r = ruleset(&cfg());
+        // DNS to the resolver, and a catch-all that sends every TCP port to the
+        // single sniffing proxy (hostname precision on any port).
+        assert!(r.contains("udp dport 53 redirect to :53"));
+        assert!(r.contains("tcp dport 53 redirect to :53"));
+        assert!(r.contains("meta l4proto tcp redirect to :8443"));
+    }
+
+    #[test]
+    fn ruleset_filter_drops_non_tcp_residue() {
+        let r = ruleset(&cfg());
+        // filter output drops by default; the REDIRECT can't carry UDP/ICMP, so the
+        // filter chain is what stops non-DNS UDP and ICMP from leaking.
+        assert!(r.contains("filter hook output"));
+        assert!(r.contains("policy drop"));
+        assert!(r.contains("udp dport 53 accept"));
+        assert!(r.contains("ct state established,related accept"));
+    }
+
+    #[test]
+    fn ruleset_exempts_approved_subnets_both_chains() {
+        let r = ruleset(&cfg());
+        // Approved Compose networks bypass the proxy (nat return) and are allowed
+        // out (filter accept).
+        assert!(r.contains("ip daddr 172.20.0.0/16 return"));
         assert!(r.contains("ip daddr 172.20.0.0/16 accept"));
     }
 }

@@ -113,12 +113,17 @@ impl AgentRuntime {
         &self.container_name
     }
 
-    /// The host control address + token (`bridge_gateway:port`, token) the host
-    /// binds its TCP control server on, when network isolation is enabled.
+    /// The host control bind address + token the host binds its TCP control
+    /// server on, when network isolation is enabled. This is the *bind* address
+    /// (loopback on Docker Desktop, the bridge IP on Linux), which may differ from
+    /// the address the gateway dials (`GatewayNetwork::control_addr`).
     pub fn control_endpoint(&self) -> Option<(String, String)> {
-        self.gateway
-            .as_ref()
-            .map(|g| (g.control_addr().to_string(), g.control_token().to_string()))
+        self.gateway.as_ref().map(|g| {
+            (
+                g.control_bind_addr().to_string(),
+                g.control_token().to_string(),
+            )
+        })
     }
 
     /// The project root (for approval persistence).
@@ -242,18 +247,28 @@ impl AgentRuntime {
             }
         }
 
-        // When isolation is enabled, attach the agent to the internal-only
-        // network, point DNS at the gateway, drop NET_ADMIN/NET_RAW so the
-        // agent cannot change its route, and disable IPv6.
-        let (network, ip, dns, cap_drop, sysctls) = match &self.gateway {
+        // When isolation is enabled, attach the agent to its egress-capable
+        // network and drop NET_ADMIN/NET_RAW. The gateway runs as a sidecar in
+        // this container's netns and installs the nft REDIRECT that forces all
+        // agent egress through its in-process proxy/resolver — so the agent has a
+        // route out, but every connection is policy-gated and it can't undo the
+        // rules (no NET_ADMIN). DNS is pointed anywhere; nft redirects :53 to the
+        // in-netns resolver. `route_localnet` lets the REDIRECT reach the loopback
+        // proxy; `host.docker.internal` lets the sidecar dial the host control
+        // server (inherited into the sidecar's /etc/hosts).
+        let (network, ip, dns, cap_drop, sysctls, extra_hosts) = match &self.gateway {
             Some(gw) => (
-                Some(gw.internal_net.clone()),
+                Some(gw.agent_net().to_string()),
                 None,
-                vec![gw.gateway_ip.clone()],
+                vec!["1.1.1.1".to_string()],
                 gw.agent_caps(),
-                vec![("net.ipv6.conf.all.disable_ipv6".into(), "1".into())],
+                vec![
+                    ("net.ipv6.conf.all.disable_ipv6".into(), "1".into()),
+                    ("net.ipv4.conf.all.route_localnet".into(), "1".into()),
+                ],
+                gw.agent_extra_hosts(),
             ),
-            None => (None, None, Vec::new(), Vec::new(), Vec::new()),
+            None => (None, None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         };
 
         // Resolve cpu/memory limits (honoring `auto`) and, when a cpu limit applies,
@@ -285,6 +300,7 @@ impl AgentRuntime {
             cap_add: Vec::new(),
             sysctls,
             dns,
+            extra_hosts,
             user: self.user.clone(),
             entrypoint: None,
             keep_alive: None,
@@ -336,17 +352,16 @@ impl AgentRuntime {
     }
 
     /// Ensure a long-lived agent container is running, creating or starting it.
-    /// Restarting a container that idle-teardown stopped re-pins its egress route
-    /// through the gateway (the entrypoint does this too, but we re-force it so a
-    /// restarted container is never briefly unrouted).
+    /// A restarted agent gets a fresh netns (its nft rules are gone), so we
+    /// re-launch the gateway sidecar to reinstall enforcement before any command
+    /// runs — a restarted container is never briefly unsandboxed.
     pub async fn ensure_running(&self) -> Result<()> {
         match self.docker.container_state(&self.container_name).await? {
             ContainerState::Running => Ok(()),
             ContainerState::Stopped => {
                 self.docker.start(&self.container_name).await?;
                 if let Some(gw) = &self.gateway {
-                    gw.force_agent_route(&*self.docker, &self.container_name)
-                        .await?;
+                    gw.start_sidecar(&*self.docker, &self.container_name).await?;
                 }
                 Ok(())
             }
@@ -354,9 +369,9 @@ impl AgentRuntime {
         }
     }
 
-    /// Stop the agent container (idle teardown) to free its RAM; the gateway is
-    /// left running (it's tiny) so the next command restarts only the agent via
-    /// [`ensure_running`]. Best-effort.
+    /// Stop the agent container (idle teardown) to free its RAM. The gateway
+    /// sidecar shares the agent's netns, so it exits with the agent; the next
+    /// command restarts both via [`ensure_running`]. Best-effort.
     pub async fn stop(&self) {
         if matches!(
             self.docker.container_state(&self.container_name).await,
@@ -369,18 +384,19 @@ impl AgentRuntime {
 
     async fn create(&self) -> Result<()> {
         self.ensure_image().await?;
-        // Bring the gateway up before the agent so the route helper can run.
+        // Create the agent's egress network and verify the gateway image is
+        // present BEFORE the agent starts — the agent must never run un-sandboxed.
         if let Some(gw) = &self.gateway {
-            gw.ensure(&*self.docker).await?;
+            gw.ensure_network(&*self.docker).await?;
         }
         let spec = self.build_spec()?;
         self.docker.run_detached(&spec).await?;
 
         if let Some(gw) = &self.gateway {
-            // Force the agent's default route through the gateway (the agent
-            // lacks NET_ADMIN, so it cannot undo this).
-            gw.force_agent_route(&*self.docker, &self.container_name)
-                .await?;
+            // Start the gateway as a sidecar sharing the agent's netns; it applies
+            // the nft REDIRECT that forces all agent egress through its policy
+            // proxy. The agent lacks NET_ADMIN, so it cannot undo the rules.
+            gw.start_sidecar(&*self.docker, &self.container_name).await?;
             // Attach any approved Compose networks (traffic to these bypasses
             // the gateway via the agent's own NIC).
             for net in &self.security.networks.compose.approved {
@@ -973,17 +989,25 @@ mod tests {
     }
 
     #[test]
-    fn build_spec_isolated_drops_caps_and_points_dns_at_gateway() {
+    fn build_spec_isolated_drops_caps_and_wires_sidecar_netns() {
         let (rt, _tmp) = fixture(true, MockDockerCli::new());
         let spec = rt.build_spec().unwrap();
 
-        // Agent is on the internal network with NET_ADMIN/NET_RAW dropped.
-        assert!(spec.network.as_deref().unwrap().starts_with("cowboy-int-"));
+        // Agent is on its egress-capable network with NET_ADMIN/NET_RAW dropped
+        // (the gateway sidecar enforces policy in the shared netns).
+        assert!(spec.network.as_deref().unwrap().starts_with("cowboy-net-"));
         assert!(spec.cap_drop.contains(&"NET_ADMIN".to_string()));
         assert!(spec.cap_drop.contains(&"NET_RAW".to_string()));
-        // DNS points at the gateway IP (10.88.x.2).
-        assert_eq!(spec.dns.len(), 1);
-        assert!(spec.dns[0].starts_with("10.88.") && spec.dns[0].ends_with(".2"));
+        // host.docker.internal is mapped so the sidecar can dial the host control
+        // server; route_localnet lets the REDIRECT reach the loopback proxy.
+        assert!(spec
+            .extra_hosts
+            .iter()
+            .any(|h| h.starts_with("host.docker.internal:")));
+        assert!(spec
+            .sysctls
+            .iter()
+            .any(|(k, v)| k == "net.ipv4.conf.all.route_localnet" && v == "1"));
         // IPv6 disabled.
         assert!(spec
             .sysctls
@@ -1246,31 +1270,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_create_brings_up_gateway_and_forces_route() {
+    async fn isolated_create_brings_up_agent_then_gateway_sidecar() {
         let mut docker = MockDockerCli::new();
-        // Agent absent -> create path. Gateway image + agent image present.
+        // Agent + gateway both absent -> create path. Images present.
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Absent));
         docker.expect_image_exists().returning(|_| Ok(true));
         docker.expect_network_exists().returning(|_| Ok(false));
-        // Both networks (internal + egress) get created.
+        // One egress-capable network is created (no separate internal/egress split).
         docker
             .expect_create_network()
-            .times(2)
+            .times(1)
             .returning(|_| Ok(()));
-        // Gateway + agent containers launched.
+        // Agent container, then the gateway sidecar, are launched.
         docker.expect_run_detached().times(2).returning(|_| Ok(()));
-        // Egress network attached to the gateway.
-        docker
-            .expect_connect_network()
-            .times(1)
-            .returning(|_, _| Ok(()));
-        // The route-forcing helper MUST run (the core of the boundary).
-        docker
-            .expect_run_oneshot()
-            .times(1)
-            .returning(|_| Ok(ExecResult { exit_code: 0 }));
+        // No route helper and no extra network attach in the sidecar model.
         let (rt, _tmp) = fixture(true, docker);
         rt.ensure_running().await.unwrap();
     }

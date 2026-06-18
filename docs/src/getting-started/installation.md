@@ -2,9 +2,11 @@
 
 ## Requirements
 
-- **Linux** (the current target).
-- **Docker** and **`docker compose`**.
-- **`nftables`** (the gateway applies an nft ruleset).
+- **Linux** or **macOS** (Docker Desktop). The network gateway runs as a sidecar
+  inside the agent's container netns, so the host needs no `nftables` itself — the
+  enforcement uses the Docker (VM) kernel's netfilter.
+- **Docker** and **`docker compose`**. On macOS, Docker Desktop (its Linux VM is
+  where containers and the gateway run).
 - An **OpenAI-compatible model endpoint** (see below).
 
 `cowboy doctor` checks all of these and reports what's missing.
@@ -87,5 +89,5 @@ the agent can never reach your credentials.
 ## Verify
 
 ```sh
-cowboy doctor                   # Docker, Linux, nft, model config, Compose
+cowboy doctor                   # platform, Docker, model config, gateway image, Compose
 ```

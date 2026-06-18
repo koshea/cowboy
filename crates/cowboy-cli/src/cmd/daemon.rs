@@ -556,6 +556,19 @@ fn worker_log_path(id: &str) -> PathBuf {
         .join(format!("worker-{id}.log"))
 }
 
+/// The last few non-empty lines of a worker's log. Surfaced when a worker dies
+/// before binding its socket so the daemon reports *why* (e.g. "run `cowboy
+/// init` first") instead of an opaque "socket never appeared".
+fn worker_log_tail(id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(worker_log_path(id)).ok()?;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let start = lines.len().saturating_sub(20);
+    Some(lines[start..].join("\n"))
+}
+
 /// Path to the `cowboy` client binary (sibling of this `cowboyd`).
 fn worker_binary() -> PathBuf {
     std::env::current_exe()
@@ -1188,7 +1201,8 @@ async fn start_session(
         }
     });
 
-    // Wait for the worker to bind its socket.
+    // Wait for the worker to bind its socket. Bail out early — with the worker's
+    // own error — if it exits first, rather than blocking for the full timeout.
     for _ in 0..100 {
         if sock.exists() {
             return DaemonResp::Started {
@@ -1196,11 +1210,29 @@ async fn start_session(
                 worker_sock: sock,
             };
         }
+        // The supervisor marks the session terminal (Stale) the moment the child
+        // exits; a missing record means it never registered. Either way, stop.
+        let gone = {
+            let d = daemon.lock().await;
+            d.state
+                .sessions
+                .get(&id)
+                .map(|s| s.status.is_terminal())
+                .unwrap_or(true)
+        };
+        if gone {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    DaemonResp::Err {
-        message: "worker did not start (socket never appeared)".into(),
-    }
+    let message = match worker_log_tail(&id) {
+        Some(tail) => format!("worker did not start:\n{tail}"),
+        None => format!(
+            "worker did not start (socket never appeared); see {}",
+            worker_log_path(&id).display()
+        ),
+    };
+    DaemonResp::Err { message }
 }
 
 // ---------------------------------------------------------------------------

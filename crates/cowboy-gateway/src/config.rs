@@ -8,8 +8,9 @@ use cowboy_core::config::NetworkPolicy;
 
 /// Listener ports inside the gateway container.
 pub const PORT_CONNECT: u16 = 8080;
+/// The single transparent proxy port: all of the agent's TCP is REDIRECTed here,
+/// and the handler sniffs SNI/Host (any port) or falls back to the DNS map.
 pub const PORT_TLS: u16 = 8443;
-pub const PORT_HTTP: u16 = 8081;
 pub const PORT_DNS: u16 = 53;
 
 /// Resolved gateway configuration.
@@ -27,7 +28,8 @@ pub struct GatewayConfig {
     /// Per-session token presented to the host control server (must match, or the
     /// host drops the connection).
     pub control_token: Option<String>,
-    /// Additional subnets (approved Docker/Compose networks) to allow in forward.
+    /// Approved Docker/Compose subnets: exempt from the REDIRECT (bypass the
+    /// proxy) and accepted by the filter-drop chain.
     pub allow_subnets: Vec<String>,
 }
 

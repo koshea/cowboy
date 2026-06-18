@@ -860,17 +860,30 @@ impl AgentConfig {
     }
 }
 
-/// The home config directory (`~/.config/cowboy`), if resolvable. Mirrors the
-/// skills crate's use of `directories::BaseDirs`.
+/// A user base dir resolved the XDG way on *every* platform: the named XDG env
+/// var if set, else `~/<fallback>`. Cowboy standardizes on the XDG layout — the
+/// security model documents credentials at `~/.config/cowboy/providers.yaml`,
+/// and the test suite isolates config via `XDG_CONFIG_HOME`. Plain
+/// `directories::BaseDirs` would resolve to `~/Library/Application Support` on
+/// macOS (and `%APPDATA%` on Windows), diverging from both; on Linux this is
+/// identical to what `BaseDirs` already returned.
+fn xdg_dir(env: &str, fallback: &str) -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os(env).filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(v));
+    }
+    directories::BaseDirs::new().map(|b| b.home_dir().join(fallback))
+}
+
+/// The home config directory (`~/.config/cowboy`), if resolvable.
 pub fn global_config_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|b| b.config_dir().join("cowboy"))
+    xdg_dir("XDG_CONFIG_HOME", ".config").map(|d| d.join("cowboy"))
 }
 
 /// The home cache directory (`~/.cache/cowboy`), if resolvable. For data that's
 /// expensive to rebuild but safe to lose — e.g. the mise toolchain store
 /// persisted across agent-container recreations.
 pub fn global_cache_dir() -> Option<PathBuf> {
-    directories::BaseDirs::new().map(|b| b.cache_dir().join("cowboy"))
+    xdg_dir("XDG_CACHE_HOME", ".cache").map(|d| d.join("cowboy"))
 }
 
 fn write_yaml<T: Serialize>(value: &T, path: &Path) -> Result<()> {

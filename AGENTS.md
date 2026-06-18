@@ -157,8 +157,12 @@ Two guards keep it honest (both run under `cargo test`):
   `docker rm -f $(docker ps -aq --filter label=cowboy=1)`.
 - The daemon persists state to `$XDG_STATE_HOME/cowboy/daemon/state.json`; sockets
   live under `$XDG_RUNTIME_DIR/cowboy`.
-- Linux + Docker + `nftables` are required for the full stack (`cowboy doctor`
-  checks them).
+- Linux or macOS (Docker Desktop) + Docker are required for the full stack
+  (`cowboy doctor` checks them). The gateway runs as a **sidecar in the agent's
+  container netns** (not a separate routing hop), so the host needs no `nftables`
+  itself — enforcement uses the Docker (VM) kernel's netfilter, which is also what
+  makes it work under Docker Desktop's gvisor networking. See
+  `docs/src/security/network.md`.
 
 ## Before you commit
 
