@@ -1287,6 +1287,14 @@ mod tests {
             .returning(|_| Ok(()));
         // Agent container, then the gateway sidecar, are launched.
         docker.expect_run_detached().times(2).returning(|_| Ok(()));
+        // The sidecar bring-up polls the proxy's listener before returning, so
+        // the agent's first command never races the not-yet-bound proxy.
+        docker.expect_exec_capture().returning(|_, _, _, _| {
+            Ok((
+                ExecResult { exit_code: 0 },
+                "LISTEN 0 0 0.0.0.0:8443 0.0.0.0:*\n".to_string(),
+            ))
+        });
         // No route helper and no extra network attach in the sidecar model.
         let (rt, _tmp) = fixture(true, docker);
         rt.ensure_running().await.unwrap();

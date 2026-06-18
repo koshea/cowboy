@@ -210,7 +210,7 @@ impl GatewayNetwork {
     /// exited (its netns is gone), so a non-running one is removed and recreated.
     pub async fn start_sidecar(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
         match docker.container_state(&self.gateway_name).await? {
-            super::docker::ContainerState::Running => {}
+            super::docker::ContainerState::Running => return Ok(()),
             super::docker::ContainerState::Stopped => {
                 docker.remove(&self.gateway_name, true).await?;
                 docker.run_detached(&self.gateway_spec(agent)).await?;
@@ -219,7 +219,36 @@ impl GatewayNetwork {
                 docker.run_detached(&self.gateway_spec(agent)).await?;
             }
         }
-        Ok(())
+        // `run_detached` returns once the container is started, not once the
+        // in-process proxy has bound its listeners. The agent's nft REDIRECT is
+        // already active by then, so a command run in this window has its egress
+        // sent to a not-yet-listening :8443 and fails with "connection refused".
+        // Wait for the proxy before returning so the first command never races it.
+        self.wait_ready(docker).await
+    }
+
+    /// Block until the gateway's transparent proxy listener is bound in the
+    /// shared netns. Fails closed: if the proxy never comes up we refuse rather
+    /// than let the agent run against a half-initialized gateway.
+    async fn wait_ready(&self, docker: &dyn DockerCli) -> Result<()> {
+        // The transparent listener port (mirrors cowboy-gateway's `PORT_TLS`);
+        // its presence means the proxy is accepting REDIRECTed egress.
+        const PROXY_LISTEN_MARKER: &str = ":8443";
+        let probe = ["ss".to_string(), "-ltn".to_string()];
+        for _ in 0..100 {
+            if let Ok((res, out)) = docker
+                .exec_capture(&self.gateway_name, "/", "root", &probe)
+                .await
+            {
+                if res.exit_code == 0 && out.contains(PROXY_LISTEN_MARKER) {
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        anyhow::bail!(
+            "gateway proxy never bound its listener; refusing to run the agent unsandboxed"
+        )
     }
 
     /// Capabilities the agent container must **drop** (so it can't alter the nft

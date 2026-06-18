@@ -27,6 +27,16 @@ struct Conn {
     writer: tokio::net::tcp::OwnedWriteHalf,
 }
 
+/// Connect retries for an `ask` (a real decision the host owns): retry ~3 s to
+/// absorb the host control server's startup race.
+const ASK_CONNECT_ATTEMPTS: usize = 20;
+
+/// Best-effort decision logging must never stall egress. An allowed connection
+/// only reaches the splice after `decide` returns, so a slow `event` directly
+/// delays the user's traffic. Cap the whole send (single connect + write) so a
+/// missing/unreachable host costs milliseconds, not seconds.
+const EVENT_DEADLINE: Duration = Duration::from_millis(250);
+
 impl ControlClient {
     pub fn new(addr: Option<String>, token: Option<String>) -> Self {
         Self {
@@ -49,11 +59,13 @@ impl ControlClient {
         }
     }
 
-    /// Connect to the host control server over TCP, retrying briefly to absorb
-    /// startup races, then authenticate by sending `Hello { token }` first.
-    async fn connect(addr: &str, token: Option<&str>) -> Result<TcpStream> {
+    /// Connect to the host control server over TCP, making up to `attempts`
+    /// tries (150 ms apart) to absorb startup races, then authenticate by sending
+    /// `Hello { token }` first. `attempts == 1` is a single fast try (no retry
+    /// sleeps) used by best-effort event logging, which must never stall egress.
+    async fn connect(addr: &str, token: Option<&str>, attempts: usize) -> Result<TcpStream> {
         let mut last = None;
-        for attempt in 0..20 {
+        for attempt in 0..attempts.max(1) {
             match TcpStream::connect(addr).await {
                 Ok(mut s) => {
                     if attempt > 0 {
@@ -69,21 +81,25 @@ impl ControlClient {
                 }
                 Err(e) => {
                     last = Some(e);
-                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    if attempt + 1 < attempts {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
                 }
             }
         }
         Err(last.unwrap()).with_context(|| format!("connecting control server {addr}"))
     }
 
-    /// Ensure `guard` holds a live, authenticated connection, (re)connecting if absent.
+    /// Ensure `guard` holds a live, authenticated connection, (re)connecting (with
+    /// up to `attempts` tries) if absent.
     async fn ensure_conn<'a>(
         guard: &'a mut Option<Conn>,
         addr: &str,
         token: Option<&str>,
+        attempts: usize,
     ) -> Result<&'a mut Conn> {
         if guard.is_none() {
-            let stream = Self::connect(addr, token).await?;
+            let stream = Self::connect(addr, token, attempts).await?;
             let (r, w) = stream.into_split();
             *guard = Some(Conn {
                 reader: BufReader::new(r),
@@ -126,7 +142,7 @@ impl ControlClient {
         attempt: &NetworkAttempt,
         reason: Option<&str>,
     ) -> Result<Verdict> {
-        let conn = Self::ensure_conn(guard, addr, token).await?;
+        let conn = Self::ensure_conn(guard, addr, token, ASK_CONNECT_ATTEMPTS).await?;
 
         let msg = GatewayMessage::Ask {
             id,
@@ -166,23 +182,34 @@ impl ControlClient {
     /// Best-effort: notify the host of a decision for the activity log. Opens
     /// the connection if needed (so allow/deny verdicts — which never `ask` —
     /// still reach the host's activity pane).
+    ///
+    /// This runs on the egress critical path (an allowed connection splices only
+    /// after `decide` returns), so it is strictly bounded: a single connect try,
+    /// the whole thing capped by [`EVENT_DEADLINE`]. A missing or unreachable
+    /// host drops the log line — never stalls the user's traffic.
     pub async fn event(&self, attempt: &NetworkAttempt, verdict: Verdict, reason: String) {
         let Some(addr) = self.addr.clone() else {
             return;
         };
         let mut guard = self.inner.lock().await;
-        if let Err(e) = Self::event_on_conn(
+        let send = Self::event_on_conn(
             &mut guard,
             &addr,
             self.token.as_deref(),
             attempt,
             verdict,
             reason,
-        )
-        .await
-        {
-            tracing::debug!(error = %e, "control event send failed");
-            *guard = None; // reconnect next time
+        );
+        match tokio::time::timeout(EVENT_DEADLINE, send).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "control event send failed");
+                *guard = None; // reconnect next time
+            }
+            Err(_) => {
+                tracing::debug!("control event timed out (best-effort; dropped)");
+                *guard = None;
+            }
         }
     }
 
@@ -194,7 +221,8 @@ impl ControlClient {
         verdict: Verdict,
         reason: String,
     ) -> Result<()> {
-        let conn = Self::ensure_conn(guard, addr, token).await?;
+        // Single fast connect attempt: best-effort logging must not retry-storm.
+        let conn = Self::ensure_conn(guard, addr, token, 1).await?;
         let msg = GatewayMessage::Event {
             attempt: attempt.clone(),
             verdict,

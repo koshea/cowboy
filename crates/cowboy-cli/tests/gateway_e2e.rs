@@ -95,8 +95,13 @@ fn network_boundary_is_enforced() {
     let (containers_before, networks_before) = cowboy_objects();
 
     let tmp = assert_fs::TempDir::new().unwrap();
-    // Allow only 1.1.1.1:80 through the gateway; everything else asks (and with
-    // no host approver, fails closed). Metadata is denied by default.
+    // Allow Cloudflare's DNS anycast pair (1.1.1.1 + 1.0.0.1) on :443; everything
+    // else asks (and with no host approver, fails closed). Metadata is denied by
+    // default. Both IPs are listed deliberately: `https://1.1.1.1` 301-redirects to
+    // `https://one.one.one.one/`, which busybox wget follows, and that name
+    // resolves to *both* anycast addresses — so allow-listing only one would make
+    // reachability a coin-flip on which address the redirect lands on. We prove a
+    // non-listed-but-reachable IP is blocked separately (8.8.8.8 below).
     tmp.child(".cowboy/security.yaml")
         .write_str(
             "version: 1\n\
@@ -110,7 +115,7 @@ fn network_boundary_is_enforced() {
              network_policy:\n\
              \x20 default_external: ask\n\
              \x20 allow:\n\
-             \x20   cidrs: [\"1.1.1.1/32\"]\n\
+             \x20   cidrs: [\"1.1.1.1/32\", \"1.0.0.1/32\"]\n\
              \x20   ports: [443]\n\
              \x20 deny:\n\
              \x20   cidrs: [\"169.254.169.254/32\"]\n",
@@ -135,9 +140,8 @@ fn network_boundary_is_enforced() {
             .unwrap()
     };
 
-    // wget helper: succeeds (exit 0) only if the request completes. We use
-    // direct https (no redirects) so the destination IP/port is exactly what we
-    // allow-list, avoiding http->https->hostname redirect confounds.
+    // wget helper: succeeds (exit 0) only if the request completes (including any
+    // redirect busybox follows; the allow-list covers the redirect target above).
     let wget = |url: &str| -> bool {
         cowboy(&["run", "wget", "-q", "-T", "10", "-O", "/dev/null", url])
             .status
@@ -146,8 +150,10 @@ fn network_boundary_is_enforced() {
 
     // 1. Allowed destination reachable through the transparent TLS proxy.
     let allowed = wget("https://1.1.1.1");
-    // 2. Un-listed destination blocked (ask -> fail-closed deny).
-    let unlisted = wget("https://1.0.0.1");
+    // 2. A reachable but un-listed destination is blocked (ask -> fail-closed
+    //    deny). 8.8.8.8 is up, so this proves the gateway blocks by policy rather
+    //    than the address merely being unreachable.
+    let unlisted = wget("https://8.8.8.8");
     // 3. Metadata endpoint denied (blackholed at the agent + denied by policy).
     let metadata = wget("http://169.254.169.254");
     // 4. Non-80/443 port dropped by the forward chain (not an open router).
@@ -172,7 +178,10 @@ fn network_boundary_is_enforced() {
         allowed,
         "allow-listed 1.1.1.1:443 should be reachable via the gateway"
     );
-    assert!(!unlisted, "un-listed 1.0.0.1 must be blocked (fail-closed)");
+    assert!(
+        !unlisted,
+        "un-listed but reachable 8.8.8.8 must be blocked (fail-closed)"
+    );
     assert!(!metadata, "metadata endpoint must be denied");
     assert!(
         !high_port,
