@@ -135,7 +135,7 @@ async fn sniff_host(client: &mut TcpStream, buf: &mut Vec<u8>) -> Option<String>
             SniResult::NotTls => match parse_host_header(buf) {
                 Ok(Some(h)) => return Some(h),
                 Ok(None) if buf.len() > 16384 => return None,
-                Ok(None) => {} // plausibly HTTP, need more bytes
+                Ok(None) => {}          // plausibly HTTP, need more bytes
                 Err(()) => return None, // not HTTP either → opaque
             },
             SniResult::Incomplete if buf.len() > 16384 => return None,
@@ -177,9 +177,7 @@ async fn handle_transparent(
         return Ok(()); // drop: closing the socket fails the connection
     }
 
-    let mut upstream = TcpStream::connect(orig)
-        .await
-        .context("dialing upstream")?;
+    let mut upstream = TcpStream::connect(orig).await.context("dialing upstream")?;
     if !buf.is_empty() {
         upstream.write_all(&buf).await?; // replay buffered client bytes
     }

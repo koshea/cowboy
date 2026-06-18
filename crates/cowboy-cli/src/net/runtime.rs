@@ -361,7 +361,8 @@ impl AgentRuntime {
             ContainerState::Stopped => {
                 self.docker.start(&self.container_name).await?;
                 if let Some(gw) = &self.gateway {
-                    gw.start_sidecar(&*self.docker, &self.container_name).await?;
+                    gw.start_sidecar(&*self.docker, &self.container_name)
+                        .await?;
                 }
                 Ok(())
             }
@@ -396,7 +397,8 @@ impl AgentRuntime {
             // Start the gateway as a sidecar sharing the agent's netns; it applies
             // the nft REDIRECT that forces all agent egress through its policy
             // proxy. The agent lacks NET_ADMIN, so it cannot undo the rules.
-            gw.start_sidecar(&*self.docker, &self.container_name).await?;
+            gw.start_sidecar(&*self.docker, &self.container_name)
+                .await?;
             // Attach any approved Compose networks (traffic to these bypasses
             // the gateway via the agent's own NIC).
             for net in &self.security.networks.compose.approved {
