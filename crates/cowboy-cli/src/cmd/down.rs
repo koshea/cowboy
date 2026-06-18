@@ -8,6 +8,7 @@ use cowboy_core::daemonproto::{DaemonReq, DaemonResp, SessionInfo};
 use crate::cli::DownArgs;
 use crate::net::docker::{CliDocker, DockerCli};
 use crate::net::{gateway, runtime};
+use crate::style;
 
 /// Stop the worker processes of the given live sessions (SIGTERM). A worker whose
 /// container we're about to remove must be killed too — otherwise it lingers as a
@@ -70,9 +71,12 @@ pub async fn run(args: DownArgs) -> Result<()> {
             let _ = docker.remove_network(n).await;
         }
         println!(
-            "stopped {killed} session(s); removed {} container(s) and {} network(s)",
-            containers.len(),
-            networks.len()
+            "{}",
+            style::success(&format!(
+                "stopped {killed} session(s); removed {} container(s) and {} network(s)",
+                containers.len(),
+                networks.len()
+            ))
         );
         return Ok(());
     }
@@ -90,7 +94,10 @@ pub async fn run(args: DownArgs) -> Result<()> {
     let killed = kill_session_workers(&live_sessions(Some(&root)).await);
     teardown_project(&docker, &root, &agent).await;
     println!(
-        "cowboy down: stopped {killed} session(s) and removed this project's containers and networks"
+        "{}",
+        style::success(&format!(
+            "cowboy down: stopped {killed} session(s) and removed this project's containers and networks"
+        ))
     );
     Ok(())
 }

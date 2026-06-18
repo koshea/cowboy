@@ -1,6 +1,5 @@
 //! `cowboy doctor` — environment and configuration checks.
 
-use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Command;
 
@@ -10,21 +9,7 @@ use cowboy_core::config::{
 };
 
 use crate::net::compose;
-
-// ANSI styling — applied only when stdout is a TTY and NO_COLOR is unset, so
-// piped/redirected output stays plain. Matches the raw-escape style used in
-// `agent/ui.rs` (no extra color dependency).
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const RED: &str = "\x1b[31m";
-
-/// Whether to emit ANSI styling.
-fn use_color() -> bool {
-    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-}
+use crate::style;
 
 /// Outcome of a single check.
 enum Status {
@@ -36,7 +21,6 @@ enum Status {
 struct Report {
     failures: usize,
     warnings: usize,
-    color: bool,
 }
 
 impl Report {
@@ -44,29 +28,24 @@ impl Report {
         Self {
             failures: 0,
             warnings: 0,
-            color: use_color(),
         }
     }
 
     fn check(&mut self, label: &str, status: Status) {
-        let (word, color, msg) = match status {
-            Status::Ok(m) => ("ok", GREEN, m),
+        // Colored status tag ([ ok ]/[warn]/[fail]); detail dimmed. `style` is
+        // TTY-gated, so piped output stays plain.
+        let (tag, msg) = match status {
+            Status::Ok(m) => (style::success("[ ok ]"), m),
             Status::Warn(m) => {
                 self.warnings += 1;
-                ("warn", YELLOW, m)
+                (style::warning("[warn]"), m)
             }
             Status::Fail(m) => {
                 self.failures += 1;
-                ("fail", RED, m)
+                (style::error("[fail]"), m)
             }
         };
-        // "[ ok ]" / "[warn]" / "[fail]" — the word centered in 4 columns.
-        let tag = format!("[{word:^4}]");
-        if self.color {
-            println!("{BOLD}{color}{tag}{RESET} {label:<22} {DIM}{msg}{RESET}");
-        } else {
-            println!("{tag} {label:<22} {msg}");
-        }
+        println!("{tag} {label:<22} {}", style::dim(&msg));
     }
 }
 
@@ -75,11 +54,11 @@ pub async fn run() -> Result<()> {
     let paths = ConfigPaths::for_root(&root);
     let mut r = Report::new();
 
-    if r.color {
-        println!("{BOLD}cowboy doctor{RESET} {DIM}— {}{RESET}\n", root.display());
-    } else {
-        println!("cowboy doctor — {}\n", root.display());
-    }
+    println!(
+        "{} {}\n",
+        style::bold("cowboy doctor"),
+        style::dim(&format!("— {}", root.display()))
+    );
 
     // Platform.
     r.check("platform", check_platform());
@@ -125,27 +104,24 @@ pub async fn run() -> Result<()> {
     r.check("cowboyd", check_daemon().await);
 
     println!();
-    let paint = |color: &str, s: String| -> String {
-        if r.color {
-            format!("{BOLD}{color}{s}{RESET}")
-        } else {
-            s
-        }
-    };
     if r.failures > 0 {
         println!(
             "{}",
-            paint(
-                RED,
-                format!("{} failure(s), {} warning(s).", r.failures, r.warnings)
-            )
+            style::error(&format!(
+                "{} failure(s), {} warning(s).",
+                r.failures, r.warnings
+            ))
         );
         anyhow::bail!("doctor found {} problem(s)", r.failures);
     }
     let summary = format!("All checks passed ({} warning(s)).", r.warnings);
     println!(
         "{}",
-        paint(if r.warnings > 0 { YELLOW } else { GREEN }, summary)
+        if r.warnings > 0 {
+            style::warning(&summary)
+        } else {
+            style::success(&summary)
+        }
     );
 
     // Offer Compose network approval (interactive only; no-op otherwise).

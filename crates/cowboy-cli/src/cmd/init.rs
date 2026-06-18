@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use cowboy_core::config::{self, ConfigPaths, ProvidersConfig};
 
 use crate::cli::InitArgs;
+use crate::style;
 
 pub fn run(args: InitArgs) -> Result<()> {
     let root = crate::cmd::project_root()?;
@@ -29,7 +30,11 @@ pub fn run(args: InitArgs) -> Result<()> {
     // Offer to approve Compose networks for the agent (interactive only).
     crate::net::compose::prompt_and_persist(&root)?;
 
-    println!("\nInitialized cowboy config in {}", paths.dir.display());
+    println!(
+        "\n{} {}",
+        style::success("Initialized cowboy config in"),
+        paths.dir.display()
+    );
     println!("  - {} (host-owned, never mounted)", config::SECURITY_FILE);
     println!("  - {} (mounted into the container)", config::AGENT_FILE);
 
@@ -38,9 +43,12 @@ pub fn run(args: InitArgs) -> Result<()> {
         .map(|p| !p.providers.is_empty())
         .unwrap_or(false);
     if has_provider {
-        println!("\nNext: run `cowboy doctor`.");
+        println!("\n{} run `cowboy doctor`.", style::bold("Next:"));
     } else {
-        println!("\nNext: run `cowboy models setup` to configure a model provider, then `cowboy doctor`.");
+        println!(
+            "\n{} run `cowboy models setup` to configure a model provider, then `cowboy doctor`.",
+            style::bold("Next:")
+        );
     }
     Ok(())
 }
@@ -48,14 +56,15 @@ pub fn run(args: InitArgs) -> Result<()> {
 fn write_file(path: &Path, contents: &str, force: bool) -> Result<()> {
     if path.exists() && !force {
         println!(
-            "  skip   {} (exists; use --force to overwrite)",
+            "  {} {} (exists; use --force to overwrite)",
+            style::dim("skip  "),
             path.display()
         );
         return Ok(());
     }
     let verb = if path.exists() { "rewrote" } else { "created" };
     fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
-    println!("  {verb} {}", path.display());
+    println!("  {} {}", style::green(verb), path.display());
     Ok(())
 }
 

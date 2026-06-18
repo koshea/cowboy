@@ -8,3 +8,4 @@ pub mod cmd;
 pub mod mcp;
 pub mod net;
 pub mod session;
+pub mod style;
