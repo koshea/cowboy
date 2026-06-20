@@ -4,6 +4,7 @@ use anyhow::Result;
 use cowboy_core::daemonproto::{DaemonReq, DaemonResp, SessionInfo, SessionStatus};
 
 use crate::cmd::daemon;
+use crate::style;
 
 pub async fn run() -> Result<()> {
     let sessions = match daemon::request(DaemonReq::ListSessions { root: None }).await {
@@ -23,14 +24,17 @@ pub async fn run() -> Result<()> {
     let any_ranch = sessions.iter().any(|s| s.ranch_id.is_some());
     if any_ranch {
         println!(
-            "{:<22} {:<11} {:<18} {:<22} TASK",
-            "ID", "STATUS", "BRANCH", "RANCH/WORKSTREAM"
+            "{}",
+            style::bold(&format!(
+                "{:<22} {:<11} {:<18} {:<22} TASK",
+                "ID", "STATUS", "BRANCH", "RANCH/WORKSTREAM"
+            ))
         );
         for s in &sessions {
             println!(
-                "{:<22} {:<11} {:<18} {:<22} {}",
+                "{:<22} {} {:<18} {:<22} {}",
                 s.id,
-                status_str(s.status),
+                status_cell(s.status),
                 s.branch.as_deref().unwrap_or("-"),
                 truncate(&ranch_cell(s), 22),
                 task_str(s),
@@ -38,14 +42,17 @@ pub async fn run() -> Result<()> {
         }
     } else {
         println!(
-            "{:<22} {:<11} {:<18} {:<34} TASK",
-            "ID", "STATUS", "BRANCH", "WORKTREE"
+            "{}",
+            style::bold(&format!(
+                "{:<22} {:<11} {:<18} {:<34} TASK",
+                "ID", "STATUS", "BRANCH", "WORKTREE"
+            ))
         );
         for s in &sessions {
             println!(
-                "{:<22} {:<11} {:<18} {:<34} {}",
+                "{:<22} {} {:<18} {:<34} {}",
                 s.id,
-                status_str(s.status),
+                status_cell(s.status),
                 s.branch.as_deref().unwrap_or("-"),
                 truncate(&s.root.display().to_string(), 34),
                 task_str(s),
@@ -86,9 +93,12 @@ pub async fn cleanup(dry_run: bool) -> Result<()> {
         return Ok(());
     }
     let verb = if dry_run { "would reap" } else { "reaped" };
-    println!("{verb} {} stale session(s):", reclaimed.len());
+    println!(
+        "{}",
+        style::success(&format!("{verb} {} stale session(s):", reclaimed.len()))
+    );
     for id in &reclaimed {
-        println!("  {id}");
+        println!("  {}", style::dim(id));
     }
     if !leases_released.is_empty() {
         let verb = if dry_run { "would free" } else { "freed" };
@@ -115,6 +125,21 @@ fn status_str(s: SessionStatus) -> &'static str {
         SessionStatus::Completed => "completed",
         SessionStatus::Failed => "failed",
         SessionStatus::Stale => "stale",
+    }
+}
+
+/// The status column, padded to width *then* colored by state (so the ANSI codes
+/// don't throw off alignment, and piped/non-TTY output stays plain).
+fn status_cell(s: SessionStatus) -> String {
+    let padded = format!("{:<11}", status_str(s));
+    match s {
+        SessionStatus::Running | SessionStatus::Idle => style::green(&padded),
+        SessionStatus::Starting => style::cyan(&padded),
+        SessionStatus::AwaitingApproval | SessionStatus::AwaitingInput | SessionStatus::Blocked => {
+            style::yellow(&padded)
+        }
+        SessionStatus::Failed | SessionStatus::Stale => style::red(&padded),
+        SessionStatus::Completed => style::dim(&padded),
     }
 }
 

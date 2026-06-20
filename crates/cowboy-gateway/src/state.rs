@@ -44,24 +44,72 @@ impl GatewayState {
         &self.dns
     }
 
-    /// Enrich an attempt with a hostname from the DNS map if we only have an IP.
-    pub fn enrich(&self, mut attempt: NetworkAttempt) -> NetworkAttempt {
-        if attempt.host.is_none() {
-            if let Some(ip) = attempt.ip {
-                if let Some(host) = self.dns.lookup(ip) {
-                    attempt.host = Some(host);
-                }
-            }
+    /// Decide a **transparent** connection, authorizing it by the hostname(s)
+    /// *this gateway resolved* for the dialed IP — never the client-presented
+    /// SNI/Host, which a malicious agent controls (we don't MITM). Precedence:
+    /// any resolved name that the policy denies wins; else any that it allows;
+    /// else the IP-class default. With no resolved name (a raw-IP connection) it
+    /// falls back to IP-only matching (CIDR allow/deny + class default). Returns
+    /// the verdict and the attempt actually used (for the splice/logging).
+    pub async fn decide_connection(
+        &self,
+        ip: IpAddr,
+        port: u16,
+        protocol: Protocol,
+    ) -> (Verdict, NetworkAttempt) {
+        let names = self.dns.lookup_all(ip);
+        let mk = |host: Option<String>| NetworkAttempt {
+            protocol,
+            host,
+            ip: Some(ip),
+            port,
+        };
+
+        // No resolved name: decide by IP alone (CIDR/classify).
+        if names.is_empty() {
+            let a = mk(None);
+            let (v, r) = policy::evaluate(&self.policy, &a);
+            let v = self.run_decision(&a, v, r).await;
+            return (v, a);
         }
-        attempt
+
+        // Evaluate every resolved name; combine by policy precedence.
+        let evals: Vec<(NetworkAttempt, Verdict, String)> = names
+            .into_iter()
+            .map(|n| {
+                let a = mk(Some(n));
+                let (v, r) = policy::evaluate(&self.policy, &a);
+                (a, v, r)
+            })
+            .collect();
+
+        // Deny wins over any allow.
+        if let Some((a, _, r)) = evals.iter().find(|(_, v, _)| *v == Verdict::Deny) {
+            let v = self.run_decision(a, Verdict::Deny, r.clone()).await;
+            return (v, a.clone());
+        }
+        // Then any allow.
+        if let Some((a, _, r)) = evals.iter().find(|(_, v, _)| *v == Verdict::Allow) {
+            let v = self.run_decision(a, Verdict::Allow, r.clone()).await;
+            return (v, a.clone());
+        }
+        // Otherwise all names ask → run the ask flow on the first (representative).
+        let (a, v, r) = &evals[0];
+        let v = self.run_decision(a, *v, r.clone()).await;
+        (v, a.clone())
     }
 
     fn cache_key(attempt: &NetworkAttempt) -> String {
-        // Key by host (not host:port) so one approval covers a host across the DNS
-        // resolution (port 53) and the subsequent connection (443/80) — no double
-        // prompt. IP-only attempts still key by ip:port.
+        // Key by host+port so an approval is scoped to the port it was granted for
+        // (approving `evil.com:443` must not also open `evil.com:22`). DNS
+        // resolution is keyed separately (port 53) and gated by name, not cached
+        // here, so this doesn't reintroduce a double prompt for the 53→443 step.
         match &attempt.host {
-            Some(h) => format!("host:{}", h.trim_end_matches('.').to_ascii_lowercase()),
+            Some(h) => format!(
+                "host:{}:{}",
+                h.trim_end_matches('.').to_ascii_lowercase(),
+                attempt.port
+            ),
             None => match attempt.ip {
                 Some(ip) => format!("ip:{ip}:{}", attempt.port),
                 None => format!("port:{}", attempt.port),
@@ -252,15 +300,6 @@ mod tests {
             s.decide(&attempt(Some("anything.test"), None, 443)).await,
             Verdict::Allow
         );
-    }
-
-    #[test]
-    fn enrich_fills_host_from_dns_map() {
-        let s = state(NetworkPolicy::default());
-        s.dns()
-            .record("1.2.3.4".parse().unwrap(), "host.test".into());
-        let enriched = s.enrich(attempt(None, Some("1.2.3.4"), 443));
-        assert_eq!(enriched.host.as_deref(), Some("host.test"));
     }
 
     // --- DNS policy ---

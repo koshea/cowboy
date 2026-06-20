@@ -27,17 +27,56 @@ impl From<DefaultVerdict> for Verdict {
     }
 }
 
+/// Ports an allow rule covers when it lists none. Empty means "the web ports",
+/// not "every port" — an allow rule without ports must not silently open SSH/SMTP
+/// /arbitrary-protocol tunnels to the host.
+const DEFAULT_ALLOW_PORTS: [u16; 2] = [80, 443];
+
+/// Whether `attempt.port` is permitted by an allow rule set's port list.
+fn allow_port_ok(rules: &RuleSet, port: u16) -> bool {
+    if rules.ports.is_empty() {
+        DEFAULT_ALLOW_PORTS.contains(&port)
+    } else {
+        rules.ports.contains(&port)
+    }
+}
+
 /// Evaluate an attempt against the policy, returning a verdict and a short
 /// human-readable reason.
 pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, String) {
-    // 1. Deny list — highest precedence.
+    // 1. Deny list — highest precedence (domain or CIDR, any port/class).
     if let Some(reason) = matches_ruleset(&policy.deny, attempt, /* require_port */ false) {
         return (Verdict::Deny, format!("denied by policy ({reason})"));
     }
 
-    // 2. Allow list. If the allow set lists ports, the port must be allowed too.
-    if let Some(reason) = matches_ruleset(&policy.allow, attempt, /* require_port */ true) {
-        return (Verdict::Allow, format!("allowed by policy ({reason})"));
+    // 2. Allow list (port must be permitted).
+    if allow_port_ok(&policy.allow, attempt.port) {
+        // 2a. A CIDR allow is an explicit IP grant — it wins for any address class
+        //     (allow-listing 10.0.0.0/8 means it).
+        if let Some(ip) = attempt.ip {
+            if let Some(rule) = policy.allow.cidrs.iter().find(|c| cidr_matches(c, ip)) {
+                return (Verdict::Allow, format!("allowed by policy (cidr {rule})"));
+            }
+        }
+        // 2b. A domain allow grants by name, but must NOT become a path to a
+        //     private/loopback/link-local address — a public name that resolves
+        //     (or is DNS-rebound) to an internal IP. If the destination IP is not
+        //     public, fall through to the destination-class default instead.
+        if let Some(host) = &attempt.host {
+            if let Some(rule) = policy
+                .allow
+                .domains
+                .iter()
+                .find(|d| domain_matches(d, host))
+            {
+                let ip_is_public = attempt
+                    .ip
+                    .is_none_or(|ip| classify(Some(ip)) == DestClass::External);
+                if ip_is_public {
+                    return (Verdict::Allow, format!("allowed by policy (domain {rule})"));
+                }
+            }
+        }
     }
 
     // 3. No rule matched — fall back to the default for the destination's class.
@@ -298,6 +337,72 @@ mod tests {
     }
 
     #[test]
+    fn empty_allow_ports_mean_web_ports_not_all() {
+        // An allow rule with no port list covers only 80/443 — it must not silently
+        // open arbitrary ports (SSH/SMTP/C2 tunnels) on the host.
+        let mut policy = NetworkPolicy::default();
+        policy.allow.domains = vec!["github.com".into()];
+        policy.allow.ports = vec![];
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("github.com"), None, 443)).0,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("github.com"), None, 80)).0,
+            Verdict::Allow
+        );
+        // A non-web port is NOT covered -> falls through to default (ask).
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("github.com"), None, 22)).0,
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn domain_allow_does_not_grant_private_ip() {
+        // A public name that resolves (or is DNS-rebound) to an internal IP must
+        // NOT be allowed by the domain rule — that would be an SSRF pivot. The IP
+        // (from SO_ORIGINAL_DST) is real, so the private-class default applies.
+        let mut policy = NetworkPolicy {
+            default_private_lan: DefaultVerdict::Deny,
+            ..Default::default()
+        };
+        policy.allow.domains = vec!["evil.example".into()];
+        policy.allow.ports = vec![443];
+        // host matches the allow domain, but the dialed IP is RFC1918 -> not granted.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &attempt(Some("evil.example"), Some("10.1.2.3"), 443)
+            )
+            .0,
+            Verdict::Deny
+        );
+        // The same name to a public IP IS granted.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &attempt(Some("evil.example"), Some("93.184.216.34"), 443)
+            )
+            .0,
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn cidr_allow_grants_private_ip_explicitly() {
+        // Unlike a domain allow, an explicit CIDR allow IS honored for a private
+        // range — the user opted into that address space.
+        let mut policy = NetworkPolicy::default();
+        policy.allow.cidrs = vec!["10.0.0.0/8".into()];
+        policy.allow.ports = vec![443];
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("10.1.2.3"), 443)).0,
+            Verdict::Allow
+        );
+    }
+
+    #[test]
     fn deny_beats_allow() {
         let mut policy = NetworkPolicy::default();
         policy.allow.domains.push("evil.example".into());
@@ -315,6 +420,46 @@ mod tests {
         assert!(domain_matches("github.com", "GitHub.com"));
         assert!(domain_matches("github.com", "a.b.github.com"));
         assert!(!domain_matches("github.com", "github.com.evil.com"));
+    }
+
+    #[test]
+    fn ipv6_classification_and_cidr() {
+        use crate::config::DefaultVerdict;
+        // Distinct defaults per class so the verdict reveals the classification.
+        let policy = NetworkPolicy {
+            default_external: DefaultVerdict::Ask,
+            default_private_lan: DefaultVerdict::Deny,
+            default_host: DefaultVerdict::Allow,
+            ..Default::default()
+        };
+        // loopback ::1 -> host
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("::1"), 443)).0,
+            Verdict::Allow
+        );
+        // unique-local fc00::/7 and link-local fe80::/10 -> private lan
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("fd00::1"), 443)).0,
+            Verdict::Deny
+        );
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("fe80::1"), 443)).0,
+            Verdict::Deny
+        );
+        // global unicast -> external
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("2606:4700:4700::1111"), 443)).0,
+            Verdict::Ask
+        );
+        // CIDR matching over v6.
+        assert!(cidr_matches(
+            "2606:4700::/32",
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+        assert!(!cidr_matches(
+            "2606:4700::/32",
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 
     #[test]

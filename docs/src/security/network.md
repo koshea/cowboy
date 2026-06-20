@@ -31,22 +31,31 @@ Fail-closed: if the nftables ruleset cannot be applied, the gateway refuses to
 run rather than leave the agent un-sandboxed.
 
 - **nftables**: a `nat output` REDIRECT in the agent's netns sends **all** of the
-  agent's TCP to the in-process proxy and DNS (`:53`) to the resolver; a
-  `filter output` chain then **drops by default**, so the residue REDIRECT can't
-  carry (non-DNS UDP, ICMP) can't leak. The gateway's own root-uid egress is exempt
-  so it can reach upstream and the host control channel; approved Compose subnets
-  bypass the proxy.
-- **Transparent proxy** (`:8443`, every port): sniffs the first bytes — TLS
-  **SNI**, else HTTP **Host** — with a short timeout so server-speaks-first
-  protocols don't block. No MITM, no decryption. HTTP/HTTPS get hostname precision
-  on any port; opaque/encrypted-ClientHello traffic falls back to the DNS map
-  (`ip → domain`) or, lacking that, `ask` by `ip:port`.
-- **Explicit CONNECT proxy** for proxy-aware clients (convenience).
-- **DNS resolver** (`:53`): **policy-enforced** — see below. Records `ip → domain`
-  for resolved names so a connection's destination IP maps back to a hostname.
-- **Policy**: deny-list wins, then allow-list (domain via SNI/Host, or CIDR; with
-  optional port restriction), else `default_external`. `ask` is sent to the host;
-  with no approver it fails closed.
+  agent's TCP to the in-process proxy and **all** of its DNS (`:53`) to the
+  resolver — the DNS redirect runs ahead of Docker's own embedded resolver
+  (`127.0.0.11`), so queries can't slip around the gateway. A `filter output` chain
+  then **drops by default**, so the residue REDIRECT can't carry (non-DNS UDP,
+  ICMP) can't leak. The gateway's own root-uid egress is exempt so it can reach
+  upstream and the host control channel; the agent is kept non-root so it never
+  inherits that exemption. Approved Compose subnets bypass the proxy.
+- **Transparent proxy** (`:8443`, every port): authorizes a connection by the
+  hostname(s) **the gateway itself resolved** for the destination IP — *not* the
+  client-presented SNI/Host, which the (untrusted) agent controls. It still sniffs
+  the first bytes (TLS SNI / HTTP Host) but only to classify the protocol and to
+  flag a name that wasn't among what the gateway resolved (a spoof attempt). No
+  MITM, no decryption. A raw-IP connection with no prior lookup falls to CIDR/`ask`
+  by `ip:port`.
+- **Explicit CONNECT proxy** for proxy-aware clients (the named host is what gets
+  dialed, so it's authorized directly).
+- **DNS resolver** (`:53`): **policy-enforced** — see below. All agent DNS is
+  routed here first (then forwarded to Docker's embedded resolver, preserving
+  Compose service discovery), and every answer is recorded `ip → {domains}` so a
+  connection's destination IP maps back to the name(s) that resolved to it.
+- **Policy**: deny-list wins, then allow-list (domain matched against the
+  gateway-resolved name for the IP, or CIDR by the real destination IP; with
+  optional port restriction), else `default_external`. A domain allow only grants a
+  **public** IP (it can't become a path to an internal address). `ask` is sent to
+  the host; with no approver it fails closed.
 
 ## DNS policy
 
@@ -87,16 +96,21 @@ entirely — no prompt. Approve such networks deliberately.
 ## Honest scope
 
 - **Every** outbound TCP port is intercepted and gated by domain/CIDR with
-  allow/deny/ask; HTTP/HTTPS are attributed by SNI/Host on any port, other
-  protocols by the DNS map (`ip → domain`) or `ask` by `ip:port`.
+  allow/deny/ask. Connections are attributed by the name the gateway resolved for
+  the destination IP (never the agent-supplied SNI/Host), or by CIDR on the real
+  IP; a raw IP with no prior lookup → `ask` by `ip:port`.
 - DNS only via the gateway resolver, **policy-gated** (strict allowlist + tunnel
-  detection; risky record types refused).
+  detection; risky record types refused) — including queries the agent aims at
+  Docker's embedded resolver.
 - Non-DNS UDP, ICMP, and IPv6 are deny-by-default (IPv6 disabled; the rest dropped
   by the `filter output` chain).
 - Cloud metadata (`169.254.169.254`) is denied by policy on every port.
 - SNI-less / encrypted-ClientHello TLS → ask by IP:port.
 - No TLS MITM. DNS is UDP-only (no TCP/53 large-response fallback yet); tunnel
   detection is heuristic (entropy/length/rate), not a guarantee.
-- Attribution for non-TLS/HTTP relies on the DNS map, so it inherits its
-  limits (shared CDN IPs are coarse; an IP-literal with no prior lookup → `ask`).
+- Attribution is by the gateway-resolved `ip → {domains}` map, so it inherits the
+  limits of IP-based filtering **without** MITM: a host **co-located on an
+  allow-listed CDN IP** is reachable (e.g. another site behind the same Cloudflare
+  anycast address as an allowed domain), and an IP-literal with no prior lookup →
+  `ask`. Closing the co-hosting gap would require MITM/SNI-pinning.
 - Arbitrary **UDP is dropped, not proxied** — proxying it would need TPROXY.

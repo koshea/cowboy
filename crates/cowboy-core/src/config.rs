@@ -782,6 +782,14 @@ impl SecurityConfig {
                     mount.source
                 )));
             }
+            // Fail closed on an unknown mode rather than silently treating it as
+            // read-write (a typo like `readonly` must not yield a writable mount).
+            if !matches!(mount.mode.as_str(), "ro" | "rw") {
+                return Err(Error::SecurityInvariant(format!(
+                    "mount mode {:?} is invalid; use \"ro\" or \"rw\"",
+                    mount.mode
+                )));
+            }
         }
         // Credential grants: never re-expose host config, and never shadow the
         // workspace or the masked `.cowboy/` config with a mount target.
@@ -828,11 +836,16 @@ impl SecurityConfig {
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
         if self.container.privileged {
-            out.push("container.privileged = true grants the agent broad host access".to_string());
+            out.push(
+                "container.privileged is set but NOT honored by cowboy (a privileged agent would \
+                 not be sandboxed); remove it"
+                    .to_string(),
+            );
         }
         if self.container.docker_socket {
             out.push(
-                "container.docker_socket = true exposes the Docker daemon to the agent (container escape risk)"
+                "container.docker_socket is set but NOT honored by cowboy (Docker-daemon access \
+                 is a container escape); remove it"
                     .to_string(),
             );
         }
@@ -840,18 +853,40 @@ impl SecurityConfig {
     }
 }
 
-/// True if a mount source path points at the host-owned security config.
-/// True if `source` points at a host-owned secret/config the agent must never
-/// see: `security.yaml`, `providers.yaml` (API keys!), the project `.cowboy` dir,
-/// or the home `cowboy` config dir (which contains providers.yaml). Defense in
-/// depth — the agent can't author `security.yaml`, but a user must not be able to
-/// foot-gun their keys into the container via a mount/grant either.
+/// True if `source` points at — or *contains* — a host-owned secret/config the
+/// agent must never see: `security.yaml`, `providers.yaml` (API keys!), a project
+/// `.cowboy` dir, or the home `cowboy` config dir. The check resolves `~`/`${VAR}`
+/// and matches by path prefix, not just basename, so mounting an **ancestor** of
+/// the config dir (e.g. `~` or `~/.config`) — which would drag `providers.yaml`
+/// into the container — is also refused. Defense in depth: the agent can't author
+/// `security.yaml`, but a user mustn't be able to foot-gun their keys in via a
+/// mount/grant either.
 fn mount_targets_host_secret(source: &str) -> bool {
-    let name = Path::new(source).file_name().and_then(|n| n.to_str());
-    matches!(
+    // Resolve ~ and ${VAR}; fall back to the literal path if expansion fails.
+    let resolved = expand_path(source).unwrap_or_else(|_| PathBuf::from(source));
+    let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+
+    // The secret files by basename, or any `.cowboy` component in the path.
+    let name = resolved.file_name().and_then(|n| n.to_str());
+    if matches!(
         name,
-        Some(SECURITY_FILE) | Some(PROVIDERS_FILE) | Some(COWBOY_DIR) | Some("cowboy")
-    )
+        Some(SECURITY_FILE) | Some(PROVIDERS_FILE) | Some(COWBOY_DIR)
+    ) {
+        return true;
+    }
+    if resolved.components().any(|c| c.as_os_str() == COWBOY_DIR) {
+        return true;
+    }
+
+    // The home cowboy config dir (holds providers.yaml): refuse the dir itself,
+    // anything inside it, or any ancestor of it.
+    if let Some(cfg_dir) = global_config_dir() {
+        let cfg_dir = std::fs::canonicalize(&cfg_dir).unwrap_or(cfg_dir);
+        if resolved.starts_with(&cfg_dir) || cfg_dir.starts_with(&resolved) {
+            return true;
+        }
+    }
+    false
 }
 
 impl AgentConfig {
@@ -920,23 +955,70 @@ impl ProvidersConfig {
     }
 
     /// Write to `path` with owner-only (`0600`) permissions — this file holds
-    /// API keys.
+    /// API keys. The file is created `0600` *before* any bytes are written (via a
+    /// temp file + atomic rename), so there's no window where the keys are
+    /// world-readable.
     pub fn save(&self, path: &Path) -> Result<()> {
-        write_yaml(self, path)?;
+        write_yaml_private(self, path)
+    }
+
+    /// Whether `path` (a providers file) is readable by group or other — i.e. its
+    /// `0600` invariant has been broken (hand-edited, restored, copied). Used by
+    /// `cowboy doctor` to surface a leaked-key risk. Always false on non-unix.
+    pub fn perms_are_loose(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o077 != 0)
+                .unwrap_or(false)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            false
+        }
+    }
+}
+
+/// Serialize `value` to YAML at `path` with owner-only (`0600`) perms, created
+/// atomically (temp file at `0600` + rename) so secrets are never briefly exposed.
+fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| Error::ConfigRead {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let yaml = serde_yaml_ng::to_string(value).map_err(|e| Error::Invalid(e.to_string()))?;
+    let err = |p: &Path, source| Error::ConfigRead {
+        path: p.to_path_buf(),
+        source,
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = path.with_extension("tmp");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|s| err(&tmp, s))?;
+        f.write_all(yaml.as_bytes()).map_err(|s| err(&tmp, s))?;
+        f.sync_all().ok();
+        std::fs::rename(&tmp, path).map_err(|s| err(path, s))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, yaml).map_err(|s| err(path, s))?;
         set_owner_only(path)
     }
 }
 
-#[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
-        Error::ConfigRead {
-            path: path.to_path_buf(),
-            source,
-        }
-    })
-}
 #[cfg(not(unix))]
 fn set_owner_only(_path: &Path) -> Result<()> {
     Ok(())

@@ -281,6 +281,13 @@ fn check_providers() -> Status {
         Ok(cfg) if cfg.providers.is_empty() => {
             Status::Warn("none configured; run `cowboy models setup`".to_string())
         }
+        // Loud warning if the key file lost its 0600 perms (hand-edited, restored
+        // from backup, copied) — group/other can read the API keys.
+        Ok(_) if ProvidersConfig::perms_are_loose(&path) => Status::Warn(format!(
+            "{} is readable by group/other; run `chmod 600 {}`",
+            path.display(),
+            path.display()
+        )),
         Ok(cfg) => Status::Ok(format!(
             "{} configured ({})",
             cfg.providers.len(),

@@ -24,6 +24,7 @@ use crate::cmd::daemon;
 use crate::net::control;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
+use crate::style;
 
 pub async fn run(
     task: Option<String>,
@@ -392,15 +393,21 @@ fn decide_collision(held_by: &SessionInfo, flags: &StartFlags) -> Result<Collisi
 /// is plain stdin/stdout).
 fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
     loop {
-        println!("\nThis worktree already has an active session:");
+        println!(
+            "\n{}",
+            style::warning("This worktree already has an active session:")
+        );
         println!("  id      {}", held_by.id);
         println!("  status  {:?}", held_by.status);
         if let Some(b) = &held_by.branch {
             println!("  branch  {b}");
         }
         print!(
-            "[a]ttach  [r]ead-only  [w] new worktree{}  [q]uit > ",
-            if live { "" } else { "  [f]orce-takeover" }
+            "{} ",
+            style::bold(&format!(
+                "[a]ttach  [r]ead-only  [w] new worktree{}  [q]uit >",
+                if live { "" } else { "  [f]orce-takeover" }
+            ))
         );
         io::stdout().flush().ok();
 
@@ -414,7 +421,10 @@ fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
             "w" | "new" | "worktree" => return Ok(Collision::NewWorktree),
             "f" | "force" if !live => return Ok(Collision::Force),
             "q" | "quit" | "" => return Ok(Collision::Quit),
-            other => println!("unrecognized choice: {other:?}"),
+            other => println!(
+                "{}",
+                style::warning(&format!("unrecognized choice: {other:?}"))
+            ),
         }
     }
 }

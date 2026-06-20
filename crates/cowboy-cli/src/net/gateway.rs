@@ -83,6 +83,13 @@ impl GatewayNetwork {
         let json = serde_json::to_string_pretty(&policy).context("serializing network policy")?;
         std::fs::write(&policy_file, json)
             .with_context(|| format!("writing policy file {}", policy_file.display()))?;
+        // Owner-only: this shared-/tmp file isn't secret, but it shouldn't expose
+        // the project's network posture (allow/deny lists) to other local users.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&policy_file, std::fs::Permissions::from_mode(0o600));
+        }
 
         // Control channel: the gateway (sidecar, in the agent's netns) dials the
         // host over TCP for `ask` decisions. A deterministic per-project port; the
@@ -156,7 +163,8 @@ impl GatewayNetwork {
     /// (`--network container:<agent>`), which forbids per-container network flags
     /// (`--ip`, `--add-host`, `--dns`); those settings live on the agent and are
     /// inherited here. The gateway runs as root (uid 0) so the nft rule can exempt
-    /// its own egress.
+    /// its own egress (and Docker's embedded resolver) by `skuid 0`; the agent is
+    /// kept non-root so it never inherits that exemption.
     fn gateway_spec(&self, agent: &str) -> ContainerSpec {
         let policy = self.policy_file.to_string_lossy().into_owned();
         ContainerSpec {
@@ -251,9 +259,17 @@ impl GatewayNetwork {
         )
     }
 
-    /// Capabilities the agent container must **drop** (so it can't alter the nft
-    /// rules the sidecar installs in their shared netns).
+    /// Capabilities the agent container must **drop**. `NET_ADMIN`/`NET_RAW` stop
+    /// it altering the shared-netns nft rules or sending raw packets; `SETUID`/
+    /// `SETGID` stop a (root) agent from changing identity — defence in depth atop
+    /// the non-root remap that keeps it from matching the gateway's `skuid 0`
+    /// exemption in the first place.
     pub fn agent_caps(&self) -> Vec<String> {
-        vec!["NET_ADMIN".into(), "NET_RAW".into()]
+        vec![
+            "NET_ADMIN".into(),
+            "NET_RAW".into(),
+            "SETUID".into(),
+            "SETGID".into(),
+        ]
     }
 }

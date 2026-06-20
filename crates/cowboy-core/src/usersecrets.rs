@@ -227,6 +227,35 @@ mod tests {
     }
 
     #[test]
+    fn merged_footgun_grant_is_caught_by_validate() {
+        // The overlay is host-owned, but a foot-gun grant in it (a credential
+        // whose source is a host secret) must still be rejected once merged — the
+        // merge+validate contract is what callers rely on. This locks it in.
+        let base = tmp();
+        write(
+            &base.join("global.yaml"),
+            &UserSecrets {
+                files: vec![SecretMount {
+                    source: "~/.config/cowboy/providers.yaml".into(),
+                    target: "/tmp/keys".into(),
+                    read_only: true,
+                    required: false,
+                    approval: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut sec = SecurityConfig::default();
+        merge_into_base(&mut sec, &base, "abcd1234");
+        assert!(
+            matches!(sec.validate(), Err(crate::Error::SecurityInvariant(_))),
+            "a merged grant exposing providers.yaml must fail validate()"
+        );
+    }
+
+    #[test]
     fn merge_is_deduped() {
         let base = tmp();
         let grant = UserSecrets {

@@ -52,8 +52,12 @@ async fn main() -> Result<()> {
         control,
     ));
 
-    // DNS resolver (policy-enforced).
-    let dns_bind: SocketAddr = ([0, 0, 0, 0], PORT_DNS).into();
+    // DNS resolver (policy-enforced). Bind loopback, not 0.0.0.0: the agent's
+    // queries are REDIRECTed here (DNAT to 127.0.0.1:PORT_DNS), and replying from
+    // 127.0.0.1 is what lets conntrack reverse the DNAT so the agent accepts the
+    // answer (a 0.0.0.0 bind would source the reply from the netns IP and the
+    // agent would reject it).
+    let dns_bind: SocketAddr = ([127, 0, 0, 1], PORT_DNS).into();
     let upstream = cfg.dns_upstream;
     let dns_state = state.clone();
     tokio::spawn(async move {

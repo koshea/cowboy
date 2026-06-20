@@ -233,3 +233,78 @@ impl ControlClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cowboy_core::netproto::{ApprovalScope, Protocol};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::net::TcpListener;
+
+    fn attempt() -> NetworkAttempt {
+        NetworkAttempt {
+            protocol: Protocol::Tls,
+            host: Some("example.com".into()),
+            ip: None,
+            port: 443,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_control_addr_fails_closed() {
+        // No host to ask → deny, never allow.
+        let c = ControlClient::new(None, None);
+        assert_eq!(c.ask(&attempt(), None).await, Verdict::Deny);
+    }
+
+    #[tokio::test]
+    async fn ask_skips_unmatched_id_and_returns_decision() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, mut w) = s.into_split();
+            let mut br = BufReader::new(r);
+            let mut line = String::new();
+            br.read_line(&mut line).await.unwrap(); // Hello
+            line.clear();
+            br.read_line(&mut line).await.unwrap(); // Ask
+            let id = match serde_json::from_str::<GatewayMessage>(line.trim()).unwrap() {
+                GatewayMessage::Ask { id, .. } => id,
+                other => panic!("expected Ask, got {other:?}"),
+            };
+            // A decision for a *different* id must be skipped by the client.
+            let wrong = HostMessage::Decision {
+                id: id.wrapping_add(7),
+                verdict: Verdict::Deny,
+                scope: ApprovalScope::Once,
+            };
+            w.write_all(encode_line(&wrong).as_bytes()).await.unwrap();
+            let right = HostMessage::Decision {
+                id,
+                verdict: Verdict::Allow,
+                scope: ApprovalScope::Session,
+            };
+            w.write_all(encode_line(&right).as_bytes()).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+        let c = ControlClient::new(Some(addr), Some("tok".into()));
+        assert_eq!(c.ask(&attempt(), None).await, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn ask_fails_closed_when_host_drops_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (s, _) = listener.accept().await.unwrap();
+            let (r, _w) = s.into_split();
+            // Read the Hello, then drop the connection without deciding.
+            let mut br = BufReader::new(r);
+            let mut line = String::new();
+            let _ = br.read_line(&mut line).await;
+        });
+        let c = ControlClient::new(Some(addr), Some("tok".into()));
+        assert_eq!(c.ask(&attempt(), None).await, Verdict::Deny);
+    }
+}

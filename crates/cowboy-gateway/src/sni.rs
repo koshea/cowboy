@@ -68,49 +68,52 @@ pub fn extract_sni(buf: &[u8]) -> SniResult {
     SniResult::Incomplete
 }
 
+/// Build a minimal TLS record framing around a handshake body. Test-only, shared
+/// with the proxy's `sniff_host` tests.
+#[cfg(test)]
+pub(crate) fn tls_record(handshake: &[u8]) -> Vec<u8> {
+    let mut v = vec![0x16, 0x03, 0x01];
+    v.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    v.extend_from_slice(handshake);
+    v
+}
+
+/// Construct a ClientHello carrying a single SNI extension for `host`. Test-only.
+#[cfg(test)]
+pub(crate) fn client_hello_with_sni(host: &str) -> Vec<u8> {
+    // SNI extension body: server_name_list.
+    let mut sni_entry = vec![0x00]; // name_type = host_name
+    sni_entry.extend_from_slice(&(host.len() as u16).to_be_bytes());
+    sni_entry.extend_from_slice(host.as_bytes());
+    let mut sni_list = (sni_entry.len() as u16).to_be_bytes().to_vec();
+    sni_list.extend_from_slice(&sni_entry);
+    let mut ext = vec![0x00, 0x00]; // extension type 0 = server_name
+    ext.extend_from_slice(&(sni_list.len() as u16).to_be_bytes());
+    ext.extend_from_slice(&sni_list);
+
+    let mut exts = (ext.len() as u16).to_be_bytes().to_vec();
+    exts.extend_from_slice(&ext);
+
+    // ClientHello body.
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // client_version TLS 1.2
+    body.extend_from_slice(&[0u8; 32]); // random
+    body.push(0x00); // session_id length
+    body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
+    body.extend_from_slice(&[0x01, 0x00]); // compression methods
+    body.extend_from_slice(&exts);
+
+    // Handshake header: type 1 (ClientHello) + 3-byte length.
+    let mut hs = vec![0x01];
+    let len = body.len();
+    hs.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    hs.extend_from_slice(&body);
+    hs
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a minimal TLS record framing around a handshake body.
-    fn tls_record(handshake: &[u8]) -> Vec<u8> {
-        let mut v = vec![0x16, 0x03, 0x01];
-        v.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
-        v.extend_from_slice(handshake);
-        v
-    }
-
-    /// Construct a ClientHello carrying a single SNI extension for `host`.
-    fn client_hello_with_sni(host: &str) -> Vec<u8> {
-        // SNI extension body: server_name_list.
-        let mut sni_entry = vec![0x00]; // name_type = host_name
-        sni_entry.extend_from_slice(&(host.len() as u16).to_be_bytes());
-        sni_entry.extend_from_slice(host.as_bytes());
-        let mut sni_list = (sni_entry.len() as u16).to_be_bytes().to_vec();
-        sni_list.extend_from_slice(&sni_entry);
-        let mut ext = vec![0x00, 0x00]; // extension type 0 = server_name
-        ext.extend_from_slice(&(sni_list.len() as u16).to_be_bytes());
-        ext.extend_from_slice(&sni_list);
-
-        let mut exts = (ext.len() as u16).to_be_bytes().to_vec();
-        exts.extend_from_slice(&ext);
-
-        // ClientHello body.
-        let mut body = Vec::new();
-        body.extend_from_slice(&[0x03, 0x03]); // client_version TLS 1.2
-        body.extend_from_slice(&[0u8; 32]); // random
-        body.push(0x00); // session_id length
-        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]); // cipher suites
-        body.extend_from_slice(&[0x01, 0x00]); // compression methods
-        body.extend_from_slice(&exts);
-
-        // Handshake header: type 1 (ClientHello) + 3-byte length.
-        let mut hs = vec![0x01];
-        let len = body.len();
-        hs.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
-        hs.extend_from_slice(&body);
-        hs
-    }
 
     #[test]
     fn extracts_sni() {

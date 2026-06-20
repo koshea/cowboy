@@ -73,6 +73,10 @@ pub struct ContainerSpec {
     pub extra_hosts: Vec<String>,
     /// Run as this `uid:gid` (`--user`) — used to run the agent non-root.
     pub user: Option<String>,
+    /// `--security-opt` values (e.g. `no-new-privileges`).
+    pub security_opt: Vec<String>,
+    /// `--pids-limit`: cap the number of processes (fork-bomb resilience).
+    pub pids_limit: Option<u32>,
     /// Override the image `ENTRYPOINT` (`--entrypoint`).
     pub entrypoint: Option<String>,
     /// Command to run; defaults to `tail -f /dev/null` for keep-alive.
@@ -228,6 +232,14 @@ fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
     if let Some(user) = &spec.user {
         args.push("--user".into());
         args.push(user.clone());
+    }
+    for opt in &spec.security_opt {
+        args.push("--security-opt".into());
+        args.push(opt.clone());
+    }
+    if let Some(pids) = spec.pids_limit {
+        args.push("--pids-limit".into());
+        args.push(pids.to_string());
     }
     if let Some(net) = &spec.network {
         args.push("--network".into());

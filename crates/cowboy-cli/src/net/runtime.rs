@@ -302,6 +302,11 @@ impl AgentRuntime {
             dns,
             extra_hosts,
             user: self.user.clone(),
+            // Defence in depth: stop privilege escalation via setuid binaries, and
+            // bound process count against a fork-bomb DoS. The agent runs untrusted
+            // code, so it should never be able to gain privileges it wasn't given.
+            security_opt: vec!["no-new-privileges".into()],
+            pids_limit: Some(4096),
             entrypoint: None,
             keep_alive: None,
         })
@@ -606,11 +611,21 @@ impl AgentRuntime {
     }
 }
 
-/// The host user as `uid:gid`, so the container runs non-root and writes files
-/// owned by the user.
+/// The agent container's `uid:gid`. Normally the host user, so files in the
+/// mounted workspace are owned correctly. But the agent must **never run as uid 0**:
+/// the gateway exempts root egress (`skuid 0`) so its own proxy/DNS dials — and
+/// Docker's embedded resolver — aren't redirected into themselves, and a uid-0
+/// agent would inherit that exemption and bypass the proxy entirely. So when the
+/// operator runs `cowboy` as root we remap the agent to a fixed non-root uid/gid
+/// (root on the host can still access the files it writes).
 fn host_user() -> String {
     // SAFETY: getuid/getgid are always-safe libc calls.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+    // `nobody`-style fallback when invoked as root, so the agent is never uid 0.
+    const NONROOT_UID: u32 = 65534;
+    const NONROOT_GID: u32 = 65534;
+    let uid = if uid == 0 { NONROOT_UID } else { uid };
+    let gid = if gid == 0 { NONROOT_GID } else { gid };
     format!("{uid}:{gid}")
 }
 

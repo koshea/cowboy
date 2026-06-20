@@ -54,6 +54,7 @@ pub async fn run(command: RanchCommand) -> Result<()> {
         RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
         RanchCommand::Complete { id, workstream } => complete(&root, &id, &workstream),
         RanchCommand::Accept { id, workstream } => accept(&root, &id, &workstream),
+        RanchCommand::Retry { id, workstream } => retry(&root, &id, &workstream),
         RanchCommand::Watch { id } => watch(&root, &id).await,
         RanchCommand::Propose {
             id,
@@ -115,9 +116,82 @@ fn accept(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
     mark_done(root, id, workstream, "accepted")
 }
 
+/// `cowboy ranch retry <id> <workstream>` — reset a `Failed` or interrupted
+/// (`WaitingForUser`) workstream back to the queue so the next `start` relaunches
+/// it with a fresh session/worktree. Without this a crashed workstream is a
+/// terminal dead-end that wedges its dependents (the only other escape being to
+/// hand-edit the committed `ranch.yaml`, which the design forbids). Best-effort
+/// tears down the abandoned worktree/branch so the relaunch reuses the canonical
+/// name.
+fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
+    let _lock = lock_ranch(root, id)?;
+    let mut ranch = ranch::load(root, id)?;
+    let Some(w) = ranch.workstream_mut(workstream) else {
+        bail!("no workstream `{workstream}` in ranch `{id}`");
+    };
+    if !matches!(
+        w.status,
+        WorkstreamStatus::Failed | WorkstreamStatus::WaitingForUser
+    ) {
+        bail!(
+            "can't retry `{workstream}`: it is {} (only failed or waiting-for-user \
+             workstreams can be retried)",
+            ws_status(w.status)
+        );
+    }
+    let old = w.worktree_path.clone().zip(w.branch.clone());
+    w.status = WorkstreamStatus::Planned; // recompute_readiness re-derives Ready/Blocked
+    w.session_id = None;
+    w.worktree_path = None;
+    w.branch = None;
+    ranch.recompute_readiness();
+    ranch::save(root, &ranch)?;
+    if let Some((path, branch)) = old {
+        crate::net::worktree::remove(root, &path, &branch);
+    }
+    println!(
+        "{}",
+        crate::style::success(&format!(
+            "ranch {id}: reset `{workstream}` to retry — run `cowboy ranch start {id}` to relaunch"
+        ))
+    );
+    Ok(())
+}
+
+/// A held exclusive lock on a ranch's directory. `ranch.yaml` is the committed
+/// source of truth, mutated by several processes (the daemon coordinator's
+/// `advance`, `cowboy ranch start/accept`, the watch TUI). Without a lock, two
+/// concurrent advances each load → mutate → save and the last write wins —
+/// losing updates and even double-spawning a workstream. Holding this around the
+/// whole load→save cycle serializes them. Released on drop (file close).
+struct RanchLock {
+    _file: std::fs::File,
+}
+
+fn lock_ranch(root: &Path, id: &str) -> Result<RanchLock> {
+    use std::os::fd::AsRawFd;
+    let dir = ranch::ranches_dir(root).join(id);
+    std::fs::create_dir_all(&dir).ok();
+    let path = dir.join(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening ranch lock {}", path.display()))?;
+    // Blocking exclusive lock; advances are short and infrequent, so brief
+    // contention here is fine.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        bail!("acquiring ranch lock {}", path.display());
+    }
+    Ok(RanchLock { _file: file })
+}
+
 /// Shared body for `complete`/`accept`: force a workstream to Complete, promote
 /// its outputs, recompute readiness, and report newly-unblocked dependents.
 fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> Result<()> {
+    let _lock = lock_ranch(root, id)?;
     let mut ranch = ranch::load(root, id)?;
     {
         let ws = ranch
@@ -295,6 +369,13 @@ fn apply_change(ranch: &mut Ranch, change: &ScopeChange) -> Result<String> {
             w.status = WorkstreamStatus::Planned; // a freshly-added workstream starts planned
             let wid = w.id.clone();
             ranch.workstreams.push(w);
+            // Validate the graph (dangling deps, cycles, dupes) before committing —
+            // the approve path is the only sanctioned way to mutate the plan, so it
+            // must never write an unrunnable `ranch.yaml`. Revert on failure.
+            if let Err(e) = ranch.validate() {
+                ranch.workstreams.retain(|o| o.id != wid);
+                bail!("adding `{wid}` would make the plan invalid: {e}");
+            }
             ranch.recompute_readiness();
             Ok(format!("added workstream `{wid}`"))
         }
@@ -593,6 +674,10 @@ async fn start(root: &std::path::Path, id: &str) -> Result<()> {
 /// them in-pane, so it never writes to the raw-mode terminal). Assumes the
 /// daemon is already running.
 async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
+    // Serialize the whole load→mutate→save against other advances/accepts so two
+    // coordinators can't both launch the same Ready workstream (each would create
+    // a distinct worktree, so the per-worktree lease doesn't catch it).
+    let _lock = lock_ranch(root, id)?;
     let mut log: Vec<String> = Vec::new();
     let mut ranch = ranch::load(root, id)?;
     // Reject a broken dependency graph up front: a cycle or a typo'd `depends_on`
@@ -670,9 +755,15 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
                 started.push((ws_id.clone(), sid, branch));
             }
             DaemonResp::LeaseDenied { .. } => {
+                // The worktree we just created went unused — tear it down so it
+                // doesn't leak (and a later attempt reuses the canonical branch).
+                crate::net::worktree::remove(root, &path, &branch);
                 log.push(format!("skip {}: worktree already in use", ws.id))
             }
-            DaemonResp::Err { message } => log.push(format!("skip {}: {message}", ws.id)),
+            DaemonResp::Err { message } => {
+                crate::net::worktree::remove(root, &path, &branch);
+                log.push(format!("skip {}: {message}", ws.id))
+            }
             other => bail!("unexpected daemon response: {other:?}"),
         }
     }
@@ -998,8 +1089,14 @@ fn reconcile_and_pick(
                         w.status = WorkstreamStatus::WaitingForUser;
                         awaiting_acceptance.push(w.id.clone());
                     }
-                    Some(SessionStatus::Failed) | Some(SessionStatus::Stale) => {
-                        w.status = WorkstreamStatus::Failed
+                    // An explicit failure is terminal. A *stale* session (worker pid
+                    // gone with no terminal message — a clean detach, a kill, or a
+                    // daemon-restart race) is NOT a crash: park it for the user to
+                    // re-attach/re-run rather than dead-ending its dependents.
+                    Some(SessionStatus::Failed) => w.status = WorkstreamStatus::Failed,
+                    Some(SessionStatus::Stale) => {
+                        w.status = WorkstreamStatus::WaitingForUser;
+                        awaiting_acceptance.push(w.id.clone());
                     }
                     _ => {}
                 }
@@ -1032,6 +1129,10 @@ fn promote_artifacts(
     };
     let session_dir = crate::session::session_dir(wt, sid);
     let dest = ranch::ranch_artifact_dir(root, &ranch.id, &ws.id);
+    // Clean sync: clear the prior promotion first so the store mirrors the current
+    // session (promotion runs again at acceptance; an artifact the user *removed*
+    // between attempts must not survive as a stale copy downstream consumers see).
+    let _ = std::fs::remove_dir_all(&dest);
     if std::fs::create_dir_all(&dest).is_err() {
         return 0;
     }
@@ -1324,6 +1425,81 @@ mod tests {
             created_ms: 1,
             updated_ms: 1,
         }
+    }
+
+    #[test]
+    fn reconcile_parks_stale_session_not_failed() {
+        // A stale session (worker gone without a terminal message) is a detach/
+        // kill/restart-race, not a crash — park it for attention, don't dead-end it.
+        let mut r = ranch(vec![
+            ws("schema", &[], WorkstreamStatus::Running, Some("s1")),
+            ws("api", &["schema"], WorkstreamStatus::Planned, None),
+        ]);
+        reconcile_and_pick(&mut r, &|sid| (sid == "s1").then_some(SessionStatus::Stale));
+        assert_eq!(
+            r.workstream("schema").unwrap().status,
+            WorkstreamStatus::WaitingForUser
+        );
+        // An explicit failure, by contrast, is terminal.
+        let mut r2 = ranch(vec![ws(
+            "schema",
+            &[],
+            WorkstreamStatus::Running,
+            Some("s1"),
+        )]);
+        reconcile_and_pick(&mut r2, &|sid| {
+            (sid == "s1").then_some(SessionStatus::Failed)
+        });
+        assert_eq!(
+            r2.workstream("schema").unwrap().status,
+            WorkstreamStatus::Failed
+        );
+    }
+
+    #[test]
+    fn apply_change_rejects_dangling_dependency() {
+        // The approve path must validate the graph before committing: adding a
+        // workstream whose `depends_on` names an unknown id is rejected, and the
+        // bad workstream is not left in the plan.
+        let mut r = ranch(vec![ws("a", &[], WorkstreamStatus::Planned, None)]);
+        let change = ScopeChange::AddWorkstream {
+            workstream: ws("b", &["nonexistent"], WorkstreamStatus::Planned, None),
+        };
+        assert!(apply_change(&mut r, &change).is_err());
+        assert!(
+            r.workstream("b").is_none(),
+            "reverted on validation failure"
+        );
+    }
+
+    #[test]
+    fn retry_resets_failed_workstream_and_rejects_running() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        // A failed workstream with a dead session; a dependent is blocked on it.
+        let mut r = ranch(vec![
+            ws("a", &[], WorkstreamStatus::Failed, Some("dead-sid")),
+            ws("b", &["a"], WorkstreamStatus::Blocked, None),
+        ]);
+        r.workstream_mut("a").unwrap().worktree_path = Some("/nonexistent/wt".into());
+        ranch::save(root, &r).unwrap();
+
+        retry(root, "r", "a").unwrap();
+
+        let r2 = ranch::load(root, "r").unwrap();
+        let a = r2.workstream("a").unwrap();
+        assert_eq!(
+            a.status,
+            WorkstreamStatus::Ready,
+            "no deps → ready to re-run"
+        );
+        assert!(a.session_id.is_none(), "dead session forgotten");
+        assert!(a.worktree_path.is_none(), "abandoned worktree forgotten");
+
+        // A running (non-terminal) workstream can't be retried.
+        let running = ranch(vec![ws("a", &[], WorkstreamStatus::Running, Some("s"))]);
+        ranch::save(root, &running).unwrap();
+        assert!(retry(root, "r", "a").is_err());
     }
 
     #[test]

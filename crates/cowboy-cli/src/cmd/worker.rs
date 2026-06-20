@@ -180,11 +180,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     status,
                     turn: st.turn,
                     tokens: st.tokens,
-                    diffstat: st.diffstat,
+                    diffstat: st.diffstat.clone(),
                     attached_clients: attached,
-                    running_command: st.running_command,
+                    running_command: st.running_command.clone(),
                     branch: None,
-                    blocked_reason: st.blocked_reason,
+                    blocked_reason: st.blocked_reason.clone(),
                 })
                 .await;
                 match resp {
@@ -192,10 +192,18 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     // re-register so a surviving worker is re-adopted. Reachable.
                     Ok(cowboy_core::daemonproto::DaemonResp::Err { .. }) => {
                         unreachable = 0;
-                        let _ = daemon::request(DaemonReq::RegisterWorker {
-                            info: hb_info.clone(),
-                        })
-                        .await;
+                        // Re-register from CURRENT state, not the startup snapshot:
+                        // a daemon that restarted must not resurrect us at turn 0 /
+                        // status Running when we're actually further along / blocked.
+                        let mut info = hb_info.clone();
+                        info.status = status;
+                        info.turn = st.turn;
+                        info.tokens = st.tokens;
+                        info.diffstat = st.diffstat.clone();
+                        info.attached_clients = attached;
+                        info.running_command = st.running_command.clone();
+                        info.blocked_reason = st.blocked_reason.clone();
+                        let _ = daemon::request(DaemonReq::RegisterWorker { info }).await;
                     }
                     Ok(_) => unreachable = 0,
                     // Connection error → the daemon is down. If it stays down past
@@ -454,8 +462,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             end = true;
                             break;
                         }
-                        // Queue further input to run after this turn.
-                        Some(ClientMsg::Message(m)) => queue.push_back(m),
+                        // Queue further input to run after this turn. Bounded so a
+                        // client streaming faster than turns complete can't grow
+                        // memory without limit; drop the oldest queued input once
+                        // the cap is hit (a turn is in flight, so this is backlog).
+                        Some(ClientMsg::Message(m)) => {
+                            const MAX_QUEUED: usize = 256;
+                            if queue.len() >= MAX_QUEUED {
+                                queue.pop_front();
+                                tracing::warn!(
+                                    cap = MAX_QUEUED,
+                                    "input queue full; dropping oldest queued message"
+                                );
+                            }
+                            queue.push_back(m);
+                        }
                         // Swapping the model needs &mut agent, so finish the
                         // current turn first, then apply below.
                         Some(ClientMsg::SwitchModel(n)) => {

@@ -45,8 +45,13 @@ impl GatewayConfig {
 
         let agent_subnet =
             std::env::var("COWBOY_AGENT_SUBNET").unwrap_or_else(|_| "10.88.0.0/24".to_string());
+        // Forward approved queries to Docker's embedded resolver (always 127.0.0.11
+        // on a user-defined network), not straight to a public resolver — that
+        // preserves Docker Compose service-name discovery while still routing every
+        // agent query through *this* resolver first (gating + IP→host recording).
+        // cowboy's own forward is `skuid 0`-exempt, so it reaches 127.0.0.11.
         let dns_upstream = std::env::var("COWBOY_DNS_UPSTREAM")
-            .unwrap_or_else(|_| "1.1.1.1:53".to_string())
+            .unwrap_or_else(|_| "127.0.0.11:53".to_string())
             .parse()
             .context("parsing COWBOY_DNS_UPSTREAM")?;
         let control_addr = std::env::var("COWBOY_CONTROL_ADDR").ok();

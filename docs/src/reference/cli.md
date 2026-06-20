@@ -559,6 +559,16 @@ Reject a pending proposal (records the decision; plan unchanged)
 | `--reason` |  |
 
 
+### `cowboy ranch retry`
+
+Reset a failed or interrupted workstream so it re-runs on the next start
+
+| Arg | Description |
+|-----|-------------|
+| `<RANCH>` |  |
+| `<WORKSTREAM>` |  |
+
+
 ### `cowboy ranch start`
 
 Launch ready workstreams (deps complete), each in its own worktree/branch. Re-run as workstreams finish to advance the plan

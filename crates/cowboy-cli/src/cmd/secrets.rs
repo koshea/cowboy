@@ -14,6 +14,7 @@ use cowboy_core::usersecrets;
 
 use crate::cli::{SecretsAddArgs, SecretsCommand};
 use crate::net::runtime::repo_key;
+use crate::style;
 
 pub fn run(command: SecretsCommand) -> Result<()> {
     match command {
@@ -214,7 +215,10 @@ fn add(args: SecretsAddArgs) -> Result<()> {
     } else {
         "this repo (all worktrees)"
     };
-    println!("✓ wrote credential grant to {}", path.display());
+    println!(
+        "{}",
+        style::success(&format!("✓ wrote credential grant to {}", path.display()))
+    );
     println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
     for n in &c.notes {
         println!("  {n}");
@@ -317,8 +321,14 @@ fn list() -> Result<()> {
         }
     }
     if !any {
-        println!("no credential grants. Add one with `cowboy secrets add <preset>`.");
-        println!("presets: {}", PRESETS.join(", "));
+        println!(
+            "{}",
+            style::dim("no credential grants. Add one with `cowboy secrets add <preset>`.")
+        );
+        println!(
+            "{}",
+            style::dim(&format!("presets: {}", PRESETS.join(", ")))
+        );
     }
     Ok(())
 }

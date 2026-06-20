@@ -274,3 +274,119 @@ fn dns_resolution_is_policy_gated() {
         "un-allowed example.com must be REFUSED at the resolver (no exfil channel)"
     );
 }
+
+/// A malicious agent cannot reach an arbitrary IP by presenting an allow-listed
+/// SNI. Egress is authorized by the hostname the *gateway* resolved for the dialed
+/// IP, not by the client-controlled SNI. We allow `cloudflare.com`, then from a
+/// non-root peer in the agent's netns (the agent's identity — root is the gateway's
+/// own exempt uid): a TLS handshake to cloudflare's real IP with its own SNI
+/// succeeds, but a handshake to 8.8.8.8 (reachable, never resolved as cloudflare)
+/// while *spoofing* `SNI=cloudflare.com` is denied. Needs Docker + internet.
+#[test]
+#[ignore = "builds gateway image and runs multiple containers + needs internet"]
+fn sni_spoof_cannot_reach_arbitrary_ip() {
+    if !docker_available() {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+    ensure_gateway_image();
+
+    let (containers_before, networks_before) = cowboy_objects();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    tmp.child(".cowboy/security.yaml")
+        .write_str(
+            "version: 1\n\
+             container:\n\
+             \x20 image: busybox:latest\n\
+             \x20 workdir: /workspace\n\
+             \x20 mounts:\n\
+             \x20   - source: .\n\
+             \x20     target: /workspace\n\
+             \x20     mode: rw\n\
+             network_policy:\n\
+             \x20 default_external: ask\n\
+             \x20 allow:\n\
+             \x20   domains: [\"cloudflare.com\"]\n\
+             \x20   ports: [443]\n",
+        )
+        .unwrap();
+    tmp.child(".cowboy/agent.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+    tmp.child(".cowboy/models.yaml")
+        .write_str("version: 1\n")
+        .unwrap();
+
+    let agent_name = format!("cowboy-e2e-spoof-{}", std::process::id());
+    let cowboy = |args: &[&str]| -> std::process::Output {
+        Command::cargo_bin("cowboy")
+            .unwrap()
+            .current_dir(tmp.path())
+            .env("COWBOY_CONTAINER_NAME", &agent_name)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    // Bring up the agent + gateway sidecar so its netns exists for the probe.
+    let _ = cowboy(&["run", "true"]);
+
+    // A non-root openssl probe sharing the agent's netns (so its egress is
+    // REDIRECTed through the proxy, exactly like the agent). The gateway image
+    // carries openssl + a CA bundle. A `subject=` line means the server's cert was
+    // received — i.e. the connection was allowed through; a denied connection is
+    // dropped by the proxy and yields `no peer certificate available` instead.
+    // (`Verify return code: 0` is printed vacuously even with no cert, so it's not
+    // a reliable allow signal.)
+    let tls_probe = |connect: &str, sni: &str| -> String {
+        let out = Std::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--user",
+                "65534:65534",
+                "--cap-drop",
+                "ALL",
+                "--network",
+                &format!("container:{agent_name}"),
+                "--entrypoint",
+                "sh",
+                GATEWAY_IMAGE,
+                "-c",
+                &format!(
+                    "echo | timeout 12 openssl s_client -connect {connect} -servername {sni} 2>&1"
+                ),
+            ])
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // Legit: cloudflare.com resolves through the gateway and connects.
+    let legit = tls_probe("cloudflare.com:443", "cloudflare.com");
+    // Spoof: dial 8.8.8.8 while claiming SNI=cloudflare.com.
+    let spoof = tls_probe("8.8.8.8:443", "cloudflare.com");
+
+    // Cleanup BEFORE asserting so a failure never leaks containers/networks.
+    let _ = Std::new("docker").args(["rm", "-f", &agent_name]).output();
+    let (containers_after, networks_after) = cowboy_objects();
+    for id in containers_after.difference(&containers_before) {
+        let _ = Std::new("docker").args(["rm", "-f", id]).output();
+    }
+    for id in networks_after.difference(&networks_before) {
+        let _ = Std::new("docker").args(["network", "rm", id]).output();
+    }
+
+    assert!(
+        legit.contains("subject="),
+        "allow-listed cloudflare.com should connect (a cert is received); got:\n{legit}"
+    );
+    assert!(
+        !spoof.contains("subject="),
+        "spoofing SNI=cloudflare.com to dial 8.8.8.8 must be DENIED (authorize by \
+         resolved name, not client SNI — no cert should be received); got:\n{spoof}"
+    );
+}

@@ -18,6 +18,7 @@ use cowboy_core::model::list_models;
 use cowboy_core::model_defaults;
 
 use crate::cli::{ModelsArgs, ModelsCommand};
+use crate::style;
 
 pub async fn run(args: ModelsArgs) -> Result<()> {
     match args.command {
@@ -79,7 +80,13 @@ fn setup() -> Result<()> {
         },
     );
     providers.save(&providers_path)?;
-    println!("✓ saved provider `{pname}` to {}", providers_path.display());
+    println!(
+        "{}",
+        style::success(&format!(
+            "✓ saved provider `{pname}` to {}",
+            providers_path.display()
+        ))
+    );
 
     // --- model ---
     if yes_no("\nDefine a model that uses this provider now?", true)? {
@@ -116,7 +123,13 @@ fn setup() -> Result<()> {
             user_models.default = Some(mname.clone());
         }
         user_models.save(&user_models_path)?;
-        println!("✓ saved model `{mname}` to {}", user_models_path.display());
+        println!(
+            "{}",
+            style::success(&format!(
+                "✓ saved model `{mname}` to {}",
+                user_models_path.display()
+            ))
+        );
         if user_models.default.as_deref() == Some(mname.as_str()) {
             println!("  (set as the default model)");
         }
@@ -136,9 +149,9 @@ fn list() -> Result<()> {
         .flatten();
     let project = project_models()?;
 
-    println!("providers (home-only):");
+    println!("{}", style::bold("providers (home-only):"));
     if providers.providers.is_empty() {
-        println!("  (none — run `cowboy models setup`)");
+        println!("  {}", style::dim("(none — run `cowboy models setup`)"));
     } else {
         for (name, p) in &providers.providers {
             // Never print the key, only whether one is set.
@@ -151,7 +164,7 @@ fn list() -> Result<()> {
         }
     }
 
-    println!("\nmodels:");
+    println!("\n{}", style::bold("models:"));
     let mut names: Vec<&String> = Vec::new();
     if let Some(u) = &user {
         names.extend(u.models.keys());
@@ -162,7 +175,7 @@ fn list() -> Result<()> {
     names.sort();
     names.dedup();
     if names.is_empty() {
-        println!("  (none — run `cowboy models setup`)");
+        println!("  {}", style::dim("(none — run `cowboy models setup`)"));
     } else {
         for name in names {
             // Project overrides user; report the effective source + def.
@@ -192,7 +205,7 @@ fn list() -> Result<()> {
     // Confirm the default actually resolves to a provider.
     match resolve_model(&providers, user.as_ref(), project.as_ref(), None) {
         Ok(m) => println!("resolves to: {} @ {}", m.model, m.base_url),
-        Err(e) => println!("note: {e}"),
+        Err(e) => println!("{}", style::warning(&format!("note: {e}"))),
     }
     Ok(())
 }
@@ -235,7 +248,13 @@ fn use_default(name: &str, global: bool) -> Result<()> {
         let mut cfg = user.unwrap_or_default();
         cfg.default = Some(name.to_string());
         cfg.save(&path)?;
-        println!("✓ user default is now `{name}` ({})", path.display());
+        println!(
+            "{}",
+            style::success(&format!(
+                "✓ user default is now `{name}` ({})",
+                path.display()
+            ))
+        );
     } else {
         let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
         let mut cfg = project.unwrap_or_default();
@@ -270,7 +289,7 @@ async fn available(all: bool) -> Result<()> {
 
     for (pname, p) in &providers.providers {
         let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
-        println!("provider {pname} ({base}):");
+        println!("{}", style::bold(&format!("provider {pname} ({base}):")));
         match list_models(&base, &p.api_key, &p.headers).await {
             Ok(mut entries) => {
                 entries.sort_by(|a, b| a.id.cmp(&b.id));
@@ -292,7 +311,7 @@ async fn available(all: bool) -> Result<()> {
                     println!("  (no chat models; pass --all to see everything)");
                 }
             }
-            Err(err) => println!("  error: {err}"),
+            Err(err) => println!("  {}", style::error(&format!("error: {err}"))),
         }
     }
     println!("\nRegister one with: cowboy models add <id>");
@@ -367,7 +386,14 @@ fn add(a: AddArgs) -> Result<()> {
         cfg.default = Some(name.clone());
     }
     cfg.save(&path)?;
-    println!("✓ saved model `{name}` ({}) to {}", a.id, path.display());
+    println!(
+        "{}",
+        style::success(&format!(
+            "✓ saved model `{name}` ({}) to {}",
+            a.id,
+            path.display()
+        ))
+    );
     if cfg.default.as_deref() == Some(name.as_str()) {
         println!("  (default model)");
     }

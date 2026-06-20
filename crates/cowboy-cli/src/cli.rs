@@ -597,6 +597,13 @@ pub enum RanchCommand {
         #[arg(value_name = "WORKSTREAM")]
         workstream: String,
     },
+    /// Reset a failed or interrupted workstream so it re-runs on the next start.
+    Retry {
+        #[arg(value_name = "RANCH")]
+        id: String,
+        #[arg(value_name = "WORKSTREAM")]
+        workstream: String,
+    },
     /// Live TUI dashboard: watch workstreams advance, start/refresh from keys.
     Watch {
         #[arg(value_name = "RANCH")]

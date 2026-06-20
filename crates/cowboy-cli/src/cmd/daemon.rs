@@ -609,11 +609,21 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<(
         if reader.read_line(&mut line).await? == 0 {
             return Ok(());
         }
-        let Ok(req) = serde_json::from_str::<DaemonRequest>(line.trim()) else {
-            continue; // ignore malformed
+        let out = match serde_json::from_str::<DaemonRequest>(line.trim()) {
+            Ok(req) => DaemonResponse {
+                id: req.id,
+                resp: dispatch(req.req, &daemon).await,
+            },
+            // Reply with an error instead of silently dropping it, so the client
+            // gets a clear failure rather than waiting (then timing out) for a
+            // reply that never comes.
+            Err(e) => DaemonResponse {
+                id: 0,
+                resp: DaemonResp::Err {
+                    message: format!("malformed request: {e}"),
+                },
+            },
         };
-        let resp = dispatch(req.req, &daemon).await;
-        let out = DaemonResponse { id: req.id, resp };
         w.write_all(encode_line(&out).as_bytes()).await?;
         w.flush().await?;
     }
@@ -1251,7 +1261,18 @@ pub async fn request(req: DaemonReq) -> Result<DaemonResp> {
     w.flush().await?;
     let mut reader = BufReader::new(r);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    // Bound the wait: a wedged daemon (e.g. holding its state lock) must not hang
+    // every CLI call and the worker heartbeat indefinitely. Daemon RPCs are all
+    // quick state reads/writes, so 30s is generous.
+    let n = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        reader.read_line(&mut line),
+    )
+    .await
+    .context("timed out waiting for cowboyd reply (daemon wedged?)")??;
+    if n == 0 {
+        anyhow::bail!("cowboyd closed the connection without replying");
+    }
     let resp: DaemonResponse = serde_json::from_str(line.trim()).context("parsing daemon reply")?;
     Ok(resp.resp)
 }

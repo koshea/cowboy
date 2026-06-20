@@ -55,11 +55,34 @@ pub async fn serve_on(
                 continue;
             }
         };
-        let (r, w) = stream.into_split();
-        if let Err(e) = handle_conn(BufReader::new(r), w, &token, &approvals, &events).await {
-            tracing::debug!(%peer, error = %e, "control connection ended");
-        }
+        // Spawn per connection: a slow/wedged gateway connection must not block
+        // accepting (and thus serving approvals/events for) every other one.
+        let token = token.clone();
+        let approvals = approvals.clone();
+        let events = events.clone();
+        tokio::spawn(async move {
+            let (r, w) = stream.into_split();
+            if let Err(e) = handle_conn(BufReader::new(r), w, &token, &approvals, &events).await {
+                tracing::debug!(%peer, error = %e, "control connection ended");
+            }
+        });
     }
+}
+
+/// Constant-time token comparison. The per-session token gates the control
+/// channel, and the agent shares the netns and can reach the port, so a byte-wise
+/// short-circuit (`==`) would be a timing oracle. Length may leak — the token is
+/// a fixed-length UUID.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Handle one control connection: authenticate, then bridge asks/events. Generic
@@ -82,7 +105,7 @@ where
         return Ok(());
     }
     match serde_json::from_str::<GatewayMessage>(line.trim()) {
-        Ok(GatewayMessage::Hello { token: t }) if t == token => {}
+        Ok(GatewayMessage::Hello { token: t }) if ct_eq(&t, token) => {}
         _ => {
             tracing::warn!("control connection rejected (missing/invalid token)");
             return Ok(()); // drop — no decisions for an unauthenticated peer

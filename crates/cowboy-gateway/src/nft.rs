@@ -7,23 +7,33 @@
 //! - `nat output` REDIRECTs **all** of the agent's TCP to the in-process proxy
 //!   (DNS to the resolver), which applies policy. The proxy sniffs each connection
 //!   (SNI/Host on any port) and falls back to the DNS map for opaque traffic.
+//!   The DNS redirect sits **above** the loopback `return` and the chain runs at
+//!   priority `-150` (ahead of Docker's `dns-dnat` at `-100`), so even the agent's
+//!   queries to Docker's embedded resolver (`127.0.0.11:53`) are caught and
+//!   gated/recorded here first; the resolver then forwards them on to `127.0.0.11`.
 //! - `filter output` then **drops by default**, so the residue the REDIRECT can't
 //!   carry — non-DNS UDP, ICMP — can't leak. This is what restores deny-by-default
 //!   on every port/protocol.
 //!
 //! The gateway's own egress (the proxy's upstream dials, DNS forwarding, the host
-//! control channel) is exempted by uid: it runs as root, the agent as the
-//! unprivileged host uid, so `skuid 0` is the gateway and is left untouched (else
-//! the proxy's own dial would be redirected back into itself). Approved Compose
-//! subnets bypass the proxy and are accepted directly. Applying the ruleset is
-//! fatal on failure — we fail closed, never open.
+//! control channel) — and Docker's embedded DNS resolver, which also runs as root
+//! — are exempted by `skuid 0`. The agent must therefore never run as uid 0; the
+//! host remaps it to a non-root uid when `cowboy` itself runs as root (see
+//! `runtime::host_user`), so a root operator can't make the agent inherit this
+//! exemption and bypass the proxy. Approved Compose subnets bypass the proxy and
+//! are accepted directly.
+//!
+//! IPv6 is dropped wholesale (`table ip6`): the proxy is IPv4-only, so a separate
+//! default-drop chain makes v6 fail **closed** independent of the `disable_ipv6`
+//! sysctl the host also sets. Applying the ruleset is fatal on failure — we fail
+//! closed, never open.
 
 use anyhow::{bail, Context, Result};
 
 use crate::config::{GatewayConfig, PORT_DNS, PORT_TLS};
 
-/// The uid the gateway process runs as (root). Its own sockets are exempt from
-/// the REDIRECT so relayed/upstream/control connections egress directly.
+/// The uid whose egress is exempt: root, covering the gateway process and Docker's
+/// embedded DNS resolver. The agent is kept non-root so it never matches.
 const GATEWAY_UID: u32 = 0;
 
 /// Render the nft ruleset for the given config.
@@ -39,12 +49,12 @@ pub fn ruleset(cfg: &GatewayConfig) -> String {
     format!(
         "table ip cowboy {{
   chain output {{
-    type nat hook output priority -100; policy accept;
+    type nat hook output priority -150; policy accept;
     meta skuid {GATEWAY_UID} return
-    ip daddr 127.0.0.0/8 return
-{nat_exempt}    udp dport 53 redirect to :{PORT_DNS}
+    udp dport 53 redirect to :{PORT_DNS}
     tcp dport 53 redirect to :{PORT_DNS}
-    meta l4proto tcp redirect to :{PORT_TLS}
+    ip daddr 127.0.0.0/8 return
+{nat_exempt}    meta l4proto tcp redirect to :{PORT_TLS}
   }}
   chain filter_out {{
     type filter hook output priority 0; policy drop;
@@ -55,6 +65,14 @@ pub fn ruleset(cfg: &GatewayConfig) -> String {
     meta l4proto tcp accept
   }}
 }}
+table ip6 cowboy {{
+  chain filter_out {{
+    type filter hook output priority 0; policy drop;
+    meta skuid {GATEWAY_UID} accept
+    ip6 daddr ::1 accept
+    ct state established,related accept
+  }}
+}}
 "
     )
 }
@@ -62,8 +80,12 @@ pub fn ruleset(cfg: &GatewayConfig) -> String {
 /// Apply the ruleset via `nft -f -`. Fatal on failure (fail-closed).
 pub async fn apply(cfg: &GatewayConfig) -> Result<()> {
     let rules = ruleset(cfg);
-    // Flush any prior cowboy table, then load.
-    let script = format!("table ip cowboy\ndelete table ip cowboy\n{rules}");
+    // Flush any prior cowboy tables (create-if-missing then delete, so the first
+    // run doesn't error), then load.
+    let script = format!(
+        "table ip cowboy\ndelete table ip cowboy\n\
+         table ip6 cowboy\ndelete table ip6 cowboy\n{rules}"
+    );
     apply_script(&script)
         .await
         .context("applying nft ruleset (gateway fails closed if this fails)")
@@ -129,12 +151,27 @@ mod tests {
     }
 
     #[test]
-    fn ruleset_exempts_the_gateway_uid() {
+    fn ruleset_exempts_root_egress() {
         let r = ruleset(&cfg());
-        // The gateway's own egress (proxy upstream, DNS forward, control) must not
-        // be redirected back into the proxy.
+        // The gateway's own egress (proxy upstream, DNS forward, control) and
+        // Docker's embedded DNS resolver both run as root and are exempted by
+        // `skuid 0`. The agent is kept non-root (see runtime::host_user) so it
+        // never matches this exemption.
         assert!(r.contains("meta skuid 0 return"));
+        assert!(r.contains("meta skuid 0 accept"));
         assert!(r.contains("ip daddr 127.0.0.0/8 return"));
+    }
+
+    #[test]
+    fn ruleset_drops_ipv6_by_default() {
+        let r = ruleset(&cfg());
+        // The proxy is IPv4-only; v6 must fail closed regardless of the sysctl.
+        assert!(r.contains("table ip6 cowboy"));
+        // The v6 chain default-drops and only lets the gateway / loopback /
+        // established traffic through.
+        let v6 = r.split("table ip6 cowboy").nth(1).unwrap();
+        assert!(v6.contains("policy drop"));
+        assert!(v6.contains("ip6 daddr ::1 accept"));
     }
 
     #[test]

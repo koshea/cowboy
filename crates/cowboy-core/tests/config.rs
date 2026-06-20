@@ -97,6 +97,37 @@ fn security_invariant_rejects_mounting_providers_or_home_config() {
     }
 }
 
+#[test]
+fn security_invariant_rejects_mounting_an_ancestor_of_the_config_dir() {
+    // Mounting a parent of the home cowboy config dir (e.g. `~` or `~/.config`)
+    // would drag providers.yaml into the container — must be refused, not just the
+    // exact dir/file (basename) like before.
+    for source in ["~", "~/.config"] {
+        let mut cfg = SecurityConfig::default();
+        cfg.container.mounts.push(Mount {
+            source: source.into(),
+            target: "/tmp/x".into(),
+            mode: "ro".into(),
+        });
+        assert!(
+            matches!(cfg.validate(), Err(Error::SecurityInvariant(_))),
+            "mount of ancestor {source:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn security_invariant_rejects_unknown_mount_mode() {
+    // A typo'd mode must fail closed rather than silently become read-write.
+    let mut cfg = SecurityConfig::default();
+    cfg.container.mounts.push(Mount {
+        source: "/tmp/data".into(),
+        target: "/data".into(),
+        mode: "readonly".into(),
+    });
+    assert!(matches!(cfg.validate(), Err(Error::SecurityInvariant(_))));
+}
+
 fn grant(source: &str, target: &str) -> SecretMount {
     SecretMount {
         source: source.into(),

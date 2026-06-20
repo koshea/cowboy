@@ -243,6 +243,25 @@ pub fn create(
     Ok((path, branch))
 }
 
+/// Remove a worktree and delete its branch. Best-effort cleanup for a launch that
+/// failed after the worktree was created (so it doesn't leak and a retry reuses
+/// the canonical `cowboy/<ranch>-<ws>` name instead of suffixing `-2`, `-3`, …).
+/// Errors are ignored — there's nothing useful to do if cleanup fails.
+pub fn remove(repo: &Path, path: &Path, branch: &str) {
+    let Ok(repo) = repo_root(repo) else { return };
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(path)
+        .output();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "-D", branch])
+        .output();
+}
+
 /// List the repo's worktrees (path + branch). Status is filled in by the daemon
 /// from its session registry; here it defaults to `Idle`.
 pub fn list(repo: &Path) -> Result<Vec<WorktreeInfo>> {
