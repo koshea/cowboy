@@ -334,9 +334,22 @@ impl AgentUi for SocketUi {
             options: options.to_vec(),
         });
         // The agent loop blocks here for the answer; the reply arrives on a
-        // socket-server task (separate runtime thread), so this does not
-        // deadlock. First reply wins; timeout yields "".
-        let answer = rx.recv_timeout(ASK_TIMEOUT).unwrap_or_default();
+        // socket-server task (separate runtime thread), so this does not deadlock.
+        // First reply wins. Bail to "" early if every client detaches mid-ask (no
+        // one left to answer — e.g. a detached ranch workstream), and cap the total
+        // wait at ASK_TIMEOUT.
+        let deadline = std::time::Instant::now() + ASK_TIMEOUT;
+        let answer = loop {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(a) => break a,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break String::new(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if self.attached() == 0 || std::time::Instant::now() >= deadline {
+                        break String::new();
+                    }
+                }
+            }
+        };
         self.inner
             .pending_asks
             .lock()
@@ -826,6 +839,34 @@ mod tests {
         )
         .await;
         assert_eq!(answer.await.unwrap(), "yes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ask_user_returns_empty_when_client_detaches_midask() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+
+        let (mut reader, w) = attach_client(&sock).await;
+        let mut ask_ui = ui.clone();
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("continue?", &[]));
+
+        // Confirm the ask was routed (so the client is attached and waiting)…
+        match read_msg(&mut reader).await {
+            ServerMsg::Ask { .. } => {}
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        // …then detach. With no one left to answer, ask_user must give up promptly
+        // (poll interval), not block for ASK_TIMEOUT.
+        drop(reader);
+        drop(w);
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+            .await
+            .expect("ask_user must return promptly after the last client detaches")
+            .unwrap();
+        assert_eq!(got, "");
     }
 
     /// `Hello{since_seq: Some(n)}` resumes: the snapshot reports the true

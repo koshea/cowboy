@@ -156,10 +156,10 @@ pub async fn run(
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         let mut security = SecurityConfig::load(&paths.security)
             .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-        cowboy_core::usersecrets::merge_into(
-            &mut security,
-            &format!("{:08x}", project_hash(&root)),
-        );
+        // Key the personal overlay by the repo (matches the worker + `doctor`), so
+        // a per-repo credential grant applies on this piped path too — `project_hash`
+        // is per-worktree and would silently miss it.
+        cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(&root));
         security
             .validate()
             .context("validating merged credential grants")?;

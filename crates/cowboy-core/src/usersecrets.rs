@@ -60,7 +60,9 @@ pub fn read(path: &Path) -> UserSecrets {
         .unwrap_or_default()
 }
 
-/// Write an overlay file (creates the dir 0700, atomic temp+rename).
+/// Write an overlay file (creates the dir 0700, atomic temp+rename). The temp is
+/// created `0600` before any bytes — overlay files name `source_env`/grant paths,
+/// so they shouldn't be world-readable even briefly.
 pub fn write(path: &Path, secrets: &UserSecrets) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -68,8 +70,28 @@ pub fn write(path: &Path, secrets: &UserSecrets) -> Result<()> {
     }
     let yaml = serde_yaml_ng::to_string(secrets).map_err(|e| Error::Invalid(e.to_string()))?;
     let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, yaml)?;
-    std::fs::rename(&tmp, path)?;
+    let cleanup = |e: std::io::Error| {
+        let _ = std::fs::remove_file(&tmp);
+        e
+    };
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(yaml.as_bytes()).map_err(cleanup)?;
+        f.sync_all().map_err(cleanup)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&tmp, &yaml).map_err(cleanup)?;
+    }
+    std::fs::rename(&tmp, path).map_err(cleanup)?;
     Ok(())
 }
 

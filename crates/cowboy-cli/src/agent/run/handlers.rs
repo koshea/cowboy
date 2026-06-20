@@ -148,10 +148,16 @@ impl AgentLoop<'_> {
             "publish" | "add" => {
                 let content = match (&args.content, &args.path) {
                     (Some(c), _) => c.clone(),
-                    (None, Some(p)) => match std::fs::read_to_string(self.runtime.root().join(p)) {
-                        Ok(s) => s,
-                        Err(e) => return format!("error: cannot read {p}: {e}"),
-                    },
+                    // Confine `path` to the workspace — a raw join would let the
+                    // agent publish (and exfil) arbitrary host files via `..`.
+                    (None, Some(p)) => {
+                        match crate::cmd::fileop::resolve(self.runtime.root(), p)
+                            .and_then(|abs| Ok(std::fs::read_to_string(abs)?))
+                        {
+                            Ok(s) => s,
+                            Err(e) => return format!("error: cannot read {p}: {e}"),
+                        }
+                    }
                     (None, None) => return "error: `publish` requires `path` or `content`".into(),
                 };
                 let title = args

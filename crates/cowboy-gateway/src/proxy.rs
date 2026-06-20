@@ -112,6 +112,18 @@ async fn handle_connect(mut client: TcpStream, state: Arc<GatewayState>) -> Resu
     let mut upstream = TcpStream::connect((target.host.as_str(), target.port))
         .await
         .context("dialing CONNECT target")?;
+    // SSRF guard: CONNECT can't apply the IP-class check up front (it only learns
+    // the IP by dialing), so a domain/default allow could resolve to an internal
+    // address. Now that we know the peer, reject a non-public one — matching the
+    // by-IP transparent path, where a domain-allow never grants a private IP.
+    if let Ok(peer) = upstream.peer_addr() {
+        if !cowboy_core::policy::is_public(peer.ip()) {
+            tracing::warn!(host = %target.host, ip = %peer.ip(),
+                "CONNECT target resolved to a non-public address; dropping (SSRF guard)");
+            let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;
+            return Ok(());
+        }
+    }
     client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         .await?;

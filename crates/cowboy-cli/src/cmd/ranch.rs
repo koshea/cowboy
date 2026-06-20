@@ -54,7 +54,7 @@ pub async fn run(command: RanchCommand) -> Result<()> {
         RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
         RanchCommand::Complete { id, workstream } => complete(&root, &id, &workstream),
         RanchCommand::Accept { id, workstream } => accept(&root, &id, &workstream),
-        RanchCommand::Retry { id, workstream } => retry(&root, &id, &workstream),
+        RanchCommand::Retry { id, workstream } => retry(&root, &id, &workstream).await,
         RanchCommand::Watch { id } => watch(&root, &id).await,
         RanchCommand::Propose {
             id,
@@ -123,7 +123,7 @@ fn accept(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
 /// hand-edit the committed `ranch.yaml`, which the design forbids). Best-effort
 /// tears down the abandoned worktree/branch so the relaunch reuses the canonical
 /// name.
-fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
+async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
     let _lock = lock_ranch(root, id)?;
     let mut ranch = ranch::load(root, id)?;
     let Some(w) = ranch.workstream_mut(workstream) else {
@@ -138,6 +138,17 @@ fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
              workstreams can be retried)",
             ws_status(w.status)
         );
+    }
+    // Refuse if the parked session is actually still live (e.g. a `Stale` parked
+    // workstream whose worker has since recovered) — `worktree::remove --force`
+    // would otherwise destroy in-flight work and orphan the session's lease.
+    if let Some(sid) = w.session_id.clone() {
+        if session_is_live(&sid).await {
+            bail!(
+                "workstream `{workstream}` still has a live session ({sid}); end it first \
+                 (e.g. `cowboy down`) before retrying"
+            );
+        }
     }
     let old = w.worktree_path.clone().zip(w.branch.clone());
     w.status = WorkstreamStatus::Planned; // recompute_readiness re-derives Ready/Blocked
@@ -156,6 +167,18 @@ fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
         ))
     );
     Ok(())
+}
+
+/// Whether the daemon currently reports session `sid` as actively live (not a
+/// terminal/stale record). Used by `retry` to avoid wiping a worktree whose
+/// worker is still running. Treats "daemon unreachable" as not-live (the worker
+/// can't be running without a daemon).
+async fn session_is_live(sid: &str) -> bool {
+    matches!(
+        daemon::request(DaemonReq::ListSessions { root: None }).await,
+        Ok(DaemonResp::Sessions { sessions })
+            if sessions.iter().any(|s| s.id == sid && !s.status.is_terminal())
+    )
 }
 
 /// A held exclusive lock on a ranch's directory. `ranch.yaml` is the committed
@@ -1472,11 +1495,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retry_resets_failed_workstream_and_rejects_running() {
+    #[tokio::test]
+    async fn retry_resets_failed_workstream_and_rejects_running() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let root = tmp.path();
         // A failed workstream with a dead session; a dependent is blocked on it.
+        // (No daemon in the test → session_is_live is false → retry proceeds.)
         let mut r = ranch(vec![
             ws("a", &[], WorkstreamStatus::Failed, Some("dead-sid")),
             ws("b", &["a"], WorkstreamStatus::Blocked, None),
@@ -1484,7 +1508,7 @@ mod tests {
         r.workstream_mut("a").unwrap().worktree_path = Some("/nonexistent/wt".into());
         ranch::save(root, &r).unwrap();
 
-        retry(root, "r", "a").unwrap();
+        retry(root, "r", "a").await.unwrap();
 
         let r2 = ranch::load(root, "r").unwrap();
         let a = r2.workstream("a").unwrap();
@@ -1499,7 +1523,7 @@ mod tests {
         // A running (non-terminal) workstream can't be retried.
         let running = ranch(vec![ws("a", &[], WorkstreamStatus::Running, Some("s"))]);
         ranch::save(root, &running).unwrap();
-        assert!(retry(root, "r", "a").is_err());
+        assert!(retry(root, "r", "a").await.is_err());
     }
 
     #[test]

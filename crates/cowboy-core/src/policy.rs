@@ -88,6 +88,14 @@ pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, S
     (default.into(), format!("{class} = {default:?}"))
 }
 
+/// Whether `ip` is a public (External-class) address — i.e. not loopback, RFC1918,
+/// link-local, or unique-local. The gateway's CONNECT path uses this to reject a
+/// name that resolves to an internal address (the SSRF guard that the by-IP path
+/// gets from [`evaluate`]'s domain-allow check).
+pub fn is_public(ip: IpAddr) -> bool {
+    matches!(classify(Some(ip)), DestClass::External)
+}
+
 /// Evaluate a bare DNS **name** against the policy (no port/CIDR/IP logic — a
 /// resolution isn't a connection). Precedence mirrors [`evaluate`]: a deny-domain
 /// match wins, then an allow-domain match, else `default_external`. Used by the

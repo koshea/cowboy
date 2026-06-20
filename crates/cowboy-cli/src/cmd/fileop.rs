@@ -78,7 +78,7 @@ fn read(root: &Path, path: &str, offset: Option<usize>, limit: Option<usize>) ->
     for (i, line) in lines.iter().enumerate().skip(start - 1).take(limit) {
         out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
     }
-    let shown_end = (start - 1 + limit).min(total);
+    let shown_end = start.saturating_sub(1).saturating_add(limit).min(total);
     if total == 0 {
         out.push_str("(empty file)\n");
     } else if shown_end < total {

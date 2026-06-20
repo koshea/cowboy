@@ -81,6 +81,19 @@ impl AgentRuntime {
         // container (default bridge, full egress, caps intact). `None` means
         // isolation was not requested, never "we gave up".
         let gateway = if security.networks.isolated.enabled {
+            // The agent runs as the host uid (so it owns the files it writes in the
+            // mounted workspace). The gateway exempts root (`skuid 0`) egress, so a
+            // root agent would inherit that exemption and bypass the proxy. Refuse
+            // rather than run as root — and rather than remap to a non-root uid,
+            // which would leave the agent unable to write the root-owned workspace.
+            // SAFETY: getuid() is always safe.
+            if unsafe { libc::getuid() } == 0 {
+                anyhow::bail!(
+                    "refusing to run as root with network isolation: the sandboxed agent runs \
+                     as your uid, but as root it would inherit the gateway's egress exemption. \
+                     Run cowboy as a non-root user."
+                );
+            }
             Some(
                 GatewayNetwork::for_project(project_hash(&root), &security, &root).context(
                     "network isolation is enabled but the gateway could not be built; \
@@ -611,21 +624,14 @@ impl AgentRuntime {
     }
 }
 
-/// The agent container's `uid:gid`. Normally the host user, so files in the
-/// mounted workspace are owned correctly. But the agent must **never run as uid 0**:
-/// the gateway exempts root egress (`skuid 0`) so its own proxy/DNS dials — and
-/// Docker's embedded resolver — aren't redirected into themselves, and a uid-0
-/// agent would inherit that exemption and bypass the proxy entirely. So when the
-/// operator runs `cowboy` as root we remap the agent to a fixed non-root uid/gid
-/// (root on the host can still access the files it writes).
+/// The agent container's `uid:gid` — the host user, so files it writes in the
+/// mounted workspace are owned correctly. With network isolation the agent must
+/// never be uid 0 (it would inherit the gateway's `skuid 0` egress exemption);
+/// `AgentRuntime::new` refuses to start as root in that case, so this is always a
+/// non-root identity on the isolated path.
 fn host_user() -> String {
     // SAFETY: getuid/getgid are always-safe libc calls.
     let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    // `nobody`-style fallback when invoked as root, so the agent is never uid 0.
-    const NONROOT_UID: u32 = 65534;
-    const NONROOT_GID: u32 = 65534;
-    let uid = if uid == 0 { NONROOT_UID } else { uid };
-    let gid = if gid == 0 { NONROOT_GID } else { gid };
     format!("{uid}:{gid}")
 }
 

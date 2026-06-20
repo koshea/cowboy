@@ -215,6 +215,9 @@ pub fn save_in(
 
 /// Full body of a memory by name (project store wins over global).
 pub fn recall_in(base: &Path, project_key: &str, name: &str) -> Result<Option<String>> {
+    if !is_safe_name(name) {
+        return Ok(None);
+    }
     for scope in [Scope::Project, Scope::Global] {
         let path = scope_dir(base, project_key, scope).join(format!("{name}.md"));
         if let Ok(text) = std::fs::read_to_string(&path) {
@@ -225,9 +228,20 @@ pub fn recall_in(base: &Path, project_key: &str, name: &str) -> Result<Option<St
     Ok(None)
 }
 
+/// A memory name must be a single filename component — no path separators, no
+/// `..`/`.` — so an agent-supplied `name` can't traverse out of the memory store
+/// to read or delete arbitrary host files. (Saved names are slugified, so this
+/// only ever rejects hostile input.)
+fn is_safe_name(name: &str) -> bool {
+    !name.is_empty() && Path::new(name).file_name() == Some(std::ffi::OsStr::new(name))
+}
+
 /// Delete a memory by name from both stores; returns whether anything was
 /// removed.
 pub fn delete_in(base: &Path, project_key: &str, name: &str) -> Result<bool> {
+    if !is_safe_name(name) {
+        return Ok(false);
+    }
     let mut removed = false;
     for scope in [Scope::Project, Scope::Global] {
         let path = scope_dir(base, project_key, scope).join(format!("{name}.md"));
@@ -299,6 +313,25 @@ mod tests {
         assert_eq!(slugify("Build uses Just!"), "build-uses-just");
         assert_eq!(slugify("  --weird-- "), "weird");
         assert_eq!(slugify(""), "note");
+    }
+
+    #[test]
+    fn recall_and_delete_reject_path_traversal() {
+        let base = tmp();
+        // Plant a file outside the memory store the traversal would target.
+        let outside = base.join("secret.md");
+        std::fs::write(&outside, "frontmatter\n---\nTOP SECRET").unwrap();
+        // A traversal name must not read it, and must not delete it.
+        let evil = "../secret";
+        assert_eq!(recall_in(&base, "proj", evil).unwrap(), None);
+        assert!(!delete_in(&base, "proj", evil).unwrap());
+        assert!(
+            outside.exists(),
+            "traversal must not delete an outside file"
+        );
+        // Bare slugs still work.
+        save_in(&base, "proj", "note one", "body", Scope::Project, None).unwrap();
+        assert!(recall_in(&base, "proj", "note-one").unwrap().is_some());
     }
 
     #[test]

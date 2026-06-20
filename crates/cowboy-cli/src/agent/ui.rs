@@ -190,8 +190,11 @@ impl AgentUi for ConsoleUi {
     }
 
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
-        // A subagent is non-interactive; don't block on input.
-        if self.final_only {
+        // Non-interactive (a subagent, or stdin isn't a terminal — piped/headless):
+        // no one can answer, so don't block on input — return empty (the agent
+        // treats this as "no answer / proceed").
+        use std::io::IsTerminal;
+        if self.final_only || !std::io::stdin().is_terminal() {
             return String::new();
         }
         use std::io::BufRead;

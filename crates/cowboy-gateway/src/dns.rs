@@ -22,10 +22,10 @@ use crate::state::GatewayState;
 use cowboy_core::netproto::Verdict;
 
 /// How long a resolved `IP → name` mapping is trusted for connect-time
-/// attribution. Generous (the resolve→connect window is seconds, but agents
-/// re-resolve and long sessions reuse IPs); long enough to avoid false denials,
-/// short enough that a reassigned IP doesn't authorize forever.
-const DNS_TTL: Duration = Duration::from_secs(3600);
+/// attribution. The resolve→connect window is seconds; this is generous enough to
+/// cover a session reusing an IP across a few connections, but short enough that a
+/// reassigned/rebound IP doesn't stay authorized by a stale name for long.
+const DNS_TTL: Duration = Duration::from_secs(600);
 /// Cap names retained per IP (shared CDN IPs front many hosts) — bounds memory.
 const MAX_NAMES_PER_IP: usize = 16;
 
@@ -81,18 +81,31 @@ impl DnsMap {
             .unwrap_or_default()
     }
 
-    /// Record every A/AAAA answer in a DNS response message.
+    /// Record every A/AAAA answer in a DNS response message, mapping each IP to
+    /// the hostname(s) it should be attributed to.
+    ///
+    /// Crucially this records under the **queried name** (what the client asked
+    /// for, and what allow-lists match), not only the A-record's *owner* — for a
+    /// CNAME'd host (`files.pythonhosted.org → …fastly.net → 1.2.3.4`) the owner is
+    /// the canonical CDN name, which no allow-list mentions. We also keep each
+    /// record's owner so chain intermediates resolve too.
     pub fn record_answers(&self, msg: &Message) {
+        let qname = msg.queries.first().map(|q| q.name().to_utf8());
         for record in &msg.answers {
-            let name = record.name.to_utf8();
-            let host = name.trim_end_matches('.').to_string();
-            if host.is_empty() {
-                continue;
-            }
-            match &record.data {
-                RData::A(a) => self.record(IpAddr::V4(a.0), host),
-                RData::AAAA(aaaa) => self.record(IpAddr::V6(aaaa.0), host),
-                _ => {}
+            let ip = match &record.data {
+                RData::A(a) => IpAddr::V4(a.0),
+                RData::AAAA(aaaa) => IpAddr::V6(aaaa.0),
+                _ => continue,
+            };
+            let owner = record.name.to_utf8();
+            for name in [qname.as_deref(), Some(owner.as_str())]
+                .into_iter()
+                .flatten()
+            {
+                let host = name.trim_end_matches('.').to_string();
+                if !host.is_empty() {
+                    self.record(ip, host);
+                }
             }
         }
     }
@@ -276,6 +289,40 @@ mod tests {
             }
             other => panic!("expected Resolve, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn record_answers_maps_ip_to_the_queried_name_through_cname() {
+        use hickory_proto::rr::rdata::{A, CNAME};
+        use hickory_proto::rr::Record;
+        use std::net::Ipv4Addr;
+
+        // files.pythonhosted.org CNAME …fastly.net A 1.2.3.4 — an allow-list names
+        // the alias, never the canonical CDN owner, so the IP must be attributed to
+        // the queried name (the regression: it was attributed only to the owner).
+        let map = DnsMap::new();
+        let mut m = Message::new(1, MessageType::Response, OpCode::Query);
+        m.add_query(Query::query(
+            Name::from_ascii("files.pythonhosted.org.").unwrap(),
+            RecordType::A,
+        ));
+        m.add_answer(Record::from_rdata(
+            Name::from_ascii("files.pythonhosted.org.").unwrap(),
+            300,
+            RData::CNAME(CNAME(Name::from_ascii("dukxyz.fastly.net.").unwrap())),
+        ));
+        m.add_answer(Record::from_rdata(
+            Name::from_ascii("dukxyz.fastly.net.").unwrap(),
+            300,
+            RData::A(A(Ipv4Addr::new(1, 2, 3, 4))),
+        ));
+        map.record_answers(&m);
+
+        let names = map.lookup_all("1.2.3.4".parse().unwrap());
+        assert!(
+            names.contains(&"files.pythonhosted.org".to_string()),
+            "IP must be attributed to the queried (allow-listed) name; got {names:?}"
+        );
     }
 
     #[test]

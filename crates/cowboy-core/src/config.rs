@@ -1000,6 +1000,12 @@ fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let tmp = path.with_extension("tmp");
+        // Helper so any failure after the temp file exists removes it (no stale
+        // 0600 leftover) before propagating the error.
+        let cleanup = |e: Error| {
+            let _ = std::fs::remove_file(&tmp);
+            e
+        };
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -1007,9 +1013,16 @@ fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .map_err(|s| err(&tmp, s))?;
-        f.write_all(yaml.as_bytes()).map_err(|s| err(&tmp, s))?;
-        f.sync_all().ok();
-        std::fs::rename(&tmp, path).map_err(|s| err(path, s))?;
+        f.write_all(yaml.as_bytes())
+            .map_err(|s| cleanup(err(&tmp, s)))?;
+        f.sync_all().map_err(|s| cleanup(err(&tmp, s)))?;
+        std::fs::rename(&tmp, path).map_err(|s| cleanup(err(path, s)))?;
+        // Durably commit the rename so a crash can't leave the file missing.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
     }
     #[cfg(not(unix))]
