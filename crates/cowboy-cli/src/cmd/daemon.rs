@@ -483,6 +483,11 @@ pub async fn serve() -> Result<()> {
 
     let daemon = Arc::new(Mutex::new(Daemon::load(state_path())));
 
+    // Fired by a `Shutdown` request (an upgraded CLI rolling a stale-version
+    // daemon). Breaks the accept loop so `serve` returns and the process exits —
+    // releasing the lock + socket — without touching the workers it spawned.
+    let shutdown = tokio_util::sync::CancellationToken::new();
+
     // Reconcile on startup: any session whose worker pid is dead (or whose
     // worktree is gone) is marked Stale. Surviving workers re-heartbeat and
     // recover. Heartbeat age is ignored here (on-disk timestamps are old).
@@ -549,20 +554,28 @@ pub async fn serve() -> Result<()> {
     });
 
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "accept error");
-                continue;
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "accept error");
+                    continue;
+                }
+            },
+            _ = shutdown.cancelled() => {
+                tracing::info!("cowboyd shutting down on request (workers left running)");
+                break;
             }
         };
         let daemon = daemon.clone();
+        let shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, daemon).await {
+            if let Err(e) = handle_conn(stream, daemon, shutdown).await {
                 tracing::debug!(error = %e, "connection ended");
             }
         });
     }
+    Ok(())
 }
 
 /// Host-only path for a worker's captured stdout/stderr: `<state>/cowboy/logs/
@@ -611,17 +624,31 @@ fn acquire_lock(path: &Path) -> Result<LockGuard> {
         .truncate(false)
         .open(path)
         .with_context(|| format!("opening lock {}", path.display()))?;
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        anyhow::bail!(
-            "another cowboyd is already running (lock {})",
-            path.display()
-        );
+    // Retry briefly: when an upgraded CLI rolls the daemon, this successor can
+    // start while the predecessor is still releasing its lock. A short LOCK_NB
+    // loop waits that handoff out (the OS frees the lock when the old process
+    // exits) without blocking forever on a genuinely-live daemon.
+    for attempt in 0..30 {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(LockGuard { _file: file });
+        }
+        if attempt == 0 {
+            tracing::debug!("cowboyd lock held; waiting for a predecessor to exit");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    Ok(LockGuard { _file: file })
+    anyhow::bail!(
+        "another cowboyd is already running (lock {})",
+        path.display()
+    )
 }
 
-async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<()> {
+async fn handle_conn(
+    stream: UnixStream,
+    daemon: Arc<Mutex<Daemon>>,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<()> {
     let (r, mut w) = stream.into_split();
     let mut reader = BufReader::new(r);
     let mut line = String::new();
@@ -633,7 +660,7 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<(
         let out = match serde_json::from_str::<DaemonRequest>(line.trim()) {
             Ok(req) => DaemonResponse {
                 id: req.id,
-                resp: dispatch(req.req, &daemon).await,
+                resp: dispatch(req.req, &daemon, &shutdown).await,
             },
             // Reply with an error instead of silently dropping it, so the client
             // gets a clear failure rather than waiting (then timing out) for a
@@ -652,8 +679,23 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Mutex<Daemon>>) -> Result<(
 
 /// Handle one request. Milestones extend this match; unimplemented ops return
 /// a clear error rather than panicking.
-async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
+async fn dispatch(
+    req: DaemonReq,
+    daemon: &Arc<Mutex<Daemon>>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> DaemonResp {
     match req {
+        DaemonReq::Shutdown => {
+            // Ack now, then cancel after a short grace so this response flushes
+            // before the accept loop breaks and the process exits. Workers are
+            // left running; they re-heartbeat into the successor daemon.
+            let token = shutdown.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                token.cancel();
+            });
+            DaemonResp::ShuttingDown
+        }
         DaemonReq::Ping => {
             let d = daemon.lock().await;
             DaemonResp::Pong {
@@ -1298,13 +1340,52 @@ pub async fn request(req: DaemonReq) -> Result<DaemonResp> {
     Ok(resp.resp)
 }
 
-/// Ensure a daemon is running: ping it, and if unreachable, spawn the `cowboyd`
-/// binary (found next to the current exe), then wait for the socket.
+/// Ensure a daemon of *this* version is running.
+///
+/// - Matching-version daemon already up → reuse it.
+/// - A daemon of a **different** version is up (post-upgrade) → roll it: ask it
+///   to shut down (its workers survive and re-heartbeat into the successor) and
+///   start the new one. Set `COWBOY_NO_DAEMON_AUTORESTART` to refuse instead.
+/// - No daemon → spawn one.
+///
+/// Rolling on version skew is what prevents a stale `cowboyd` (old protocol in
+/// memory, spawning workers from the now-overwritten binary) from lingering
+/// behind an upgraded CLI.
 pub async fn ensure_running() -> Result<()> {
-    if matches!(request(DaemonReq::Ping).await, Ok(DaemonResp::Pong { .. })) {
-        return Ok(());
+    match request(DaemonReq::Ping).await {
+        Ok(DaemonResp::Pong { version, .. }) if version == env!("CARGO_PKG_VERSION") => Ok(()),
+        Ok(DaemonResp::Pong { version, .. }) => {
+            if std::env::var_os("COWBOY_NO_DAEMON_AUTORESTART").is_some() {
+                anyhow::bail!(
+                    "a cowboyd from version {version} is running but this CLI is {}; \
+                     COWBOY_NO_DAEMON_AUTORESTART is set — stop cowboyd and retry",
+                    env!("CARGO_PKG_VERSION")
+                );
+            }
+            tracing::info!(
+                daemon_version = %version,
+                cli_version = env!("CARGO_PKG_VERSION"),
+                "rolling stale-version cowboyd to match this CLI (workers survive)"
+            );
+            // Ask it to exit (best-effort), then wait for it to stop serving
+            // before starting the successor — which clears the stale socket and
+            // re-binds. The lock handoff is covered by acquire_lock's retry.
+            let _ = request(DaemonReq::Shutdown).await;
+            for _ in 0..50 {
+                if !matches!(request(DaemonReq::Ping).await, Ok(DaemonResp::Pong { .. })) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            spawn_daemon_and_wait().await
+        }
+        _ => spawn_daemon_and_wait().await,
     }
-    // Spawn the cowboyd binary sitting next to us.
+}
+
+/// Spawn the `cowboyd` binary sitting next to the current exe and poll until it
+/// answers a matching-version `Ping`.
+async fn spawn_daemon_and_wait() -> Result<()> {
     let exe = std::env::current_exe().context("locating current exe")?;
     let cowboyd = exe.with_file_name("cowboyd");
     std::process::Command::new(&cowboyd)
@@ -1313,10 +1394,11 @@ pub async fn ensure_running() -> Result<()> {
         .stderr(std::process::Stdio::null())
         .spawn()
         .with_context(|| format!("spawning {}", cowboyd.display()))?;
-    // Poll for readiness.
     for _ in 0..50 {
-        if matches!(request(DaemonReq::Ping).await, Ok(DaemonResp::Pong { .. })) {
-            return Ok(());
+        if let Ok(DaemonResp::Pong { version, .. }) = request(DaemonReq::Ping).await {
+            if version == env!("CARGO_PKG_VERSION") {
+                return Ok(());
+            }
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }

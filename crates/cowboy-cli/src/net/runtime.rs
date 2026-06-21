@@ -389,7 +389,21 @@ impl AgentRuntime {
     /// re-launch the gateway sidecar to reinstall enforcement before any command
     /// runs — a restarted container is never briefly unsandboxed.
     pub async fn ensure_running(&self) -> Result<()> {
-        match self.docker.container_state(&self.container_name).await? {
+        let state = self.docker.container_state(&self.container_name).await?;
+        // A container created by a *different* cowboy version (a leftover from
+        // before an upgrade) must not be silently reused — its image and the
+        // gateway's nft enforcement may be stale. Recreate it (agent + gateway
+        // together) so the running binary always drives a container it built. A
+        // live, same-version session keeps its container (label matches).
+        if !matches!(state, ContainerState::Absent) && self.container_version_mismatch().await {
+            tracing::info!(
+                container = %self.container_name,
+                "agent container was created by a different cowboy version; recreating"
+            );
+            self.teardown_containers().await;
+            return self.create().await;
+        }
+        match state {
             ContainerState::Running => Ok(()),
             ContainerState::Stopped => {
                 self.docker.start(&self.container_name).await?;
@@ -401,6 +415,33 @@ impl AgentRuntime {
             }
             ContainerState::Absent => self.create().await,
         }
+    }
+
+    /// True if the agent container carries a `cowboy.version` label that differs
+    /// from this binary's version — or has none (predates versioning). A docker
+    /// error reads as "not mismatched" so a transient inspect failure never tears
+    /// down a healthy session's container.
+    async fn container_version_mismatch(&self) -> bool {
+        match self
+            .docker
+            .container_label(&self.container_name, "cowboy.version")
+            .await
+        {
+            Ok(Some(v)) => v != env!("CARGO_PKG_VERSION"),
+            Ok(None) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Remove this session's gateway + agent containers (best-effort). The
+    /// gateway sidecar shares the agent's netns, so both must go before a
+    /// recreate. The network is version-stable and left in place (idempotently
+    /// re-ensured by [`create`]).
+    async fn teardown_containers(&self) {
+        if let Some(gw) = &self.gateway {
+            let _ = self.docker.remove(&gw.gateway_name, true).await;
+        }
+        let _ = self.docker.remove(&self.container_name, true).await;
     }
 
     /// Stop the agent container (idle teardown) to free its RAM. The gateway
@@ -1209,7 +1250,33 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Stopped));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker.expect_start().times(1).returning(|_| Ok(()));
+        let (rt, _tmp) = fixture(false, docker);
+        rt.ensure_running().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_running_recreates_a_container_from_a_different_version() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        // The existing container was created by an older cowboy version.
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some("0.0.1-old".to_string())));
+        // It must be removed (no gateway in the non-isolated fixture) and a fresh
+        // one created from the current image — never silently reused.
+        docker.expect_remove().times(1).returning(|_, _| Ok(()));
+        docker.expect_image_exists().returning(|_| Ok(true));
+        docker.expect_run_detached().times(1).returning(|_| Ok(()));
+        docker.expect_start().never();
         let (rt, _tmp) = fixture(false, docker);
         rt.ensure_running().await.unwrap();
     }
@@ -1342,6 +1409,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker
             .expect_exec()
             .withf(|_name, workdir, _user, argv| workdir == "/workspace" && argv == ["pwd"])

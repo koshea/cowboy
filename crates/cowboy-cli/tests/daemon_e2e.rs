@@ -581,6 +581,61 @@ fn e2e_daemon_restart_readopts_worker() {
     std::thread::sleep(Duration::from_millis(500));
 }
 
+/// A `Shutdown` request exits the daemon gracefully **without** killing its
+/// workers — the mechanism an upgraded CLI uses to roll a stale-version daemon.
+/// The worker survives and a successor daemon re-adopts it.
+#[test]
+#[ignore = "spawns real worker processes"]
+fn e2e_shutdown_request_exits_daemon_and_keeps_workers() {
+    let env = Env::fake();
+    let sock = env.sock();
+    let proj = make_project();
+
+    let d1 = env.spawn_daemon();
+    assert!(wait_pong(&sock));
+    let (id, ws) = match start(&sock, proj.path(), None) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    // Graceful shutdown: the daemon acks and then exits on its own.
+    assert!(matches!(
+        dreq(&sock, DaemonReq::Shutdown),
+        Some(DaemonResp::ShuttingDown)
+    ));
+    let mut down = false;
+    for _ in 0..50 {
+        if !matches!(dreq(&sock, DaemonReq::Ping), Some(DaemonResp::Pong { .. })) {
+            down = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(down, "daemon should stop serving after Shutdown");
+    // The worker was left running — its socket is still bound.
+    assert!(ws.exists(), "Shutdown must not kill workers");
+    drop(d1); // already exited; Kill-drop is a no-op kill
+
+    // A successor daemon re-adopts the surviving worker via its heartbeat.
+    let _d2 = env.spawn_daemon();
+    assert!(wait_pong(&sock));
+    let mut readopted = false;
+    for _ in 0..120 {
+        if get(&sock, &id).is_some() {
+            readopted = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        readopted,
+        "successor daemon should re-adopt the surviving worker"
+    );
+
+    Client::connect(&ws).send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(500));
+}
+
 /// Foundations against a real model: a single turn must drive the coordination
 /// tools (artifact, blocked/unblock, handoff) and leave the right on-disk
 /// effects — the regression check for prompt/model compatibility. Asserts the

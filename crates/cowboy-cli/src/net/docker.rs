@@ -128,6 +128,9 @@ pub trait DockerCli: Send + Sync {
     async fn build_image(&self, dockerfile: &Path, context: &Path, tag: &str) -> Result<()>;
     async fn pull_image(&self, image: &str) -> Result<()>;
     async fn container_state(&self, name: &str) -> Result<ContainerState>;
+    /// The value of a container label (`None` if the container or label is
+    /// absent). Used to detect a container left by a different cowboy version.
+    async fn container_label(&self, name: &str, key: &str) -> Result<Option<String>>;
     async fn run_detached(&self, spec: &ContainerSpec) -> Result<()>;
     /// Run a one-shot container to completion (`docker run --rm`), returning its
     /// exit code. Used for the route-setup helper.
@@ -359,8 +362,17 @@ fn build_create(
         env: (!spec.env.is_empty())
             .then(|| spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
         entrypoint: spec.entrypoint.as_ref().map(|e| vec![e.clone()]),
-        // Label so cowboy-managed containers are discoverable for teardown.
-        labels: Some(HashMap::from([("cowboy".to_string(), "1".to_string())])),
+        // Labels: `cowboy=1` makes cowboy-managed containers discoverable for
+        // teardown; `cowboy.version` records the binary version that created the
+        // container so an upgraded binary recreates (rather than silently reuses)
+        // a container from an older version.
+        labels: Some(HashMap::from([
+            ("cowboy".to_string(), "1".to_string()),
+            (
+                "cowboy.version".to_string(),
+                env!("CARGO_PKG_VERSION").to_string(),
+            ),
+        ])),
         host_config: Some(host),
         networking_config,
         ..Default::default()
@@ -439,6 +451,20 @@ impl DockerCli for CliDocker {
                 status_code: 404, ..
             }) => Ok(ContainerState::Absent),
             Err(e) => Err(e).context("docker inspect"),
+        }
+    }
+
+    async fn container_label(&self, name: &str, key: &str) -> Result<Option<String>> {
+        let docker = self.client().await?;
+        match docker.inspect_container(name, None).await {
+            Ok(info) => Ok(info
+                .config
+                .and_then(|c| c.labels)
+                .and_then(|l| l.get(key).cloned())),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(e).context("docker inspect (label)"),
         }
     }
 
@@ -1033,6 +1059,14 @@ mod tests {
         assert_eq!(config.image.as_deref(), Some("img:1"));
         assert_eq!(config.working_dir.as_deref(), Some("/w"));
         assert_eq!(config.env, Some(vec!["K=V".to_string()]));
+        // Labels: discovery marker + the creating cowboy version (so an upgraded
+        // binary can detect and recreate a stale-version container).
+        let labels = config.labels.unwrap();
+        assert_eq!(labels.get("cowboy").map(String::as_str), Some("1"));
+        assert_eq!(
+            labels.get("cowboy.version").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
         // static IP recorded on the endpoint config for `net`.
         let ep = config
             .networking_config

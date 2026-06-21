@@ -300,6 +300,10 @@ pub enum DaemonReq {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         note: Option<String>,
     },
+    /// Ask the daemon to exit gracefully (release its lock + socket) WITHOUT
+    /// killing its workers — they survive and re-heartbeat into the successor.
+    /// Sent by an upgraded CLI to roll a stale-version daemon to the new binary.
+    Shutdown,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -356,6 +360,8 @@ pub enum DaemonResp {
     },
     /// A workstream was signed off and the plan advanced.
     Accepted,
+    /// The daemon acknowledged a [`DaemonReq::Shutdown`] and is exiting.
+    ShuttingDown,
     Err {
         message: String,
     },

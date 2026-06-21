@@ -32,6 +32,25 @@ x-session-worker`). The daemon:
 It listens on a per-user Unix socket under `$XDG_RUNTIME_DIR/cowboy` and persists
 state to `$XDG_STATE_HOME/cowboy/daemon/state.json`.
 
+## Upgrades
+
+`cowboy` and `cowboyd` are version-locked, as are the agent/gateway container
+images (each is pinned to the binary version). After you upgrade the binary,
+cowboy keeps the two in sync automatically — you should never end up driving a
+new CLI against a stale daemon or a stale container:
+
+- **Daemon roll.** The first `cowboy` command after an upgrade notices the
+  running `cowboyd` is a different version and rolls it: the old daemon is asked
+  to shut down (its workers keep running) and a matching one starts in its place.
+  In-flight sessions survive — their workers re-register with the new daemon and
+  stay attachable. Set `COWBOY_NO_DAEMON_AUTORESTART=1` to refuse instead (the
+  command errors and tells you to restart `cowboyd` yourself).
+- **Container recreate.** A session's agent/gateway container is stamped with the
+  version that created it. If a new binary finds a container left by an older
+  version, it removes and recreates it from the current image rather than
+  reusing it — so you never silently run a stale (possibly outdated) sandbox or
+  gateway. A live, same-version session keeps its container untouched.
+
 ## Worktree collisions
 
 Starting `cowboy` in a worktree that already has a live session is refused by

@@ -1671,6 +1671,9 @@ mod tests {
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
         docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
+        docker
             .expect_exec_stream()
             .withf(|_n, _w, _u, command, _t, _c, _ch| command.contains("ls"))
             .times(1)
@@ -1718,6 +1721,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker
             .expect_exec_stream()
             .returning(|_, _, _, _, _, _, chunks| {
@@ -1779,6 +1785,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -1859,6 +1868,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -1911,6 +1923,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -1971,6 +1986,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -2034,6 +2052,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -2101,6 +2122,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -2155,6 +2179,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker
             .expect_exec_stream()
             .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "same".into())));
@@ -2232,6 +2259,9 @@ mod tests {
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
         docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
+        docker
             .expect_exec_stdin()
             .withf(|_n, _w, _u, argv, stdin| {
                 argv == ["cowboy", "x-fileop"]
@@ -2285,6 +2315,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         // Deliberately set NO `expect_exec_stdin`: if the edit reached the file
         // op, mockall would panic on the unexpected call — so this asserts the
         // gate actually prevents the mutation, not just discourages it.
@@ -2335,6 +2368,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         let good = r#"{"title":"Billing","goal":"stripe + invoicing","workstreams":[
             {"id":"schema","goal":"tables"},
             {"id":"api","goal":"api","depends_on":["schema"]}]}"#;
@@ -2376,6 +2412,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -2410,6 +2449,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker
             .expect_exec_stream()
             .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "ok".into())));
@@ -2458,6 +2500,9 @@ mod tests {
         docker
             .expect_container_state()
             .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
