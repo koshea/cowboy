@@ -378,14 +378,24 @@ impl Daemon {
 
     /// Remove per-session socket files (`s-<id>.sock`) that don't belong to a
     /// currently-live session — leftovers from ended/crashed workers.
-    fn prune_sockets(&self) {
-        let live: std::collections::HashSet<&str> = self
+    ///
+    /// `prune_unknown` governs sockets whose id isn't in our state *at all*. At
+    /// startup these may belong to a worker that **survived a daemon restart**
+    /// (e.g. one whose state was lost) and hasn't re-heartbeated yet — pruning it
+    /// would strand a live worker with no client socket. So startup passes
+    /// `false` (only reap sockets of sessions we *know* are terminal); the
+    /// periodic vacuum passes `true`, by which point any survivor has
+    /// re-registered and reads as live.
+    fn prune_sockets(&self, prune_unknown: bool) {
+        use std::collections::HashSet;
+        let live: HashSet<&str> = self
             .state
             .sessions
             .iter()
             .filter(|(_, s)| !s.status.is_terminal())
             .map(|(id, _)| id.as_str())
             .collect();
+        let known: HashSet<&str> = self.state.sessions.keys().map(String::as_str).collect();
         let Ok(entries) = std::fs::read_dir(runtime_dir()) else {
             return;
         };
@@ -396,7 +406,13 @@ impl Daemon {
                 .strip_prefix("s-")
                 .and_then(|n| n.strip_suffix(".sock"))
             {
-                if !live.contains(id) {
+                if live.contains(id) {
+                    continue; // a live worker — never prune its socket
+                }
+                // Otherwise the id is either a known-terminal session (always safe
+                // to reap) or unknown to us (a possible restart survivor — only
+                // reap once we're past the re-heartbeat window).
+                if known.contains(id) || prune_unknown {
                     let _ = std::fs::remove_file(entry.path());
                 }
             }
@@ -473,7 +489,10 @@ pub async fn serve() -> Result<()> {
     {
         let mut d = daemon.lock().await;
         let newly = d.sweep_stale(false);
-        d.prune_sockets();
+        // Only reap sockets of known-terminal sessions here; a worker that
+        // survived this daemon's restart may not have re-heartbeated yet, so
+        // leave unknown-id sockets for the periodic vacuum (post-recovery window).
+        d.prune_sockets(false);
         if !newly.is_empty() {
             // Mark only; the periodic vacuum (below) reaps + tears down their
             // containers a tick later, giving any worker that survived the daemon
@@ -513,7 +532,9 @@ pub async fn serve() -> Result<()> {
             let containers = {
                 let mut d = sweeper.lock().await;
                 let outcome = d.vacuum();
-                d.prune_sockets();
+                // Survivors have had their re-heartbeat window by now, so it's
+                // safe to also reap sockets with no matching session record.
+                d.prune_sockets(true);
                 if !outcome.reaped.is_empty() {
                     tracing::info!(
                         reaped = ?outcome.reaped,

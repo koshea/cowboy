@@ -239,6 +239,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // approvals to attached clients (fail closed with none); log + surface
     // decisions. Bound before the first turn so the gateway has a listener.
     if let Some((ctrl_addr, ctrl_token)) = runtime.control_endpoint() {
+        // Create the gateway network up front so the control server can bind its
+        // bridge IP immediately — otherwise it spin-retries until the first turn
+        // brings the network up (and a session that never runs a turn would have
+        // no reachable control channel at all). Containers/enforcement still come
+        // up lazily on the first command, so this opens no egress path.
+        runtime.ensure_control_network().await;
         tokio::spawn(run_control_pipeline(
             ctrl_addr,
             ctrl_token,

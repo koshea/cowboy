@@ -139,6 +139,21 @@ impl AgentRuntime {
         })
     }
 
+    /// Eagerly create the gateway's docker network so the host control server can
+    /// bind its bridge IP at startup, instead of spin-retrying until the first
+    /// turn brings the network up. This creates **only** the network — no agent
+    /// or gateway container and no nft enforcement (those come up together in
+    /// [`create`] on the first command), so it opens no egress path. No-op when
+    /// isolation is disabled; best-effort otherwise (a failure just leaves the
+    /// control server retrying its bind, exactly as before).
+    pub async fn ensure_control_network(&self) {
+        if let Some(gw) = &self.gateway {
+            if let Err(e) = gw.ensure_network(&*self.docker).await {
+                tracing::debug!(error = %e, "eager control-network create failed; control server will retry its bind");
+            }
+        }
+    }
+
     /// The project root (for approval persistence).
     pub fn root(&self) -> &Path {
         &self.root

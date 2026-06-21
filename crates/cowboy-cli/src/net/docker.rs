@@ -1,15 +1,36 @@
 //! Docker control.
 //!
-//! For the MVP we shell out to the `docker` CLI, behind the [`DockerCli`] trait
-//! so the implementation can be swapped for `bollard` later without touching
-//! callers. The trait is mockable (`mockall`) for unit tests.
+//! The lifecycle/network/exec operations talk to the Docker daemon through the
+//! typed [`bollard`] API (no arg-quoting or output-parsing fragility, one HTTP
+//! connection instead of a process per call). Two operations stay as `docker`
+//! CLI shell-outs on purpose — `build_image` (the CLI tars the context and
+//! honors `.dockerignore` for free) and `exec_interactive` (the CLI handles
+//! terminal raw-mode + window-resize for free) — neither passes user data
+//! through a shell, so there is no fragility to remove there. Everything sits
+//! behind the [`DockerCli`] trait, which is mockable (`mockall`) for unit tests.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use bollard::container::LogOutput;
+use bollard::errors::Error as BollardError;
+use bollard::exec::{CreateExecOptions, StartExecResults};
+use bollard::models::{
+    ContainerCreateBody, EndpointIpamConfig, EndpointSettings, HostConfig, Ipam, IpamConfig,
+    NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig,
+};
+use bollard::query_parameters::{
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    ListNetworksOptionsBuilder, RemoveContainerOptionsBuilder,
+};
+use bollard::Docker;
+use futures::StreamExt;
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 
 /// A bind mount applied to the agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,7 +120,7 @@ pub struct ExecResult {
     pub exit_code: i32,
 }
 
-/// Docker operations cowboy needs. Shell-out today, `bollard` tomorrow.
+/// Docker operations cowboy needs. bollard-backed, behind a mockable trait.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait DockerCli: Send + Sync {
@@ -186,28 +207,35 @@ pub enum ContainerState {
     Stopped,
 }
 
-/// The default implementation that shells out to the `docker` binary.
-#[derive(Debug, Default, Clone)]
-pub struct CliDocker;
+/// The production implementation, backed by the bollard Docker API.
+///
+/// The client is connected lazily on first use and cached, so `new()` is
+/// infallible and a down daemon surfaces as an operation error (more useful
+/// than a construction error). `Clone` shares the same connection.
+#[derive(Default, Clone)]
+pub struct CliDocker {
+    client: Arc<OnceCell<Docker>>,
+}
 
 impl CliDocker {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// The connected bollard client, connecting on first use.
+    async fn client(&self) -> Result<&Docker> {
+        self.client
+            .get_or_try_init(|| async {
+                Docker::connect_with_defaults()
+                    .context("connect to Docker daemon (is it installed and running?)")
+            })
+            .await
     }
 }
 
-async fn run_quiet(args: &[&str]) -> Result<std::process::Output> {
-    Command::new("docker")
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .context("failed to invoke `docker` (is it installed and running?)")
-}
-
 /// A `Stdio` pointing at our own stderr, so a child's stdout is merged into our
-/// stderr (where build/pull progress belongs) instead of leaking onto our stdout
-/// and polluting the output of the command we're about to run. Falls back to
+/// stderr (where build progress belongs) instead of leaking onto our stdout and
+/// polluting the output of the command we're about to run. Falls back to
 /// discarding rather than ever risking stdout contamination.
 fn stderr_stdio() -> Stdio {
     use std::os::fd::AsFd;
@@ -218,101 +246,147 @@ fn stderr_stdio() -> Stdio {
         .unwrap_or_else(|_| Stdio::null())
 }
 
-/// Append the common `docker run` flags for a [`ContainerSpec`] to `args`
-/// (everything after `run [-d|--rm]`). Shared by detached and one-shot runs.
-fn render_run_args(args: &mut Vec<String>, spec: &ContainerSpec) {
-    if !spec.name.is_empty() {
-        args.push("--name".into());
-        args.push(spec.name.clone());
+/// `Some(s)` if `s` is non-empty, else `None` — for bollard's `Option` fields.
+fn non_empty(s: &str) -> Option<String> {
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Split an image reference into `(repo, tag)`, defaulting to `latest`. The tag
+/// is the part after the last `:` *only* when that `:` follows the final `/`
+/// (so a registry `host:port/repo` is not mistaken for a tag).
+fn split_ref(image: &str) -> (&str, &str) {
+    let last_segment = image.rsplit_once('/').map_or(image, |(_, seg)| seg);
+    if last_segment.contains(':') {
+        let idx = image.rfind(':').expect("segment contains ':'");
+        (&image[..idx], &image[idx + 1..])
+    } else {
+        (image, "latest")
     }
-    if !spec.workdir.is_empty() {
-        args.push("-w".into());
-        args.push(spec.workdir.clone());
+}
+
+/// Parse a docker-style memory string (`512m`, `2g`, `1024`) into bytes
+/// (powers of 1024, matching the docker CLI). Returns `None` if unparseable.
+fn parse_memory(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let last = s.chars().last()?;
+    let (num, mult): (&str, i64) = match last.to_ascii_lowercase() {
+        'b' => (&s[..s.len() - 1], 1),
+        'k' => (&s[..s.len() - 1], 1024),
+        'm' => (&s[..s.len() - 1], 1024 * 1024),
+        'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        c if c.is_ascii_digit() => (s, 1),
+        _ => return None,
+    };
+    num.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|n| (n * mult as f64) as i64)
+}
+
+/// Map a [`ContainerSpec`] to bollard's create body + create options.
+fn build_create(
+    spec: &ContainerSpec,
+) -> (
+    ContainerCreateBody,
+    bollard::query_parameters::CreateContainerOptions,
+) {
+    let mut host = HostConfig::default();
+    if !spec.mounts.is_empty() {
+        host.binds = Some(spec.mounts.iter().map(BindMount::to_arg).collect());
     }
-    if let Some(user) = &spec.user {
-        args.push("--user".into());
-        args.push(user.clone());
-    }
-    for opt in &spec.security_opt {
-        args.push("--security-opt".into());
-        args.push(opt.clone());
-    }
-    if let Some(pids) = spec.pids_limit {
-        args.push("--pids-limit".into());
-        args.push(pids.to_string());
-    }
-    if let Some(net) = &spec.network {
-        args.push("--network".into());
-        args.push(net.clone());
-    }
-    if let Some(ip) = &spec.ip {
-        args.push("--ip".into());
-        args.push(ip.clone());
-    }
-    if let Some(mem) = &spec.memory {
-        args.push("--memory".into());
-        args.push(mem.clone());
+    if let Some(mem) = spec.memory.as_deref() {
+        host.memory = parse_memory(mem);
     }
     if let Some(cpus) = spec.cpus {
-        args.push("--cpus".into());
-        args.push(cpus.to_string());
+        host.nano_cpus = Some((cpus * 1e9) as i64);
     }
-    for cap in &spec.cap_drop {
-        args.push("--cap-drop".into());
-        args.push(cap.clone());
+    if let Some(pids) = spec.pids_limit {
+        host.pids_limit = Some(pids as i64);
     }
-    for cap in &spec.cap_add {
-        args.push("--cap-add".into());
-        args.push(cap.clone());
+    if !spec.cap_drop.is_empty() {
+        host.cap_drop = Some(spec.cap_drop.clone());
     }
-    for (k, v) in &spec.sysctls {
-        args.push("--sysctl".into());
-        args.push(format!("{k}={v}"));
+    if !spec.cap_add.is_empty() {
+        host.cap_add = Some(spec.cap_add.clone());
     }
-    for d in &spec.dns {
-        args.push("--dns".into());
-        args.push(d.clone());
+    if !spec.dns.is_empty() {
+        host.dns = Some(spec.dns.clone());
     }
-    for h in &spec.extra_hosts {
-        args.push("--add-host".into());
-        args.push(h.clone());
+    if !spec.extra_hosts.is_empty() {
+        host.extra_hosts = Some(spec.extra_hosts.clone());
     }
-    if let Some(ep) = &spec.entrypoint {
-        args.push("--entrypoint".into());
-        args.push(ep.clone());
+    if !spec.security_opt.is_empty() {
+        host.security_opt = Some(spec.security_opt.clone());
     }
-    for m in &spec.mounts {
-        args.push("-v".into());
-        args.push(m.to_arg());
+    if !spec.sysctls.is_empty() {
+        host.sysctls = Some(spec.sysctls.iter().cloned().collect());
     }
-    for (k, v) in &spec.env {
-        args.push("-e".into());
-        args.push(format!("{k}={v}"));
+
+    // Networking: `network_mode` covers both named networks and `container:<id>`
+    // namespace-sharing (the gateway). A static IP requires an endpoint config.
+    let mut networking_config = None;
+    if let Some(net) = &spec.network {
+        host.network_mode = Some(net.clone());
+        if let Some(ip) = &spec.ip {
+            let endpoint = EndpointSettings {
+                ipam_config: Some(EndpointIpamConfig {
+                    ipv4_address: Some(ip.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            networking_config = Some(NetworkingConfig {
+                endpoints_config: Some(HashMap::from([(net.clone(), endpoint)])),
+            });
+        }
     }
-    // Label so cowboy-managed containers are discoverable for teardown.
-    args.push("--label".into());
-    args.push("cowboy=1".into());
-    args.push(spec.image.clone());
-    match &spec.keep_alive {
-        Some(cmd) => args.extend(cmd.iter().cloned()),
-        // `tail -f /dev/null` keeps a container alive portably (works on both
-        // the debian default image and minimal busybox/alpine images).
-        None => args.extend([
+
+    // `tail -f /dev/null` keeps a container alive portably (works on the debian
+    // default image and minimal busybox/alpine images alike).
+    let cmd = spec.keep_alive.clone().unwrap_or_else(|| {
+        vec![
             "tail".to_string(),
             "-f".to_string(),
             "/dev/null".to_string(),
-        ]),
-    }
+        ]
+    });
+
+    let config = ContainerCreateBody {
+        image: Some(spec.image.clone()),
+        cmd: Some(cmd),
+        working_dir: non_empty(&spec.workdir),
+        user: spec.user.clone(),
+        env: (!spec.env.is_empty())
+            .then(|| spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect()),
+        entrypoint: spec.entrypoint.as_ref().map(|e| vec![e.clone()]),
+        // Label so cowboy-managed containers are discoverable for teardown.
+        labels: Some(HashMap::from([("cowboy".to_string(), "1".to_string())])),
+        host_config: Some(host),
+        networking_config,
+        ..Default::default()
+    };
+    let opts = CreateContainerOptionsBuilder::new()
+        .name(&spec.name)
+        .build();
+    (config, opts)
 }
 
 #[async_trait]
 impl DockerCli for CliDocker {
     async fn image_exists(&self, image: &str) -> Result<bool> {
-        let out = run_quiet(&["image", "inspect", image]).await?;
-        Ok(out.status.success())
+        let docker = self.client().await?;
+        match docker.inspect_image(image).await {
+            Ok(_) => Ok(true),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(e).context("docker image inspect"),
+        }
     }
 
     async fn build_image(&self, dockerfile: &Path, context: &Path, tag: &str) -> Result<()> {
+        // Shell out: the CLI tars the build context and applies `.dockerignore`
+        // for us, and passes everything as argv (no quoting fragility).
         let status = Command::new("docker")
             .args(["build", "-t", tag, "-f"])
             .arg(dockerfile)
@@ -330,147 +404,214 @@ impl DockerCli for CliDocker {
     }
 
     async fn pull_image(&self, image: &str) -> Result<()> {
-        let status = Command::new("docker")
-            .args(["pull", image])
-            // `docker pull` writes its progress to stdout; route it to stderr so
-            // it never lands in the output of the command we're about to run.
-            .stdout(stderr_stdio())
-            .status()
-            .await
-            .context("docker pull")?;
-        if !status.success() {
-            bail!("docker pull failed for {image} ({status})");
+        let docker = self.client().await?;
+        let (repo, tag) = split_ref(image);
+        let opts = CreateImageOptionsBuilder::new()
+            .from_image(repo)
+            .tag(tag)
+            .build();
+        let mut stream = docker.create_image(Some(opts), None, None);
+        while let Some(item) = stream.next().await {
+            let info = item.context("docker pull")?;
+            // Print milestone lines (skip the per-layer progress ticks, which
+            // carry a `progress_detail`) to stderr, where pull progress belongs.
+            if info.progress_detail.is_none() {
+                if let Some(s) = info.status {
+                    eprintln!("{s}");
+                }
+            }
         }
         Ok(())
     }
 
     async fn container_state(&self, name: &str) -> Result<ContainerState> {
-        let out = run_quiet(&["inspect", "-f", "{{.State.Running}}", name]).await?;
-        if !out.status.success() {
-            return Ok(ContainerState::Absent);
+        let docker = self.client().await?;
+        match docker.inspect_container(name, None).await {
+            Ok(info) => {
+                let running = info.state.and_then(|s| s.running).unwrap_or(false);
+                Ok(if running {
+                    ContainerState::Running
+                } else {
+                    ContainerState::Stopped
+                })
+            }
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(ContainerState::Absent),
+            Err(e) => Err(e).context("docker inspect"),
         }
-        let running = String::from_utf8_lossy(&out.stdout).trim() == "true";
-        Ok(if running {
-            ContainerState::Running
-        } else {
-            ContainerState::Stopped
-        })
     }
 
     async fn run_detached(&self, spec: &ContainerSpec) -> Result<()> {
-        let mut args = vec!["run".to_string(), "-d".to_string()];
-        render_run_args(&mut args, spec);
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = run_quiet(&argv).await?;
-        if !out.status.success() {
-            bail!(
-                "docker run failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let docker = self.client().await?;
+        let (config, opts) = build_create(spec);
+        docker
+            .create_container(Some(opts), config)
+            .await
+            .context("docker create")?;
+        docker
+            .start_container(
+                &spec.name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .context("docker start")?;
         Ok(())
     }
 
     async fn run_oneshot(&self, spec: &ContainerSpec) -> Result<ExecResult> {
-        let mut args = vec!["run".to_string(), "--rm".to_string()];
-        render_run_args(&mut args, spec);
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = run_quiet(&argv).await?;
-        if !out.status.success() {
-            bail!(
-                "docker run (oneshot) failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        let docker = self.client().await?;
+        let (config, opts) = build_create(spec);
+        docker
+            .create_container(Some(opts), config)
+            .await
+            .context("docker create (oneshot)")?;
+        docker
+            .start_container(
+                &spec.name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .context("docker start (oneshot)")?;
+        // Wait for exit. bollard surfaces a non-zero exit as a typed error
+        // carrying the code; both paths give us the code we return.
+        let mut wait = docker.wait_container(
+            &spec.name,
+            None::<bollard::query_parameters::WaitContainerOptions>,
+        );
+        let mut code: i64 = 0;
+        while let Some(item) = wait.next().await {
+            match item {
+                Ok(resp) => code = resp.status_code,
+                Err(BollardError::DockerContainerWaitError { code: c, .. }) => code = c,
+                Err(e) => return Err(e).context("docker wait (oneshot)"),
+            }
         }
+        // `--rm` equivalent: remove the finished container (best-effort).
+        let opts = RemoveContainerOptionsBuilder::new().force(true).build();
+        let _ = docker.remove_container(&spec.name, Some(opts)).await;
         Ok(ExecResult {
-            exit_code: out.status.code().unwrap_or(-1),
+            exit_code: code as i32,
         })
     }
 
     async fn network_exists(&self, name: &str) -> Result<bool> {
-        let out = run_quiet(&["network", "inspect", name]).await?;
-        Ok(out.status.success())
+        let docker = self.client().await?;
+        match docker
+            .inspect_network(
+                name,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(e).context("docker network inspect"),
+        }
     }
 
     async fn create_network(&self, spec: &NetworkSpec) -> Result<()> {
-        let mut args = vec!["network".to_string(), "create".to_string()];
-        if spec.internal {
-            args.push("--internal".into());
-        }
-        if let Some(subnet) = &spec.subnet {
-            args.push("--subnet".into());
-            args.push(subnet.clone());
-        }
-        if let Some(gw) = &spec.gateway {
-            args.push("--gateway".into());
-            args.push(gw.clone());
-        }
-        args.push("--label".into());
-        args.push("cowboy=1".into());
-        args.push(spec.name.clone());
-        let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-        let out = run_quiet(&argv).await?;
-        if !out.status.success() {
-            bail!(
-                "docker network create failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let docker = self.client().await?;
+        let ipam = (spec.subnet.is_some() || spec.gateway.is_some()).then(|| Ipam {
+            config: Some(vec![IpamConfig {
+                subnet: spec.subnet.clone(),
+                gateway: spec.gateway.clone(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let req = NetworkCreateRequest {
+            name: spec.name.clone(),
+            internal: Some(spec.internal),
+            ipam,
+            labels: Some(HashMap::from([("cowboy".to_string(), "1".to_string())])),
+            ..Default::default()
+        };
+        docker
+            .create_network(req)
+            .await
+            .context("docker network create")?;
         Ok(())
     }
 
     async fn connect_network(&self, network: &str, container: &str) -> Result<()> {
-        let out = run_quiet(&["network", "connect", network, container]).await?;
-        if !out.status.success() {
-            bail!(
-                "docker network connect failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let docker = self.client().await?;
+        docker
+            .connect_network(
+                network,
+                NetworkConnectRequest {
+                    container: container.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("docker network connect")?;
         Ok(())
     }
 
     async fn remove_network(&self, name: &str) -> Result<()> {
-        let _ = run_quiet(&["network", "rm", name]).await?; // ignore "not found"
+        let docker = self.client().await?;
+        let _ = docker.remove_network(name).await; // ignore "not found"
         Ok(())
     }
 
     async fn list_labeled(&self) -> Result<(Vec<String>, Vec<String>)> {
-        let lines = |out: std::process::Output| -> Vec<String> {
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .map(str::to_string)
-                .filter(|s| !s.is_empty())
-                .collect()
-        };
-        let containers = run_quiet(&["ps", "-aq", "--filter", "label=cowboy=1"]).await?;
-        let networks = run_quiet(&["network", "ls", "-q", "--filter", "label=cowboy=1"]).await?;
-        Ok((lines(containers), lines(networks)))
+        let docker = self.client().await?;
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("label".to_string(), vec!["cowboy=1".to_string()])]);
+        let containers = docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .context("docker ps")?
+            .into_iter()
+            .filter_map(|c| c.id)
+            .collect();
+        let networks = docker
+            .list_networks(Some(
+                ListNetworksOptionsBuilder::new().filters(&filters).build(),
+            ))
+            .await
+            .context("docker network ls")?
+            .into_iter()
+            .filter_map(|n| n.id)
+            .collect();
+        Ok((containers, networks))
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        let out = run_quiet(&["start", name]).await?;
-        if !out.status.success() {
-            bail!(
-                "docker start failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        let docker = self.client().await?;
+        docker
+            .start_container(
+                name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .context("docker start")?;
         Ok(())
     }
 
     async fn stop(&self, name: &str) -> Result<()> {
-        let _ = run_quiet(&["stop", name]).await?;
+        let docker = self.client().await?;
+        let _ = docker
+            .stop_container(
+                name,
+                None::<bollard::query_parameters::StopContainerOptions>,
+            )
+            .await; // best-effort (already stopped / absent)
         Ok(())
     }
 
     async fn remove(&self, name: &str, force: bool) -> Result<()> {
-        let mut args = vec!["rm"];
-        if force {
-            args.push("-f");
-        }
-        args.push(name);
-        let _ = run_quiet(&args).await?;
+        let docker = self.client().await?;
+        let opts = RemoveContainerOptionsBuilder::new().force(force).build();
+        let _ = docker.remove_container(name, Some(opts)).await; // ignore "not found"
         Ok(())
     }
 
@@ -481,14 +622,44 @@ impl DockerCli for CliDocker {
         user: &str,
         argv: &[String],
     ) -> Result<ExecResult> {
-        let mut cmd = Command::new("docker");
-        cmd.arg("exec");
-        push_exec_flags(&mut cmd, workdir, user);
-        cmd.arg(name);
-        cmd.args(argv);
-        let status = cmd.status().await.context("docker exec")?;
+        let docker = self.client().await?;
+        let exec = docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    cmd: Some(argv.to_vec()),
+                    working_dir: non_empty(workdir),
+                    user: non_empty(user),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("docker exec (create)")?;
+        if let StartExecResults::Attached { mut output, .. } = docker
+            .start_exec(&exec.id, None)
+            .await
+            .context("docker exec")?
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut out = tokio::io::stdout();
+            let mut err = tokio::io::stderr();
+            while let Some(frame) = output.next().await {
+                match frame.context("docker exec (stream)")? {
+                    LogOutput::StdErr { message } => {
+                        err.write_all(&message).await.ok();
+                    }
+                    other => {
+                        out.write_all(&other.into_bytes()).await.ok();
+                    }
+                }
+            }
+            out.flush().await.ok();
+            err.flush().await.ok();
+        }
         Ok(ExecResult {
-            exit_code: status.code().unwrap_or(-1),
+            exit_code: exec_exit_code(docker, &exec.id).await,
         })
     }
 
@@ -499,21 +670,35 @@ impl DockerCli for CliDocker {
         user: &str,
         argv: &[String],
     ) -> Result<(ExecResult, String)> {
-        let mut cmd = Command::new("docker");
-        cmd.arg("exec");
-        push_exec_flags(&mut cmd, workdir, user);
-        cmd.arg(name);
-        cmd.args(argv);
-        cmd.kill_on_drop(true);
-        let out = cmd.output().await.context("docker exec (capture)")?;
-        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.is_empty() {
-            combined.push_str(&stderr);
+        let docker = self.client().await?;
+        let exec = docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    cmd: Some(argv.to_vec()),
+                    working_dir: non_empty(workdir),
+                    user: non_empty(user),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("docker exec (create)")?;
+        let mut combined = String::new();
+        if let StartExecResults::Attached { mut output, .. } = docker
+            .start_exec(&exec.id, None)
+            .await
+            .context("docker exec (capture)")?
+        {
+            while let Some(frame) = output.next().await {
+                let bytes = frame.context("docker exec (capture)")?.into_bytes();
+                combined.push_str(&String::from_utf8_lossy(&bytes));
+            }
         }
         Ok((
             ExecResult {
-                exit_code: out.status.code().unwrap_or(-1),
+                exit_code: exec_exit_code(docker, &exec.id).await,
             },
             combined,
         ))
@@ -527,36 +712,49 @@ impl DockerCli for CliDocker {
         argv: &[String],
         stdin: &str,
     ) -> Result<(ExecResult, String)> {
-        use tokio::io::AsyncWriteExt;
-        let mut cmd = Command::new("docker");
-        cmd.arg("exec").arg("-i");
-        push_exec_flags(&mut cmd, workdir, user);
-        cmd.arg(name);
-        cmd.args(argv);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn().context("docker exec (stdin)")?;
-        // The in-container helper reads all of stdin before emitting output, so
-        // writing fully then awaiting completion does not deadlock.
-        if let Some(mut si) = child.stdin.take() {
-            si.write_all(stdin.as_bytes()).await?;
-            si.shutdown().await.ok();
-            drop(si);
-        }
-        let out = child
-            .wait_with_output()
+        let docker = self.client().await?;
+        let exec = docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    cmd: Some(argv.to_vec()),
+                    working_dir: non_empty(workdir),
+                    user: non_empty(user),
+                    attach_stdin: Some(true),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
             .await
-            .context("docker exec (stdin)")?;
-        let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        if !stderr.is_empty() {
-            combined.push_str(&stderr);
+            .context("docker exec (create)")?;
+        let mut combined = String::new();
+        if let StartExecResults::Attached {
+            mut output,
+            mut input,
+        } = docker
+            .start_exec(&exec.id, None)
+            .await
+            .context("docker exec (stdin)")?
+        {
+            use tokio::io::AsyncWriteExt;
+            // Write stdin on a separate task so a command that emits output
+            // before consuming all of stdin can't deadlock the single
+            // multiplexed connection.
+            let payload = stdin.as_bytes().to_vec();
+            let writer = tokio::spawn(async move {
+                let _ = input.write_all(&payload).await;
+                let _ = input.shutdown().await;
+            });
+            while let Some(frame) = output.next().await {
+                let bytes = frame.context("docker exec (stdin)")?.into_bytes();
+                combined.push_str(&String::from_utf8_lossy(&bytes));
+            }
+            let _ = writer.await;
         }
         Ok((
             ExecResult {
-                exit_code: out.status.code().unwrap_or(-1),
+                exit_code: exec_exit_code(docker, &exec.id).await,
             },
             combined,
         ))
@@ -573,46 +771,51 @@ impl DockerCli for CliDocker {
         cancel: tokio_util::sync::CancellationToken,
         chunks: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<(ExecResult, String)> {
-        use tokio::io::AsyncReadExt;
+        let docker = self.client().await?;
 
         // Run the command in its own process group, recording the leader pid so
         // we can signal the whole group on cancel/timeout. The command is passed
-        // via env to avoid shell quoting.
+        // via env to avoid shell quoting. No PTY: over a plain pipe, tools like
+        // mise/cargo/docker detect "not a TTY" and emit plain, streamable log
+        // lines instead of cursor-movement progress we'd have to emulate. The
+        // wrapper's `2>&1` merges stderr into stdout.
         let pidfile = "/tmp/cowboy-exec.pgid";
         let wrapper =
             format!("setsid sh -c 'echo $$ > {pidfile}; exec sh -c \"$COWBOY_CMD\"' 2>&1");
-        let mut cmd = Command::new("docker");
-        cmd.arg("exec");
-        // No `-t` (PTY): with a real terminal, tools like mise/cargo/docker draw
-        // multi-line progress with cursor-movement escapes (cursor-up + reprint)
-        // that we'd need a terminal emulator to render — they tiled down the
-        // screen. Over a plain pipe those tools detect "not a TTY" and emit plain,
-        // streamable log lines instead, which our line splitter handles.
-        push_exec_flags(&mut cmd, workdir, user);
-        cmd.args([
-            "-e",
-            &format!("COWBOY_CMD={command}"),
-            name,
-            "sh",
-            "-c",
-            &wrapper,
-        ]);
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::null()); // merged into stdout by the wrapper's 2>&1
-        cmd.kill_on_drop(true);
+        let exec = docker
+            .create_exec(
+                name,
+                CreateExecOptions {
+                    cmd: Some(vec!["sh".to_string(), "-c".to_string(), wrapper]),
+                    env: Some(vec![format!("COWBOY_CMD={command}")]),
+                    working_dir: non_empty(workdir),
+                    user: non_empty(user),
+                    attach_stdout: Some(true),
+                    attach_stderr: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .context("docker exec (create stream)")?;
 
-        let mut child = cmd.spawn().context("spawning streaming docker exec")?;
-        let mut stdout = child.stdout.take().context("exec stdout")?;
-        let mut output = String::new();
+        let mut output = match docker
+            .start_exec(&exec.id, None)
+            .await
+            .context("starting streaming docker exec")?
+        {
+            StartExecResults::Attached { output, .. } => output,
+            StartExecResults::Detached => bail!("docker exec started detached"),
+        };
+
+        let mut accumulated = String::new();
         // Split the byte stream ourselves: `\n` (and `\r\n`) commits a line; a
         // bare `\r` is a single-line progress overwrite (transient). `line_start`
-        // marks where the current line begins in `output` so transient updates
-        // replace it in place. (UTF-8 multibyte never contains 0x0A/0x0D, so
-        // splitting on those bytes is safe.)
+        // marks where the current line begins in `accumulated` so transient
+        // updates replace it in place. (UTF-8 multibyte never contains
+        // 0x0A/0x0D, so splitting on those bytes is safe.)
         let mut line: Vec<u8> = Vec::new();
         let mut line_start = 0usize;
         let mut pending_cr = false;
-        let mut rbuf = [0u8; 8192];
 
         let timeout = if timeout_secs == 0 {
             std::time::Duration::from_secs(86_400)
@@ -625,23 +828,24 @@ impl DockerCli for CliDocker {
         let mut interrupted: Option<&str> = None;
         loop {
             tokio::select! {
-                read = stdout.read(&mut rbuf) => match read {
-                    Ok(0) | Err(_) => break, // EOF or read error
-                    Ok(n) => {
-                        for &b in &rbuf[..n] {
+                frame = output.next() => match frame {
+                    None => break, // EOF
+                    Some(Err(_)) => break, // stream error
+                    Some(Ok(f)) => {
+                        for &b in f.into_bytes().iter() {
                             if pending_cr {
                                 pending_cr = false;
                                 if b == b'\n' {
-                                    commit_line(&mut output, &mut line_start, &mut line, &chunks);
+                                    commit_line(&mut accumulated, &mut line_start, &mut line, &chunks);
                                     continue;
                                 }
                                 // bare `\r`: overwrite the line so far, then this
                                 // byte starts fresh content on the same line.
-                                transient_line(&mut output, line_start, &mut line, &chunks);
+                                transient_line(&mut accumulated, line_start, &mut line, &chunks);
                             }
                             match b {
                                 b'\n' => {
-                                    commit_line(&mut output, &mut line_start, &mut line, &chunks)
+                                    commit_line(&mut accumulated, &mut line_start, &mut line, &chunks)
                                 }
                                 b'\r' => pending_cr = true,
                                 _ => line.push(b),
@@ -654,33 +858,34 @@ impl DockerCli for CliDocker {
             }
         }
         // Flush any trailing partial line (no final newline) as transient.
-        transient_line(&mut output, line_start, &mut line, &chunks);
+        transient_line(&mut accumulated, line_start, &mut line, &chunks);
 
         if let Some(why) = interrupted {
-            // Kill the in-container process group, then the local client.
+            // Kill the in-container process group, then drop the local stream.
             let kill = format!(
                 "p=$(cat {pidfile} 2>/dev/null); [ -n \"$p\" ] && \
                  (kill -TERM -\"$p\" 2>/dev/null; sleep 1; kill -KILL -\"$p\" 2>/dev/null) || true"
             );
-            let _ = run_quiet(&["exec", name, "sh", "-c", &kill]).await;
-            let _ = child.start_kill();
+            let _ = self
+                .exec_capture(name, "", "", &["sh".into(), "-c".into(), kill])
+                .await;
+            drop(output);
             let note = format!("[command {why}]");
-            output.push_str(&note);
+            accumulated.push_str(&note);
             let _ = chunks.send(format!("{note}\n"));
             return Ok((
                 ExecResult {
                     exit_code: if why == "timed out" { 124 } else { 130 },
                 },
-                output,
+                accumulated,
             ));
         }
 
-        let status = child.wait().await.context("waiting for docker exec")?;
         Ok((
             ExecResult {
-                exit_code: status.code().unwrap_or(-1),
+                exit_code: exec_exit_code(docker, &exec.id).await,
             },
-            output,
+            accumulated,
         ))
     }
 
@@ -691,6 +896,9 @@ impl DockerCli for CliDocker {
         user: &str,
         argv: &[String],
     ) -> Result<ExecResult> {
+        // Shell out: the CLI puts the host terminal into raw mode, allocates a
+        // PTY, and forwards window-resize events for us. argv is passed as a
+        // list (no quoting fragility).
         let mut cmd = Command::new("docker");
         cmd.arg("exec");
         cmd.arg("-it");
@@ -702,6 +910,17 @@ impl DockerCli for CliDocker {
             exit_code: status.code().unwrap_or(-1),
         })
     }
+}
+
+/// Inspect a finished exec for its exit code (`-1` if unavailable).
+async fn exec_exit_code(docker: &Docker, exec_id: &str) -> i32 {
+    docker
+        .inspect_exec(exec_id)
+        .await
+        .ok()
+        .and_then(|r| r.exit_code)
+        .map(|c| c as i32)
+        .unwrap_or(-1)
 }
 
 /// Push `-w <workdir>` and (if non-empty) `--user <user>` onto a `docker exec`.
@@ -757,5 +976,74 @@ mod tests {
     fn bind_mount_args() {
         assert_eq!(BindMount::rw("/a", "/b").to_arg(), "/a:/b");
         assert_eq!(BindMount::ro("/a", "/b").to_arg(), "/a:/b:ro");
+    }
+
+    #[test]
+    fn split_ref_extracts_tag_not_registry_port() {
+        assert_eq!(split_ref("alpine"), ("alpine", "latest"));
+        assert_eq!(split_ref("alpine:3.20"), ("alpine", "3.20"));
+        assert_eq!(
+            split_ref("ghcr.io/koshea/cowboy/gateway:0.1.0"),
+            ("ghcr.io/koshea/cowboy/gateway", "0.1.0")
+        );
+        // registry host:port with no tag → repo unchanged, default tag.
+        assert_eq!(
+            split_ref("localhost:5000/img"),
+            ("localhost:5000/img", "latest")
+        );
+        assert_eq!(
+            split_ref("localhost:5000/img:v2"),
+            ("localhost:5000/img", "v2")
+        );
+    }
+
+    #[test]
+    fn parse_memory_handles_suffixes() {
+        assert_eq!(parse_memory("1024"), Some(1024));
+        assert_eq!(parse_memory("512m"), Some(512 * 1024 * 1024));
+        assert_eq!(parse_memory("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory("8G"), Some(8 * 1024 * 1024 * 1024));
+        assert_eq!(parse_memory("nonsense"), None);
+        assert_eq!(parse_memory(""), None);
+    }
+
+    #[test]
+    fn build_create_maps_spec_to_host_config() {
+        let spec = ContainerSpec {
+            name: "c".into(),
+            image: "img:1".into(),
+            workdir: "/w".into(),
+            mounts: vec![BindMount::ro("/h", "/c")],
+            env: vec![("K".into(), "V".into())],
+            network: Some("net".into()),
+            ip: Some("10.0.0.5".into()),
+            memory: Some("256m".into()),
+            cpus: Some(2.0),
+            cap_drop: vec!["ALL".into()],
+            pids_limit: Some(4096),
+            ..Default::default()
+        };
+        let (config, _opts) = build_create(&spec);
+        let host = config.host_config.unwrap();
+        assert_eq!(host.binds, Some(vec!["/h:/c:ro".to_string()]));
+        assert_eq!(host.memory, Some(256 * 1024 * 1024));
+        assert_eq!(host.nano_cpus, Some(2_000_000_000));
+        assert_eq!(host.pids_limit, Some(4096));
+        assert_eq!(host.network_mode.as_deref(), Some("net"));
+        assert_eq!(config.image.as_deref(), Some("img:1"));
+        assert_eq!(config.working_dir.as_deref(), Some("/w"));
+        assert_eq!(config.env, Some(vec!["K=V".to_string()]));
+        // static IP recorded on the endpoint config for `net`.
+        let ep = config
+            .networking_config
+            .unwrap()
+            .endpoints_config
+            .unwrap()
+            .remove("net")
+            .unwrap();
+        assert_eq!(
+            ep.ipam_config.unwrap().ipv4_address.as_deref(),
+            Some("10.0.0.5")
+        );
     }
 }

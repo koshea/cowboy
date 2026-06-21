@@ -569,6 +569,14 @@ fn e2e_daemon_restart_readopts_worker() {
         "worker should re-register after a daemon restart"
     );
 
+    // The surviving worker must still be reachable on its original socket — a
+    // restarted daemon that lost its state must not prune a live worker's socket
+    // before it re-heartbeats (regression: startup prune_sockets nuked it).
+    assert!(
+        ws.exists(),
+        "surviving worker's socket should outlive a daemon restart"
+    );
+
     Client::connect(&ws).send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(500));
 }
