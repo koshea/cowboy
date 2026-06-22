@@ -121,6 +121,14 @@ impl Model {
         }
     }
 
+    /// Optimistically echo a message the user just sent, so it appears instantly
+    /// (the worker's journaled `UserMessage` echo is then deduped in `apply`).
+    pub fn push_user(&mut self, text: String) {
+        self.commit();
+        self.blocks.push(Block::User(text));
+        self.running = true;
+    }
+
     /// The socket dropped (not a session end) — show "reconnecting" unless the
     /// session is already terminally ended.
     pub fn set_reconnecting(&mut self) {
@@ -138,6 +146,16 @@ impl Model {
 
     fn apply_event(&mut self, ev: UiEventMsg) {
         match ev {
+            UiEventMsg::UserMessage(m) => {
+                self.running = true;
+                // Skip the journaled echo of our own optimistic local push (live
+                // send); render genuinely-new ones — a journal replay on refresh,
+                // or a message another client sent.
+                if !matches!(self.blocks.last(), Some(Block::User(prev)) if *prev == m) {
+                    self.commit();
+                    self.blocks.push(Block::User(m));
+                }
+            }
             UiEventMsg::Delta(t) => {
                 self.running = true;
                 self.streaming.push_str(&t);
@@ -203,12 +221,5 @@ impl Model {
             | UiEventMsg::SubagentStarted { .. }
             | UiEventMsg::SubagentDone { .. } => {}
         }
-    }
-
-    /// A user message we send locally — echoed into the transcript immediately so
-    /// the sender sees it without waiting for a round-trip.
-    pub fn push_user(&mut self, text: String) {
-        self.blocks.push(Block::User(text));
-        self.running = true;
     }
 }

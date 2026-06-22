@@ -144,6 +144,10 @@ impl AgentUi for TuiUi {
 /// mutation; control-flow events (Ask/Approval/TurnDone/Done) stay in the loop.
 fn apply_wire(app: &mut App, msg: UiEventMsg) {
     match msg {
+        // The TUI echoes user input locally on submit, so ignore the journaled
+        // copy to avoid a double line. (The web client, which can refresh, renders
+        // from this instead.)
+        UiEventMsg::UserMessage(_) => {}
         UiEventMsg::Delta(t) => app.stream(&t),
         UiEventMsg::Reasoning(t) => app.stream_reasoning(&t),
         UiEventMsg::ModelDone => app.commit_stream(),

@@ -387,6 +387,9 @@ pub enum DaemonResp {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UiEventMsg {
+    /// A message the user sent. Journaled (unlike the TUI's local echo) so it
+    /// replays on reconnect/refresh and reaches every attached client.
+    UserMessage(String),
     Delta(String),
     /// The model's streamed "thinking" (reasoning), shown dimmed and never
     /// folded into the answer.

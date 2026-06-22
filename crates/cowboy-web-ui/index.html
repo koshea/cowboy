@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
   <meta name="theme-color" content="#0d1117" />
   <title>cowboy</title>
   <link data-trunk rel="rust" data-wasm-opt="z" />
@@ -23,8 +23,10 @@
     code, pre, .cmd, .output, .agent, .reasoning, .diff pre {
       font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
     }
-    .page { display: flex; flex-direction: column; height: 100dvh; }
-    .center { display: grid; place-content: center; height: 100dvh; text-align: center; padding: 1rem; }
+    /* Size to the *visual* viewport (set by the script below) so the on-screen
+       keyboard shrinks the app instead of pushing the composer off-screen. */
+    .page { display: flex; flex-direction: column; height: var(--app-height, 100dvh); }
+    .center { display: grid; place-content: center; height: var(--app-height, 100dvh); text-align: center; padding: 1rem; }
     .muted { color: var(--muted); }
     .error { color: var(--red); }
 
@@ -38,6 +40,11 @@
     .bar .stats { font-size: .8rem; white-space: nowrap; }
 
     .transcript { flex: 1; overflow-y: auto; padding: .8rem; display: flex; flex-direction: column; gap: .6rem; -webkit-overflow-scrolling: touch; }
+    /* flex-shrink:0 stops items collapsing vertically — a child with
+       `overflow:hidden` (command/diff) otherwise gets min-height:0 and is shrunk
+       to nothing in the scrolling column. min-width:0 lets inner `overflow-x`
+       scroll instead of blowing out the width. */
+    .transcript > * { flex-shrink: 0; min-width: 0; max-width: 100%; }
 
     .msg.user { align-self: flex-end; max-width: 85%; background: var(--user); color: #fff; padding: .5rem .7rem; border-radius: .8rem .8rem .2rem .8rem; white-space: pre-wrap; word-break: break-word; }
     pre.agent { margin: 0; white-space: pre-wrap; word-break: break-word; }
@@ -45,7 +52,26 @@
     pre.reasoning { margin: 0; white-space: pre-wrap; color: var(--muted); font-size: .85em; opacity: .8; }
     .tool { color: #bc8cff; }
     .notice { font-size: .9em; }
-    .final { color: var(--green); font-weight: 600; white-space: pre-wrap; }
+    .final { color: var(--green); }
+    .agent, .final { line-height: 1.55; }
+
+    /* Rendered markdown (agent/final message bodies). */
+    .md { display: block; }
+    .md > :first-child { margin-top: 0; }
+    .md > :last-child { margin-bottom: 0; }
+    .md p { margin: .5em 0; }
+    .md h1, .md h2, .md h3, .md h4 { margin: .8em 0 .3em; line-height: 1.25; }
+    .md h1 { font-size: 1.3em; } .md h2 { font-size: 1.18em; } .md h3 { font-size: 1.06em; } .md h4 { font-size: 1em; }
+    .md ul, .md ol { margin: .4em 0; padding-left: 1.3em; }
+    .md li { margin: .15em 0; }
+    .md code { background: var(--panel2); padding: .1em .35em; border-radius: .3rem; font-size: .88em; word-break: break-word; }
+    .md pre { background: var(--panel2); border: 1px solid var(--border); border-radius: .5rem; padding: .6rem .7rem; overflow-x: auto; margin: .5em 0; }
+    .md pre code { background: none; padding: 0; font-size: .85em; }
+    .md a { color: var(--accent); }
+    .md blockquote { margin: .5em 0; padding-left: .8em; border-left: 3px solid var(--border); color: var(--muted); }
+    .md table { border-collapse: collapse; display: block; overflow-x: auto; }
+    .md th, .md td { border: 1px solid var(--border); padding: .25em .5em; }
+    .md hr { border: none; border-top: 1px solid var(--border); margin: .8em 0; }
 
     .command { background: var(--panel); border: 1px solid var(--border); border-radius: .5rem; overflow: hidden; }
     .command .cmd { background: var(--panel2); padding: .4rem .6rem; color: var(--yellow); overflow-x: auto; white-space: pre; }
@@ -95,4 +121,22 @@
   </style>
 </head>
 <body></body>
+<script>
+  // Track the visual viewport so the app fits the area above the on-screen
+  // keyboard (iOS Safari doesn't honor interactive-widget). Sets --app-height,
+  // which .page/.center use for their height.
+  (function () {
+    var vv = window.visualViewport;
+    function set() {
+      var h = vv ? vv.height : window.innerHeight;
+      document.documentElement.style.setProperty('--app-height', h + 'px');
+    }
+    if (vv) {
+      vv.addEventListener('resize', set);
+      vv.addEventListener('scroll', set);
+    }
+    window.addEventListener('resize', set);
+    set();
+  })();
+</script>
 </html>

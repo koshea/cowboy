@@ -22,6 +22,7 @@ use model::{Block, Model};
 /// Reducer actions for the session [`Model`].
 pub enum Action {
     Server(ServerMsg),
+    /// Optimistic local echo of a message the user just sent.
     User(String),
     /// A fresh WebSocket opened.
     Connected,
@@ -250,15 +251,16 @@ fn session(props: &SessionProps) -> Html {
         }
     };
 
-    // Submit the input box.
+    // Submit the input box: echo it locally for instant feedback and send it. The
+    // worker journals a `UserMessage` (deduped against this echo) so it also
+    // survives a refresh and reaches other clients.
     let on_submit = {
         let model = model.clone();
         let input_ref = input_ref.clone();
         let send = send.clone();
         Callback::from(move |_| {
             if let Some(ta) = input_ref.cast::<HtmlTextAreaElement>() {
-                let text = ta.value();
-                let text = text.trim().to_string();
+                let text = ta.value().trim().to_string();
                 if !text.is_empty() {
                     model.dispatch(Action::User(text.clone()));
                     send(ClientMsg::Message(text));
@@ -388,10 +390,10 @@ fn title(m: &Model) -> String {
 fn render_block(b: &Block) -> Html {
     match b {
         Block::User(t) => html! { <div class="msg user">{ t.clone() }</div> },
-        Block::Agent(t) => html! { <pre class="agent">{ t.clone() }</pre> },
+        Block::Agent(t) => html! { <div class="agent">{ markdown(t) }</div> },
         Block::Tool(t) => html! { <div class="tool">{ "✎ " }{ t.clone() }</div> },
         Block::Notice(t) => html! { <div class="notice muted">{ t.clone() }</div> },
-        Block::Final(t) => html! { <div class="final">{ "✓ " }{ t.clone() }</div> },
+        Block::Final(t) => html! { <div class="final">{ "✓ " }{ markdown(t) }</div> },
         Block::Command { cmd, output, exit } => html! {
             <div class="command">
                 <div class="cmd">{ "$ " }{ cmd.clone() }</div>
@@ -408,6 +410,50 @@ fn render_block(b: &Block) -> Html {
             </div>
         },
     }
+}
+
+/// Render agent markdown to sanitized HTML. Raw HTML embedded in the model's
+/// output is shown as escaped text (never executed), and link hrefs are limited
+/// to safe schemes — the agent's output is untrusted, so this must not be an XSS
+/// vector into the page that holds the access token.
+fn markdown(src: &str) -> Html {
+    use pulldown_cmark::{html, Event, Options, Parser, Tag};
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    let events = Parser::new_ext(src, opts).map(|ev| match ev {
+        Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            let dest_url = if is_safe_url(&dest_url) {
+                dest_url
+            } else {
+                "#".into()
+            };
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            })
+        }
+        ev => ev,
+    });
+    let mut body = String::new();
+    html::push_html(&mut body, events);
+    Html::from_html_unchecked(format!("<div class=\"md\">{body}</div>").into())
+}
+
+/// Allow only obviously-safe link schemes (block `javascript:`, `data:`, etc.).
+fn is_safe_url(url: &str) -> bool {
+    let u = url.trim_start();
+    u.starts_with("http://")
+        || u.starts_with("https://")
+        || u.starts_with("mailto:")
+        || u.starts_with('/')
+        || u.starts_with('#')
 }
 
 fn diff_line(line: &str) -> Html {

@@ -365,6 +365,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
     let mut queue: VecDeque<String> = VecDeque::new();
     if let Some(task) = args.task.clone() {
+        emitter.emit(UiEventMsg::UserMessage(task.clone()));
         queue.push_back(task);
     }
     'serve: loop {
@@ -396,7 +397,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 };
                 match msg {
                     None => break,
-                    Some(ClientMsg::Message(m)) => m,
+                    Some(ClientMsg::Message(m)) => {
+                        emitter.emit(UiEventMsg::UserMessage(m.clone()));
+                        m
+                    }
                     Some(ClientMsg::End) => break,
                     Some(ClientMsg::SwitchModel(name)) => {
                         apply_switch(&mut agent, &resolve, &emitter, &name);
@@ -473,6 +477,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         // memory without limit; drop the oldest queued input once
                         // the cap is hit (a turn is in flight, so this is backlog).
                         Some(ClientMsg::Message(m)) => {
+                            emitter.emit(UiEventMsg::UserMessage(m.clone()));
                             const MAX_QUEUED: usize = 256;
                             if queue.len() >= MAX_QUEUED {
                                 queue.pop_front();
