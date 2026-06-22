@@ -304,6 +304,11 @@ pub enum DaemonReq {
     /// killing its workers — they survive and re-heartbeat into the successor.
     /// Sent by an upgraded CLI to roll a stale-version daemon to the new binary.
     Shutdown,
+    /// Re-read `web.yaml` and start/stop the web server to match it. Sent by
+    /// `cowboy web on|off` so the change applies to the running daemon at once.
+    ReloadWeb,
+    /// Ask whether the daemon is currently serving the web UI.
+    WebStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,6 +367,11 @@ pub enum DaemonResp {
     Accepted,
     /// The daemon acknowledged a [`DaemonReq::Shutdown`] and is exiting.
     ShuttingDown,
+    /// Web-server state after a [`DaemonReq::ReloadWeb`]/[`DaemonReq::WebStatus`]:
+    /// `serving` is whether the daemon currently has the web UI bound.
+    Web {
+        serving: bool,
+    },
     Err {
         message: String,
     },

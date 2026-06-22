@@ -37,6 +37,8 @@ libc = "0.2"
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = "0.29"
 rust-embed = { version = "8", features = ["debug-embed"] }
+# Terminal QR of the access URL so a phone can scan it (no image deps).
+qrcode = { version = "0.14", default-features = false }
 
 # serialization / config
 serde = { version = "1", features = ["derive"] }

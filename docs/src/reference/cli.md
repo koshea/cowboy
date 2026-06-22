@@ -694,11 +694,25 @@ Print a skill's instructions (to follow / pull into context)
 
 Serve a web UI to attach to running sessions from a browser (e.g. a phone over Tailscale). Binds loopback by default; token-authenticated
 
+
+### `cowboy web off`
+
+Disable the web UI and stop the daemon serving it
+
+
+### `cowboy web on`
+
+Enable the web UI and have the daemon start serving it
+
 | Arg | Description |
 |-----|-------------|
-| `--bind` | Address to bind, e.g. `127.0.0.1:8787` or your Tailscale IP `100.x.y.z:8787`. Non-loopback/non-Tailscale binds are refused unless `--insecure-allow-lan` is set |
-| `--token` | Auth token clients must present (`Authorization: Bearer` or `?token=`). Defaults to `$COWBOY_WEB_TOKEN`, else a random token printed at startup |
-| `--insecure-allow-lan` | Permit a non-loopback, non-Tailscale bind (LAN / `0.0.0.0`). The token then travels in cleartext — only use on a trusted network |
+| `--bind` | Address to bind, e.g. `127.0.0.1:8787` or your Tailscale IP `100.x.y.z:8787`. Persisted; defaults to `127.0.0.1:8787`. Non-loopback/non-Tailscale binds are refused unless `--lan` is set |
+| `--lan` | Permit a non-loopback, non-Tailscale bind (LAN / `0.0.0.0`). The token then travels in cleartext — only use on a trusted network |
+
+
+### `cowboy web status`
+
+Show whether the web UI is enabled + serving, with its URL (and a QR for a remote bind)
 
 
 ## `cowboy worktree`

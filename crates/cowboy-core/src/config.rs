@@ -981,6 +981,61 @@ impl ProvidersConfig {
     }
 }
 
+/// Host-global settings for the `cowboy web` remote-control server. The daemon
+/// serves the web UI whenever `enabled`; toggled with `cowboy web on|off`. Lives
+/// at `~/.config/cowboy/web.yaml` and holds the access token, so it's `0600`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebConfig {
+    /// Whether `cowboyd` serves the web UI.
+    pub enabled: bool,
+    /// Bind address, e.g. `127.0.0.1:8787` or a Tailscale IP `100.x.y.z:8787`.
+    pub bind: String,
+    /// Bearer token clients must present. Minted on first `cowboy web on`.
+    pub token: String,
+    /// Permit a non-loopback, non-Tailscale bind (token travels in cleartext).
+    pub allow_lan: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: "127.0.0.1:8787".into(),
+            token: String::new(),
+            allow_lan: false,
+        }
+    }
+}
+
+impl WebConfig {
+    /// `~/.config/cowboy/web.yaml`.
+    pub fn global_path() -> Option<PathBuf> {
+        global_config_dir().map(|d| d.join("web.yaml"))
+    }
+
+    /// Load the global web config, or defaults if absent/unreadable.
+    pub fn load_global() -> Self {
+        match Self::global_path() {
+            Some(p) if p.exists() => read_yaml(&p).unwrap_or_default(),
+            _ => Self::default(),
+        }
+    }
+
+    /// Persist to `~/.config/cowboy/web.yaml` with owner-only (`0600`) perms (it
+    /// holds the access token).
+    pub fn save_global(&self) -> Result<()> {
+        let path =
+            Self::global_path().ok_or_else(|| Error::Invalid("no home config dir".into()))?;
+        write_yaml_private(self, &path)
+    }
+
+    /// The full access URL, or `None` until a token has been minted.
+    pub fn url(&self) -> Option<String> {
+        (!self.token.is_empty()).then(|| format!("http://{}/?token={}", self.bind, self.token))
+    }
+}
+
 /// Serialize `value` to YAML at `path` with owner-only (`0600`) perms, created
 /// atomically (temp file at `0600` + rename) so secrets are never briefly exposed.
 fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {

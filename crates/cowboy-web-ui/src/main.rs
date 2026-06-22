@@ -11,7 +11,7 @@ use std::rc::Rc;
 use cowboy_proto::daemonproto::{ClientMsg, InterruptKind, ServerMsg, SessionInfo, SessionStatus};
 use cowboy_proto::netproto::{ApprovalScope, Verdict};
 use futures::channel::mpsc;
-use futures::{SinkExt, StreamExt};
+use futures::{FutureExt, SinkExt, StreamExt};
 use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
 use web_sys::{HtmlTextAreaElement, KeyboardEvent};
@@ -23,6 +23,10 @@ use model::{Block, Model};
 pub enum Action {
     Server(ServerMsg),
     User(String),
+    /// A fresh WebSocket opened.
+    Connected,
+    /// The WebSocket dropped (transient) — retrying.
+    Disconnected,
 }
 
 impl Reducible for Model {
@@ -32,6 +36,8 @@ impl Reducible for Model {
         match action {
             Action::Server(msg) => m.apply(msg),
             Action::User(text) => m.push_user(text),
+            Action::Connected => m.set_live(),
+            Action::Disconnected => m.set_reconnecting(),
         }
         Rc::new(m)
     }
@@ -169,44 +175,70 @@ fn session(props: &SessionProps) -> Html {
     });
     let input_ref = use_node_ref();
 
-    // Open the WebSocket once per session id.
+    // One task per Session: connect, relay both ways, and reconnect on a
+    // transient drop (resuming the journal from the last seq seen). It ends when
+    // the session truly ends (`Ended`) or the component unmounts — unmount drops
+    // every outbound sender, so `rx` closes and the loop falls through.
     {
         let model = model.clone();
         let outbox = outbox.clone();
         let token = props.token.clone();
-        use_effect_with(props.id.clone(), move |id| {
-            let url = ws_url(id, &token);
-            match WebSocket::open(&url) {
-                Ok(ws) => {
-                    let (mut write, mut read) = ws.split();
-                    // Drain the outbox → WS.
-                    if let Some(mut rx) = outbox.1.borrow_mut().take() {
-                        wasm_bindgen_futures::spawn_local(async move {
-                            while let Some(cmd) = rx.next().await {
-                                let json = serde_json::to_string(&cmd).unwrap_or_default();
-                                if write.send(WsMessage::Text(json)).await.is_err() {
-                                    break;
-                                }
+        let id = props.id.clone();
+        use_effect_with(props.id.clone(), move |_| {
+            if let Some(mut rx) = outbox.1.borrow_mut().take() {
+                wasm_bindgen_futures::spawn_local(async move {
+                    // First seq we still need; `None` = replay the whole journal.
+                    let mut next_seq: Option<u64> = None;
+                    let mut attempt: u32 = 0;
+                    'reconnect: loop {
+                        let ws = match WebSocket::open(&ws_url(&id, &token, next_seq)) {
+                            Ok(ws) => ws,
+                            Err(_) => {
+                                backoff(&mut attempt).await;
+                                continue;
                             }
-                        });
-                    }
-                    // WS → reducer.
-                    let model = model.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        while let Some(Ok(WsMessage::Text(txt))) = read.next().await {
-                            if let Ok(msg) = serde_json::from_str::<ServerMsg>(&txt) {
-                                model.dispatch(Action::Server(msg));
+                        };
+                        attempt = 0;
+                        model.dispatch(Action::Connected);
+                        let (mut write, mut read) = ws.split();
+                        let mut terminal = false;
+                        loop {
+                            futures::select! {
+                                incoming = read.next().fuse() => match incoming {
+                                    Some(Ok(WsMessage::Text(txt))) => {
+                                        if let Ok(msg) = serde_json::from_str::<ServerMsg>(&txt) {
+                                            if let ServerMsg::Event { seq, .. } = &msg {
+                                                next_seq = Some(seq + 1);
+                                            }
+                                            if matches!(msg, ServerMsg::Ended { .. }) {
+                                                terminal = true;
+                                            }
+                                            model.dispatch(Action::Server(msg));
+                                        }
+                                    }
+                                    _ => break, // socket closed/errored
+                                },
+                                cmd = rx.next().fuse() => match cmd {
+                                    Some(c) => {
+                                        let json = serde_json::to_string(&c).unwrap_or_default();
+                                        if write.send(WsMessage::Text(json)).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    // Outbound channel closed → the component unmounted.
+                                    None => break 'reconnect,
+                                },
                             }
                         }
-                        model.dispatch(Action::Server(ServerMsg::Ended {
-                            reason: "disconnected".into(),
-                        }));
-                    });
-                }
-                Err(e) => model.dispatch(Action::Server(ServerMsg::Ended {
-                    reason: format!("connection failed: {e}"),
-                })),
+                        if terminal {
+                            break;
+                        }
+                        model.dispatch(Action::Disconnected);
+                        backoff(&mut attempt).await;
+                    }
+                });
             }
+            // Teardown is implicit: unmounting drops the senders, closing `rx`.
             || ()
         });
     }
@@ -290,9 +322,7 @@ fn session(props: &SessionProps) -> Html {
                 if model.running {
                     <div class="spinner muted">{ "…working" }</div>
                 }
-                if let Some(reason) = &model.ended {
-                    <div class="banner ended">{ format!("session ended: {reason}") }</div>
-                }
+                { conn_banner(&model.conn) }
             </main>
 
             if let Some(ask) = &model.ask { { render_ask(ask, send.clone()) } }
@@ -310,7 +340,7 @@ fn session(props: &SessionProps) -> Html {
     }
 }
 
-fn ws_url(id: &str, token: &str) -> String {
+fn ws_url(id: &str, token: &str, since_seq: Option<u64>) -> String {
     let loc = web_sys::window().unwrap().location();
     let proto = if loc.protocol().as_deref() == Ok("https:") {
         "wss"
@@ -320,7 +350,31 @@ fn ws_url(id: &str, token: &str) -> String {
     let host = loc.host().unwrap_or_default();
     let id = js_sys::encode_uri_component(id);
     let token = js_sys::encode_uri_component(token);
-    format!("{proto}://{host}/api/session/{id}/ws?token={token}")
+    let mut url = format!("{proto}://{host}/api/session/{id}/ws?token={token}");
+    // On reconnect, resume the journal from where we left off instead of
+    // replaying everything (the server passes this through as the worker Hello).
+    if let Some(seq) = since_seq {
+        url.push_str(&format!("&since_seq={seq}"));
+    }
+    url
+}
+
+/// Exponential backoff between reconnect attempts: 0.5s → 8s.
+async fn backoff(attempt: &mut u32) {
+    let ms = (500u32 << (*attempt).min(4)).min(8_000);
+    *attempt = attempt.saturating_add(1);
+    gloo_timers::future::TimeoutFuture::new(ms).await;
+}
+
+fn conn_banner(conn: &model::ConnState) -> Html {
+    use model::ConnState::*;
+    match conn {
+        Reconnecting => html! { <div class="banner reconnecting">{ "reconnecting…" }</div> },
+        Ended(reason) => {
+            html! { <div class="banner ended">{ format!("session ended: {reason}") }</div> }
+        }
+        Connecting | Live => html! {},
+    }
 }
 
 fn title(m: &Model) -> String {

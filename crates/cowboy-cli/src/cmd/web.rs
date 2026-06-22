@@ -25,13 +25,14 @@ use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use cowboy_core::config::WebConfig;
 use cowboy_core::daemonproto::{AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg};
 use cowboy_core::netproto::encode_line;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
+use tokio_util::sync::CancellationToken;
 
-use crate::cli::WebArgs;
 use crate::net::control::ct_eq;
 
 /// Resolves a session id to its attach target. Injected so the WS bridge is
@@ -45,20 +46,110 @@ struct AppState {
     resolve: Resolver,
 }
 
-pub async fn run(args: WebArgs) -> Result<()> {
-    let addr: SocketAddr = args
-        .bind
+// --- `cowboy web on|off|status`: manage the persistent setting ---------------
+
+/// `cowboy web on`: enable the web UI in `web.yaml` (minting a token on first
+/// use) and tell the running daemon to start serving it now.
+pub async fn on(bind: Option<String>, lan: bool) -> Result<()> {
+    let mut cfg = WebConfig::load_global();
+    if let Some(b) = bind {
+        cfg.bind = b;
+    }
+    if lan {
+        cfg.allow_lan = true;
+    }
+    cfg.enabled = true;
+    if cfg.token.is_empty() {
+        cfg.token = uuid::Uuid::new_v4().simple().to_string();
+    }
+    // Validate the bind up front for immediate feedback (the daemon re-checks).
+    let addr = guard_bind_str(&cfg.bind, cfg.allow_lan)?;
+    cfg.save_global().context("saving web.yaml")?;
+
+    // Apply on the running daemon (starting one if needed).
+    crate::cmd::daemon::ensure_running().await?;
+    let serving = matches!(
+        crate::cmd::daemon::request(DaemonReq::ReloadWeb).await,
+        Ok(DaemonResp::Web { serving: true })
+    );
+    if serving {
+        println!("web UI enabled.");
+    } else {
+        println!("web UI enabled, but the daemon isn't serving it — check `cowboy web status`.");
+    }
+    print_access(&cfg, addr);
+    Ok(())
+}
+
+/// `cowboy web off`: disable the web UI and stop the daemon serving it.
+pub async fn off() -> Result<()> {
+    let mut cfg = WebConfig::load_global();
+    cfg.enabled = false;
+    cfg.save_global().context("saving web.yaml")?;
+    // Only poke a daemon that's already up; don't spawn one just to turn it off.
+    if matches!(
+        crate::cmd::daemon::request(DaemonReq::Ping).await,
+        Ok(DaemonResp::Pong { .. })
+    ) {
+        let _ = crate::cmd::daemon::request(DaemonReq::ReloadWeb).await;
+    }
+    println!("web UI disabled.");
+    Ok(())
+}
+
+/// `cowboy web status`: show whether it's enabled + actually serving, with the URL/QR.
+pub async fn status() -> Result<()> {
+    let cfg = WebConfig::load_global();
+    if !cfg.enabled {
+        println!("web UI: disabled (enable with `cowboy web on`)");
+        return Ok(());
+    }
+    let serving = matches!(
+        crate::cmd::daemon::request(DaemonReq::WebStatus).await,
+        Ok(DaemonResp::Web { serving: true })
+    );
+    println!(
+        "web UI: enabled · {}",
+        if serving {
+            "serving"
+        } else {
+            "not serving (is cowboyd running?)"
+        }
+    );
+    if let Ok(addr) = guard_bind_str(&cfg.bind, cfg.allow_lan) {
+        print_access(&cfg, addr);
+    }
+    Ok(())
+}
+
+/// Print the access URL, plus a scannable QR + warning for a remote bind.
+fn print_access(cfg: &WebConfig, addr: SocketAddr) {
+    let Some(url) = cfg.url() else { return };
+    println!("open:  {url}");
+    if !addr.ip().is_loopback() {
+        if let Some(qr) = render_qr(&url) {
+            println!("\n{qr}");
+        }
+        println!(
+            "note: reachable beyond localhost — anyone with this URL can drive your sessions."
+        );
+    }
+}
+
+// --- the server itself (run inside cowboyd) ----------------------------------
+
+/// Parse + validate a bind string, returning the socket address.
+pub fn guard_bind_str(bind: &str, allow_lan: bool) -> Result<SocketAddr> {
+    let addr: SocketAddr = bind
         .parse()
-        .with_context(|| format!("invalid --bind address: {}", args.bind))?;
-    guard_bind(addr.ip(), args.insecure_allow_lan)?;
+        .with_context(|| format!("invalid bind address: {bind}"))?;
+    guard_bind(addr.ip(), allow_lan)?;
+    Ok(addr)
+}
 
-    let token = args
-        .token
-        .or_else(|| std::env::var("COWBOY_WEB_TOKEN").ok())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-
-    // Production resolver: ask the daemon for the session's worker socket.
+/// Serve the web UI until `cancel` fires (the daemon owns the cancel token, so
+/// `cowboy web off` stops it cleanly). Resolves sessions via the daemon socket.
+pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationToken) -> Result<()> {
     let resolve: Resolver = Arc::new(|id: String| {
         Box::pin(async move {
             match crate::cmd::daemon::request(DaemonReq::AttachSession { id }).await {
@@ -67,24 +158,12 @@ pub async fn run(args: WebArgs) -> Result<()> {
             }
         })
     });
-    let state = Arc::new(AppState {
-        token: token.clone(),
-        resolve,
-    });
-    let app = router(state);
-
+    let state = Arc::new(AppState { token, resolve });
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
-    println!("cowboy web listening on http://{addr}");
-    println!("open:  http://{addr}/?token={token}");
-    if !addr.ip().is_loopback() {
-        println!(
-            "note: this is reachable beyond localhost — anyone with the URL above can drive \
-             your sessions."
-        );
-    }
-    axum::serve(listener, app)
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
         .context("web server failed")?;
     Ok(())
@@ -144,6 +223,13 @@ fn guard_bind(ip: IpAddr, allow_lan: bool) -> Result<()> {
          travel in cleartext. Bind 127.0.0.1 and tunnel in, use your Tailscale IP \
          (100.64.0.0/10), or pass --insecure-allow-lan if this network is trusted."
     );
+}
+
+/// Render `url` as a terminal QR (half-block unicode) so a phone can scan it.
+fn render_qr(url: &str) -> Option<String> {
+    use qrcode::render::unicode;
+    let code = qrcode::QrCode::new(url.as_bytes()).ok()?;
+    Some(code.render::<unicode::Dense1x2>().quiet_zone(true).build())
 }
 
 /// Tailscale assigns IPv4 from 100.64.0.0/10 (CGNAT) and IPv6 from

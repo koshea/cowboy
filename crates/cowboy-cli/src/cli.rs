@@ -296,19 +296,29 @@ pub struct DownArgs {
 
 #[derive(Debug, Args)]
 pub struct WebArgs {
-    /// Address to bind, e.g. `127.0.0.1:8787` or your Tailscale IP
-    /// `100.x.y.z:8787`. Non-loopback/non-Tailscale binds are refused unless
-    /// `--insecure-allow-lan` is set.
-    #[arg(long, default_value = "127.0.0.1:8787")]
-    pub bind: String,
-    /// Auth token clients must present (`Authorization: Bearer` or `?token=`).
-    /// Defaults to `$COWBOY_WEB_TOKEN`, else a random token printed at startup.
-    #[arg(long)]
-    pub token: Option<String>,
-    /// Permit a non-loopback, non-Tailscale bind (LAN / `0.0.0.0`). The token
-    /// then travels in cleartext — only use on a trusted network.
-    #[arg(long)]
-    pub insecure_allow_lan: bool,
+    #[command(subcommand)]
+    pub command: WebCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebCommand {
+    /// Enable the web UI and have the daemon start serving it.
+    On {
+        /// Address to bind, e.g. `127.0.0.1:8787` or your Tailscale IP
+        /// `100.x.y.z:8787`. Persisted; defaults to `127.0.0.1:8787`.
+        /// Non-loopback/non-Tailscale binds are refused unless `--lan` is set.
+        #[arg(long)]
+        bind: Option<String>,
+        /// Permit a non-loopback, non-Tailscale bind (LAN / `0.0.0.0`). The token
+        /// then travels in cleartext — only use on a trusted network.
+        #[arg(long)]
+        lan: bool,
+    },
+    /// Disable the web UI and stop the daemon serving it.
+    Off,
+    /// Show whether the web UI is enabled + serving, with its URL (and a QR for
+    /// a remote bind).
+    Status,
 }
 
 #[derive(Debug, Args)]

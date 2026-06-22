@@ -101,6 +101,9 @@ struct Daemon {
     /// flag: set when another workstream finishes while an advance is running, so
     /// the coordinator re-runs once to pick up the late completion. Runtime-only.
     coordinating: std::collections::HashMap<String, bool>,
+    /// Cancel handle for the running web server (`cowboy web on`); `None` when not
+    /// serving. Runtime-only — the setting itself lives in `web.yaml`.
+    web: Option<tokio_util::sync::CancellationToken>,
 }
 
 use cowboy_core::time::now_ms;
@@ -153,7 +156,41 @@ impl Daemon {
             state_path,
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
+            web: None,
         }
+    }
+
+    /// Start/stop the web server to match `web.yaml` (idempotent). Called on
+    /// startup and on `DaemonReq::ReloadWeb`. Best-effort: a bad bind / missing
+    /// token logs and leaves the server stopped rather than failing the daemon.
+    fn apply_web(&mut self) {
+        if let Some(tok) = self.web.take() {
+            tok.cancel(); // stop the previous server (config changed / disabled)
+        }
+        let cfg = cowboy_core::config::WebConfig::load_global();
+        if !cfg.enabled {
+            return;
+        }
+        let addr = match crate::cmd::web::guard_bind_str(&cfg.bind, cfg.allow_lan) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "web UI enabled but bind rejected; not serving");
+                return;
+            }
+        };
+        if cfg.token.is_empty() {
+            tracing::warn!("web UI enabled but no token in web.yaml; not serving");
+            return;
+        }
+        let cancel = tokio_util::sync::CancellationToken::new();
+        self.web = Some(cancel.clone());
+        let token = cfg.token.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::cmd::web::serve_with(addr, token, cancel).await {
+                tracing::warn!(error = %e, "web server exited");
+            }
+        });
+        tracing::info!(bind = %addr, "serving web UI");
     }
 
     /// Canonical lease key for a worktree root (matches the container/network
@@ -505,6 +542,8 @@ pub async fn serve() -> Result<()> {
             tracing::info!(?newly, "marked dead sessions stale on startup");
             d.save();
         }
+        // Serve the web UI now if it's enabled in web.yaml (always-on setting).
+        d.apply_web();
     }
 
     // Periodic staleness sweep so crashed/abandoned workers are noticed even
@@ -695,6 +734,19 @@ async fn dispatch(
                 token.cancel();
             });
             DaemonResp::ShuttingDown
+        }
+        DaemonReq::ReloadWeb => {
+            let mut d = daemon.lock().await;
+            d.apply_web();
+            DaemonResp::Web {
+                serving: d.web.is_some(),
+            }
+        }
+        DaemonReq::WebStatus => {
+            let d = daemon.lock().await;
+            DaemonResp::Web {
+                serving: d.web.is_some(),
+            }
         }
         DaemonReq::Ping => {
             let d = daemon.lock().await;
@@ -1415,6 +1467,7 @@ mod tests {
             state_path: PathBuf::from("/dev/null"),
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
+            web: None,
         }
     }
 

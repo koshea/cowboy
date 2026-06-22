@@ -23,6 +23,18 @@ pub enum Block {
     Final(String),
 }
 
+/// Connection lifecycle, shown as a banner.
+#[derive(Clone, PartialEq, Default)]
+pub enum ConnState {
+    #[default]
+    Connecting,
+    Live,
+    /// The socket dropped (network blip); the client is retrying.
+    Reconnecting,
+    /// The session itself ended (terminal — no reconnect).
+    Ended(String),
+}
+
 /// A pending question or approval awaiting the user.
 #[derive(Clone, PartialEq)]
 pub struct Ask {
@@ -54,11 +66,9 @@ pub struct Model {
     pub ask: Option<Ask>,
     pub approval: Option<Approval>,
     pub status: Option<SessionStatus>,
-    pub ended: Option<String>,
+    pub conn: ConnState,
     /// A turn is in flight (drives the spinner / disables nothing).
     pub running: bool,
-    /// True once the initial journal snapshot has been received.
-    pub connected: bool,
 }
 
 impl Model {
@@ -76,7 +86,7 @@ impl Model {
     pub fn apply(&mut self, msg: ServerMsg) {
         match msg {
             ServerMsg::Snapshot { info, .. } => {
-                self.connected = true;
+                self.conn = ConnState::Live;
                 self.status = Some(info.status);
                 if self.title.is_empty() {
                     self.title = info.task.unwrap_or(info.id);
@@ -106,8 +116,23 @@ impl Model {
             ServerMsg::Ended { reason } => {
                 self.commit();
                 self.running = false;
-                self.ended = Some(reason);
+                self.conn = ConnState::Ended(reason);
             }
+        }
+    }
+
+    /// The socket dropped (not a session end) — show "reconnecting" unless the
+    /// session is already terminally ended.
+    pub fn set_reconnecting(&mut self) {
+        if !matches!(self.conn, ConnState::Ended(_)) {
+            self.conn = ConnState::Reconnecting;
+        }
+    }
+
+    /// A fresh socket is open again.
+    pub fn set_live(&mut self) {
+        if !matches!(self.conn, ConnState::Ended(_)) {
+            self.conn = ConnState::Live;
         }
     }
 
