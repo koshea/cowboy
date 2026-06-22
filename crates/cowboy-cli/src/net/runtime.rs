@@ -888,12 +888,15 @@ fn resolve_image(
 
 /// Resolve a mount source relative to the project root (`.` -> root).
 fn resolve_source(root: &Path, source: &str) -> PathBuf {
-    let p = Path::new(source);
+    // Expand a leading `~` and `${VAR}` (consistent with `secrets.files`), so a
+    // mount source like `~/.cache/uv` resolves to the host home rather than being
+    // treated as a path relative to the repo. Falls back to the raw string.
+    let p = config::expand_path(source).unwrap_or_else(|_| PathBuf::from(source));
     if p.is_absolute() {
-        p.to_path_buf()
+        p
     } else {
-        // Canonicalize so docker gets an absolute host path.
-        let joined = root.join(p);
+        // Canonicalize so docker gets an absolute host path (e.g. `.` → repo root).
+        let joined = root.join(&p);
         std::fs::canonicalize(&joined).unwrap_or(joined)
     }
 }
@@ -1007,6 +1010,27 @@ mod tests {
     use super::*;
     use crate::net::docker::MockDockerCli;
     use cowboy_core::config::Mount;
+
+    #[test]
+    fn resolve_source_expands_tilde_and_vars() {
+        let root = Path::new("/repo");
+        // `~` → an absolute host-home path, not treated as repo-relative.
+        let home = resolve_source(root, "~/.cache/uv");
+        assert!(
+            home.is_absolute(),
+            "tilde should expand to an absolute path"
+        );
+        assert!(home.ends_with(".cache/uv"));
+        assert!(!home.starts_with("/repo"));
+        // `${VAR}` expands from the environment.
+        std::env::set_var("COWBOY_TEST_MOUNT_SRC", "/data/store");
+        assert_eq!(
+            resolve_source(root, "${COWBOY_TEST_MOUNT_SRC}"),
+            Path::new("/data/store")
+        );
+        // An absolute path passes through unchanged.
+        assert_eq!(resolve_source(root, "/abs/path"), Path::new("/abs/path"));
+    }
 
     /// Build a runtime over a temp project dir with `security.yaml` + `models.yaml`
     /// present, so the mask logic has something to mask. `isolated` toggles the

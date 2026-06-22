@@ -35,6 +35,13 @@ secrets:
     - { source: ~/.config/gh, target: /tmp/.config/gh, read_only: true }
 ```
 
+**Mounts & caches.** `container.mounts` sources expand a leading `~` and `${VAR}`
+(like `secrets.files`). The container's `HOME` is `/tmp` with default XDG paths, so
+to reuse your host package-manager caches (no re-downloading) mount them onto those
+defaults — e.g. `~/.local/share/pnpm → /tmp/.local/share/pnpm` and
+`~/.cache/uv → /tmp/.cache/uv` (rw, so new packages cache back). The mise toolchain
+store is already persisted automatically.
+
 **Network policy / DNS.** The full allow/deny/ask model — and the DNS sub-policy
 (`network_policy.dns`: strict allowlist gating, tunnel detection, allowed record
 types) — is documented in [Network gateway](../security/network.md).
