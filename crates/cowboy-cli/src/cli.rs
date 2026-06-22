@@ -129,6 +129,10 @@ pub enum Command {
     /// Stop and remove this project's agent + gateway containers and networks.
     Down(DownArgs),
 
+    /// Serve a web UI to attach to running sessions from a browser (e.g. a phone
+    /// over Tailscale). Binds loopback by default; token-authenticated.
+    Web(WebArgs),
+
     /// Attach the TUI to a running session (by id, or a worker socket path).
     Attach {
         #[arg(value_name = "SESSION")]
@@ -288,6 +292,23 @@ pub struct DownArgs {
     /// Remove ALL cowboy-managed containers and networks (every project).
     #[arg(long)]
     pub all: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WebArgs {
+    /// Address to bind, e.g. `127.0.0.1:8787` or your Tailscale IP
+    /// `100.x.y.z:8787`. Non-loopback/non-Tailscale binds are refused unless
+    /// `--insecure-allow-lan` is set.
+    #[arg(long, default_value = "127.0.0.1:8787")]
+    pub bind: String,
+    /// Auth token clients must present (`Authorization: Bearer` or `?token=`).
+    /// Defaults to `$COWBOY_WEB_TOKEN`, else a random token printed at startup.
+    #[arg(long)]
+    pub token: Option<String>,
+    /// Permit a non-loopback, non-Tailscale bind (LAN / `0.0.0.0`). The token
+    /// then travels in cleartext — only use on a trusted network.
+    #[arg(long)]
+    pub insecure_allow_lan: bool,
 }
 
 #[derive(Debug, Args)]

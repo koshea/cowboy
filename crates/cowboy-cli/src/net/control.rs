@@ -72,8 +72,8 @@ pub async fn serve_on(
 /// Constant-time token comparison. The per-session token gates the control
 /// channel, and the agent shares the netns and can reach the port, so a byte-wise
 /// short-circuit (`==`) would be a timing oracle. Length may leak — the token is
-/// a fixed-length UUID.
-fn ct_eq(a: &str, b: &str) -> bool {
+/// a fixed-length UUID. Shared with the `cowboy web` token check.
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
         return false;

@@ -25,6 +25,7 @@ pub mod secrets;
 pub mod session;
 pub mod sessions;
 pub mod skill;
+pub mod web;
 pub mod worker;
 pub mod worktree;
 

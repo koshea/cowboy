@@ -30,6 +30,11 @@ futures = "0.3"
 async-trait = "0.1"
 libc = "0.2"
 
+# web server (remote-control UI): axum's built-in WebSocket bridges the browser
+# to a session's worker socket. `tokio-tungstenite` is a test-only WS client.
+axum = { version = "0.8", features = ["ws"] }
+tokio-tungstenite = "0.29"
+
 # serialization / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

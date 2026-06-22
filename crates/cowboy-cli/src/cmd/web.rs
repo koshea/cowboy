@@ -1,0 +1,421 @@
+//! `cowboy web` — a host-side server that lets a browser (e.g. a phone over
+//! Tailscale) attach to a live agent session.
+//!
+//! It is a **thin bridge, fat client**: the browser opens a WebSocket, the
+//! server connects to that session's worker unix socket and relays the
+//! line-delimited `ServerMsg`/`ClientMsg` JSON both ways. All rendering happens
+//! in the WASM client; the server interprets only enough to authenticate, route,
+//! and validate inbound messages. A web client is just another attacher, so it
+//! gets the same journal replay + multi-client guarantees as the TUI.
+//!
+//! Security: the server grants full control of a session, so every request
+//! carries a bearer token (constant-time check, fail closed) and it binds
+//! loopback by default. A non-loopback bind is refused unless it's a Tailscale
+//! address (100.64.0.0/10 — Tailscale encrypts + authenticates the transport) or
+//! the operator explicitly opts into an unencrypted LAN bind.
+
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{bail, Context, Result};
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use cowboy_core::daemonproto::{AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg};
+use cowboy_core::netproto::encode_line;
+use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
+use crate::cli::WebArgs;
+use crate::net::control::ct_eq;
+
+/// Resolves a session id to its attach target. Injected so the WS bridge is
+/// testable without a live daemon: production asks the daemon, tests point at a
+/// fake worker socket. `None` = unknown/unreachable session.
+type Resolver =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<AttachTarget>> + Send + Sync>;
+
+struct AppState {
+    token: String,
+    resolve: Resolver,
+}
+
+pub async fn run(args: WebArgs) -> Result<()> {
+    let addr: SocketAddr = args
+        .bind
+        .parse()
+        .with_context(|| format!("invalid --bind address: {}", args.bind))?;
+    guard_bind(addr.ip(), args.insecure_allow_lan)?;
+
+    let token = args
+        .token
+        .or_else(|| std::env::var("COWBOY_WEB_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
+    // Production resolver: ask the daemon for the session's worker socket.
+    let resolve: Resolver = Arc::new(|id: String| {
+        Box::pin(async move {
+            match crate::cmd::daemon::request(DaemonReq::AttachSession { id }).await {
+                Ok(DaemonResp::Attach { target }) => Some(target),
+                _ => None,
+            }
+        })
+    });
+    let state = Arc::new(AppState {
+        token: token.clone(),
+        resolve,
+    });
+    let app = router(state);
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding {addr}"))?;
+    println!("cowboy web listening on http://{addr}");
+    println!("open:  http://{addr}/?token={token}");
+    if !addr.ip().is_loopback() {
+        println!(
+            "note: this is reachable beyond localhost — anyone with the URL above can drive \
+             your sessions."
+        );
+    }
+    axum::serve(listener, app)
+        .await
+        .context("web server failed")?;
+    Ok(())
+}
+
+/// Build the router (separated from `run` so tests can mount it on an ephemeral
+/// port without the bind guard / token minting).
+fn router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/api/health", get(health))
+        .route("/api/sessions", get(list_sessions))
+        .route("/api/session/{id}/ws", get(ws_handler))
+        .with_state(state)
+}
+
+/// Refuse a bind that would leak the token in cleartext. Loopback is always
+/// fine; Tailscale's CGNAT range (100.64.0.0/10) and ULA prefix are fine
+/// (Tailscale provides transport encryption + device identity). Anything else
+/// requires an explicit opt-in.
+fn guard_bind(ip: IpAddr, allow_lan: bool) -> Result<()> {
+    if ip.is_loopback() || is_tailscale(ip) || allow_lan {
+        return Ok(());
+    }
+    bail!(
+        "refusing to bind {ip}: not loopback or a Tailscale address, so the auth token would \
+         travel in cleartext. Bind 127.0.0.1 and tunnel in, use your Tailscale IP \
+         (100.64.0.0/10), or pass --insecure-allow-lan if this network is trusted."
+    );
+}
+
+/// Tailscale assigns IPv4 from 100.64.0.0/10 (CGNAT) and IPv6 from
+/// `fd7a:115c:a1e0::/48`.
+fn is_tailscale(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 0x40
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            s[0] == 0xfd7a && s[1] == 0x115c && s[2] == 0xa1e0
+        }
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WsQuery {
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    since_seq: Option<u64>,
+}
+
+/// True if the request presents the right token, via `Authorization: Bearer` or
+/// the `?token=` query param (browsers can't set headers on a WS handshake).
+fn authed(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or(query_token);
+    presented.is_some_and(|t| ct_eq(t, &state.token))
+}
+
+async fn health() -> &'static str {
+    "ok"
+}
+
+async fn index() -> Html<&'static str> {
+    // Placeholder until the WASM bundle is embedded (Phase 2). The real SPA reads
+    // the `?token=` param, lists sessions, and opens the session WebSocket.
+    Html(INDEX_PLACEHOLDER)
+}
+
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match crate::cmd::daemon::request(DaemonReq::ListSessions { root: None }).await {
+        Ok(DaemonResp::Sessions { sessions }) => Json(sessions).into_response(),
+        _ => (StatusCode::BAD_GATEWAY, "daemon unreachable").into_response(),
+    }
+}
+
+async fn ws_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<WsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let target = match (state.resolve)(id).await {
+        Some(t) => t,
+        None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
+    };
+    let worker_sock = match target {
+        AttachTarget::Live { worker_sock } => worker_sock,
+        AttachTarget::Replay { .. } => {
+            return (
+                StatusCode::CONFLICT,
+                "session is not live (journal replay over the web is not supported yet)",
+            )
+                .into_response()
+        }
+    };
+    let since = q.since_seq;
+    ws.on_upgrade(move |socket| bridge(socket, worker_sock, since))
+}
+
+/// Relay between a browser WebSocket and a session's worker unix socket: every
+/// worker line becomes a WS text frame; every (well-formed) WS frame becomes a
+/// `ClientMsg` line to the worker.
+async fn bridge(ws: WebSocket, worker_sock: PathBuf, since_seq: Option<u64>) {
+    let stream = match UnixStream::connect(&worker_sock).await {
+        Ok(s) => s,
+        Err(e) => {
+            ended(ws, &format!("worker unreachable: {e}")).await;
+            return;
+        }
+    };
+    let (sock_r, mut sock_w) = stream.into_split();
+
+    // Subscribe with full control + replay from the requested seq.
+    let hello = encode_line(&ClientMsg::Hello {
+        since_seq,
+        read_only: false,
+    });
+    if sock_w.write_all(hello.as_bytes()).await.is_err() {
+        return;
+    }
+
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut sock_lines = BufReader::new(sock_r).lines();
+
+    // worker → browser
+    let to_browser = async {
+        while let Ok(Some(line)) = sock_lines.next_line().await {
+            if ws_tx.send(Message::Text(line.into())).await.is_err() {
+                break;
+            }
+        }
+    };
+
+    // browser → worker (validate as ClientMsg so we never inject arbitrary bytes)
+    let to_worker = async {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let text = match msg {
+                Message::Text(t) => t.to_string(),
+                Message::Close(_) => break,
+                _ => continue, // ping/pong handled by axum; ignore binary
+            };
+            match serde_json::from_str::<ClientMsg>(&text) {
+                Ok(cmd) => {
+                    if sock_w
+                        .write_all(encode_line(&cmd).as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => continue, // drop malformed frames
+            }
+        }
+        // Browser left: detach (leave the session running) rather than End it.
+        let _ = sock_w
+            .write_all(encode_line(&ClientMsg::Detach).as_bytes())
+            .await;
+    };
+
+    tokio::select! {
+        _ = to_browser => {}
+        _ = to_worker => {}
+    }
+}
+
+/// Send a single `Ended` frame and close (used when we can't reach the worker).
+async fn ended(mut ws: WebSocket, reason: &str) {
+    let line = encode_line(&ServerMsg::Ended {
+        reason: reason.to_string(),
+    });
+    let _ = ws
+        .send(Message::Text(line.trim_end().to_string().into()))
+        .await;
+    let _ = ws.close().await;
+}
+
+const INDEX_PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8>\
+<title>cowboy web</title>\
+<body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem\">\
+<h1>cowboy web</h1>\
+<p>The server is running. The web UI bundle isn't built into this binary yet \
+(build the <code>cowboy-web-ui</code> crate with trunk).</p>\
+<p>The API is live: <code>GET /api/sessions</code> and \
+<code>GET /api/session/&lt;id&gt;/ws</code> (bearer token required).</p>";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv6Addr;
+
+    #[test]
+    fn bind_guard_allows_loopback_and_tailscale_refuses_lan() {
+        // loopback
+        assert!(guard_bind("127.0.0.1".parse().unwrap(), false).is_ok());
+        assert!(guard_bind(IpAddr::V6(Ipv6Addr::LOCALHOST), false).is_ok());
+        // tailscale v4 (100.64.0.0/10) + v6 ULA
+        assert!(guard_bind("100.101.102.103".parse().unwrap(), false).is_ok());
+        assert!(guard_bind("fd7a:115c:a1e0::1".parse().unwrap(), false).is_ok());
+        // a non-tailscale 100.x outside the /10 is NOT tailscale (100.128.x is /9-ish)
+        assert!(guard_bind("100.128.0.1".parse().unwrap(), false).is_err());
+        // plain LAN refused without the opt-in, allowed with it
+        assert!(guard_bind("192.168.1.50".parse().unwrap(), false).is_err());
+        assert!(guard_bind("192.168.1.50".parse().unwrap(), true).is_ok());
+        assert!(guard_bind("0.0.0.0".parse().unwrap(), false).is_err());
+    }
+
+    /// End-to-end relay: a browser WebSocket ↔ a fake worker unix socket. Proves
+    /// the bridge sends `Hello`, forwards worker lines to the browser, and
+    /// forwards (validated) browser frames back to the worker.
+    #[tokio::test]
+    async fn ws_bridge_relays_both_directions() {
+        use cowboy_core::daemonproto::UiEventMsg;
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let worker_sock = tmp.path().join("s-test.sock");
+
+        // Fake worker: accept one client, read Hello, push an Event, then read
+        // the ClientMsg the bridge forwards and report it back.
+        let listener = tokio::net::UnixListener::bind(&worker_sock).unwrap();
+        let (got_tx, got_rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (r, mut w) = stream.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let hello = lines.next_line().await.unwrap().unwrap();
+            assert!(hello.contains("hello"), "first line is a Hello: {hello}");
+            let evt = encode_line(&ServerMsg::Event {
+                seq: 0,
+                event: UiEventMsg::Notice("from-worker".into()),
+            });
+            w.write_all(evt.as_bytes()).await.unwrap();
+            // Next line is whatever the browser sent, forwarded by the bridge.
+            let forwarded = lines.next_line().await.unwrap().unwrap();
+            let _ = got_tx.send(forwarded);
+        });
+
+        // Mount the router with a resolver pointing at the fake worker.
+        let ws = worker_sock.clone();
+        let state = Arc::new(AppState {
+            token: "t".into(),
+            resolve: Arc::new(move |_id| {
+                let ws = ws.clone();
+                Box::pin(async move { Some(AttachTarget::Live { worker_sock: ws }) })
+            }),
+        });
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(tcp, router(state)).await.unwrap();
+        });
+
+        // Connect as a browser would, with the token in the query.
+        let url = format!("ws://127.0.0.1:{port}/api/session/s1/ws?token=t");
+        let (mut sock, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+
+        // First frame is the worker's Event, relayed verbatim.
+        let frame = sock.next().await.unwrap().unwrap();
+        let text = frame.into_text().unwrap();
+        assert!(text.contains("from-worker"), "relayed worker event: {text}");
+
+        // Send a ClientMsg::Message; the worker must receive it.
+        let msg = serde_json::to_string(&ClientMsg::Message("hi-from-browser".into())).unwrap();
+        sock.send(tokio_tungstenite::tungstenite::Message::text(msg))
+            .await
+            .unwrap();
+        let forwarded = tokio::time::timeout(std::time::Duration::from_secs(5), got_rx)
+            .await
+            .expect("worker received the forwarded message")
+            .unwrap();
+        assert!(
+            forwarded.contains("hi-from-browser"),
+            "worker got the browser's message: {forwarded}"
+        );
+    }
+
+    /// A WS upgrade without the token is rejected (401) — fail closed.
+    #[tokio::test]
+    async fn ws_without_token_is_rejected() {
+        let state = Arc::new(AppState {
+            token: "t".into(),
+            resolve: Arc::new(|_| Box::pin(async { None })),
+        });
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(tcp, router(state)).await.unwrap();
+        });
+        let url = format!("ws://127.0.0.1:{port}/api/session/s1/ws"); // no token
+        assert!(
+            tokio_tungstenite::connect_async(&url).await.is_err(),
+            "unauthenticated WS upgrade must fail"
+        );
+    }
+
+    #[test]
+    fn auth_accepts_header_or_query_constant_time() {
+        let state = AppState {
+            token: "secret-token".into(),
+            resolve: Arc::new(|_| Box::pin(async { None })),
+        };
+        let mut h = HeaderMap::new();
+        // no creds
+        assert!(!authed(&state, &h, None));
+        // query param
+        assert!(authed(&state, &h, Some("secret-token")));
+        assert!(!authed(&state, &h, Some("wrong")));
+        // bearer header
+        h.insert(
+            header::AUTHORIZATION,
+            "Bearer secret-token".parse().unwrap(),
+        );
+        assert!(authed(&state, &h, None));
+    }
+}
