@@ -263,7 +263,7 @@ fn session(props: &SessionProps) -> Html {
                 <button class="ghost" onclick={on_back}>{ "‹" }</button>
                 <span class="title">{ title(&model) }</span>
                 <span class="muted stats">
-                    { format!("{}↑ {}↓", model.tokens_in, model.tokens_out) }
+                    { format!("{} in · {} out", model.tokens_in, model.tokens_out) }
                     if model.cost_usd > 0.0 { { format!(" · ${:.3}", model.cost_usd) } }
                 </span>
             </header>

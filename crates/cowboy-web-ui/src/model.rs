@@ -151,7 +151,15 @@ impl Model {
             }
             UiEventMsg::Final(m) => {
                 self.commit();
-                self.blocks.push(Block::Final(m));
+                // The loop emits `Final` with the whole answer, which usually
+                // repeats the just-committed model output. Re-tag that last block
+                // as the final rather than rendering it twice (mirrors the TUI).
+                match self.blocks.last_mut() {
+                    Some(Block::Agent(prev)) if prev.trim() == m.trim() => {
+                        *self.blocks.last_mut().unwrap() = Block::Final(m);
+                    }
+                    _ => self.blocks.push(Block::Final(m)),
+                }
             }
             UiEventMsg::Notice(m) => self.blocks.push(Block::Notice(m)),
             UiEventMsg::DiffStat(s) => self.diffstat = s,
