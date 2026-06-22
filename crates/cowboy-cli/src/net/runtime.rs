@@ -475,11 +475,19 @@ impl AgentRuntime {
             gw.start_sidecar(&*self.docker, &self.container_name)
                 .await?;
             // Attach any approved Compose networks (traffic to these bypasses
-            // the gateway via the agent's own NIC).
+            // the gateway via the agent's own NIC). Best-effort: a missing or
+            // renamed network (e.g. the compose stack isn't up, or it's named
+            // `foo-1_default` not `foo_default`) must NOT brick the whole session
+            // — the agent simply won't reach that network. Warn and continue.
             for net in &self.security.networks.compose.approved {
-                self.docker
-                    .connect_network(net, &self.container_name)
-                    .await?;
+                if let Err(e) = self.docker.connect_network(net, &self.container_name).await {
+                    tracing::warn!(
+                        network = %net,
+                        error = %e,
+                        "could not attach approved compose network; the agent won't reach it \
+                         (is the stack up? is the network name right?)"
+                    );
+                }
             }
         }
         Ok(())

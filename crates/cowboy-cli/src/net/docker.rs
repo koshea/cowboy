@@ -617,7 +617,7 @@ impl DockerCli for CliDocker {
                 },
             )
             .await
-            .context("docker network connect")?;
+            .with_context(|| format!("connecting container {container} to network {network}"))?;
         Ok(())
     }
 
