@@ -747,7 +747,13 @@ impl<'a> AgentLoop<'a> {
         self.ui.command_start(&args.command);
         match self.run_shell_streaming(&args).await {
             Ok((result, _)) => self.ui.command_end(result.exit_code, ""),
-            Err(e) => self.ui.notice(&format!("mise install did not run: {e}")),
+            // The command never ran (e.g. the gateway/compose network wasn't up).
+            // Still emit `command_end` so the live "running" indicator clears —
+            // otherwise the status bar shows `mise install` running forever.
+            Err(e) => {
+                self.ui.command_end(-1, "");
+                self.ui.notice(&format!("mise install did not run: {e}"));
+            }
         }
     }
 
