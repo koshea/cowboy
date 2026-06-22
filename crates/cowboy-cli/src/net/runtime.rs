@@ -146,12 +146,13 @@ impl AgentRuntime {
     /// [`create`] on the first command), so it opens no egress path. No-op when
     /// isolation is disabled; best-effort otherwise (a failure just leaves the
     /// control server retrying its bind, exactly as before).
-    pub async fn ensure_control_network(&self) {
-        if let Some(gw) = &self.gateway {
-            if let Err(e) = gw.ensure_network(&*self.docker).await {
-                tracing::debug!(error = %e, "eager control-network create failed; control server will retry its bind");
-            }
-        }
+    /// A cheap, owned handle to the gateway network, or `None` when isolation is
+    /// off. Lets the eager control-network ensure run on a detached task with its
+    /// own Docker client, off the serve-loop critical path — blocking the serve
+    /// loop on Docker (which may build/pull the gateway image) would leave the
+    /// session unresponsive to control messages until the image is ready.
+    pub fn gateway_handle(&self) -> Option<GatewayNetwork> {
+        self.gateway.clone()
     }
 
     /// The project root (for approval persistence).

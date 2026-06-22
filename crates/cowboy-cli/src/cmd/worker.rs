@@ -239,12 +239,24 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // approvals to attached clients (fail closed with none); log + surface
     // decisions. Bound before the first turn so the gateway has a listener.
     if let Some((ctrl_addr, ctrl_token)) = runtime.control_endpoint() {
-        // Create the gateway network up front so the control server can bind its
-        // bridge IP immediately — otherwise it spin-retries until the first turn
-        // brings the network up (and a session that never runs a turn would have
-        // no reachable control channel at all). Containers/enforcement still come
-        // up lazily on the first command, so this opens no egress path.
-        runtime.ensure_control_network().await;
+        // Eagerly create the gateway network so the control server can bind its
+        // bridge IP without spin-retrying. This does real Docker work (network
+        // create + ensuring the gateway image, which may build/pull on a cold
+        // host), so run it on a DETACHED task rather than awaiting it here:
+        // blocking the serve loop on Docker would leave the session unresponsive
+        // to control messages (interrupt/end/switch) until the image was ready.
+        // The control pipeline retries its own bind until the network exists, and
+        // the first turn does the full, awaited setup, so this is a pure
+        // optimization and is safe to run in the background. (A session that never
+        // runs a turn still gets a reachable control channel once this completes.)
+        if let Some(gw) = runtime.gateway_handle() {
+            tokio::spawn(async move {
+                let docker = CliDocker::new();
+                if let Err(e) = gw.ensure_network(&docker).await {
+                    tracing::debug!(error = %e, "eager control-network create failed; control server will retry its bind");
+                }
+            });
+        }
         tokio::spawn(run_control_pipeline(
             ctrl_addr,
             ctrl_token,
@@ -518,20 +530,31 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    // Bounded: `shutdown` execs into the container to stop managed processes, and
-    // a wedged/unresponsive container must not keep the worker alive after End —
-    // the process has to exit so the daemon stops reporting the session Running.
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
+    // Tell the world the session has ended BEFORE any container cleanup. The
+    // cleanup below touches Docker (a `container_state` probe, exec, container +
+    // network removal) and a wedged/unreachable Docker can make those calls hang
+    // for their full timeout — that must not delay the daemon learning the session
+    // is over, or it keeps reporting it `Running` (and a client keeps waiting) long
+    // after `End`. Finalizing the journal and notifying clients/daemon are
+    // disk/socket-only and complete promptly.
     agent.finalize_session();
     emitter.end("session ended");
     if args.register {
         let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
     }
-    // Reap this session's container + gateway + networks now that it has ended.
-    // We held the exclusive worktree lease, so we're the sole user; a *crashed*
-    // worker's containers are instead reaped by the daemon's vacuum. (A detach
-    // never reaches here — the worker keeps serving — so detached sessions live.)
-    crate::cmd::down::teardown_project(&CliDocker::new(), &root, &container_name).await;
+    // Now do the (bounded) container cleanup. `shutdown` execs into the container
+    // to stop managed processes; the reap removes this session's container +
+    // gateway + networks. We held the exclusive worktree lease, so we're the sole
+    // user; a *crashed* worker's containers are instead reaped by the daemon's
+    // vacuum. (A detach never reaches here — the worker keeps serving — so detached
+    // sessions live.) Both are bounded so a wedged Docker can't keep the worker
+    // process alive forever.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        crate::cmd::down::teardown_project(&CliDocker::new(), &root, &container_name),
+    )
+    .await;
     Ok(())
 }
 
