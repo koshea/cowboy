@@ -54,6 +54,14 @@ use cowboy_core::time::now_ms;
 /// restart while reaping true zombies).
 const ORPHAN_GRACE_BEATS: u32 = 4;
 
+/// Hard bound on waiting for a turn to unwind after a cancel (End/Interrupt/etc).
+/// The cancel kills any in-flight command (its process group) and aborts the model
+/// call, so this normally returns near-instantly; the bound guarantees the worker
+/// still terminates if some step refuses to cancel (e.g. a wedged Docker swallowing
+/// the kill) — so a session is ALWAYS endable. On timeout we abandon the turn (it
+/// is dropped when we break, aborting its remaining work) and synthesize TurnDone.
+const TURN_UNWIND_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+
 pub async fn run(args: WorkerArgs) -> Result<()> {
     let root = std::fs::canonicalize(&args.root).unwrap_or(args.root.clone());
     let paths = ConfigPaths::for_root(&root);
@@ -456,21 +464,50 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     // Daemon gone + no client mid-turn → cancel and end the session.
                     _ = orphan.cancelled() => {
                         tc.cancel();
-                        let _ = (&mut turn).await;
+                        if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after cancel; \
+                                 abandoning it"
+                            );
+                            emitter.emit(UiEventMsg::TurnDone);
+                        }
                         end = true;
                         break;
                     }
                     ctl = cmd_rx.recv() => match ctl {
                         None => {
                             tc.cancel();
-                            let _ = (&mut turn).await;
+                            if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after cancel; \
+                                 abandoning it"
+                            );
+                            emitter.emit(UiEventMsg::TurnDone);
+                        }
                             end = true;
                             break;
                         }
                         Some(ClientMsg::Interrupt { kind }) => {
                             tc.cancel();
                             emitter.emit(UiEventMsg::Notice("interrupting current turn…".into()));
-                            let _ = (&mut turn).await; // unwinds + emits TurnDone
+                            // Unwinds the turn (which emits TurnDone), bounded so a
+                            // turn that won't cancel can't wedge the interrupt.
+                            if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "turn did not unwind within {TURN_UNWIND_BOUND:?} after \
+                                     cancel; abandoning it"
+                                );
+                                emitter.emit(UiEventMsg::TurnDone);
+                            }
                             match kind {
                                 InterruptKind::End => end = true,
                                 // Turn / Instruct: drop queued work, return to idle.
@@ -480,7 +517,16 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         }
                         Some(ClientMsg::End) => {
                             tc.cancel();
-                            let _ = (&mut turn).await;
+                            if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after cancel; \
+                                 abandoning it"
+                            );
+                            emitter.emit(UiEventMsg::TurnDone);
+                        }
                             end = true;
                             break;
                         }
@@ -504,7 +550,16 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         // current turn first, then apply below.
                         Some(ClientMsg::SwitchModel(n)) => {
                             tc.cancel();
-                            let _ = (&mut turn).await;
+                            if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after cancel; \
+                                 abandoning it"
+                            );
+                            emitter.emit(UiEventMsg::TurnDone);
+                        }
                             switch_to = Some(n);
                             break;
                         }
@@ -512,7 +567,16 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         // and end the session.
                         Some(ClientMsg::Accept { note }) => {
                             tc.cancel();
-                            let _ = (&mut turn).await;
+                            if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after cancel; \
+                                 abandoning it"
+                            );
+                            emitter.emit(UiEventMsg::TurnDone);
+                        }
                             sign_off(&id, note, &emitter).await;
                             end = true;
                             break;

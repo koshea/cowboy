@@ -29,8 +29,52 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures::StreamExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::process::Command;
 use tokio::sync::OnceCell;
+
+/// Monotonic counter for unique per-exec tags. Each streaming exec gets its own
+/// pidfile name and env marker so concurrent execs (e.g. parallel subagents, or a
+/// foreman running alongside them) never clobber each other's kill target — a
+/// shared pidfile would make cancel/timeout signal the wrong process group.
+static EXEC_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A process-unique tag for one streamed exec, used as both its pidfile name and
+/// the `COWBOY_EXEC_TAG` env marker. `pid-seq` is unique within this process; a
+/// subagent is a separate process (distinct pid), so it can't collide either.
+fn next_exec_tag() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        EXEC_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+/// Shell run (as a one-shot exec) to terminate a streamed command on
+/// cancel/timeout. Two layers, TERM then — after a short grace — KILL:
+/// (a) signal the recorded process group (fast, the common case); (b) sweep
+/// `/proc` for any process still carrying this exec's `COWBOY_EXEC_TAG` and signal
+/// it too — catching descendants that re-`setsid` into a fresh group and so
+/// escaped (a) (e.g. a `mise` hook). Finally removes the per-exec pidfile.
+fn kill_exec_script(pidfile: &str, tag: &str) -> String {
+    let sweep = |sig: &str| {
+        format!(
+            "for e in /proc/[0-9]*/environ; do \
+               grep -qz 'COWBOY_EXEC_TAG={tag}' \"$e\" 2>/dev/null && \
+               kill -{sig} \"$(basename \"$(dirname \"$e\")\")\" 2>/dev/null; \
+             done"
+        )
+    };
+    format!(
+        "p=$(cat {pidfile} 2>/dev/null); \
+         [ -n \"$p\" ] && kill -TERM -\"$p\" 2>/dev/null; {term_sweep}; \
+         sleep 1; \
+         [ -n \"$p\" ] && kill -KILL -\"$p\" 2>/dev/null; {kill_sweep}; \
+         rm -f {pidfile} 2>/dev/null; true",
+        term_sweep = sweep("TERM"),
+        kill_sweep = sweep("KILL"),
+    )
+}
 
 /// A bind mount applied to the agent container.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,15 +849,32 @@ impl DockerCli for CliDocker {
         // mise/cargo/docker detect "not a TTY" and emit plain, streamable log
         // lines instead of cursor-movement progress we'd have to emulate. The
         // wrapper's `2>&1` merges stderr into stdout.
-        let pidfile = "/tmp/cowboy-exec.pgid";
-        let wrapper =
-            format!("setsid sh -c 'echo $$ > {pidfile}; exec sh -c \"$COWBOY_CMD\"' 2>&1");
+        //
+        // Each exec gets a UNIQUE tag (#1): the pidfile name is per-exec, so
+        // concurrent execs don't overwrite each other's recorded pgid (which would
+        // make a cancel/timeout kill the wrong group and leak the real command).
+        // The tag is also exported as an env var (#2) inherited by every
+        // descendant — even ones that re-`setsid` into their own process group and
+        // so escape the recorded pgid (e.g. a `mise` hook) — so the kill can sweep
+        // them by marker as a backstop to the group signal.
+        let tag = next_exec_tag();
+        let pidfile = format!("/tmp/cowboy-exec-{tag}.pgid");
+        // `setsid` puts the command in its own group (leader pid recorded in the
+        // pidfile). We don't `exec` the inner shell so the wrapper can `rm` the
+        // pidfile on normal exit (the kill path removes it otherwise); killing is
+        // by process group, so the extra shell layer doesn't affect signalling.
+        let wrapper = format!(
+            "setsid sh -c 'echo $$ > {pidfile}; sh -c \"$COWBOY_CMD\"; r=$?; rm -f {pidfile}; exit $r' 2>&1"
+        );
         let exec = docker
             .create_exec(
                 name,
                 CreateExecOptions {
                     cmd: Some(vec!["sh".to_string(), "-c".to_string(), wrapper]),
-                    env: Some(vec![format!("COWBOY_CMD={command}")]),
+                    env: Some(vec![
+                        format!("COWBOY_CMD={command}"),
+                        format!("COWBOY_EXEC_TAG={tag}"),
+                    ]),
                     working_dir: non_empty(workdir),
                     user: non_empty(user),
                     attach_stdout: Some(true),
@@ -887,13 +948,14 @@ impl DockerCli for CliDocker {
         transient_line(&mut accumulated, line_start, &mut line, &chunks);
 
         if let Some(why) = interrupted {
-            // Kill the in-container process group, then drop the local stream.
-            let kill = format!(
-                "p=$(cat {pidfile} 2>/dev/null); [ -n \"$p\" ] && \
-                 (kill -TERM -\"$p\" 2>/dev/null; sleep 1; kill -KILL -\"$p\" 2>/dev/null) || true"
-            );
+            // Kill the command in the container, then drop the local stream.
             let _ = self
-                .exec_capture(name, "", "", &["sh".into(), "-c".into(), kill])
+                .exec_capture(
+                    name,
+                    "",
+                    "",
+                    &["sh".into(), "-c".into(), kill_exec_script(&pidfile, &tag)],
+                )
                 .await;
             drop(output);
             let note = format!("[command {why}]");
@@ -1002,6 +1064,30 @@ mod tests {
     fn bind_mount_args() {
         assert_eq!(BindMount::rw("/a", "/b").to_arg(), "/a:/b");
         assert_eq!(BindMount::ro("/a", "/b").to_arg(), "/a:/b:ro");
+    }
+
+    #[test]
+    fn exec_tags_are_unique() {
+        // Concurrent execs must not share a kill target (the shared-pidfile bug).
+        let a = next_exec_tag();
+        let b = next_exec_tag();
+        assert_ne!(a, b);
+        assert!(a.starts_with(&format!("{}-", std::process::id())));
+    }
+
+    #[test]
+    fn kill_script_targets_group_and_tag_then_cleans_up() {
+        let script = kill_exec_script("/tmp/cowboy-exec-42-7.pgid", "42-7");
+        // Reads the per-exec pidfile (not a shared one) and signals its group.
+        assert!(script.contains("cat /tmp/cowboy-exec-42-7.pgid"));
+        assert!(script.contains("kill -TERM -\"$p\""));
+        assert!(script.contains("kill -KILL -\"$p\""));
+        // Sweeps /proc for the escapee marker, TERM then KILL.
+        assert!(script.contains("COWBOY_EXEC_TAG=42-7"));
+        assert!(script.contains("kill -TERM \"$(basename"));
+        assert!(script.contains("kill -KILL \"$(basename"));
+        // Cleans up the pidfile so /tmp doesn't accumulate.
+        assert!(script.contains("rm -f /tmp/cowboy-exec-42-7.pgid"));
     }
 
     #[test]
