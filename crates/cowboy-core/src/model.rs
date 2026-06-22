@@ -319,13 +319,26 @@ fn to_openai_messages(messages: &[Message]) -> Result<Vec<ChatCompletionRequestM
                         .tool_calls
                         .iter()
                         .map(|tc| {
+                            // Some models emit malformed tool calls — empty/blank
+                            // `arguments`, or a missing `name` (seen with GLM-5.2).
+                            // Echoing those back in the history makes strict
+                            // providers reject the *entire* request (HTTP 400), so
+                            // one bad call bricks the whole session. Normalize to a
+                            // structurally-valid call so history stays replayable.
+                            let arguments = if tc.arguments.trim().is_empty() {
+                                "{}".to_string()
+                            } else {
+                                tc.arguments.clone()
+                            };
+                            let name = if tc.name.trim().is_empty() {
+                                "unknown".to_string()
+                            } else {
+                                tc.name.clone()
+                            };
                             ChatCompletionMessageToolCalls::Function(
                                 ChatCompletionMessageToolCall {
                                     id: tc.id.clone(),
-                                    function: FunctionCall {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
+                                    function: FunctionCall { name, arguments },
                                 },
                             )
                         })
@@ -708,6 +721,32 @@ mod tests {
             arr[1]["reasoning_content"],
             serde_json::json!("plan: grep then summarize")
         );
+    }
+
+    #[test]
+    fn malformed_tool_calls_are_normalized_for_the_wire() {
+        // A model that emits empty arguments / a blank name would otherwise make a
+        // strict provider reject the whole request (HTTP 400) once it's replayed in
+        // history. to_openai_messages normalizes them to a valid call.
+        let mut assistant = Message::new(Role::Assistant, "");
+        assistant.tool_calls = vec![
+            ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: "".into(),
+            },
+            ToolCall {
+                id: "2".into(),
+                name: "".into(),
+                arguments: "  ".into(),
+            },
+        ];
+        let body_msgs = to_openai_messages(&[assistant]).unwrap();
+        let v = serde_json::to_value(&body_msgs).unwrap();
+        let calls = v[0]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls[0]["function"]["arguments"], serde_json::json!("{}"));
+        assert_eq!(calls[1]["function"]["arguments"], serde_json::json!("{}"));
+        assert_eq!(calls[1]["function"]["name"], serde_json::json!("unknown"));
     }
 
     #[test]
