@@ -46,9 +46,15 @@ fn now_ms() -> u128 {
 }
 
 impl SessionLogger {
-    /// Create a new session directory under `root/.cowboy/sessions/`.
+    /// Create a new session directory under `root/.cowboy/sessions/`. Honors a
+    /// caller-supplied `COWBOY_SESSION_ID` (a subagent parent assigns the child's
+    /// id so it knows where the child's journal lives), else generates one.
     pub fn create(root: &Path) -> Result<Self> {
-        Self::create_with_id(root, &format!("{}-{}", now_ms(), std::process::id()))
+        let id = std::env::var("COWBOY_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| format!("{}-{}", now_ms(), std::process::id()));
+        Self::create_with_id(root, &id)
     }
 
     /// Create a session with a caller-supplied id (used by the daemon-managed

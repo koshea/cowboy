@@ -43,9 +43,17 @@ use crate::net::control::ct_eq;
 type Resolver =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<AttachTarget>> + Send + Sync>;
 
+/// Resolves a parent session id to `(root, is_live)`, so a subagent watch can
+/// find the child's journal at `<root>/.cowboy/sessions/<sub>/events.jsonl` and
+/// decide whether to follow it live or replay a finished one. Injected for tests.
+type RootResolver = Arc<
+    dyn Fn(String) -> futures::future::BoxFuture<'static, Option<(PathBuf, bool)>> + Send + Sync,
+>;
+
 struct AppState {
     token: String,
     resolve: Resolver,
+    resolve_root: RootResolver,
 }
 
 // --- `cowboy web on|off|status`: manage the persistent setting ---------------
@@ -160,7 +168,21 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
             }
         })
     });
-    let state = Arc::new(AppState { token, resolve });
+    let resolve_root: RootResolver = Arc::new(|id: String| {
+        Box::pin(async move {
+            match crate::cmd::daemon::request(DaemonReq::GetSession { id }).await {
+                Ok(DaemonResp::Session { info }) => {
+                    Some((info.root, info.status == SessionStatus::Running))
+                }
+                _ => None,
+            }
+        })
+    });
+    let state = Arc::new(AppState {
+        token,
+        resolve,
+        resolve_root,
+    });
     // SO_REUSEADDR so a quick restart (daemon roll, `web off`/`on`) can rebind the
     // port while the previous listener is still in TIME_WAIT.
     let socket = if addr.is_ipv6() {
@@ -189,6 +211,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
         .route("/api/session/{id}/ws", get(ws_handler))
+        .route("/api/subagent/{parent}/{sub}/ws", get(subagent_ws_handler))
         // Static SPA assets (the trunk-built .js/.wasm). Unauthenticated — they're
         // inert code; the token still gates every /api route. /api/* and / are
         // matched first as explicit routes.
@@ -333,28 +356,128 @@ async fn ws_handler(
 /// Stream a finished session's journal to the browser as `Event`s, then `Ended`
 /// — so a completed/failed session renders read-only instead of looping on a
 /// dead worker socket.
-async fn replay(mut ws: WebSocket, journal_path: PathBuf, status: SessionStatus) {
-    if let Ok(file) = tokio::fs::File::open(&journal_path).await {
-        let mut lines = BufReader::new(file).lines();
-        let mut seq = 0u64;
-        while let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(event) = serde_json::from_str::<UiEventMsg>(&line) {
-                let frame = encode_line(&ServerMsg::Event { seq, event });
-                if ws
-                    .send(Message::Text(frame.trim_end().to_string().into()))
-                    .await
-                    .is_err()
-                {
-                    return;
+async fn replay(ws: WebSocket, journal_path: PathBuf, status: SessionStatus) {
+    stream_journal(
+        ws,
+        journal_path,
+        false,
+        format!("session {}", status_word(&status)),
+    )
+    .await;
+}
+
+/// Watch a subagent: resolve the parent's root, then stream the child's journal at
+/// `<root>/.cowboy/sessions/<sub>/events.jsonl`. Follow it live while the parent
+/// is running; replay once (read-only) if the parent has finished.
+async fn subagent_ws_handler(
+    State(state): State<Arc<AppState>>,
+    Path((parent, sub)): Path<(String, String)>,
+    Query(q): Query<WsQuery>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some((root, live)) = (state.resolve_root)(parent).await else {
+        return (StatusCode::NOT_FOUND, "no such session").into_response();
+    };
+    // Subagent ids are opaque session ids (no slashes/`..`); reject anything that
+    // could escape the sessions dir.
+    if sub.is_empty() || sub.contains('/') || sub.contains("..") {
+        return (StatusCode::BAD_REQUEST, "bad subagent id").into_response();
+    }
+    let journal = root
+        .join(".cowboy")
+        .join("sessions")
+        .join(&sub)
+        .join("events.jsonl");
+    ws.on_upgrade(move |socket| stream_journal(socket, journal, live, "subagent ended".into()))
+}
+
+/// Stream a journal file to the browser as `Event`s then a final `Ended`. With
+/// `follow`, tail the file as it grows (for a live subagent) until the subagent's
+/// `Final` event arrives or it goes idle; without it, read once and end (replay).
+///
+/// Tails by byte offset (not `BufReader::lines`, which stops at EOF): each poll
+/// reads from the last offset to EOF and splits off complete `\n`-terminated
+/// lines, holding any trailing partial until the writer appends its newline.
+async fn stream_journal(
+    mut ws: WebSocket,
+    journal_path: PathBuf,
+    follow: bool,
+    end_reason: String,
+) {
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    /// Give up following a quiet journal after this long (the subagent likely died
+    /// without a `Final`). Long enough not to cut off a slow-but-working subagent.
+    const IDLE_GIVE_UP: Duration = Duration::from_secs(300);
+    const POLL: Duration = Duration::from_millis(200);
+
+    // The child may not have created the file yet; wait briefly when following.
+    let mut file = None;
+    for _ in 0..(if follow { 50 } else { 1 }) {
+        if let Ok(f) = tokio::fs::File::open(&journal_path).await {
+            file = Some(f);
+            break;
+        }
+        if !follow {
+            break;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+
+    let mut seq = 0u64;
+    let mut done = false;
+    if let Some(mut f) = file {
+        let mut pos: u64 = 0;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut last_activity = Instant::now();
+        loop {
+            let mut chunk = Vec::new();
+            if f.seek(std::io::SeekFrom::Start(pos)).await.is_ok() {
+                if let Ok(read) = f.read_to_end(&mut chunk).await {
+                    if read > 0 {
+                        pos += read as u64;
+                        last_activity = Instant::now();
+                        buf.extend_from_slice(&chunk);
+                    }
                 }
             }
-            seq += 1;
+            // Emit every complete line currently buffered.
+            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=nl).collect();
+                if let Ok(s) = std::str::from_utf8(&line[..line.len() - 1]) {
+                    if let Ok(event) = serde_json::from_str::<UiEventMsg>(s.trim_end()) {
+                        if matches!(event, UiEventMsg::Final(_)) {
+                            done = true;
+                        }
+                        let frame = encode_line(&ServerMsg::Event { seq, event });
+                        if ws
+                            .send(Message::Text(frame.trim_end().to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                seq += 1;
+                if done {
+                    break;
+                }
+            }
+            if done || !follow || last_activity.elapsed() > IDLE_GIVE_UP {
+                break;
+            }
+            tokio::time::sleep(POLL).await;
         }
     }
-    let reason = format!("session {}", status_word(&status));
+
     let _ = ws
         .send(Message::Text(
-            encode_line(&ServerMsg::Ended { reason })
+            encode_line(&ServerMsg::Ended { reason: end_reason })
                 .trim_end()
                 .to_string()
                 .into(),
@@ -519,6 +642,7 @@ mod tests {
                 let ws = ws.clone();
                 Box::pin(async move { Some(AttachTarget::Live { worker_sock: ws }) })
             }),
+            resolve_root: Arc::new(|_| Box::pin(async { None })),
         });
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
@@ -556,6 +680,7 @@ mod tests {
         let state = Arc::new(AppState {
             token: "t".into(),
             resolve: Arc::new(|_| Box::pin(async { None })),
+            resolve_root: Arc::new(|_| Box::pin(async { None })),
         });
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
@@ -574,6 +699,7 @@ mod tests {
         let state = AppState {
             token: "secret-token".into(),
             resolve: Arc::new(|_| Box::pin(async { None })),
+            resolve_root: Arc::new(|_| Box::pin(async { None })),
         };
         let mut h = HeaderMap::new();
         // no creds

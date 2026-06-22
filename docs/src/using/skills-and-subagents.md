@@ -39,3 +39,17 @@ Use a subagent for independent, well-scoped work you want handled with its own
 context budget — distinct from a [Ranch](../ranch/overview.md) workstream, which
 is a full session in its own worktree/branch coordinated across the dependency
 graph.
+
+### Watching a subagent
+
+Each running subagent streams its own live journal, so you can look inside one
+instead of waiting for its final answer. They appear in the background pane as the
+foreman fans them out; to watch one:
+
+- **TUI** — press **Ctrl-C → `w`** to open a subagent's live output (press `w`
+  again to cycle through them; **Esc** returns to the main session).
+- **Web UI** — tap a subagent chip above the transcript to open its live view
+  (read-only); a finished subagent replays its recorded transcript.
+
+This is the fast way to see *why* a subagent is slow or stuck (e.g. a hung
+command) rather than guessing from a frozen timer.

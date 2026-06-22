@@ -97,6 +97,14 @@ pub(super) fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
 
 /// Draw the whole UI.
 pub fn draw(f: &mut Frame, app: &App) {
+    // Watching a subagent: render its nested transcript full-screen instead of the
+    // main session, with a header + a return hint.
+    if app.mode == Mode::WatchingSubagent {
+        if let Some(sub) = app.watching.as_deref() {
+            draw_watch(f, app, sub);
+            return;
+        }
+    }
     let area = f.area();
     // The input box grows with its content, up to 5 visible lines (+2 borders).
     let input_h = (app.input_lines().clamp(1, 5) as u16) + 2;
@@ -173,6 +181,7 @@ pub fn draw(f: &mut Frame, app: &App) {
             "r  resume\n\
              i  instruct — stop this turn and redirect (history kept)\n\
              k  kill — stop the running command/turn only\n\
+             w  watch — open a subagent's live output\n\
              d  detach — leave it running in the background, exit\n\
              e  end — finish the session",
             "press a key  ·  Esc = resume",
@@ -189,6 +198,53 @@ pub fn draw(f: &mut Frame, app: &App) {
         }
         _ => {}
     }
+}
+
+/// Render a watched subagent's nested transcript full-screen, with a header
+/// naming it and a footer hint (Esc to return, `w` to cycle).
+fn draw_watch(f: &mut Frame, app: &App, sub: &App) {
+    let area = f.area();
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let header = Line::from(vec![
+        Span::styled(
+            " 👁 watching ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            app.watch_label.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  [{}]", app.watch_id),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(header), rows[0]);
+    draw_transcript(f, sub, rows[1]);
+    let footer = Line::from(vec![
+        Span::styled(
+            format!(" {} ", sub.status),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::styled(
+            "·  Esc back  ·  w next subagent",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(footer), rows[2]);
 }
 
 /// Centered rect `w`×`h` (clamped to `area`), cleared for an overlay.
@@ -840,6 +896,7 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::Paused => "paused",
         Mode::ModelPicker => "models",
         Mode::ModelForm => "models",
+        Mode::WatchingSubagent => "watching",
         Mode::Done => "done",
     };
     let cols = Layout::default()

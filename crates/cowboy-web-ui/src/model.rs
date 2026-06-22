@@ -49,6 +49,16 @@ pub struct Approval {
     pub dest: String,
 }
 
+/// A crew subagent shown in the session view; click it to watch its live output.
+#[derive(Clone, PartialEq)]
+pub struct SubagentStatus {
+    pub id: String,
+    pub label: String,
+    pub model: String,
+    /// `None` = running, `Some(true)` = finished ok, `Some(false)` = failed.
+    pub done: Option<bool>,
+}
+
 #[derive(Clone, PartialEq, Default)]
 pub struct Model {
     pub title: String,
@@ -69,6 +79,8 @@ pub struct Model {
     pub conn: ConnState,
     /// A turn is in flight (drives the spinner / disables nothing).
     pub running: bool,
+    /// Crew subagents dispatched this session, for the watch list.
+    pub subagents: Vec<SubagentStatus>,
 }
 
 impl Model {
@@ -117,6 +129,13 @@ impl Model {
                 self.commit();
                 self.running = false;
                 self.conn = ConnState::Ended(reason);
+                // The worker may die before reporting in-flight subagents done;
+                // freeze them so the list doesn't show them forever "running".
+                for s in &mut self.subagents {
+                    if s.done.is_none() {
+                        s.done = Some(false);
+                    }
+                }
             }
         }
     }
@@ -215,11 +234,77 @@ impl Model {
             UiEventMsg::Plan(p) => self.plan = p,
             UiEventMsg::Title(t) => self.title = t,
             UiEventMsg::TurnDone => self.running = false,
-            // Crew / process / net-activity panes are not rendered in v1.
-            UiEventMsg::NetEvent(_)
-            | UiEventMsg::Processes(_)
-            | UiEventMsg::SubagentStarted { .. }
-            | UiEventMsg::SubagentDone { .. } => {}
+            UiEventMsg::SubagentStarted { label, model, id } => {
+                // A fresh fan-out (none still running) replaces the previous batch.
+                if !self.subagents.iter().any(|s| s.done.is_none()) {
+                    self.subagents.clear();
+                }
+                self.subagents.push(SubagentStatus {
+                    id,
+                    label,
+                    model,
+                    done: None,
+                });
+            }
+            UiEventMsg::SubagentDone { ok, id, .. } => {
+                if let Some(s) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|s| s.id == id && s.done.is_none())
+                {
+                    s.done = Some(ok);
+                }
+            }
+            // Process / net-activity panes are not rendered in v1.
+            UiEventMsg::NetEvent(_) | UiEventMsg::Processes(_) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn started(id: &str, label: &str) -> UiEventMsg {
+        UiEventMsg::SubagentStarted {
+            label: label.into(),
+            model: "m".into(),
+            id: id.into(),
+        }
+    }
+
+    #[test]
+    fn tracks_subagents_and_freezes_on_end() {
+        let mut m = Model::default();
+        m.apply_event(started("a", "arch"));
+        m.apply_event(started("b", "tests"));
+        assert_eq!(m.subagents.len(), 2);
+
+        m.apply_event(UiEventMsg::SubagentDone {
+            label: "tests".into(),
+            ok: true,
+            id: "b".into(),
+        });
+        assert_eq!(m.subagents.iter().find(|s| s.id == "b").unwrap().done, Some(true));
+        assert_eq!(m.subagents.iter().find(|s| s.id == "a").unwrap().done, None);
+
+        // Session end freezes any still-running subagent (no forever "running").
+        m.apply(ServerMsg::Ended { reason: "x".into() });
+        assert_eq!(m.subagents.iter().find(|s| s.id == "a").unwrap().done, Some(false));
+    }
+
+    #[test]
+    fn fresh_fanout_replaces_previous_batch() {
+        let mut m = Model::default();
+        m.apply_event(started("a", "one"));
+        m.apply_event(UiEventMsg::SubagentDone {
+            label: "one".into(),
+            ok: true,
+            id: "a".into(),
+        });
+        // None running now → the next start replaces the batch.
+        m.apply_event(started("b", "two"));
+        assert_eq!(m.subagents.len(), 1);
+        assert_eq!(m.subagents[0].id, "b");
     }
 }

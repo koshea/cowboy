@@ -59,6 +59,8 @@ pub enum Mode {
     ModelPicker,
     /// Configuring a newly chosen model (state in `App::model_form`).
     ModelForm,
+    /// Watching a subagent's live output (the watched session in `App::watching`).
+    WatchingSubagent,
     Done,
 }
 
@@ -245,6 +247,8 @@ pub enum CrewStatus {
 /// A spawned crew subagent, shown in the background pane.
 #[derive(Debug, Clone)]
 pub struct CrewMember {
+    /// The subagent's session id — used to open its live journal when watching.
+    pub id: String,
     /// Short routing label (e.g. category or agent name).
     pub label: String,
     /// Resolved model (displayed shortened to its last path segment).
@@ -354,6 +358,12 @@ pub struct App {
     /// ratatui's own backend — writing to an independent stdout handle here
     /// races crossterm's buffered frame and the bytes get eaten.
     pub pending_copy: Option<String>,
+    /// When watching a subagent (`mode == WatchingSubagent`): a nested `App` fed by
+    /// that subagent's journal, rendered in place of the main transcript. Boxed to
+    /// break the recursive type. `watch_id` is the watched subagent's session id.
+    pub watching: Option<Box<App>>,
+    pub watch_id: String,
+    pub watch_label: String,
 }
 
 /// A text selection in *logical* transcript coordinates: a wrapped-line index
@@ -437,7 +447,44 @@ impl App {
             choice: None,
             completion: None,
             pending_copy: None,
+            watching: None,
+            watch_id: String::new(),
+            watch_label: String::new(),
         }
+    }
+
+    /// Enter watch mode for a subagent: a fresh nested `App` (driven by that
+    /// subagent's journal) replaces the main transcript until `stop_watching`.
+    pub fn watch_subagent(&mut self, id: impl Into<String>, label: impl Into<String>) {
+        self.watch_label = label.into();
+        self.watch_id = id.into();
+        let mut sub = Box::new(App::new(self.watch_label.clone()));
+        sub.mode = Mode::Running;
+        self.watching = Some(sub);
+        self.mode = Mode::WatchingSubagent;
+    }
+
+    /// Leave watch mode, returning to the main session view.
+    pub fn stop_watching(&mut self) {
+        self.watching = None;
+        self.watch_id.clear();
+        self.mode = Mode::Idle;
+    }
+
+    /// Pick the next subagent to watch (cycles through the crew, most-recent
+    /// first); `None` if there are no subagents. Used to toggle/cycle the view.
+    pub fn next_watch_target(&self) -> Option<(String, String)> {
+        if self.crew.is_empty() {
+            return None;
+        }
+        // Order shown in the pane is insertion order; cycle in that order.
+        let cur = self.crew.iter().position(|m| m.id == self.watch_id);
+        let next = match cur {
+            Some(i) => (i + 1) % self.crew.len(),
+            None => 0,
+        };
+        let m = &self.crew[next];
+        Some((m.id.clone(), m.label.clone()))
     }
 
     /// Request that `text` be copied to the system clipboard. The actual OSC 52
@@ -705,12 +752,14 @@ impl App {
         &mut self,
         label: impl Into<String>,
         model: impl Into<String>,
+        id: impl Into<String>,
         now_ms: u64,
     ) {
         if !self.crew.iter().any(|m| m.status == CrewStatus::Running) {
             self.crew.clear();
         }
         self.crew.push(CrewMember {
+            id: id.into(),
             label: label.into(),
             model: model.into(),
             status: CrewStatus::Running,
@@ -719,13 +768,12 @@ impl App {
         });
     }
 
-    /// A subagent finished (mark by label; freezes its elapsed time).
-    pub fn subagent_done(&mut self, label: &str, ok: bool) {
+    /// A subagent finished (matched by its session id; freezes its elapsed time).
+    pub fn subagent_done(&mut self, id: &str, ok: bool) {
         if let Some(m) = self
             .crew
             .iter_mut()
-            .rev()
-            .find(|m| m.label == label && m.status == CrewStatus::Running)
+            .find(|m| m.id == id && m.status == CrewStatus::Running)
         {
             m.status = if ok {
                 CrewStatus::Done
@@ -740,6 +788,18 @@ impl App {
         for m in &mut self.crew {
             if m.status == CrewStatus::Running {
                 m.elapsed_secs = now_ms.saturating_sub(m.started_ms) / 1000;
+            }
+        }
+    }
+
+    /// Freeze every still-running crew member's timer. Called when the session
+    /// ends/exits: the worker dies before emitting `SubagentDone` for in-flight
+    /// subagents, so without this their elapsed time would tick forever in the
+    /// (now dead) background pane.
+    pub fn freeze_crew(&mut self) {
+        for m in &mut self.crew {
+            if m.status == CrewStatus::Running {
+                m.status = CrewStatus::Failed;
             }
         }
     }
@@ -1487,28 +1547,42 @@ mod tests {
         app.subagent_started(
             "review",
             "fireworks/accounts/fireworks/models/minimax-m3",
+            "r1",
             1000,
         );
-        app.subagent_started("tests", "cerebras/zai-glm-4.7", 1000);
+        app.subagent_started("tests", "cerebras/zai-glm-4.7", "t1", 1000);
         assert_eq!(app.crew.len(), 2);
         app.tick_crew(5000);
         assert_eq!(app.crew[0].elapsed_secs, 4);
 
-        // Finishing freezes elapsed; status reflects success/failure.
-        app.subagent_done("tests", true);
+        // Finishing (matched by id) freezes elapsed; status reflects success.
+        app.subagent_done("t1", true);
         app.tick_crew(9000);
-        let tests = app.crew.iter().find(|m| m.label == "tests").unwrap();
+        let tests = app.crew.iter().find(|m| m.id == "t1").unwrap();
         assert_eq!(tests.status, CrewStatus::Done);
         assert_eq!(tests.elapsed_secs, 4, "done member's time is frozen");
         assert_eq!(app.crew[0].elapsed_secs, 8, "running member keeps ticking");
 
-        app.subagent_done("review", false);
+        app.subagent_done("r1", false);
         assert_eq!(app.crew[0].status, CrewStatus::Failed);
 
         // A fresh fan-out (no member still running) replaces the previous batch.
-        app.subagent_started("docs", "glm", 10000);
+        app.subagent_started("docs", "glm", "d1", 10000);
         assert_eq!(app.crew.len(), 1);
         assert_eq!(app.crew[0].label, "docs");
+    }
+
+    #[test]
+    fn freeze_crew_stops_running_timers() {
+        let mut app = App::new("t");
+        app.subagent_started("review", "m", "r1", 1000);
+        app.tick_crew(5000);
+        assert_eq!(app.crew[0].elapsed_secs, 4);
+        // Session ended while the subagent was still running: freeze it.
+        app.freeze_crew();
+        app.tick_crew(60_000);
+        assert_eq!(app.crew[0].status, CrewStatus::Failed);
+        assert_eq!(app.crew[0].elapsed_secs, 4, "frozen, not still ticking");
     }
 
     #[test]

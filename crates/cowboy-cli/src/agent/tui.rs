@@ -197,10 +197,10 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
         UiEventMsg::Blocked(reason) => app.set_blocked(reason),
         UiEventMsg::Title(t) => app.title = t,
         UiEventMsg::Processes(procs) => app.processes = procs,
-        UiEventMsg::SubagentStarted { label, model } => {
-            app.subagent_started(label, model, now_ms())
+        UiEventMsg::SubagentStarted { label, model, id } => {
+            app.subagent_started(label, model, id, now_ms())
         }
-        UiEventMsg::SubagentDone { label, ok } => app.subagent_done(&label, ok),
+        UiEventMsg::SubagentDone { ok, id, .. } => app.subagent_done(&id, ok),
         // Handled in the event loop (needs loop-local turn bookkeeping).
         UiEventMsg::TurnDone => {}
     }
@@ -451,6 +451,11 @@ fn event_loop(
     // which case copies fall back to OSC 52 through the terminal.
     let clipboard = ClipboardContext::new().ok();
 
+    // Byte offset consumed from the watched subagent's journal, reset when the
+    // watch target changes, so the nested view tails the file across ticks.
+    let mut watch_pos: u64 = 0;
+    let mut watch_pos_id = String::new();
+
     loop {
         while let Ok(ev) = events.try_recv() {
             match ev {
@@ -507,6 +512,9 @@ fn event_loop(
                 UiEvent::Done => {
                     app.mode = Mode::Done;
                     app.status = "session ended".into();
+                    // The worker may die before emitting `SubagentDone` for in-flight
+                    // subagents; freeze their timers so they don't tick forever.
+                    app.freeze_crew();
                 }
             }
         }
@@ -515,6 +523,24 @@ fn event_loop(
         app.tick_command(now_ms());
         app.tick_crew(now_ms());
         app.tick_turn(now_ms());
+        // Tail the watched subagent's journal into its nested view (poll on the
+        // tick; the file is small and local).
+        if app.mode == Mode::WatchingSubagent {
+            if app.watch_id != watch_pos_id {
+                watch_pos = 0;
+                watch_pos_id = app.watch_id.clone();
+            }
+            let path = session
+                .root
+                .join(".cowboy")
+                .join("sessions")
+                .join(&app.watch_id)
+                .join("events.jsonl");
+            watch_pos = poll_subagent_journal(&mut app, &path, watch_pos);
+        } else if !watch_pos_id.is_empty() {
+            watch_pos = 0;
+            watch_pos_id.clear();
+        }
         terminal.draw(|f| draw(f, &app))?;
 
         // Flush any queued clipboard copy. Prefer the direct OS clipboard
@@ -692,6 +718,36 @@ fn refresh_completions(app: &mut App, catalog: &[cowboy_tui::Completion]) {
 }
 
 /// Mouse → transcript-scoped selection (drag to select; press `y` to copy) +
+/// Read newly-appended complete lines from a watched subagent's `events.jsonl`
+/// (starting at byte `pos`), applying each to the nested view, and return the new
+/// offset. Only advances past `\n`-terminated lines, so a partial trailing line is
+/// re-read once the writer finishes it.
+fn poll_subagent_journal(app: &mut App, path: &std::path::Path, pos: u64) -> u64 {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return pos;
+    };
+    if f.seek(SeekFrom::Start(pos)).is_err() {
+        return pos;
+    }
+    let mut tail = String::new();
+    if f.read_to_string(&mut tail).is_err() || tail.is_empty() {
+        return pos;
+    }
+    let mut last_nl = 0usize;
+    for (i, b) in tail.bytes().enumerate() {
+        if b == b'\n' {
+            if let Ok(ev) = serde_json::from_str::<UiEventMsg>(tail[last_nl..i].trim_end()) {
+                if let Some(sub) = app.watching.as_deref_mut() {
+                    apply_wire(sub, ev);
+                }
+            }
+            last_nl = i + 1;
+        }
+    }
+    pos + last_nl as u64
+}
+
 /// wheel scroll.
 fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
     use crossterm::event::{MouseButton, MouseEventKind};
@@ -786,6 +842,32 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         }
     }
 
+    // Watching a subagent: Esc returns to the main session, `w` cycles to the
+    // next subagent, and scroll keys move the *nested* view. Handled before the
+    // global scrollback so those keys target the watched transcript.
+    if app.mode == Mode::WatchingSubagent {
+        match key.code {
+            KeyCode::Esc => app.stop_watching(),
+            KeyCode::Char('w') => {
+                if let Some((id, label)) = app.next_watch_target() {
+                    app.watch_subagent(id, label);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(s) = app.watching.as_mut() {
+                    s.scroll_up(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(s) = app.watching.as_mut() {
+                    s.scroll_down(10);
+                }
+            }
+            _ => {}
+        }
+        return false;
+    }
+
     // Transcript scrollback — works in any mode so you can read while the agent
     // runs or while typing. Uses keys the text editor doesn't claim.
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -872,6 +954,16 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 }
                 app.status = "interrupting turn…".into();
                 app.mode = ctx.mode_before_overlay.clone();
+            }
+            KeyCode::Char('w') => {
+                // Watch a subagent's live output (cycles if several). No-op with none.
+                match app.next_watch_target() {
+                    Some((id, label)) => app.watch_subagent(id, label),
+                    None => {
+                        app.status = "no subagents to watch".into();
+                        app.mode = ctx.mode_before_overlay.clone();
+                    }
+                }
             }
             KeyCode::Char('d') => {
                 // Detach: leave the session running and exit this client.

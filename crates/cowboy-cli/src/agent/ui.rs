@@ -36,10 +36,12 @@ pub trait AgentUi {
     /// (`None`). Default: ignored.
     fn blocked(&mut self, _reason: Option<&str>) {}
     /// A crew subagent was dispatched (`label` = routing label, `model` =
-    /// resolved model). Default: ignored.
-    fn subagent_started(&mut self, _label: &str, _model: &str) {}
-    /// A crew subagent finished (`ok` = whether it produced a result). Default: ignored.
-    fn subagent_done(&mut self, _label: &str, _ok: bool) {}
+    /// resolved model, `id` = the subagent's session id, whose live journal the
+    /// UI can watch). Default: ignored.
+    fn subagent_started(&mut self, _label: &str, _model: &str, _id: &str) {}
+    /// A crew subagent finished (`ok` = whether it produced a result; `id`
+    /// correlates to the start). Default: ignored.
+    fn subagent_done(&mut self, _label: &str, _ok: bool, _id: &str) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question and return their answer. `options` (possibly

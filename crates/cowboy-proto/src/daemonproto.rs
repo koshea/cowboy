@@ -423,15 +423,23 @@ pub enum UiEventMsg {
     Plan(Vec<(String, String)>),
     Title(String),
     Processes(Vec<(String, String)>),
-    /// A crew subagent was dispatched (routing label + resolved model).
+    /// A crew subagent was dispatched (routing label + resolved model). `id` is
+    /// the subagent's session id — its live journal is at
+    /// `<root>/.cowboy/sessions/<id>/events.jsonl`, which the UI can watch.
+    /// `#[serde(default)]` keeps older journals (no id) replayable.
     SubagentStarted {
         label: String,
         model: String,
+        #[serde(default)]
+        id: String,
     },
-    /// A crew subagent finished (`ok` = produced a result).
+    /// A crew subagent finished (`ok` = produced a result). `id` correlates to the
+    /// matching `SubagentStarted`.
     SubagentDone {
         label: String,
         ok: bool,
+        #[serde(default)]
+        id: String,
     },
     TurnDone,
 }

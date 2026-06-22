@@ -10,12 +10,12 @@ expression: render(&app)
 │   │r  resume                                                     │   │
 │   │i  instruct — stop this turn and redirect (history kept)      │   │
 │   │k  kill — stop the running command/turn only                  │───╯
-│   │d  detach — leave it running in the background, exit          │───╮
-│   │e  end — finish the session                                   │vit│
+│   │w  watch — open a subagent's live output                      │───╮
+│   │d  detach — leave it running in the background, exit          │vit│
+│   │e  end — finish the session                                   │   │
 │   │                                                              │   │
 │   │press a key  ·  Esc = resume                                  │   │
-│   ╰──────────────────────────────────────────────────────────────╯   │
-╰───────────────────────────────────────────────╯╰─────────────────────╯
+╰───╰──────────────────────────────────────────────────────────────╯───╯
    paused — ready
 ╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
 │                                                                      │

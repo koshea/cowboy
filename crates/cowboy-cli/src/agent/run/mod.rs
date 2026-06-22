@@ -17,6 +17,10 @@ use crate::net::docker::ExecResult;
 use crate::net::runtime::AgentRuntime;
 use crate::session::SessionLogger;
 
+/// Process-unique counter so concurrent subagents spawned in the same millisecond
+/// get distinct session ids.
+static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 mod handlers;
 mod support;
 use support::{
@@ -172,6 +176,10 @@ struct SubagentPlan {
     exe: std::path::PathBuf,
     root: std::path::PathBuf,
     container_name: String,
+    /// The child's session id (assigned by the parent via `COWBOY_SESSION_ID`), so
+    /// the parent advertises it and the UI can watch the child's journal at
+    /// `<root>/.cowboy/sessions/<id>/events.jsonl`.
+    id: String,
     child_depth: usize,
     /// Full brief sent to the worker (context + task + expected artifact).
     task: String,
@@ -196,6 +204,9 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         .current_dir(&plan.root)
         .env("COWBOY_CONTAINER_NAME", &plan.container_name)
         .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
+        // Assign the child its session id so its journal lands at a path the parent
+        // already advertised (SubagentStarted { id }) and the UI can watch.
+        .env("COWBOY_SESSION_ID", &plan.id)
         .env("COWBOY_PRINT_FINAL_ONLY", "1")
         // Capture (don't inherit) the child's stderr: inheriting would corrupt the
         // parent TUI/console, but discarding it threw away the *reason* a subagent
@@ -1429,6 +1440,7 @@ impl<'a> AgentLoop<'a> {
                 .next()
                 .unwrap_or(&plan.label)
                 .to_string();
+            let sub_id = plan.id.clone();
             async move {
                 let started = std::time::Instant::now();
                 let result = exec_subagent(plan).await;
@@ -1445,13 +1457,13 @@ impl<'a> AgentLoop<'a> {
                         duration_ms,
                     }
                 });
-                (id, label, result, status, outcome)
+                (id, label, sub_id, result, status, outcome)
             }
         }))
         .buffer_unordered(max_parallel);
 
-        while let Some((id, label, res, status, outcome)) = stream.next().await {
-            self.ui.subagent_done(&label, status == "complete");
+        while let Some((id, label, sub_id, res, status, outcome)) = stream.next().await {
+            self.ui.subagent_done(&label, status == "complete", &sub_id);
             if let Some(o) = outcome {
                 cowboy_core::crew::record_outcome(&o);
             }
@@ -1550,10 +1562,16 @@ impl<'a> AgentLoop<'a> {
             Some(r) => format!("{who}{category}/{} → {}", effort.as_str(), r.model),
             None => format!("{who}{category}/{}", effort.as_str()),
         };
+        let id = format!(
+            "{}-sub{}",
+            now_ms(),
+            SUBAGENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
             container_name: self.runtime.container_name().to_string(),
+            id,
             child_depth: self.subagent_depth + 1,
             task,
             display_task: args.task.clone(),
@@ -1573,8 +1591,11 @@ impl<'a> AgentLoop<'a> {
         ));
         // Pane label is the category/effort part (the model is shown separately).
         let label = plan.label.split(" → ").next().unwrap_or(&plan.label);
-        self.ui
-            .subagent_started(label, plan.model.as_deref().unwrap_or("<default>"));
+        self.ui.subagent_started(
+            label,
+            plan.model.as_deref().unwrap_or("<default>"),
+            &plan.id,
+        );
         if let Some((category, effort, model, fell_back)) = &plan.routed {
             self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SubagentRouted {
                 category: category.clone(),

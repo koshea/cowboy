@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tui::SessionCtx;
-use crate::agent::{AgentLoop, ConsoleUi};
+use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi};
 use crate::cli::StartFlags;
 use crate::cmd::daemon;
 use crate::net::control;
@@ -213,14 +213,21 @@ pub async fn run(
         if let Some((addr, token)) = control {
             tokio::spawn(run_control_autodeny(addr, token, session_dir));
         }
-        let mut ui = ConsoleUi::new();
+        // A subagent journals to its session's `events.jsonl` (so the parent/UI can
+        // watch it live) and still prints its final answer to stdout for capture; a
+        // top-level one-shot run uses the console UI.
+        let journal_path = logger.as_ref().map(|l| l.dir().join("events.jsonl"));
+        let mut ui: Box<dyn AgentUi> = match (is_subagent, &journal_path) {
+            (true, Some(p)) => Box::new(JournalUi::new(p)),
+            _ => Box::new(ConsoleUi::new()),
+        };
         let mut agent = AgentLoop::new(
             Box::new(model),
             runtime,
             agent_cfg.agent,
             context_window,
             cancel,
-            &mut ui,
+            &mut *ui,
         )
         .with_logger(logger)
         .with_memory_context(memory_ctx)

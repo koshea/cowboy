@@ -67,6 +67,8 @@ fn app() -> Html {
     let token = use_state(|| query_param("token").unwrap_or_default());
     // Selected session id: from `?session=` or chosen from the list.
     let selected = use_state(|| query_param("session"));
+    // When watching a subagent of the selected session: its subagent id.
+    let watching = use_state(|| Option::<String>::None);
 
     if token.is_empty() {
         return html! {
@@ -77,15 +79,31 @@ fn app() -> Html {
         };
     }
 
-    match (*selected).clone() {
-        Some(id) => {
+    match ((*selected).clone(), (*watching).clone()) {
+        // Watching a subagent: read-only view of the child's journal.
+        (Some(parent), Some(sub)) => {
+            let back = {
+                let watching = watching.clone();
+                Callback::from(move |_| watching.set(None))
+            };
+            html! {
+                <Session id={sub} parent={Some(parent)} token={(*token).clone()} on_back={back} />
+            }
+        }
+        (Some(id), None) => {
             let back = {
                 let selected = selected.clone();
                 Callback::from(move |_| selected.set(None))
             };
-            html! { <Session id={id} token={(*token).clone()} on_back={back} /> }
+            let on_watch = {
+                let watching = watching.clone();
+                Callback::from(move |sub: String| watching.set(Some(sub)))
+            };
+            html! {
+                <Session id={id} token={(*token).clone()} on_back={back} on_watch={Some(on_watch)} />
+            }
         }
-        None => {
+        (None, _) => {
             let pick = {
                 let selected = selected.clone();
                 Callback::from(move |id: String| selected.set(Some(id)))
@@ -163,6 +181,14 @@ struct SessionProps {
     id: String,
     token: String,
     on_back: Callback<()>,
+    /// When `Some(parent)`, this is a **subagent watch**: stream the child's
+    /// journal via `/api/subagent/<parent>/<id>/ws` and render read-only (no
+    /// composer/interrupt — subagents are non-interactive).
+    #[prop_or_default]
+    parent: Option<String>,
+    /// Top-level sessions only: open a subagent watch (emits the subagent id).
+    #[prop_or_default]
+    on_watch: Option<Callback<String>>,
 }
 
 #[function_component(Session)]
@@ -213,7 +239,8 @@ fn session(props: &SessionProps) -> Html {
         let outbox = outbox.clone();
         let token = props.token.clone();
         let id = props.id.clone();
-        use_effect_with(props.id.clone(), move |_| {
+        let parent = props.parent.clone();
+        use_effect_with((props.id.clone(), props.parent.clone()), move |_| {
             if let Some(mut rx) = outbox.1.borrow_mut().take() {
                 wasm_bindgen_futures::spawn_local(async move {
                     // First seq we still need; `None` = replay the whole journal.
@@ -230,7 +257,11 @@ fn session(props: &SessionProps) -> Html {
                             }));
                             break;
                         }
-                        let ws = match WebSocket::open(&ws_url(&id, &token, next_seq)) {
+                        let url = match &parent {
+                            Some(p) => subagent_ws_url(p, &id, &token, next_seq),
+                            None => ws_url(&id, &token, next_seq),
+                        };
+                        let ws = match WebSocket::open(&url) {
                             Ok(ws) => ws,
                             Err(_) => {
                                 dead += 1;
@@ -340,17 +371,33 @@ fn session(props: &SessionProps) -> Html {
     };
     let back = props.on_back.clone();
     let on_back = Callback::from(move |_| back.emit(()));
+    // Subagent watch is read-only (non-interactive child); a top-level session
+    // shows its subagents and offers input.
+    let watching = props.parent.is_some();
 
     html! {
         <div class="page">
             <header class="bar">
                 <button class="ghost" onclick={on_back}>{ "‹" }</button>
-                <span class="title">{ title(&model) }</span>
+                <span class="title">
+                    if watching { { "👁 " } }
+                    { title(&model) }
+                </span>
                 <span class="muted stats">
                     { format!("{} in · {} out", model.tokens_in, model.tokens_out) }
                     if model.cost_usd > 0.0 { { format!(" · ${:.3}", model.cost_usd) } }
                 </span>
             </header>
+
+            if !watching {
+                if let Some(on_watch) = &props.on_watch {
+                    if !model.subagents.is_empty() {
+                        <div class="subagents">
+                            { for model.subagents.iter().map(|s| render_subagent_chip(s, on_watch.clone())) }
+                        </div>
+                    }
+                }
+            }
 
             if let Some(reason) = &model.blocked {
                 <div class="banner blocked">{ format!("⏸ blocked: {reason}") }</div>
@@ -380,19 +427,56 @@ fn session(props: &SessionProps) -> Html {
                 { conn_banner(&model.conn) }
             </main>
 
-            if let Some(ask) = &model.ask { { render_ask(ask, send.clone()) } }
-            if let Some(ap) = &model.approval { { render_approval(ap, send.clone()) } }
+            if !watching {
+                if let Some(ask) = &model.ask { { render_ask(ask, send.clone()) } }
+                if let Some(ap) = &model.approval { { render_approval(ap, send.clone()) } }
 
-            <footer class="composer">
-                <textarea ref={input_ref} placeholder="Message the agent…  (Enter to send)"
-                    onkeydown={on_keydown} rows="1" />
-                <button class="send" onclick={on_submit.reform(|_| ())}>{ "Send" }</button>
-                if model.running {
-                    <button class="ghost" onclick={interrupt} title="interrupt the current turn">{ "■" }</button>
-                }
-            </footer>
+                <footer class="composer">
+                    <textarea ref={input_ref} placeholder="Message the agent…  (Enter to send)"
+                        onkeydown={on_keydown} rows="1" />
+                    <button class="send" onclick={on_submit.reform(|_| ())}>{ "Send" }</button>
+                    if model.running {
+                        <button class="ghost" onclick={interrupt} title="interrupt the current turn">{ "■" }</button>
+                    }
+                </footer>
+            }
         </div>
     }
+}
+
+/// A clickable subagent chip; click opens its read-only live watch.
+fn render_subagent_chip(s: &model::SubagentStatus, on_watch: Callback<String>) -> Html {
+    let id = s.id.clone();
+    let onclick = Callback::from(move |_| on_watch.emit(id.clone()));
+    let (mark, cls) = match s.done {
+        None => ("●", "running"),
+        Some(true) => ("✓", "done"),
+        Some(false) => ("✗", "failed"),
+    };
+    html! {
+        <button class={classes!("subagent-chip", cls)} {onclick}
+            title={format!("watch {} ({})", s.label, s.model)}>
+            { "👁 " }{ s.label.clone() }{ " " }<span class="dot">{ mark }</span>
+        </button>
+    }
+}
+
+fn subagent_ws_url(parent: &str, sub: &str, token: &str, since_seq: Option<u64>) -> String {
+    let loc = web_sys::window().unwrap().location();
+    let proto = if loc.protocol().as_deref() == Ok("https:") {
+        "wss"
+    } else {
+        "ws"
+    };
+    let host = loc.host().unwrap_or_default();
+    let parent = js_sys::encode_uri_component(parent);
+    let sub = js_sys::encode_uri_component(sub);
+    let token = js_sys::encode_uri_component(token);
+    let mut url = format!("{proto}://{host}/api/subagent/{parent}/{sub}/ws?token={token}");
+    if let Some(seq) = since_seq {
+        url.push_str(&format!("&since_seq={seq}"));
+    }
+    url
 }
 
 fn ws_url(id: &str, token: &str, since_seq: Option<u64>) -> String {
