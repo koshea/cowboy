@@ -599,10 +599,9 @@ impl DockerCli for CliDocker {
             labels: Some(HashMap::from([("cowboy".to_string(), "1".to_string())])),
             ..Default::default()
         };
-        docker
-            .create_network(req)
-            .await
-            .context("docker network create")?;
+        docker.create_network(req).await.with_context(|| {
+            format!("creating network {} (subnet {:?})", spec.name, spec.subnet)
+        })?;
         Ok(())
     }
 

@@ -214,10 +214,19 @@ impl GatewayState {
         };
 
         // 3. Tunnel detection refuses a non-deny verdict (no connection follows a
-        //    DNS-tunnel query, so this is the only place to stop it).
+        //    DNS-tunnel query, so this is the only place to stop it). Two checks:
+        //    - SHAPE (entropy/length/chunking) applies to any non-denied name — it
+        //      catches `<exfil>.allowed.com` even under an allowed parent.
+        //    - the query-RATE limiter applies only to UNKNOWN (`Ask`) names: a burst
+        //      of lookups to an explicitly ALLOWED domain (e.g. `bundle install`
+        //      hammering `index.rubygems.org`, or npm/cargo) is legitimate, not a
+        //      tunnel — rate-limiting it silently breaks the allow-list.
         let mut verdict = verdict;
         if dns.tunnel_detection && verdict != Verdict::Deny {
             let why = dns_policy::tunnel_reason(qname, dns).or_else(|| {
+                if verdict != Verdict::Ask {
+                    return None;
+                }
                 let parent = dns_policy::registrable_parent(qname);
                 self.dns_rate
                     .over_limit(&parent)
@@ -351,6 +360,44 @@ mod tests {
         assert_eq!(s.decide_dns(tunnel, "A").await, Verdict::Deny);
         // A normal name under the same allowed parent still resolves.
         assert_eq!(s.decide_dns("api.evil.com", "A").await, Verdict::Allow);
+    }
+
+    #[tokio::test]
+    async fn high_query_rate_to_allowed_domain_is_not_rate_denied() {
+        // `bundle install` / npm / cargo hammer an allowed package index's host
+        // with far more than the per-minute limit of lookups — that's legitimate,
+        // so the rate limiter must NOT deny an explicitly allowed domain (the
+        // allow-list is the user's explicit trust). Regression for rubygems.org.
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("rubygems.org".into());
+        let s = state(p);
+        for _ in 0..80 {
+            assert_eq!(
+                s.decide_dns("index.rubygems.org", "A").await,
+                Verdict::Allow,
+                "an allowed domain must never be rate-denied"
+            );
+        }
+
+        // …but a burst to an UNKNOWN parent is still rate-limited (tunnel guard).
+        let mut p2 = NetworkPolicy::default();
+        p2.allow.domains.clear();
+        let s2 = state(p2);
+        let mut denied = false;
+        for i in 0..80 {
+            if s2
+                .decide_dns(&format!("h{i}.unknown-parent.test"), "A")
+                .await
+                == Verdict::Deny
+            {
+                denied = true;
+                break;
+            }
+        }
+        assert!(
+            denied,
+            "a high query rate to an unknown parent should be denied"
+        );
     }
 
     #[tokio::test]
