@@ -69,6 +69,37 @@ default (the lease is held). Flags choose what happens instead:
 - `cowboy logs` lists past sessions; `cowboy replay <id>` replays one from its
   recorded journal.
 
+## Remote control from a browser (`cowboy web`)
+
+Because sessions live in the daemon and the worker socket accepts **multiple
+simultaneous clients**, you can drive a session from a browser — e.g. keep coding
+from your phone — while your terminal TUI stays attached to the same session.
+
+```sh
+cowboy web                       # serves http://127.0.0.1:8787, prints a tokened URL
+cowboy web --bind 100.x.y.z:8787 # your Tailscale IP, to reach it from another device
+```
+
+`cowboy web` starts a small server that bridges a browser WebSocket to a session's
+worker socket — the web client is just another attacher, so it gets the same live
+stream, journal replay, and approval prompts as the TUI. The page lists your
+sessions; open one to see its transcript, send messages, answer questions, approve
+network requests, and interrupt turns.
+
+**Access & exposure.** Every request needs the bearer token printed at startup
+(it's embedded in the `open:` URL). The server **binds loopback by default**. For
+remote access it allows binding a **Tailscale** address (`100.64.0.0/10`), which
+encrypts and authenticates the transport device-to-device. Any other non-loopback
+bind (a plain LAN IP, `0.0.0.0`) is **refused** unless you pass
+`--insecure-allow-lan`, because the token would otherwise travel in cleartext —
+prefer Tailscale, or an SSH tunnel (`ssh -L 8787:127.0.0.1:8787 …`) to the default
+loopback bind. Set a fixed token with `--token` or `$COWBOY_WEB_TOKEN`.
+
+> The web UI is a WASM bundle built with [trunk](https://trunkrs.dev) and embedded
+> into the `cowboy` binary. Building from source without trunk yields a working
+> server with a placeholder page; run `trunk build --release` in
+> `crates/cowboy-web-ui` before `cargo build` to embed the real UI (CI does this).
+
 ## Session state on disk
 
 Each session writes to `.cowboy/sessions/<id>/` (gitignored): the transcript,

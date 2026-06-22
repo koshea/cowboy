@@ -45,6 +45,33 @@ jobs:
       - name: Doctests
         run: cargo test --doc
 
+  web-ui:
+    name: build web UI (wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (+ wasm32 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      # Build the WASM bundle, then build the binary so the rust-embed of the
+      # real bundle is exercised end-to-end (not just the empty-dist fallback).
+      - name: Build web UI bundle
+        run: trunk build --release
+        working-directory: crates/cowboy-web-ui
+
+      - name: Build cowboy with the bundle embedded
+        run: cargo build -p cowboy-cli
+
   docs:
     name: build docs (mdbook)
     runs-on: ubuntu-latest

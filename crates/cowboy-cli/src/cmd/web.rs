@@ -21,7 +21,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -98,7 +98,37 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
         .route("/api/session/{id}/ws", get(ws_handler))
+        // Static SPA assets (the trunk-built .js/.wasm). Unauthenticated — they're
+        // inert code; the token still gates every /api route. /api/* and / are
+        // matched first as explicit routes.
+        .fallback(static_handler)
         .with_state(state)
+}
+
+/// The trunk-built WASM bundle, baked into the binary. Empty on a checkout that
+/// never ran `trunk build` (then we serve [`INDEX_PLACEHOLDER`]).
+#[derive(rust_embed::RustEmbed)]
+#[folder = "../cowboy-web-ui/dist"] // relative to CARGO_MANIFEST_DIR; ensured by build.rs
+struct WebAssets;
+
+fn serve_asset(path: &str) -> Option<Response> {
+    let file = WebAssets::get(path)?;
+    let mime = match path.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+    Some(([(header::CONTENT_TYPE, mime)], file.data.into_owned()).into_response())
+}
+
+/// Serve a static asset by its URL path, or 404.
+async fn static_handler(uri: Uri) -> Response {
+    serve_asset(uri.path().trim_start_matches('/'))
+        .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response())
 }
 
 /// Refuse a bind that would leak the token in cleartext. Loopback is always
@@ -154,10 +184,10 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn index() -> Html<&'static str> {
-    // Placeholder until the WASM bundle is embedded (Phase 2). The real SPA reads
-    // the `?token=` param, lists sessions, and opens the session WebSocket.
-    Html(INDEX_PLACEHOLDER)
+async fn index() -> Response {
+    // Serve the embedded SPA shell; fall back to a placeholder if no bundle was
+    // built into this binary.
+    serve_asset("index.html").unwrap_or_else(|| Html(INDEX_PLACEHOLDER).into_response())
 }
 
 async fn list_sessions(

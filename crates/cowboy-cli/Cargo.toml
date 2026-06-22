@@ -41,6 +41,7 @@ rmcp.workspace = true
 reqwest.workspace = true  # default HTTP client for MCP streamable-HTTP transport
 uuid.workspace = true     # per-session control-channel token
 axum.workspace = true     # `cowboy web` remote-control server
+rust-embed.workspace = true  # embed the trunk-built web UI bundle
 # Typed Docker API. Default features = `http` + `pipe` (unix socket via hyperlocal
 # / Windows named pipe); `ssl` (rustls) is deliberately left off — cowboy talks to
 # the local daemon, not a TLS-remote one.

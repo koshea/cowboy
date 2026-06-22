@@ -56,15 +56,18 @@ over a unix socket.
 crates/
   cowboy-cli/      the `cowboy`/`cowboyd` binaries
     src/cli.rs       clap command tree            src/main.rs  dispatch
-    src/cmd/         one module per CLI command (daemon.rs, worker.rs, ranch.rs, session.rs, …)
+    src/cmd/         one module per CLI command (daemon.rs, worker.rs, ranch.rs, session.rs, web.rs, …)
     src/agent/       the agent loop (run.rs), tool defs (tools.rs), UI impls (ui.rs/tui.rs/socket_ui.rs)
     src/net/         docker (docker.rs, bollard API; build+interactive shell out), runtime spec (runtime.rs), gateway, worktree, control socket
     src/session/     session logging / replay
   cowboy-core/     shared types, pure logic, + the model transport
-    config.rs daemonproto.rs model.rs policy.rs ranch.rs scope.rs artifact.rs
+    config.rs model.rs policy.rs ranch.rs scope.rs artifact.rs
     lifecycle.rs decision.rs memory.rs tokens.rs usersecrets.rs error.rs
+  cowboy-proto/    wire types (daemonproto, netproto) — serde-only, also compiles to wasm
   cowboy-tui/      ratatui rendering (snapshot-tested)
   cowboy-gateway/  the sole-egress gateway binary (proxy + DNS + nft policy)
+  cowboy-web-ui/   Yew/WASM remote-control frontend (NOT a workspace member —
+                   wasm32-only; `trunk build` in this dir, embedded by cowboy-cli)
 docker/  docs/
 ```
 

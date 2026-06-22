@@ -1,0 +1,6 @@
+# Build config for the WASM frontend bundle. `trunk build` emits to `dist/`,
+# which the `cowboy` binary embeds (rust-embed) and the `cowboy web` server
+# serves. Assets are referenced from the site root (public_url = "/").
+[build]
+dist = "dist"
+public_url = "/"

@@ -7,7 +7,7 @@ members = [
     "crates/cowboy-tui",
     "crates/cowboy-gateway",
 ]
-exclude = ["examples"]
+exclude = ["examples", "crates/cowboy-web-ui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,8 +32,11 @@ libc = "0.2"
 
 # web server (remote-control UI): axum's built-in WebSocket bridges the browser
 # to a session's worker socket. `tokio-tungstenite` is a test-only WS client.
+# `rust-embed` bakes the trunk-built WASM bundle into the binary (debug-embed so
+# it's embedded in dev builds too; an empty/absent dist falls back to a placeholder).
 axum = { version = "0.8", features = ["ws"] }
 tokio-tungstenite = "0.29"
+rust-embed = { version = "8", features = ["debug-embed"] }
 
 # serialization / config
 serde = { version = "1", features = ["derive"] }
