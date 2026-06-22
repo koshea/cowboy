@@ -69,44 +69,9 @@ default (the lease is held). Flags choose what happens instead:
 - `cowboy logs` lists past sessions; `cowboy replay <id>` replays one from its
   recorded journal.
 
-## Remote control from a browser (`cowboy web`)
-
-Because sessions live in the daemon and the worker socket accepts **multiple
-simultaneous clients**, you can drive a session from a browser — e.g. keep coding
-from your phone — while your terminal TUI stays attached to the same session.
-
-It's a **setting**, not a command you babysit: turn it on once and `cowboyd`
-serves the web UI itself (and re-serves it whenever the daemon starts).
-
-```sh
-cowboy web on                       # enable; cowboyd serves http://127.0.0.1:8787, prints a tokened URL
-cowboy web on --bind 100.x.y.z:8787 # bind your Tailscale IP to reach it from another device
-cowboy web status                   # is it enabled + serving? prints the URL (and a QR for a remote bind)
-cowboy web off                      # stop serving (the daemon keeps running)
-```
-
-The daemon bridges each browser WebSocket to a session's worker socket — the web
-client is just another attacher, so it gets the same live stream, journal replay,
-and approval prompts as the TUI. The page lists your sessions; open one to see its
-transcript, send messages, answer questions, approve network requests, and
-interrupt turns. If the connection drops (a phone sleeping, a network switch) the
-page **reconnects automatically** and resumes the journal where it left off. With
-a remote bind, `cowboy web on`/`status` also print a **QR code** of the tokened
-URL, so you can point your phone's camera at the terminal to open it.
-
-**Access & exposure.** The setting lives in `~/.config/cowboy/web.yaml` (`0600` —
-it holds the access token, minted on first `on`). Every request needs that token
-(embedded in the `open:` URL). It **binds loopback by default**; for remote access
-it allows a **Tailscale** address (`100.64.0.0/10`), which encrypts and
-authenticates the transport device-to-device. Any other non-loopback bind (a plain
-LAN IP, `0.0.0.0`) is **refused** unless you pass `--lan`, because the token would
-otherwise travel in cleartext — prefer Tailscale, or an SSH tunnel
-(`ssh -L 8787:127.0.0.1:8787 …`) to the default loopback bind.
-
-> The web UI is a WASM bundle built with [trunk](https://trunkrs.dev) and embedded
-> into the `cowboy` binary. Building from source without trunk yields a working
-> server with a placeholder page; run `trunk build --release` in
-> `crates/cowboy-web-ui` before `cargo build` to embed the real UI (CI does this).
+A session's worker socket accepts **multiple simultaneous clients**, so the same
+session can be driven from more than one place at once — including a browser. See
+[The web UI](web.md) for remote control (e.g. from your phone over Tailscale).
 
 ## Session state on disk
 

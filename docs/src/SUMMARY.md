@@ -18,6 +18,7 @@
 
 - [Sessions & the daemon](using/sessions-and-daemon.md)
 - [The TUI](using/tui.md)
+- [The web UI (remote control)](using/web.md)
 - [The agent & its tools](using/agent-and-tools.md)
 - [The crew (model routing)](using/crew.md)
 - [Skills, agents & subagents](using/skills-and-subagents.md)
