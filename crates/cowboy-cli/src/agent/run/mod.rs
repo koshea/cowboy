@@ -190,14 +190,20 @@ struct SubagentPlan {
 /// Execute one planned subagent: a nested one-shot `cowboy` run sharing this
 /// session's container. No parent borrow, so many can run concurrently.
 async fn exec_subagent(plan: SubagentPlan) -> String {
+    use std::os::unix::process::ExitStatusExt;
     let mut cmd = tokio::process::Command::new(&plan.exe);
     cmd.arg(&plan.task)
         .current_dir(&plan.root)
         .env("COWBOY_CONTAINER_NAME", &plan.container_name)
         .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
         .env("COWBOY_PRINT_FINAL_ONLY", "1")
-        // Don't let the child's logs corrupt the parent TUI/console.
-        .stderr(std::process::Stdio::null())
+        // Capture (don't inherit) the child's stderr: inheriting would corrupt the
+        // parent TUI/console, but discarding it threw away the *reason* a subagent
+        // failed — collapsing every failure into a bare "no final answer" that the
+        // foreman could only guess about ("resource exhaustion…"). We keep it and
+        // surface a tail only when the child actually fails.
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .kill_on_drop(true);
     if let Some(model) = &plan.model {
         cmd.env("COWBOY_MODEL", model);
@@ -206,7 +212,8 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         cmd.env("COWBOY_TEMPERATURE", t.to_string());
     }
     match cmd.output().await {
-        Ok(o) => {
+        // Clean exit: the final answer is on stdout.
+        Ok(o) if o.status.success() => {
             let result = String::from_utf8_lossy(&o.stdout).trim().to_string();
             if result.is_empty() {
                 "subagent produced no final answer".to_string()
@@ -214,8 +221,63 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
                 result
             }
         }
+        // The child ran but failed. Report WHY so the foreman (and the user) get a
+        // real cause instead of a guess. A signal death is almost always the host
+        // OOM-killer; a non-zero exit carries the child's error (a model 429 /
+        // RESOURCE_EXHAUSTED, a tool failure) on stderr.
+        Ok(o) => {
+            let tail = stderr_tail(&String::from_utf8_lossy(&o.stderr));
+            let detail = if tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n{tail}")
+            };
+            if let Some(sig) = o.status.signal() {
+                let sigkill = if sig == 9 { " (SIGKILL)" } else { "" };
+                format!(
+                    "subagent error: killed by signal {sig}{sigkill} — most likely the \
+                     host ran out of memory running several subagents at once. Lower \
+                     `delegation.max_parallel` (or run fewer subagents per turn), or give \
+                     the machine more RAM.{detail}"
+                )
+            } else {
+                let code = o.status.code().unwrap_or(-1);
+                format!("subagent error: exited with status {code}{detail}")
+            }
+        }
         Err(e) => format!("subagent failed to start: {e}"),
     }
+}
+
+/// The last few lines of a child's stderr, bounded, for a failure message: enough
+/// to show the cause (a model error, an OOM trace) without dumping a whole log into
+/// the foreman's context. Keeps the tail (where the error lands).
+fn stderr_tail(stderr: &str) -> String {
+    const MAX_LINES: usize = 12;
+    const MAX_CHARS: usize = 1500;
+    let trimmed = stderr.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() > MAX_LINES {
+        lines = lines.split_off(lines.len() - MAX_LINES);
+    }
+    let tail = lines.join("\n");
+    if tail.chars().count() > MAX_CHARS {
+        // Keep the end (the actual error), prefixed with an elision marker. Count
+        // in chars so we never slice through a multibyte boundary.
+        let kept: String = tail
+            .chars()
+            .rev()
+            .take(MAX_CHARS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        return format!("…{kept}");
+    }
+    tail
 }
 
 /// Coarsely classify a subagent's result string for the crew history:
@@ -2748,6 +2810,41 @@ mod tests {
     fn parse_args_handles_empty() {
         let a: FinalArgs = parse_args(r#"{"message":"done"}"#).unwrap();
         assert_eq!(a.message, "done");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_the_end_within_limits() {
+        assert_eq!(stderr_tail(""), "");
+        assert_eq!(stderr_tail("   \n  "), "");
+        // Short stderr passes through (trimmed).
+        assert_eq!(stderr_tail("boom: it failed\n"), "boom: it failed");
+        // More than MAX_LINES keeps only the last lines (the error).
+        let many = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail = stderr_tail(&many);
+        assert!(tail.contains("line 49"));
+        assert!(!tail.contains("line 0\n"));
+        assert!(tail.lines().count() <= 12);
+        // Over the char cap is elided from the front but never panics on a
+        // multibyte boundary.
+        let big = format!("{}é-RESOURCE_EXHAUSTED", "x".repeat(5000));
+        let tail = stderr_tail(&big);
+        assert!(tail.starts_with('…'));
+        assert!(tail.ends_with("RESOURCE_EXHAUSTED"));
+    }
+
+    #[test]
+    fn signal_and_exit_failures_classify_as_error() {
+        assert_eq!(
+            classify_subagent_result("subagent error: killed by signal 9 (SIGKILL) — …"),
+            "error"
+        );
+        assert_eq!(
+            classify_subagent_result("subagent error: exited with status 1\nboom"),
+            "error"
+        );
     }
 
     #[test]
