@@ -219,23 +219,42 @@ fn session(props: &SessionProps) -> Html {
                     // First seq we still need; `None` = replay the whole journal.
                     let mut next_seq: Option<u64> = None;
                     let mut attempt: u32 = 0;
+                    // Consecutive connections that opened but delivered no message
+                    // (e.g. a gone/unreachable session). Bail after a few so we
+                    // don't flash "reconnecting…" forever.
+                    let mut dead: u32 = 0;
                     'reconnect: loop {
+                        if dead >= 3 {
+                            model.dispatch(Action::Server(ServerMsg::Ended {
+                                reason: "could not connect to this session".into(),
+                            }));
+                            break;
+                        }
                         let ws = match WebSocket::open(&ws_url(&id, &token, next_seq)) {
                             Ok(ws) => ws,
                             Err(_) => {
+                                dead += 1;
                                 backoff(&mut attempt).await;
                                 continue;
                             }
                         };
                         attempt = 0;
-                        model.dispatch(Action::Connected);
                         let (mut write, mut read) = ws.split();
                         let mut terminal = false;
+                        let mut got_msg = false;
                         loop {
                             futures::select! {
                                 incoming = read.next().fuse() => match incoming {
                                     Some(Ok(WsMessage::Text(txt))) => {
                                         if let Ok(msg) = serde_json::from_str::<ServerMsg>(&txt) {
+                                            // Clear "reconnecting" only once a real
+                                            // message arrives — a connection that
+                                            // opens then dies sends nothing, so we
+                                            // never flash Connected for it.
+                                            if !got_msg {
+                                                model.dispatch(Action::Connected);
+                                            }
+                                            got_msg = true;
                                             if let ServerMsg::Event { seq, .. } = &msg {
                                                 next_seq = Some(seq + 1);
                                             }
@@ -262,6 +281,9 @@ fn session(props: &SessionProps) -> Html {
                         if terminal {
                             break;
                         }
+                        // A real drop (we'd received data) resets the counter; a
+                        // connection that never spoke counts toward giving up.
+                        dead = if got_msg { 0 } else { dead + 1 };
                         model.dispatch(Action::Disconnected);
                         backoff(&mut attempt).await;
                     }

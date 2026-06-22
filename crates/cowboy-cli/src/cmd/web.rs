@@ -26,7 +26,9 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use cowboy_core::config::WebConfig;
-use cowboy_core::daemonproto::{AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg};
+use cowboy_core::daemonproto::{
+    AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg, SessionStatus, UiEventMsg,
+};
 use cowboy_core::netproto::encode_line;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -159,9 +161,19 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
         })
     });
     let state = Arc::new(AppState { token, resolve });
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
+    // SO_REUSEADDR so a quick restart (daemon roll, `web off`/`on`) can rebind the
+    // port while the previous listener is still in TIME_WAIT.
+    let socket = if addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()
+    } else {
+        tokio::net::TcpSocket::new_v4()
+    }
+    .context("create web socket")?;
+    socket.set_reuseaddr(true).ok();
+    socket
+        .bind(addr)
         .with_context(|| format!("binding {addr}"))?;
+    let listener = socket.listen(1024).context("listen")?;
     axum::serve(listener, router(state))
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
@@ -304,18 +316,60 @@ async fn ws_handler(
         Some(t) => t,
         None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
     };
-    let worker_sock = match target {
-        AttachTarget::Live { worker_sock } => worker_sock,
-        AttachTarget::Replay { .. } => {
-            return (
-                StatusCode::CONFLICT,
-                "session is not live (journal replay over the web is not supported yet)",
-            )
-                .into_response()
+    match target {
+        // Live: bridge to the worker socket (full control).
+        AttachTarget::Live { worker_sock } => {
+            let since = q.since_seq;
+            ws.on_upgrade(move |socket| bridge(socket, worker_sock, since))
         }
-    };
-    let since = q.since_seq;
-    ws.on_upgrade(move |socket| bridge(socket, worker_sock, since))
+        // Terminal: stream the on-disk journal read-only, then end (no worker).
+        AttachTarget::Replay {
+            journal_path,
+            status,
+        } => ws.on_upgrade(move |socket| replay(socket, journal_path, status)),
+    }
+}
+
+/// Stream a finished session's journal to the browser as `Event`s, then `Ended`
+/// — so a completed/failed session renders read-only instead of looping on a
+/// dead worker socket.
+async fn replay(mut ws: WebSocket, journal_path: PathBuf, status: SessionStatus) {
+    if let Ok(file) = tokio::fs::File::open(&journal_path).await {
+        let mut lines = BufReader::new(file).lines();
+        let mut seq = 0u64;
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(event) = serde_json::from_str::<UiEventMsg>(&line) {
+                let frame = encode_line(&ServerMsg::Event { seq, event });
+                if ws
+                    .send(Message::Text(frame.trim_end().to_string().into()))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            seq += 1;
+        }
+    }
+    let reason = format!("session {}", status_word(&status));
+    let _ = ws
+        .send(Message::Text(
+            encode_line(&ServerMsg::Ended { reason })
+                .trim_end()
+                .to_string()
+                .into(),
+        ))
+        .await;
+    let _ = ws.close().await;
+}
+
+fn status_word(s: &SessionStatus) -> &'static str {
+    match s {
+        SessionStatus::Completed => "completed",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Stale => "stale",
+        _ => "ended",
+    }
 }
 
 /// Relay between a browser WebSocket and a session's worker unix socket: every
