@@ -643,6 +643,7 @@ version = "0.1.0"
 dependencies = [
  "async-openai",
  "async-trait",
+ "cowboy-proto",
  "directories",
  "futures",
  "insta",
@@ -680,6 +681,14 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cowboy-proto"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

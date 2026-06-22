@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cowboy-cli",
     "crates/cowboy-core",
+    "crates/cowboy-proto",
     "crates/cowboy-tui",
     "crates/cowboy-gateway",
 ]
@@ -18,6 +19,7 @@ repository = "https://github.com/koshea/cowboy"
 [workspace.dependencies]
 # internal
 cowboy-core = { path = "crates/cowboy-core" }
+cowboy-proto = { path = "crates/cowboy-proto" }
 cowboy-tui = { path = "crates/cowboy-tui" }
 
 # cli / runtime
