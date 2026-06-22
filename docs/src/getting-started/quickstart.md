@@ -3,7 +3,7 @@
 ```sh
 cd your-project
 cowboy init                 # writes .cowboy/{security,agent,models}.yaml
-cowboy doctor               # check Docker, Linux, nft, model, Compose
+cowboy doctor               # check Docker, Linux, model, network gateway, Compose
 cowboy "run the tests and fix one simple failure"
 ```
 

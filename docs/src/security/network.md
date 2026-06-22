@@ -34,7 +34,7 @@ run rather than leave the agent un-sandboxed.
   agent's TCP to the in-process proxy and **all** of its DNS (`:53`) to the
   resolver — the DNS redirect runs ahead of Docker's own embedded resolver
   (`127.0.0.11`), so queries can't slip around the gateway. A `filter output` chain
-  then **drops by default**, so the residue REDIRECT can't carry (non-DNS UDP,
+  then **drops by default**, so the residue the REDIRECT can't carry (non-DNS UDP,
   ICMP) can't leak. The gateway's own root-uid egress is exempt so it can reach
   upstream and the host control channel; the agent is kept non-root so it never
   inherits that exemption. Approved Compose subnets bypass the proxy.

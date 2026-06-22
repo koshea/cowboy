@@ -107,6 +107,24 @@ with `cowboy sessions` and `cowboy attach <id>`. Everything is journaled to
 `.cowboy/sessions/<id>/`, so even a crashed session can be replayed; `cowboy
 session cleanup` reaps stale records.
 
+## Drive a session from your phone (web UI)
+
+Because sessions live in the daemon and accept multiple clients at once, you can
+attach a browser to the same session you're driving in the TUI — handy from a
+phone over [Tailscale](https://tailscale.com).
+
+```bash
+cowboy web on                        # enable; cowboyd serves http://127.0.0.1:8787 (tokened URL)
+cowboy web on --bind 100.x.y.z:8787  # bind your Tailscale IP to reach it remotely (prints a QR)
+cowboy web status                    # is it serving? print the URL / QR
+cowboy web off                       # stop serving
+```
+
+It's a **setting**, not a process you babysit — `cowboyd` re-serves it on every
+start. Loopback by default; a Tailscale bind is allowed (any other non-loopback
+needs `--lan`, since the token would travel in cleartext). See
+[The web UI](using/web.md) for the full picture.
+
 ## Review a finished session
 
 ```bash

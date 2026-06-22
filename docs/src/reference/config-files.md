@@ -9,6 +9,10 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 |------|---------|
 | `~/.config/cowboy/providers.yaml` | Provider endpoints + API keys (`0600`). The agent can't reach this. |
 | `~/.config/cowboy/models.yaml` | User-level model definitions + default. |
+| `~/.config/cowboy/crew.yaml` | [Crew](../using/crew.md) roster — delegated-work routing by category/effort. |
+| `~/.config/cowboy/crew-history.jsonl` | Recorded delegation outcomes (append-only; powers `cowboy crew usage`). |
+| `~/.config/cowboy/mcp.yaml` | [MCP](../how-to.md) server definitions (host-owned; the agent can call but not edit). |
+| `~/.config/cowboy/web.yaml` | [Web UI](../using/web.md) setting + bearer token (`0600`). |
 | `~/.config/cowboy/skills/` | User-level [skills](../using/skills-and-subagents.md). |
 
 ## Per-project (`.cowboy/`)
@@ -18,6 +22,7 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `.cowboy/security.yaml` | **masked** | Container, mounts, networks, policy, secrets (host-owned). |
 | `.cowboy/agent.yaml` | yes | Non-security agent behavior, processes, command aliases. |
 | `.cowboy/models.yaml` | **masked** | Project model definitions (no credentials). |
+| `.mcp.json` | — | Project-declared [MCP](../how-to.md) servers (trust-gated; the format other MCP clients use). |
 | `.cowboy/approvals.json` | — | Persisted project/global network approvals. |
 | `.cowboy/skills/` | yes | Project skills. |
 | `.cowboy/sessions/<id>/` | — | Per-session logs (gitignored). |

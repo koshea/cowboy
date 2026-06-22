@@ -27,10 +27,24 @@ network_policy:
   default_external: ask          # allow | deny | ask
   allow: { domains: [github.com], cidrs: [], ports: [80, 443] }
   deny:  { domains: [], cidrs: ["169.254.169.254/32"] }
+  dns:   { enforce: true }       # strict allowlist + tunnel detection — see Network gateway
 secrets:
   env:
     - { name: GITHUB_TOKEN, source_env: COWBOY_GITHUB_TOKEN, required: false }
+  files:                         # grant host credentials so CLIs work in the sandbox
+    - { source: ~/.config/gh, target: /tmp/.config/gh, read_only: true }
 ```
+
+**Network policy / DNS.** The full allow/deny/ask model — and the DNS sub-policy
+(`network_policy.dns`: strict allowlist gating, tunnel detection, allowed record
+types) — is documented in [Network gateway](../security/network.md).
+
+**Granting credentials.** `secrets.env` injects an env var (from a host env var or
+a `source_command` like `gh auth token`); `secrets.files` mounts a host credential
+dir/file **read-only** so a CLI (`gh`, `gcloud`, `kubectl`, …) works inside the
+sandbox (container `HOME` is `/tmp`). The credential *value* never lands in config.
+`cowboy secrets add <preset>` prints ready-to-paste grants — see the
+[how-to](../how-to.md).
 
 **Resource limits.** `cpus`/`memory` are cgroup limits (a number/size, or `auto` to
 size from the host, or omit for unlimited). `cpus` also **bounds build
@@ -98,7 +112,7 @@ providers:
 
 A model names a provider plus the model id and sampling params. **Never contains
 credentials** (a stray `api_key`/`base_url` is a hard parse error). User and
-project lists merge by name (project wins); the default is `project.default` ??
+project lists merge by name (project wins); the default is `project.default`, falling back to
 `user.default`.
 
 ```yaml

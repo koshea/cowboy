@@ -22,8 +22,10 @@ docs (or the code).
   model. See [Network gateway](security/network.md).
 - **A conversational TUI** that streams the agent's work, with live approval
   prompts for network access.
+- **A web UI** to drive sessions from a browser — keep coding from your phone over
+  Tailscale, alongside or instead of the terminal. See [The web UI](using/web.md).
 - **Sessions & a daemon** (`cowboyd`) that supervise worker processes, track
-  worktree leases, and let you attach/detach/replay.
+  worktree leases, and let you attach/detach/replay — from the TUI or the browser.
 - **A configurable crew** — your selected model (the foreman) delegates work by *kind* (category
   + effort) and Cowboy routes each sub-task to the right model from your roster,
   running independent work in parallel. See [The crew](using/crew.md).

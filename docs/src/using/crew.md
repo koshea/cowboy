@@ -141,3 +141,9 @@ commands). The foreman is told to **resume from that checkpoint** — re-delegat
 with the prior work as `context` — rather than restarting the task from scratch.
 Subagents are also steered to stream large outputs to a file and publish them by
 path, so a single oversized tool call can't lose a turn's work to truncation.
+
+A subagent that fails outright — rather than ending with partial work — reports
+*why* instead of a vague empty result: the foreman gets a `subagent error:` with
+the cause (e.g. the host ran out of memory running too many at once, or the
+[gateway](../security/network.md) returned a rate-limit/quota error), so the right
+lever (lower `delegation.max_parallel`, or a gateway limit) is obvious.
