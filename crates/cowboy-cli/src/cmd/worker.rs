@@ -388,7 +388,60 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         emitter.emit(UiEventMsg::UserMessage(task.clone()));
         queue.push_back(task);
     }
+    // Run startup setup eagerly (bring the container up + `mise install` + the
+    // repo's `setup` hook) as soon as the session comes up, before any turn —
+    // instead of lazily on the first message. Kept interruptible (its own cancel
+    // token + a bounded wait) so a slow/hung setup never makes the session
+    // unendable: End/Detach/orphan abort it and end/detach cleanly; an Interrupt
+    // abandons it and returns to idle; a Message typed during setup is queued.
+    let mut setup_pending = true;
     'serve: loop {
+        if std::mem::take(&mut setup_pending) {
+            let tc = CancellationToken::new();
+            agent.set_cancel(tc.clone());
+            let setup = agent.run_session_setup();
+            tokio::pin!(setup);
+            loop {
+                tokio::select! {
+                    _ = &mut setup => break,
+                    _ = orphan.cancelled() => {
+                        tc.cancel();
+                        let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                        break 'serve;
+                    }
+                    ctl = cmd_rx.recv() => match ctl {
+                        None
+                        | Some(ClientMsg::End)
+                        | Some(ClientMsg::Interrupt { kind: InterruptKind::End }) => {
+                            tc.cancel();
+                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                            break 'serve;
+                        }
+                        Some(ClientMsg::Accept { note }) => {
+                            tc.cancel();
+                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                            sign_off(&id, note, &emitter).await;
+                            break 'serve;
+                        }
+                        // Abandon setup and drop to idle (don't end the session).
+                        Some(ClientMsg::Interrupt { .. }) => {
+                            tc.cancel();
+                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                            emitter.emit(UiEventMsg::Notice("setup interrupted".into()));
+                            break;
+                        }
+                        // A message typed during setup runs after it finishes.
+                        Some(ClientMsg::Message(m)) => {
+                            emitter.emit(UiEventMsg::UserMessage(m.clone()));
+                            queue.push_back(m);
+                        }
+                        // Detach leaves the session running; setup keeps going.
+                        _ => {}
+                    }
+                }
+            }
+            continue; // setup done/aborted → pop any queued message, else idle
+        }
         let next = match queue.pop_front() {
             Some(m) => m,
             None => {

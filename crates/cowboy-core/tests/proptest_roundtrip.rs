@@ -47,6 +47,7 @@ fn arb_agent_config() -> impl Strategy<Value = AgentConfig> {
                     max_command_output_bytes,
                     token_budget: 0,
                     cost_budget_usd: 0.0,
+                    setup: Vec::new(),
                 },
                 session: SessionConfig { scratchpad },
                 processes,

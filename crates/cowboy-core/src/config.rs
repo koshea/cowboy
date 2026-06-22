@@ -373,6 +373,13 @@ pub struct AgentBehavior {
     /// (0 = no limit; requires the model's pricing to be known). Warns at 80%.
     #[serde(default)]
     pub cost_budget_usd: f64,
+    /// Repo setup commands, run in the container **once per worktree** (after
+    /// `mise install`) when a session first comes up — e.g. `["mise run sync"]` to
+    /// install all deps. Streamed to the UI; gated by a per-worktree marker so a
+    /// second session in the same worktree skips them (delete
+    /// `.cowboy/sessions/.worktree-setup` to force a re-run).
+    #[serde(default)]
+    pub setup: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -701,6 +708,7 @@ impl Default for AgentBehavior {
             max_command_output_bytes: default_max_output(),
             token_budget: 0,
             cost_budget_usd: 0.0,
+            setup: Vec::new(),
         }
     }
 }
@@ -1356,6 +1364,12 @@ agent:
   # per-token pricing (see `cowboy models` / model-defaults).
   # token_budget: 0
   # cost_budget_usd: 0.0
+  # Repo setup commands, run in the container once per worktree (after
+  # `mise install`) when a session first comes up — e.g. to install all deps.
+  # Streamed to the UI; a per-worktree marker skips them next time (delete
+  # .cowboy/sessions/.worktree-setup to force a re-run).
+  # setup:
+  #   - mise run sync
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md

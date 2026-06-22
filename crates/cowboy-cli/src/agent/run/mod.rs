@@ -195,6 +195,15 @@ struct SubagentPlan {
     routed: Option<(String, String, String, bool)>,
 }
 
+/// A stable hash of the configured `setup` commands, written to the per-worktree
+/// marker so changing the commands re-runs them (but unchanged ones are skipped).
+fn setup_hash(cmds: &[String]) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cmds.hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// Execute one planned subagent: a nested one-shot `cowboy` run sharing this
 /// session's container. No parent borrow, so many can run concurrently.
 async fn exec_subagent(plan: SubagentPlan) -> String {
@@ -706,6 +715,13 @@ impl<'a> AgentLoop<'a> {
         self.planning = on;
     }
 
+    /// Set the cancellation token used by in-container commands. The worker uses
+    /// this so the eager startup setup (`run_session_setup`) is interruptible
+    /// before any turn token exists. `run_turn` sets it per turn.
+    pub fn set_cancel(&mut self, cancel: CancellationToken) {
+        self.cancel = cancel;
+    }
+
     /// Run one conversational turn for `task`, keeping the conversation (and the
     /// session logger) alive for subsequent turns. `turn_cancel` interrupts just
     /// this turn. Does NOT finalize the session.
@@ -723,36 +739,90 @@ impl<'a> AgentLoop<'a> {
         outcome
     }
 
-    /// One-time per-session setup, run before the first turn while the UI is
-    /// live. When the workspace uses mise, run a *visible* `mise install` (it
-    /// streams to the transcript with the live indicator) so installing the
-    /// project toolchain doesn't look like a hung first request. Best-effort:
-    /// a failure surfaces its exit code but doesn't block the session.
-    async fn run_session_setup(&mut self) {
+    /// One-time per-session setup, run **eagerly when the session comes up** (not
+    /// deferred to the first turn) while the UI is live, so the container warms up
+    /// immediately. Two steps, both streamed to the transcript with the live
+    /// indicator: a *visible* `mise install` (when the workspace uses mise) every
+    /// container-up, then the repo's configured `setup` commands run **once per
+    /// worktree** (gated by a marker). Best-effort: failures surface but don't
+    /// block the session.
+    pub async fn run_session_setup(&mut self) {
         if self.setup_done {
             return;
         }
         self.setup_done = true;
         // Subagents share the parent's container/toolchain — only the top-level
         // session does setup.
-        if self.subagent_depth > 0 || !self.runtime.has_mise_config() {
+        if self.subagent_depth > 0 {
             return;
         }
-        self.ui
-            .notice("setting up project toolchain (mise install)…");
+
+        // Toolchain: every container-up (cheap when the mise store is warm).
+        if self.runtime.has_mise_config() {
+            self.run_setup_command(
+                "setting up project toolchain (mise install)…",
+                "mise install",
+            )
+            .await;
+        }
+
+        // Repo setup hook: configured commands, run once per worktree. The marker
+        // records a hash of the commands, so changing `setup` re-runs them.
+        let cmds = self.behavior.setup.clone();
+        if cmds.is_empty() {
+            return;
+        }
+        let marker = self
+            .runtime
+            .root()
+            .join(".cowboy")
+            .join("sessions")
+            .join(".worktree-setup");
+        let want = setup_hash(&cmds);
+        if std::fs::read_to_string(&marker).is_ok_and(|s| s.trim() == want) {
+            return; // this worktree is already set up for these commands
+        }
+        let mut all_ok = true;
+        for cmd in &cmds {
+            if self
+                .run_setup_command(&format!("running project setup: {cmd}"), cmd)
+                .await
+                != 0
+            {
+                all_ok = false;
+                break; // a later command likely depends on the failed one
+            }
+        }
+        if all_ok {
+            if let Some(dir) = marker.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(&marker, want);
+        } else {
+            self.ui
+                .notice("project setup incomplete — it'll retry on the next session");
+        }
+    }
+
+    /// Run one setup command in the container, streamed with the live indicator.
+    /// Returns its exit code (`-1` if it couldn't run); clears the indicator
+    /// either way (so a command that never ran doesn't leave the status bar stuck).
+    async fn run_setup_command(&mut self, notice: &str, command: &str) -> i32 {
+        self.ui.notice(notice);
         let args = ShellArgs {
-            command: "mise install".to_string(),
+            command: command.to_string(),
             cwd: None,
         };
-        self.ui.command_start(&args.command);
+        self.ui.command_start(command);
         match self.run_shell_streaming(&args).await {
-            Ok((result, _)) => self.ui.command_end(result.exit_code, ""),
-            // The command never ran (e.g. the gateway/compose network wasn't up).
-            // Still emit `command_end` so the live "running" indicator clears —
-            // otherwise the status bar shows `mise install` running forever.
+            Ok((result, _)) => {
+                self.ui.command_end(result.exit_code, "");
+                result.exit_code
+            }
             Err(e) => {
                 self.ui.command_end(-1, "");
-                self.ui.notice(&format!("mise install did not run: {e}"));
+                self.ui.notice(&format!("`{command}` did not run: {e}"));
+                -1
             }
         }
     }
@@ -1802,6 +1872,102 @@ mod tests {
         assert_eq!(final_msg.as_deref(), Some("done; tests pass"));
         assert_eq!(ui.commands, vec!["ls"]);
         assert_eq!(ui.finals, vec!["done; tests pass"]);
+    }
+
+    #[test]
+    fn setup_hash_changes_with_commands() {
+        assert_eq!(setup_hash(&["a".into()]), setup_hash(&["a".into()]));
+        assert_ne!(setup_hash(&["a".into()]), setup_hash(&["b".into()]));
+        assert_ne!(
+            setup_hash(&["a".into()]),
+            setup_hash(&["a".into(), "b".into()])
+        );
+    }
+
+    /// A configured `setup` command runs on the first session in a worktree (and
+    /// writes the marker); a second session over the same worktree skips it.
+    #[tokio::test]
+    async fn setup_commands_run_once_per_worktree() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let build = |root: &std::path::Path| {
+            let mut security = SecurityConfig {
+                container: cowboy_core::config::ContainerConfig {
+                    image: "img".into(),
+                    mounts: vec![Mount {
+                        source: ".".into(),
+                        target: "/workspace".into(),
+                        mode: "rw".into(),
+                    }],
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            security.networks.isolated.enabled = false;
+            let mut docker = MockDockerCli::new();
+            docker
+                .expect_container_state()
+                .returning(|_| Ok(ContainerState::Running));
+            docker
+                .expect_container_label()
+                .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
+            docker
+                .expect_exec_stream()
+                .returning(|_, _, _, _, _, _, chunks| {
+                    let _ = chunks.send("ok\n".into());
+                    Ok((ExecResult { exit_code: 0 }, "ok\n".into()))
+                });
+            let behavior = cowboy_core::config::AgentBehavior {
+                setup: vec!["pnpm install".into()],
+                ..Default::default()
+            };
+            let runtime =
+                AgentRuntime::new(Box::new(docker), root.to_path_buf(), security).unwrap();
+            (runtime, behavior)
+        };
+
+        let marker = root
+            .join(".cowboy")
+            .join("sessions")
+            .join(".worktree-setup");
+
+        // First session: runs the setup command + writes the marker.
+        let (rt1, b1) = build(&root);
+        let mut ui1 = RecordingUi::default();
+        let mut a1 = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            rt1,
+            b1,
+            200_000,
+            CancellationToken::new(),
+            &mut ui1,
+        );
+        a1.run_session_setup().await;
+        assert!(marker.exists(), "marker written after successful setup");
+        assert!(
+            ui1.commands.iter().any(|c| c == "pnpm install"),
+            "setup command ran on the first session, got {:?}",
+            ui1.commands
+        );
+
+        // Second session over the same worktree: marker present → skip.
+        let (rt2, b2) = build(&root);
+        let mut ui2 = RecordingUi::default();
+        let mut a2 = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            rt2,
+            b2,
+            200_000,
+            CancellationToken::new(),
+            &mut ui2,
+        );
+        a2.run_session_setup().await;
+        assert!(
+            !ui2.commands.iter().any(|c| c == "pnpm install"),
+            "setup must be skipped when the worktree marker is present, got {:?}",
+            ui2.commands
+        );
     }
 
     #[tokio::test]

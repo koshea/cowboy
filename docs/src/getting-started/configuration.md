@@ -90,11 +90,22 @@ agent:
   idle_container_timeout_seconds: 1800   # stop an idle detached session's container (0 = off)
   max_iterations: 100
   max_command_output_bytes: 60000
+  setup:                                 # repo setup, run once per worktree (after mise install)
+    - mise run sync
 processes:
   web: { command: "npm run dev", cwd: /workspace, auto_start: false }
 commands:
   test: cargo test
 ```
+
+**Startup setup.** When a session comes up, cowboy eagerly (before the first
+message) brings the container up and — if the repo uses [mise](https://mise.jdx.dev)
+— runs a visible `mise install`, then any `agent.setup` commands. `setup` runs
+**once per worktree** (a marker at `.cowboy/sessions/.worktree-setup`, gitignored,
+keyed to the commands — change them and it re-runs; delete it to force one). It's
+streamed to the UI and stays interruptible, so a slow setup never blocks ending the
+session. Use it for the per-worktree bootstrap your repo needs (install all deps,
+codegen, …) — e.g. `mise run sync`.
 
 ## Providers & models
 

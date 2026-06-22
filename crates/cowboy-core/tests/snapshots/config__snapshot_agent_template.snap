@@ -21,6 +21,12 @@ agent:
   # per-token pricing (see `cowboy models` / model-defaults).
   # token_budget: 0
   # cost_budget_usd: 0.0
+  # Repo setup commands, run in the container once per worktree (after
+  # `mise install`) when a session first comes up — e.g. to install all deps.
+  # Streamed to the UI; a per-worktree marker skips them next time (delete
+  # .cowboy/sessions/.worktree-setup to force a re-run).
+  # setup:
+  #   - mise run sync
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md
