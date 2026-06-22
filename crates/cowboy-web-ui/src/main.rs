@@ -14,7 +14,7 @@ use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
 use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
-use web_sys::{HtmlTextAreaElement, KeyboardEvent};
+use web_sys::{Event, HtmlTextAreaElement, KeyboardEvent};
 use yew::prelude::*;
 
 use model::{Block, Model};
@@ -175,6 +175,34 @@ fn session(props: &SessionProps) -> Html {
         (tx, Rc::new(RefCell::new(Some(rx))))
     });
     let input_ref = use_node_ref();
+    let scroll_ref = use_node_ref();
+    // "Stick to bottom" unless the user scrolled up to read history.
+    let stick = use_mut_ref(|| true);
+
+    // After every render, follow new content to the bottom while sticking.
+    {
+        let scroll_ref = scroll_ref.clone();
+        let stick = stick.clone();
+        use_effect(move || {
+            if *stick.borrow() {
+                if let Some(el) = scroll_ref.cast::<web_sys::Element>() {
+                    el.set_scroll_top(el.scroll_height());
+                }
+            }
+            || ()
+        });
+    }
+    // Track whether the user is near the bottom (re-engages auto-scroll).
+    let on_scroll = {
+        let scroll_ref = scroll_ref.clone();
+        let stick = stick.clone();
+        Callback::from(move |_: Event| {
+            if let Some(el) = scroll_ref.cast::<web_sys::Element>() {
+                let from_bottom = el.scroll_height() - el.scroll_top() - el.client_height();
+                *stick.borrow_mut() = from_bottom <= 48;
+            }
+        })
+    };
 
     // One task per Session: connect, relay both ways, and reconnect on a
     // transient drop (resuming the journal from the last seq seen). It ends when
@@ -313,13 +341,16 @@ fn session(props: &SessionProps) -> Html {
                 </ul>
             }
 
-            <main class="transcript">
+            <main class="transcript" ref={scroll_ref} onscroll={on_scroll}>
                 { for model.blocks.iter().map(render_block) }
                 if !model.reasoning.is_empty() {
                     <pre class="reasoning">{ model.reasoning.clone() }</pre>
                 }
                 if !model.streaming.is_empty() {
-                    <pre class="agent streaming">{ model.streaming.clone() }</pre>
+                    // Render the in-progress answer as markdown live (incomplete
+                    // markdown renders gracefully), so it doesn't snap from raw to
+                    // formatted when the turn finishes.
+                    <div class="agent streaming">{ markdown(&model.streaming) }</div>
                 }
                 if model.running {
                     <div class="spinner muted">{ "…working" }</div>
