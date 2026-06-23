@@ -11,6 +11,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::net::docker::DockerCli as _;
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
     AttachTarget, BusMessage, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode,
@@ -143,6 +144,30 @@ async fn reap_containers(containers: Vec<(PathBuf, String)>) {
         tracing::info!(container = %name, "reaping crashed session's container");
         crate::cmd::down::teardown_project(&docker, &root, &name).await;
     }
+}
+
+/// Reap the listed `cowboy-net-*` networks that no live session owns. The
+/// clean-shutdown and crash-reap paths both tear down a session's network, but a
+/// `kill -9`'d worker (or a Docker create that lost a race and was abandoned) can
+/// leave one behind; the next session then hits a subnet/name clash.
+///
+/// `names` is a snapshot taken *before* `keep` (the deterministic network names
+/// of every session in the registry). Because the daemon records a session
+/// *before* its worker creates the network, any name in this earlier snapshot
+/// that is absent from `keep` has no owning session and is a genuine leftover —
+/// a session created after the snapshot can't appear in it. Best-effort; an
+/// in-use network refuses removal harmlessly.
+async fn reap_orphan_networks(names: Vec<String>, keep: std::collections::HashSet<String>) {
+    let docker = crate::net::docker::CliDocker::new();
+    for n in orphan_networks(names, &keep) {
+        tracing::info!(network = %n, "reaping orphaned cowboy network (no owning session)");
+        let _ = docker.remove_network(&n).await;
+    }
+}
+
+/// The listed networks with no owning session — the ones to remove.
+fn orphan_networks(names: Vec<String>, keep: &std::collections::HashSet<String>) -> Vec<String> {
+    names.into_iter().filter(|n| !keep.contains(n)).collect()
 }
 
 impl Daemon {
@@ -333,6 +358,21 @@ impl Daemon {
             self.save();
         }
         (reap, released)
+    }
+
+    /// Deterministic agent-network names of every session currently in the
+    /// registry — the set the orphan-network sweep must keep. (A session is
+    /// recorded before its worker creates the network, so this never omits a
+    /// network whose session still exists.)
+    fn owned_network_names(&self) -> std::collections::HashSet<String> {
+        self.state
+            .sessions
+            .values()
+            .map(|s| {
+                let hash = crate::net::runtime::project_hash(&s.root);
+                crate::net::gateway::network_names(hash).0
+            })
+            .collect()
     }
 
     /// Reap already-marked `Stale` sessions and release their leases, then drop
@@ -589,6 +629,17 @@ pub async fn serve() -> Result<()> {
             };
             // Tear down the crashed sessions' containers (Docker; lock released).
             reap_containers(containers).await;
+
+            // Reap networks left by `kill -9`'d workers (no clean teardown ran).
+            // List BEFORE snapshotting owners so a session created mid-sweep — its
+            // network can't be in this list yet — is never mistaken for an orphan.
+            if let Ok(net_names) = crate::net::docker::CliDocker::new()
+                .cowboy_network_names()
+                .await
+            {
+                let keep = sweeper.lock().await.owned_network_names();
+                reap_orphan_networks(net_names, keep).await;
+            }
         }
     });
 
@@ -1499,6 +1550,33 @@ mod tests {
                 workstream_id: None,
             },
         );
+    }
+
+    #[test]
+    fn owned_network_names_cover_live_sessions_and_orphans_are_reaped() {
+        let mut d = daemon();
+        put_session(&mut d, "s1", SessionStatus::Running);
+        d.state.sessions.get_mut("s1").unwrap().root = PathBuf::from("/w/alpha");
+        put_session(&mut d, "s2", SessionStatus::Stale);
+        d.state.sessions.get_mut("s2").unwrap().root = PathBuf::from("/w/beta");
+
+        let keep = d.owned_network_names();
+        let net_alpha = crate::net::gateway::network_names(crate::net::runtime::project_hash(
+            Path::new("/w/alpha"),
+        ))
+        .0;
+        let net_beta = crate::net::gateway::network_names(crate::net::runtime::project_hash(
+            Path::new("/w/beta"),
+        ))
+        .0;
+        assert!(keep.contains(&net_alpha) && keep.contains(&net_beta));
+
+        // A leftover network from a `kill -9`'d session no record owns is reaped;
+        // both live sessions' networks (even the stale-but-still-recorded one,
+        // whose container teardown runs separately) are kept.
+        let leftover = "cowboy-net-deadbeef".to_string();
+        let listed = vec![net_alpha.clone(), net_beta.clone(), leftover.clone()];
+        assert_eq!(orphan_networks(listed, &keep), vec![leftover]);
     }
 
     #[test]

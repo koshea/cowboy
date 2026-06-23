@@ -195,6 +195,10 @@ pub trait DockerCli: Send + Sync {
     async fn remove_network(&self, name: &str) -> Result<()>;
     /// IDs of cowboy-labelled containers and networks (`(containers, networks)`).
     async fn list_labeled(&self) -> Result<(Vec<String>, Vec<String>)>;
+    /// Names of all cowboy-labelled networks. Used by the daemon's orphan sweep to
+    /// reap `cowboy-net-*` networks no live session owns (matched by deterministic
+    /// name), which a `kill -9`'d worker's skipped teardown leaves behind.
+    async fn cowboy_network_names(&self) -> Result<Vec<String>>;
     /// Execute `argv` in the container, inheriting stdio, returning the exit code.
     async fn exec(
         &self,
@@ -652,6 +656,21 @@ impl DockerCli for CliDocker {
             .filter_map(|n| n.id)
             .collect();
         Ok((containers, networks))
+    }
+
+    async fn cowboy_network_names(&self) -> Result<Vec<String>> {
+        let docker = self.client().await?;
+        let filters: HashMap<String, Vec<String>> =
+            HashMap::from([("label".to_string(), vec!["cowboy=1".to_string()])]);
+        Ok(docker
+            .list_networks(Some(
+                ListNetworksOptionsBuilder::new().filters(&filters).build(),
+            ))
+            .await
+            .context("docker network ls")?
+            .into_iter()
+            .filter_map(|n| n.name)
+            .collect())
     }
 
     async fn start(&self, name: &str) -> Result<()> {
