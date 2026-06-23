@@ -192,7 +192,7 @@ impl GatewayNetwork {
     /// Called **before** the agent starts so it never runs un-sandboxed.
     pub async fn ensure_network(&self, docker: &dyn DockerCli) -> Result<()> {
         if !docker.network_exists(&self.agent_net).await? {
-            docker
+            if let Err(e) = docker
                 .create_network(&NetworkSpec {
                     // Egress-capable: the agent has a route out, but the sidecar's
                     // nft REDIRECT in the shared netns forces it through the proxy.
@@ -201,7 +201,22 @@ impl GatewayNetwork {
                     subnet: Some(self.subnet.clone()),
                     gateway: Some(self.bridge_gateway.clone()),
                 })
-                .await?;
+                .await
+            {
+                // Idempotent: a concurrent session (or a leftover network from a
+                // prior crashed run that the existence check raced) can create our
+                // network between the check and here — Docker then rejects the
+                // duplicate ("pool overlaps"). If our network is in fact present
+                // now, reuse it; only surface the error if it's genuinely absent
+                // (a real subnet conflict with a *different* network).
+                if !docker
+                    .network_exists(&self.agent_net)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Err(e);
+                }
+            }
         }
         super::runtime::ensure_image_available(
             docker,
@@ -271,5 +286,76 @@ impl GatewayNetwork {
             "SETUID".into(),
             "SETGID".into(),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::docker::MockDockerCli;
+    use mockall::Sequence;
+
+    fn test_network() -> GatewayNetwork {
+        GatewayNetwork::for_project(
+            0x1234,
+            &SecurityConfig::default(),
+            std::path::Path::new("/tmp/cowboy-gateway-test"),
+        )
+        .expect("for_project")
+    }
+
+    /// A racing/leftover network appears between the existence check and our create:
+    /// Docker rejects the duplicate, but a recheck finds our network present, so we
+    /// reuse it instead of failing the session.
+    #[tokio::test]
+    async fn ensure_network_reuses_a_racing_same_name_network() {
+        let net = test_network();
+        let mut docker = MockDockerCli::new();
+        let mut seq = Sequence::new();
+
+        // First check: absent, so we try to create.
+        docker
+            .expect_network_exists()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(false));
+        // Create loses the race ("pool overlaps").
+        docker
+            .expect_create_network()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| anyhow::bail!("Pool overlaps with other one on this address space"));
+        // Recheck: our network is in fact present now → reuse.
+        docker
+            .expect_network_exists()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_| Ok(true));
+        // Image already present → ensure_image_available short-circuits.
+        docker.expect_image_exists().returning(|_| Ok(true));
+
+        net.ensure_network(&docker)
+            .await
+            .expect("racing duplicate network should be reused, not fatal");
+    }
+
+    /// A genuine subnet conflict with a *different* network: create fails and our
+    /// network is still absent on recheck, so the error propagates.
+    #[tokio::test]
+    async fn ensure_network_propagates_a_real_subnet_conflict() {
+        let net = test_network();
+        let mut docker = MockDockerCli::new();
+
+        docker.expect_network_exists().returning(|_| Ok(false));
+        docker
+            .expect_create_network()
+            .times(1)
+            .returning(|_| anyhow::bail!("Pool overlaps with other one on this address space"));
+
+        let err = net
+            .ensure_network(&docker)
+            .await
+            .expect_err("a real conflict with a different network must be fatal");
+        assert!(err.to_string().contains("overlaps"), "got: {err}");
     }
 }
