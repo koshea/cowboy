@@ -596,6 +596,15 @@ pub enum RanchCommand {
         /// The overall goal to decompose into workstreams.
         goal: String,
     },
+    /// Draft a ranch from a decomposition spec file (YAML/JSON with `title`,
+    /// `goal`, and a `workstreams` list). Validates the dependency DAG and writes
+    /// the draft ranch.yaml. Used by `cowboy ranch plan`: the agent authors the
+    /// spec with the `write` tool, then runs this to validate and draft it.
+    Draft {
+        /// Path to the decomposition spec (YAML or JSON).
+        #[arg(value_name = "SPEC")]
+        spec: String,
+    },
     /// Show ranch status: all ranches, or one with its workstreams.
     Status {
         #[arg(value_name = "RANCH")]

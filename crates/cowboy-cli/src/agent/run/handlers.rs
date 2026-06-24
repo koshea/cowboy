@@ -8,59 +8,6 @@ use super::*;
 use cowboy_core::time::now_ms;
 
 impl AgentLoop<'_> {
-    /// Handle a `propose_ranch` tool call: turn the agent's decomposition into a
-    /// validated, draft `ranch.yaml` written host-side. Rejects an invalid graph
-    /// (cycle / unknown dependency / duplicate id) so the agent must fix and
-    /// retry — the user only ever sees a runnable plan.
-    pub(super) fn run_propose_ranch(&self, args: &ProposeRanchArgs) -> String {
-        use cowboy_core::ranch::{self, Ranch, RanchStatus, Workstream, WorkstreamStatus};
-        let root = self.root();
-        let id = ranch::fresh_id(root, &args.title);
-        let now = now_ms();
-        let workstreams: Vec<Workstream> = args
-            .workstreams
-            .iter()
-            .map(|w| Workstream {
-                id: w.id.clone(),
-                title: w.title.clone().unwrap_or_else(|| w.id.clone()),
-                goal: w.goal.clone(),
-                depends_on: w.depends_on.clone(),
-                status: WorkstreamStatus::Planned,
-                session_id: None,
-                branch: None,
-                worktree_path: None,
-                expected_artifacts: w.expected_artifacts.clone(),
-                acceptance: w.acceptance.clone(),
-            })
-            .collect();
-        let ranch = Ranch {
-            version: 1,
-            id: id.clone(),
-            title: args.title.clone(),
-            goal: args.goal.clone(),
-            status: RanchStatus::Planning,
-            workstreams,
-            auto_advance: true,
-            created_ms: now,
-            updated_ms: now,
-        };
-        if let Err(e) = ranch.validate() {
-            return format!(
-                "error: the proposed plan is invalid: {e}. Fix the workstream ids / depends_on \
-                 (no cycles, no unknown ids, no duplicates) and call propose_ranch again."
-            );
-        }
-        if let Err(e) = ranch::save(root, &ranch) {
-            return format!("error: could not write the ranch plan: {e}");
-        }
-        format!(
-            "✓ drafted ranch `{id}` with {} workstream(s). Review it with \
-             `cowboy ranch status {id}`, adjust with `cowboy ranch add {id} …`, then launch with \
-             `cowboy ranch start {id}`.",
-            ranch.workstreams.len()
-        )
-    }
-
     /// Handle a `memory` tool call host-side (the agent can't reach the home
     /// dir; the loop runs on the host, so it reads/writes it directly). Returns
     /// the observation text.

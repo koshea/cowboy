@@ -22,7 +22,6 @@ pub const TOOL_BLOCKED: &str = "blocked";
 pub const TOOL_UNBLOCK: &str = "unblock";
 pub const TOOL_DECISION: &str = "decision";
 pub const TOOL_PROPOSE_SCOPE_CHANGE: &str = "propose_scope_change";
-pub const TOOL_PROPOSE_RANCH: &str = "propose_ranch";
 /// Conditional: added only when ≥1 MCP server is enabled (see [`mcp_definition`]).
 pub const TOOL_MCP: &str = "mcp";
 
@@ -162,38 +161,6 @@ pub struct PlanArgs {
     pub steps: Vec<PlanStep>,
 }
 
-/// One workstream in a proposed Ranch Plan (see [`ProposeRanchArgs`]).
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct RanchWorkstreamArg {
-    /// Short, unique slug id (e.g. `schema`, `api`).
-    pub id: String,
-    /// What this workstream should accomplish.
-    pub goal: String,
-    /// Display title (defaults to the id).
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Ids of workstreams that must finish before this one starts (forms a DAG).
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    /// Artifacts this workstream is expected to publish (names, not paths).
-    #[serde(default)]
-    pub expected_artifacts: Vec<String>,
-    /// Human-readable acceptance criteria.
-    #[serde(default)]
-    pub acceptance: Vec<String>,
-}
-
-/// Arguments for the `propose_ranch` tool: a full multi-workstream decomposition.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct ProposeRanchArgs {
-    /// Title for the ranch plan.
-    pub title: String,
-    /// The overall goal the ranch achieves.
-    pub goal: String,
-    /// The workstreams, with `depends_on` wiring them into a dependency DAG.
-    pub workstreams: Vec<RanchWorkstreamArg>,
-}
-
 /// Arguments for the `handoff` tool — a structured end-of-session summary that
 /// the next worker (or a Ranch coordinator) can rely on.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -311,7 +278,17 @@ pub struct McpArgs {
 }
 
 fn schema_for<T: JsonSchema>() -> serde_json::Value {
-    serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| serde_json::json!({}))
+    // Inline subschemas rather than emitting `$defs` + `$ref`. Some models served
+    // through OpenAI-compatible gateways (observed: minimax-m3 on Fireworks) don't
+    // resolve `$ref`, so a nested array-of-objects param — e.g. `plan`'s `steps`
+    // (Vec<PlanStep>) — never reaches the model with its `{step, status}` shape and
+    // it emits empty placeholders (`{"steps": ["", "", ...]}`). Inlining hands every
+    // model the concrete shape directly. None of these arg types are recursive, so
+    // inlining can't blow up.
+    let settings =
+        schemars::generate::SchemaSettings::default().with(|s| s.inline_subschemas = true);
+    let schema = settings.into_generator().into_root_schema_for::<T>();
+    serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({}))
 }
 
 /// The `mcp` tool definition. Kept out of [`definitions`] and added to the surface
@@ -445,17 +422,6 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<ProposeScopeChangeArgs>(),
         },
         ToolDef {
-            name: TOOL_PROPOSE_RANCH.into(),
-            description: "Propose a multi-workstream Ranch Plan: decompose a large goal into \
-                          independent, parallelizable workstreams wired by `depends_on` into a \
-                          DAG, each with a goal, expected artifacts, and acceptance criteria. \
-                          Use ONLY when explicitly asked to plan/decompose a ranch — it writes a \
-                          draft ranch.yaml for the user to review and does NOT start any work or \
-                          edit code. Call it once with the full decomposition."
-                .into(),
-            parameters: schema_for::<ProposeRanchArgs>(),
-        },
-        ToolDef {
             name: TOOL_FINAL.into(),
             description: "Finish the task. Provide a summary of what changed, what was \
                           validated, and any remaining risks or follow-up work."
@@ -511,12 +477,33 @@ mod tests {
                 "blocked",
                 "unblock",
                 "propose_scope_change",
-                "propose_ranch",
                 "final",
                 "ask_user",
                 "subagent"
             ]
         );
+    }
+
+    #[test]
+    fn nested_arg_schemas_are_inlined_not_ref() {
+        // Models behind some OpenAI-compatible gateways (minimax-m3 on Fireworks)
+        // don't resolve `$ref`/`$defs`, so nested array-of-object params must be
+        // inlined or the model emits empty placeholders. `plan` (Vec<PlanStep>) is
+        // the only tool left with nested struct args — the heavier `propose_ranch`
+        // decomposition now goes through the `cowboy ranch draft` CLI instead.
+        let plan = definitions()
+            .into_iter()
+            .find(|d| d.name == "plan")
+            .expect("plan tool present")
+            .parameters
+            .to_string();
+        assert!(
+            !plan.contains("$ref") && !plan.contains("$defs"),
+            "plan schema must be inlined, got: {plan}"
+        );
+        // The inlined `plan` schema exposes the concrete step shape.
+        assert!(plan.contains("\"step\""), "plan step field inlined");
+        assert!(plan.contains("\"status\""), "plan status field inlined");
     }
 
     #[test]

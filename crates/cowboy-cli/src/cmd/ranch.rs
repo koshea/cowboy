@@ -49,6 +49,7 @@ pub async fn run(command: RanchCommand) -> Result<()> {
             expects,
         ),
         RanchCommand::Plan { goal } => plan(goal).await,
+        RanchCommand::Draft { spec } => draft(&root, &spec),
         RanchCommand::Status { id } => status(&root, id),
         RanchCommand::Start { id } => start(&root, &id).await,
         RanchCommand::Attach { id, workstream } => attach(&root, &id, &workstream).await,
@@ -481,17 +482,116 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
     Ok(())
 }
 
+/// A ranch decomposition spec, authored by the planning agent and read by
+/// `cowboy ranch draft`. A flat subset of [`Ranch`] — no status/session fields,
+/// which the runtime fills in. Deserialized from YAML or JSON (JSON is valid
+/// YAML, so `serde_yaml_ng` parses both).
+#[derive(Debug, serde::Deserialize)]
+struct RanchPlanSpec {
+    /// The ranch's title (also seeds its id).
+    title: String,
+    /// The overall goal the ranch achieves.
+    goal: String,
+    /// The workstreams, wired by `depends_on` into a dependency DAG.
+    #[serde(default)]
+    workstreams: Vec<WorkstreamSpec>,
+}
+
+/// One workstream within a [`RanchPlanSpec`].
+#[derive(Debug, serde::Deserialize)]
+struct WorkstreamSpec {
+    /// Short, unique slug id (e.g. `schema`, `api`).
+    id: String,
+    /// What this workstream should accomplish.
+    goal: String,
+    /// Display title (defaults to the id).
+    #[serde(default)]
+    title: Option<String>,
+    /// Ids of workstreams that must finish first (forms a DAG).
+    #[serde(default)]
+    depends_on: Vec<String>,
+    /// Artifacts this workstream is expected to publish (names, not paths).
+    #[serde(default)]
+    expected_artifacts: Vec<String>,
+    /// Human-readable acceptance criteria.
+    #[serde(default)]
+    acceptance: Vec<String>,
+}
+
+/// `cowboy ranch draft <spec>` — turn an agent-authored decomposition spec into a
+/// validated, draft `ranch.yaml`. Rejects an invalid graph (cycle / unknown
+/// dependency / duplicate id) so the user only ever sees a runnable plan. This is
+/// the host-side half of `cowboy ranch plan`: the planning agent writes the spec
+/// file, then runs this to validate and draft it.
+fn draft(root: &Path, spec_path: &str) -> Result<()> {
+    let text = std::fs::read_to_string(spec_path)
+        .with_context(|| format!("reading ranch spec `{spec_path}`"))?;
+    let spec: RanchPlanSpec = serde_yaml_ng::from_str(&text).with_context(|| {
+        format!("parsing ranch spec `{spec_path}` (expected YAML/JSON with `title`, `goal`, `workstreams`)")
+    })?;
+
+    let id = ranch::fresh_id(root, &spec.title);
+    let now = now_ms();
+    let workstreams: Vec<Workstream> = spec
+        .workstreams
+        .into_iter()
+        .map(|w| Workstream {
+            title: w.title.unwrap_or_else(|| w.id.clone()),
+            id: w.id,
+            goal: w.goal,
+            depends_on: w.depends_on,
+            status: WorkstreamStatus::Planned,
+            session_id: None,
+            branch: None,
+            worktree_path: None,
+            expected_artifacts: w.expected_artifacts,
+            acceptance: w.acceptance,
+        })
+        .collect();
+    let ranch = Ranch {
+        version: 1,
+        id: id.clone(),
+        title: spec.title,
+        goal: spec.goal,
+        status: RanchStatus::Planning,
+        workstreams,
+        auto_advance: true,
+        created_ms: now,
+        updated_ms: now,
+    };
+    // Reuse the graph validator — a cycle, unknown `depends_on`, or duplicate id
+    // is caught here, never written to a `ranch.yaml` the user might `start`.
+    ranch.validate().map_err(|e| {
+        anyhow::anyhow!(
+            "the proposed plan is invalid: {e}. Fix the workstream ids / depends_on \
+             (no cycles, unknown ids, or duplicates) in `{spec_path}` and re-run."
+        )
+    })?;
+    ranch::save(root, &ranch)?;
+    println!(
+        "✓ drafted ranch `{id}` with {} workstream(s). Review it with \
+         `cowboy ranch status {id}`, adjust with `cowboy ranch add {id} …`, then launch with \
+         `cowboy ranch start {id}`.",
+        ranch.workstreams.len()
+    );
+    Ok(())
+}
+
 /// `cowboy ranch plan "<goal>"` — let the agent decompose a goal into a ranch.
-/// Starts an interactive session seeded to research read-only and call the
-/// `propose_ranch` tool, which writes a draft ranch.yaml for the user to review.
+/// Starts an interactive session seeded to research read-only, author a
+/// decomposition spec file, and run `cowboy ranch draft` to write a draft
+/// ranch.yaml for the user to review.
 async fn plan(goal: String) -> Result<()> {
     let task = format!(
         "Plan a multi-workstream Ranch Plan for the goal below — DO NOT implement anything or \
-         edit files. Research the codebase READ-ONLY (read/grep/ls) to find the natural seams, \
+         edit code. Research the codebase READ-ONLY (read/grep/ls) to find the natural seams, \
          then decompose the goal into independent, parallelizable workstreams wired by \
-         dependencies (a DAG), and call the `propose_ranch` tool ONCE with the full decomposition \
-         (ids, goals, depends_on, expected artifacts, acceptance criteria). Keep workstreams \
-         coarse-grained. After it's drafted, summarize the plan and tell me to review it with \
+         dependencies (a DAG). Keep workstreams coarse-grained. Write the decomposition to \
+         `.cowboy/ranch-plan.yaml` with the `write` tool — a YAML doc with `title`, `goal`, and a \
+         `workstreams` list (each: `id`, `goal`, optional `title`, `depends_on`, \
+         `expected_artifacts`, `acceptance`) — then run `cowboy ranch draft .cowboy/ranch-plan.yaml` \
+         to validate and draft it. If it reports the graph is invalid, fix the spec and re-run. \
+         After it's drafted, summarize the plan and tell me to review it with \
          `cowboy ranch status`.\n\nGoal: {goal}"
     );
     let flags = crate::cli::StartFlags {
@@ -1417,6 +1517,53 @@ mod tests {
         // The bad adds didn't persist.
         let r = ranch::load(&dir, "r").unwrap();
         assert_eq!(r.workstreams.len(), 2, "only schema + api persisted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn draft_writes_a_valid_plan_and_rejects_a_bad_graph() {
+        let dir = std::env::temp_dir().join(format!("cowboy-ranch-draft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A valid decomposition spec drafts a ranch with the workstreams wired up.
+        let spec = dir.join("good.yaml");
+        std::fs::write(
+            &spec,
+            "title: Billing\ngoal: stripe + invoicing\nworkstreams:\n  \
+             - id: schema\n    goal: tables\n  \
+             - id: api\n    goal: build api\n    depends_on: [schema]\n",
+        )
+        .unwrap();
+        draft(&dir, spec.to_str().unwrap()).expect("valid spec drafts a ranch");
+        let drafted = ranch::list(&dir);
+        assert_eq!(drafted.len(), 1, "exactly one ranch drafted");
+        let r = &drafted[0];
+        assert_eq!(r.title, "Billing");
+        assert_eq!(r.workstreams.len(), 2);
+        assert_eq!(
+            r.workstream("api").unwrap().depends_on,
+            vec!["schema".to_string()]
+        );
+        assert_eq!(r.status, RanchStatus::Planning);
+
+        // A cyclic graph is rejected and nothing extra is written.
+        let bad = dir.join("cyclic.yaml");
+        std::fs::write(
+            &bad,
+            "title: X\ngoal: y\nworkstreams:\n  \
+             - id: a\n    goal: a\n    depends_on: [b]\n  \
+             - id: b\n    goal: b\n    depends_on: [a]\n",
+        )
+        .unwrap();
+        let err = draft(&dir, bad.to_str().unwrap()).expect_err("a cycle must be rejected");
+        assert!(err.to_string().contains("invalid"), "{err}");
+        assert_eq!(
+            ranch::list(&dir).len(),
+            1,
+            "a rejected plan must not be saved"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

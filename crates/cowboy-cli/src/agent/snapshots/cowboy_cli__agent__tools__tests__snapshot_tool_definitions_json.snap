@@ -1,5 +1,6 @@
 ---
 source: crates/cowboy-cli/src/agent/tools.rs
+assertion_line: 554
 expression: defs
 ---
 [
@@ -190,36 +191,31 @@ expression: defs
     "description": "Maintain a short, visible checklist for a multi-step task. Pass the full ordered list of `steps` (each with a `status` of \"pending\", \"in_progress\", or \"done\"); the list REPLACES the previous plan. Create a plan before starting non-trivial work, mark exactly one step \"in_progress\" at a time, and update statuses as you go. Skip it for trivial one-step tasks.",
     "name": "plan",
     "parameters": {
-      "$defs": {
-        "PlanStep": {
-          "description": "One step in the agent's working plan.",
-          "properties": {
-            "status": {
-              "default": null,
-              "description": "Status: \"pending\" (default), \"in_progress\", or \"done\".",
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "step": {
-              "description": "A short description of the step.",
-              "type": "string"
-            }
-          },
-          "required": [
-            "step"
-          ],
-          "type": "object"
-        }
-      },
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `plan` tool. The whole list is replaced on each call.",
       "properties": {
         "steps": {
           "description": "The full, ordered list of steps; replaces the current plan.",
           "items": {
-            "$ref": "#/$defs/PlanStep"
+            "description": "One step in the agent's working plan.",
+            "properties": {
+              "status": {
+                "default": null,
+                "description": "Status: \"pending\" (default), \"in_progress\", or \"done\".",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "step": {
+                "description": "A short description of the step.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "step"
+            ],
+            "type": "object"
           },
           "type": "array"
         }
@@ -502,90 +498,6 @@ expression: defs
         "change"
       ],
       "title": "ProposeScopeChangeArgs",
-      "type": "object"
-    }
-  },
-  {
-    "description": "Propose a multi-workstream Ranch Plan: decompose a large goal into independent, parallelizable workstreams wired by `depends_on` into a DAG, each with a goal, expected artifacts, and acceptance criteria. Use ONLY when explicitly asked to plan/decompose a ranch — it writes a draft ranch.yaml for the user to review and does NOT start any work or edit code. Call it once with the full decomposition.",
-    "name": "propose_ranch",
-    "parameters": {
-      "$defs": {
-        "RanchWorkstreamArg": {
-          "description": "One workstream in a proposed Ranch Plan (see [`ProposeRanchArgs`]).",
-          "properties": {
-            "acceptance": {
-              "default": [],
-              "description": "Human-readable acceptance criteria.",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "depends_on": {
-              "default": [],
-              "description": "Ids of workstreams that must finish before this one starts (forms a DAG).",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "expected_artifacts": {
-              "default": [],
-              "description": "Artifacts this workstream is expected to publish (names, not paths).",
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "goal": {
-              "description": "What this workstream should accomplish.",
-              "type": "string"
-            },
-            "id": {
-              "description": "Short, unique slug id (e.g. `schema`, `api`).",
-              "type": "string"
-            },
-            "title": {
-              "default": null,
-              "description": "Display title (defaults to the id).",
-              "type": [
-                "string",
-                "null"
-              ]
-            }
-          },
-          "required": [
-            "id",
-            "goal"
-          ],
-          "type": "object"
-        }
-      },
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "description": "Arguments for the `propose_ranch` tool: a full multi-workstream decomposition.",
-      "properties": {
-        "goal": {
-          "description": "The overall goal the ranch achieves.",
-          "type": "string"
-        },
-        "title": {
-          "description": "Title for the ranch plan.",
-          "type": "string"
-        },
-        "workstreams": {
-          "description": "The workstreams, with `depends_on` wiring them into a dependency DAG.",
-          "items": {
-            "$ref": "#/$defs/RanchWorkstreamArg"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "title",
-        "goal",
-        "workstreams"
-      ],
-      "title": "ProposeRanchArgs",
       "type": "object"
     }
   },

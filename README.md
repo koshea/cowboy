@@ -24,13 +24,17 @@ cowboy "run the tests and fix one simple failure"
 ```
 
 The default install ships the CLI and daemon. To also embed the **`cowboy web`**
-UI, prefix the install with `COWBOY_WEB_UI=1` — the build then fetches `trunk`
-and the wasm target if needed and bundles the frontend into the binary (one-time,
-slower):
+UI, set `COWBOY_WEB_UI=1` for the build — it then fetches `trunk` and the wasm
+target if needed and bundles the frontend into the binary (one-time, slower). The
+`env …` prefix works in every shell (including fish/zsh, which reject the bare
+`VAR=value cmd` form):
 
 ```sh
-COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli
+env COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli
 ```
+
+Already installed at the same version? Add `--force` so cargo actually rebuilds
+(it skips a same-commit reinstall otherwise, and the flag would have no effect).
 
 The agent + gateway images are **pulled from GHCR on first run**, pinned to your
 binary's version (`ghcr.io/koshea/cowboy/{agent,gateway}`) — no image build step.

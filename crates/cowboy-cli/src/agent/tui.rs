@@ -1402,8 +1402,11 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                     "This is bigger than one session — promote it into a multi-workstream Ranch \
                      Plan. Using what we've already discussed (don't re-research from scratch), \
                      decompose the work into independent, parallelizable workstreams wired by \
-                     dependencies and call the `propose_ranch` tool ONCE with the full \
-                     decomposition. Do not implement anything.{extra}"
+                     dependencies. Write the decomposition to `.cowboy/ranch-plan.yaml` with the \
+                     `write` tool (a YAML doc with `title`, `goal`, and a `workstreams` list — each \
+                     with `id`, `goal`, optional `title`, `depends_on`, `expected_artifacts`, \
+                     `acceptance`), then run `cowboy ranch draft .cowboy/ranch-plan.yaml` to \
+                     validate and draft it. Do not implement anything.{extra}"
                 )));
                 *ctx.pending_turns += 1;
                 app.mode = Mode::Running;

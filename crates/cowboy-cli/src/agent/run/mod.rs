@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{
     self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
-    McpArgs, MemoryArgs, PlanArgs, ProposeRanchArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs,
-    SubagentArgs, WriteArgs,
+    McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs, SubagentArgs,
+    WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::net::docker::ExecResult;
@@ -1258,18 +1258,6 @@ impl<'a> AgentLoop<'a> {
                         l.log_message(&tool_msg);
                     }
                     self.messages.push(tool_msg);
-                }
-                tools::TOOL_PROPOSE_RANCH => {
-                    let Some(args) = self.parse_or_report::<ProposeRanchArgs>(call) else {
-                        continue;
-                    };
-                    self.ui.tool_use(&format!(
-                        "propose_ranch: {} ({} workstreams)",
-                        args.title,
-                        args.workstreams.len()
-                    ));
-                    let observation = self.run_propose_ranch(&args);
-                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_MCP => {
                     let Some(args) = self.parse_or_report::<McpArgs>(call) else {
@@ -2614,88 +2602,6 @@ mod tests {
         assert!(blocked, "edit should be refused with a plan-mode message");
         // No edit ran (no tool_use surfaced; the fileop mock was never called).
         assert!(ui.tool_uses.is_empty(), "no edit should run in plan mode");
-    }
-
-    #[tokio::test]
-    async fn propose_ranch_drafts_a_plan_and_rejects_a_bad_graph() {
-        // A valid decomposition is written and confirmed.
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        let good = r#"{"title":"Billing","goal":"stripe + invoicing","workstreams":[
-            {"id":"schema","goal":"tables"},
-            {"id":"api","goal":"api","depends_on":["schema"]}]}"#;
-        let model = ScriptedModel::new(vec![
-            ChatResponse {
-                truncated: false,
-                reasoning: None,
-                content: None,
-                tool_calls: vec![tool_call("1", "propose_ranch", good)],
-            },
-            ChatResponse {
-                truncated: false,
-                reasoning: None,
-                content: None,
-                tool_calls: vec![tool_call("2", "final", r#"{"message":"drafted"}"#)],
-            },
-        ]);
-        let mut ui = RecordingUi::default();
-        let mut agent = AgentLoop::new(
-            Box::new(model),
-            runtime_with(docker),
-            cowboy_core::config::AgentBehavior::default(),
-            200_000,
-            CancellationToken::new(),
-            &mut ui,
-        );
-        agent.run("plan it").await.unwrap();
-        let drafted = agent
-            .messages
-            .iter()
-            .any(|m| m.content.contains("drafted ranch"));
-        assert!(drafted, "a valid decomposition should draft a ranch");
-
-        // A cyclic graph is refused (the agent is told to fix and retry).
-        let cyclic = r#"{"title":"X","goal":"y","workstreams":[
-            {"id":"a","goal":"a","depends_on":["b"]},
-            {"id":"b","goal":"b","depends_on":["a"]}]}"#;
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        let model = ScriptedModel::new(vec![
-            ChatResponse {
-                truncated: false,
-                reasoning: None,
-                content: None,
-                tool_calls: vec![tool_call("1", "propose_ranch", cyclic)],
-            },
-            ChatResponse {
-                truncated: false,
-                reasoning: None,
-                content: None,
-                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
-            },
-        ]);
-        let mut ui = RecordingUi::default();
-        let mut agent = AgentLoop::new(
-            Box::new(model),
-            runtime_with(docker),
-            cowboy_core::config::AgentBehavior::default(),
-            200_000,
-            CancellationToken::new(),
-            &mut ui,
-        );
-        agent.run("plan it").await.unwrap();
-        let rejected = agent.messages.iter().any(|m| m.content.contains("invalid"));
-        assert!(rejected, "a cyclic decomposition must be rejected");
     }
 
     #[tokio::test]
