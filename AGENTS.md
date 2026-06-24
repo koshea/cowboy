@@ -67,7 +67,9 @@ crates/
   cowboy-tui/      ratatui rendering (snapshot-tested)
   cowboy-gateway/  the sole-egress gateway binary (proxy + DNS + nft policy)
   cowboy-web-ui/   Yew/WASM remote-control frontend (NOT a workspace member —
-                   wasm32-only; `trunk build` in this dir, embedded by cowboy-cli)
+                   wasm32-only; `trunk build` in this dir, embedded by cowboy-cli.
+                   cowboy-cli/build.rs embeds an existing dist/, or builds one
+                   when COWBOY_WEB_UI=1; plain dev builds skip it → placeholder)
 docker/  docs/
 ```
 

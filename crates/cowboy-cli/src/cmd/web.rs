@@ -577,8 +577,9 @@ const INDEX_PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8>\
 <title>cowboy web</title>\
 <body style=\"font-family:system-ui;max-width:40rem;margin:3rem auto;padding:0 1rem\">\
 <h1>cowboy web</h1>\
-<p>The server is running. The web UI bundle isn't built into this binary yet \
-(build the <code>cowboy-web-ui</code> crate with trunk).</p>\
+<p>The server is running, but this binary was built without the web UI bundle. \
+Reinstall with the UI embedded: \
+<code>COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli</code>.</p>\
 <p>The API is live: <code>GET /api/sessions</code> and \
 <code>GET /api/session/&lt;id&gt;/ws</code> (bearer token required).</p>";
 

@@ -23,6 +23,15 @@ cowboy doctor                            # check platform, Docker, model, gatewa
 cowboy "run the tests and fix one simple failure"
 ```
 
+The default install ships the CLI and daemon. To also embed the **`cowboy web`**
+UI, prefix the install with `COWBOY_WEB_UI=1` — the build then fetches `trunk`
+and the wasm target if needed and bundles the frontend into the binary (one-time,
+slower):
+
+```sh
+COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli
+```
+
 The agent + gateway images are **pulled from GHCR on first run**, pinned to your
 binary's version (`ghcr.io/koshea/cowboy/{agent,gateway}`) — no image build step.
 
