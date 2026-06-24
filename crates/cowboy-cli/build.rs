@@ -43,10 +43,15 @@ fn main() {
         if let Err(e) = build_bundle(&web_ui) {
             panic!(
                 "COWBOY_WEB_UI=1 was set but the web UI bundle could not be built: {e}\n\n\
-                 Build it manually, then re-run the install:\n  \
-                 rustup target add wasm32-unknown-unknown\n  \
-                 cargo install trunk\n  \
-                 (cd {} && trunk build --release)\n",
+                 Install a PREBUILT `trunk` (building it from source pulls in libdeflate-sys, \
+                 which fails on bleeding-edge compilers like GCC 16), then re-run the install:\n  \
+                 • Arch:    sudo pacman -S trunk\n  \
+                 • macOS:   brew install trunk\n  \
+                 • any OS:  cargo binstall trunk   (cargo install cargo-binstall first)\n  \
+                 • or grab a binary from https://github.com/trunk-rs/trunk/releases\n\n\
+                 Also ensure the wasm target: rustup target add wasm32-unknown-unknown\n\
+                 With `trunk` on PATH, the build reuses it and skips the source install. To verify \
+                 manually: (cd {} && trunk build --release)\n",
                 web_ui.display()
             );
         }
@@ -90,22 +95,45 @@ fn ensure_wasm_target() {
         .status();
 }
 
-/// Locate `trunk`, installing it via `cargo install trunk` if absent. Returns
-/// the path to invoke.
+/// Locate `trunk`, installing it if absent. Returns the path to invoke.
+///
+/// Prefer a **prebuilt** binary: `cargo install trunk` builds it from source,
+/// which drags in the C crate `libdeflate-sys` and fails on bleeding-edge
+/// toolchains (e.g. GCC 16 rejects the `evex512` target attributes it emits).
+/// So if `cargo-binstall` is available we use it (downloads a release binary, no
+/// C compile); only if that's missing do we fall back to the source build. A
+/// distro package (`pacman -S trunk`, etc.) found on PATH already short-circuits
+/// in `find_trunk` and is preferred over both.
 fn ensure_trunk() -> Result<PathBuf, String> {
     if let Some(path) = find_trunk() {
         return Ok(path);
     }
 
-    // Not found — install it with the same cargo that's driving this build.
     let cargo = std::env::var_os("CARGO").map_or_else(|| PathBuf::from("cargo"), PathBuf::from);
-    println!("cargo:warning=trunk not found; installing it (cargo install trunk)…");
-    let status = Command::new(&cargo)
-        .args(["install", "trunk", "--locked"])
+    let has_binstall = Command::new(&cargo)
+        .args(["binstall", "-V"])
         .status()
-        .map_err(|e| format!("failed to run `cargo install trunk`: {e}"))?;
-    if !status.success() {
-        return Err(format!("`cargo install trunk` exited with {status}"));
+        .is_ok_and(|s| s.success());
+
+    let install = if has_binstall {
+        println!("cargo:warning=trunk not found; installing a prebuilt binary (cargo binstall trunk)…");
+        Command::new(&cargo)
+            .args(["binstall", "--no-confirm", "trunk"])
+            .status()
+            .map_err(|e| format!("failed to run `cargo binstall trunk`: {e}"))?
+    } else {
+        // No prebuilt path available — build from source and hope the toolchain
+        // is compatible. If this is the step that failed, the caller's error
+        // message points at the prebuilt alternatives.
+        println!("cargo:warning=trunk not found and cargo-binstall unavailable; building it from source (cargo install trunk)…");
+        Command::new(&cargo)
+            .args(["install", "trunk", "--locked"])
+            .status()
+            .map_err(|e| format!("failed to run `cargo install trunk`: {e}"))?
+    };
+    if !install.success() {
+        let how = if has_binstall { "cargo binstall trunk" } else { "cargo install trunk" };
+        return Err(format!("`{how}` exited with {install}"));
     }
 
     find_trunk().ok_or_else(|| {

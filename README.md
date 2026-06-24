@@ -24,13 +24,24 @@ cowboy "run the tests and fix one simple failure"
 ```
 
 The default install ships the CLI and daemon. To also embed the **`cowboy web`**
-UI, set `COWBOY_WEB_UI=1` for the build — it then fetches `trunk` and the wasm
-target if needed and bundles the frontend into the binary (one-time, slower). The
-`env …` prefix works in every shell (including fish/zsh, which reject the bare
-`VAR=value cmd` form):
+UI, set `COWBOY_WEB_UI=1` for the build — it then ensures `trunk` and the wasm
+target are present and bundles the frontend into the binary (one-time, slower).
+The `env …` prefix works in every shell (including fish/zsh, which reject the
+bare `VAR=value cmd` form):
 
 ```sh
 env COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli
+```
+
+**Install a prebuilt `trunk` first.** If `trunk` isn't found the build will try
+to install it, preferring a prebuilt binary (`cargo binstall`) but falling back
+to building from source — and the source build pulls in `libdeflate-sys`, which
+fails on bleeding-edge compilers (e.g. GCC 16). Save yourself the trouble by
+installing a prebuilt `trunk` beforehand; with it on `PATH` the build reuses it:
+
+```sh
+sudo pacman -S trunk     # Arch        (brew install trunk on macOS;
+rustup target add wasm32-unknown-unknown  #  or `cargo binstall trunk` anywhere)
 ```
 
 Already installed at the same version? Add `--force` so cargo actually rebuilds
