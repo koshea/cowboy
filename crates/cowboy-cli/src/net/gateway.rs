@@ -250,6 +250,20 @@ impl GatewayNetwork {
         self.wait_ready(docker).await
     }
 
+    /// Verify the sidecar is still alive and therefore enforcing. The gateway
+    /// applies its nft ruleset *before* it binds the proxy and exits on any
+    /// failure (see `cowboy-gateway/src/main.rs`), so a `Running` sidecar means
+    /// the netns clamp is installed. If it has died, the agent's egress is no
+    /// longer policed — bring the sidecar back (which re-applies the rules),
+    /// failing closed if it can't be restored. The caller must not run the agent
+    /// when this errors.
+    pub async fn ensure_enforcing(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
+        match docker.container_state(&self.gateway_name).await? {
+            super::docker::ContainerState::Running => Ok(()),
+            _ => self.start_sidecar(docker, agent).await,
+        }
+    }
+
     /// Block until the gateway's transparent proxy listener is bound in the
     /// shared netns. Fails closed: if the proxy never comes up we refuse rather
     /// than let the agent run against a half-initialized gateway.
@@ -266,6 +280,21 @@ impl GatewayNetwork {
                 if res.exit_code == 0 && out.contains(PROXY_LISTEN_MARKER) {
                     return Ok(());
                 }
+            }
+            // Fail fast (and with a precise cause) if the sidecar has already
+            // exited — e.g. its nft apply failed because the kernel can't load
+            // the REDIRECT/conntrack modules. Without this we'd block for the
+            // whole timeout and then report a vague "never bound" error.
+            if matches!(
+                docker.container_state(&self.gateway_name).await,
+                Ok(super::docker::ContainerState::Stopped)
+            ) {
+                anyhow::bail!(
+                    "gateway sidecar exited before it could enforce network policy \
+                     (it could not apply its nft ruleset — see `docker logs {}`); \
+                     refusing to run the agent with unsandboxed egress",
+                    self.gateway_name
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }

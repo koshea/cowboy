@@ -405,12 +405,38 @@ impl AgentRuntime {
             return self.create().await;
         }
         match state {
-            ContainerState::Running => Ok(()),
+            ContainerState::Running => {
+                // A *running* agent is not the same as an *enforced* one: the
+                // gateway sidecar shares the agent's netns but is a separate
+                // container that can die independently (e.g. its nft apply failed
+                // on a kernel missing the REDIRECT modules). Verify enforcement is
+                // live and re-establish it; if it can't be, stop the agent rather
+                // than leave it with open egress.
+                if let Some(gw) = &self.gateway {
+                    if let Err(e) = gw
+                        .ensure_enforcing(&*self.docker, &self.container_name)
+                        .await
+                    {
+                        let _ = self.docker.stop(&self.container_name).await;
+                        return Err(e).context(
+                            "network enforcement is not active; stopped the agent to fail closed",
+                        );
+                    }
+                }
+                Ok(())
+            }
             ContainerState::Stopped => {
                 self.docker.start(&self.container_name).await?;
+                // The agent is now running but UNSANDBOXED until the sidecar
+                // reinstalls the nft clamp in its fresh netns. If that fails, stop
+                // the agent again so it never serves a command with open egress.
                 if let Some(gw) = &self.gateway {
-                    gw.start_sidecar(&*self.docker, &self.container_name)
-                        .await?;
+                    if let Err(e) = gw.start_sidecar(&*self.docker, &self.container_name).await {
+                        let _ = self.docker.stop(&self.container_name).await;
+                        return Err(e).context(
+                            "network enforcement failed to start; stopped the agent to fail closed",
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -472,8 +498,15 @@ impl AgentRuntime {
             // Start the gateway as a sidecar sharing the agent's netns; it applies
             // the nft REDIRECT that forces all agent egress through its policy
             // proxy. The agent lacks NET_ADMIN, so it cannot undo the rules.
-            gw.start_sidecar(&*self.docker, &self.container_name)
-                .await?;
+            // The agent is already up and therefore UNSANDBOXED until this
+            // succeeds — if enforcement can't be installed, remove the agent
+            // rather than leave it running with open egress (fail closed).
+            if let Err(e) = gw.start_sidecar(&*self.docker, &self.container_name).await {
+                let _ = self.docker.stop(&self.container_name).await;
+                let _ = self.docker.remove(&self.container_name, true).await;
+                return Err(e)
+                    .context("gateway enforcement failed to start; removed the unsandboxed agent");
+            }
             // Attach any approved Compose networks (traffic to these bypasses
             // the gateway via the agent's own NIC). Best-effort: a missing or
             // renamed network (e.g. the compose stack isn't up, or it's named
@@ -1434,6 +1467,84 @@ mod tests {
         // No route helper and no extra network attach in the sidecar model.
         let (rt, _tmp) = fixture(true, docker);
         rt.ensure_running().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn running_agent_with_dead_gateway_fails_closed() {
+        // The agent is up but its gateway sidecar has died (e.g. nft apply failed):
+        // egress is no longer policed. ensure_running must NOT proceed — it
+        // re-tries the sidecar, and when that still can't enforce it stops the
+        // agent rather than serve a command with open egress.
+        let mut docker = MockDockerCli::new();
+        docker.expect_container_state().returning(|name| {
+            if name.starts_with("cowboy-gw") {
+                Ok(ContainerState::Stopped) // sidecar is dead
+            } else {
+                Ok(ContainerState::Running) // agent is up
+            }
+        });
+        docker.expect_remove().returning(|_, _| Ok(()));
+        docker.expect_run_detached().returning(|_| Ok(()));
+        // Proxy never reports a listener → the sidecar can't enforce.
+        docker
+            .expect_exec_capture()
+            .returning(|_, _, _, _| Ok((ExecResult { exit_code: 0 }, String::new())));
+        // Fail closed: the agent is stopped.
+        docker
+            .expect_stop()
+            .withf(|name| name.starts_with("cowboy-agent"))
+            .times(1)
+            .returning(|_| Ok(()));
+
+        let (rt, _tmp) = fixture(true, docker);
+        assert!(
+            rt.ensure_running().await.is_err(),
+            "must refuse to run when egress isn't enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_removes_agent_when_gateway_cannot_enforce() {
+        // On first create the agent starts before the sidecar. If the sidecar
+        // can't install enforcement, the half-up agent (which has open egress)
+        // must be torn down, not left running.
+        let mut docker = MockDockerCli::new();
+        docker.expect_container_state().returning(|name| {
+            if name.starts_with("cowboy-gw") {
+                Ok(ContainerState::Stopped) // sidecar never comes up
+            } else {
+                Ok(ContainerState::Absent) // agent absent → create path
+            }
+        });
+        docker.expect_image_exists().returning(|_| Ok(true));
+        docker.expect_network_exists().returning(|_| Ok(false));
+        docker.expect_create_network().returning(|_| Ok(()));
+        docker.expect_run_detached().returning(|_| Ok(()));
+        docker
+            .expect_exec_capture()
+            .returning(|_, _, _, _| Ok((ExecResult { exit_code: 0 }, String::new())));
+        // Fail closed: the unsandboxed agent is stopped and removed.
+        docker
+            .expect_stop()
+            .withf(|name| name.starts_with("cowboy-agent"))
+            .times(1)
+            .returning(|_| Ok(()));
+        docker
+            .expect_remove()
+            .withf(|name, _| name.starts_with("cowboy-agent"))
+            .times(1)
+            .returning(|_, _| Ok(()));
+        // The gateway sidecar's own remove (Stopped branch of start_sidecar).
+        docker
+            .expect_remove()
+            .withf(|name, _| name.starts_with("cowboy-gw"))
+            .returning(|_, _| Ok(()));
+
+        let (rt, _tmp) = fixture(true, docker);
+        assert!(
+            rt.ensure_running().await.is_err(),
+            "create must fail when enforcement can't be installed"
+        );
     }
 
     #[tokio::test]
