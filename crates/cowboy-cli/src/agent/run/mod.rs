@@ -142,7 +142,18 @@ pub struct AgentLoop<'a> {
     price_in: Option<f64>,
     price_out: Option<f64>,
     /// Running estimated session spend in USD (0.0 when pricing is unknown).
+    /// This is the agent's OWN spend; subagent spend is tracked separately in
+    /// [`Self::subagent_cost_usd`] and added in when reporting to the UI.
     cost_usd: f64,
+    /// Spend (USD) and token estimates rolled up from finished subagents, read
+    /// from each child's journal as it completes. Kept separate from the agent's
+    /// own counters because subagents may run different models (different prices),
+    /// so their cost can't be re-derived from the parent's per-token price — it's
+    /// summed directly. Each child journals its *combined* total (own + its own
+    /// subagents), so this accumulates the whole delegation subtree.
+    subagent_cost_usd: f64,
+    subagent_tokens_in: u64,
+    subagent_tokens_out: u64,
     /// One-shot latch so the 80%-of-budget warning fires only once.
     budget_warned: bool,
     /// The agent's current working plan: (step, status) in order.
@@ -269,6 +280,80 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
     }
 }
 
+/// Spend + token estimates rolled up from one finished subagent.
+#[derive(Default, Clone, Copy)]
+struct SubagentUsage {
+    cost_usd: f64,
+    tokens_in: u64,
+    tokens_out: u64,
+}
+
+/// Read a finished subagent's final cost/token totals from its journal
+/// (`<session>/events.jsonl`). The child emits `Cost`/`Tokens` events as it runs
+/// (each carrying its *combined* running total, so the last of each is the whole
+/// subtree); we take the last value seen. Best-effort: a missing/short journal —
+/// e.g. an unpriced model that never emitted `Cost` — just yields zeros, matching
+/// the old behavior of not counting it. Called only after the child has exited,
+/// so the journal is fully flushed.
+fn read_subagent_usage(root: &std::path::Path, id: &str) -> SubagentUsage {
+    use cowboy_core::daemonproto::UiEventMsg;
+    let path = crate::session::session_dir(root, id).join("events.jsonl");
+    let mut usage = SubagentUsage::default();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            match serde_json::from_str::<UiEventMsg>(line) {
+                Ok(UiEventMsg::Cost(c)) => usage.cost_usd = c,
+                Ok(UiEventMsg::Tokens { input, output }) => {
+                    usage.tokens_in = input;
+                    usage.tokens_out = output;
+                }
+                _ => {}
+            }
+        }
+    }
+    usage
+}
+
+/// Merged user+project model definitions (name → def), best-effort. Maps a
+/// routed model name to its provider for the per-provider throttle; a missing or
+/// unparseable file just yields fewer entries (callers then key on the model name).
+fn load_model_defs(
+    root: &std::path::Path,
+) -> std::collections::BTreeMap<String, cowboy_core::config::ModelDef> {
+    use cowboy_core::config::{ModelsConfig, COWBOY_DIR, MODELS_FILE};
+    let mut defs = std::collections::BTreeMap::new();
+    if let Some(p) = ModelsConfig::user_path() {
+        if let Ok(Some(u)) = ModelsConfig::load_opt(&p) {
+            defs.extend(u.models);
+        }
+    }
+    if let Ok(Some(p)) = ModelsConfig::load_opt(&root.join(COWBOY_DIR).join(MODELS_FILE)) {
+        defs.extend(p.models);
+    }
+    defs
+}
+
+/// The provider a subagent will hit, used to group the per-provider concurrency
+/// throttle. A routed model resolves to its `provider`; an unknown model keys on
+/// its own name (still groups identical models); a roster-less worker (`None`)
+/// runs on the foreman's model, so it keys on the foreman's provider.
+fn provider_key(
+    model: Option<&str>,
+    defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
+    foreman: Option<&str>,
+) -> String {
+    match model {
+        Some(name) => defs
+            .get(name)
+            .map(|d| d.provider.clone())
+            .unwrap_or_else(|| name.to_string()),
+        None => foreman
+            .and_then(|f| defs.get(f))
+            .map(|d| d.provider.clone())
+            .unwrap_or_else(|| "<foreman>".to_string()),
+    }
+}
+
 /// The last few lines of a child's stderr, bounded, for a failure message: enough
 /// to show the cause (a model error, an OOM trace) without dumping a whole log into
 /// the foreman's context. Keeps the tail (where the error lands).
@@ -384,6 +469,9 @@ impl<'a> AgentLoop<'a> {
             price_in: None,
             price_out: None,
             cost_usd: 0.0,
+            subagent_cost_usd: 0.0,
+            subagent_tokens_in: 0,
+            subagent_tokens_out: 0,
             budget_warned: false,
             plan: Vec::new(),
             lifecycle_started: false,
@@ -438,11 +526,27 @@ impl<'a> AgentLoop<'a> {
                 + cowboy_core::tokens::count(&tc.name)) as u64;
         }
         self.tokens_out += out;
-        self.ui.tokens(self.tokens_in, self.tokens_out);
+        self.report_usage();
+    }
+
+    /// Recompute the agent's own cost from its tokens, then report the SESSION
+    /// total — own usage plus everything rolled up from subagents — to the UI.
+    /// The displayed token and cost figures therefore include delegated work,
+    /// which previously vanished from the total (subagents run as separate
+    /// processes that only journal into their own session). Tokens are always
+    /// reported; cost is reported when we have either local pricing or a non-zero
+    /// subagent cost (a subagent may be priced even when this agent isn't).
+    fn report_usage(&mut self) {
         if let (Some(pi), Some(po)) = (self.price_in, self.price_out) {
             self.cost_usd =
                 (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po;
-            self.ui.cost(self.cost_usd);
+        }
+        self.ui.tokens(
+            self.tokens_in + self.subagent_tokens_in,
+            self.tokens_out + self.subagent_tokens_out,
+        );
+        if self.price_in.is_some() || self.subagent_cost_usd > 0.0 {
+            self.ui.cost(self.cost_usd + self.subagent_cost_usd);
         }
     }
 
@@ -499,19 +603,21 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// Hard stop reason if a configured budget has been reached, else `None`.
+    /// Budgets are for the whole session, so subagent usage counts too.
     fn budget_reached(&self) -> Option<String> {
         let b = &self.behavior;
-        let used = self.tokens_in + self.tokens_out;
+        let used = self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
         if b.token_budget > 0 && used >= b.token_budget {
             return Some(format!(
                 "token budget reached ({used} tokens ≥ {}); stopping",
                 b.token_budget
             ));
         }
-        if b.cost_budget_usd > 0.0 && self.cost_usd >= b.cost_budget_usd {
+        let spent = self.cost_usd + self.subagent_cost_usd;
+        if b.cost_budget_usd > 0.0 && spent >= b.cost_budget_usd {
             return Some(format!(
                 "cost budget reached (${:.2} ≥ ${:.2}); stopping",
-                self.cost_usd, b.cost_budget_usd
+                spent, b.cost_budget_usd
             ));
         }
         None
@@ -523,16 +629,17 @@ impl<'a> AgentLoop<'a> {
             return;
         }
         let b = &self.behavior;
-        let used = self.tokens_in + self.tokens_out;
+        let used = self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
+        let spent = self.cost_usd + self.subagent_cost_usd;
         let warn = if b.token_budget > 0 && used as f64 >= 0.8 * b.token_budget as f64 {
             Some(format!(
                 "approaching token budget ({used}/{} tokens)",
                 b.token_budget
             ))
-        } else if b.cost_budget_usd > 0.0 && self.cost_usd >= 0.8 * b.cost_budget_usd {
+        } else if b.cost_budget_usd > 0.0 && spent >= 0.8 * b.cost_budget_usd {
             Some(format!(
                 "approaching cost budget (${:.2}/${:.2})",
-                self.cost_usd, b.cost_budget_usd
+                spent, b.cost_budget_usd
             ))
         } else {
             None
@@ -1492,6 +1599,29 @@ impl<'a> AgentLoop<'a> {
             self.ui
                 .notice(&format!("↳ running {} subagents in parallel", plans.len()));
         }
+        // Per-provider throttle: cap concurrent workers hitting the same provider
+        // so a batch of same-model subagents can't trip its rate limit (429),
+        // while different providers still run fully in parallel. Bounded further by
+        // `max_parallel`; 0 = unlimited.
+        let per_provider = crew_cfg
+            .as_ref()
+            .map(|c| c.delegation.max_parallel_per_provider)
+            .unwrap_or(2) as usize;
+        let model_defs = load_model_defs(self.root());
+        let foreman = crate::cmd::crew::foreman_model();
+        let mut provider_sems: std::collections::HashMap<
+            String,
+            std::sync::Arc<tokio::sync::Semaphore>,
+        > = std::collections::HashMap::new();
+        if per_provider > 0 {
+            for (_, plan) in &plans {
+                let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
+                provider_sems
+                    .entry(key)
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(per_provider)));
+            }
+        }
+
         // Execute concurrently (owned plans → no borrow of self), timing each and
         // capturing a coarse outcome for the crew history. Process completions as
         // they arrive so the background pane flips each subagent to done/failed
@@ -1505,7 +1635,15 @@ impl<'a> AgentLoop<'a> {
                 .unwrap_or(&plan.label)
                 .to_string();
             let sub_id = plan.id.clone();
+            let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
+            let sem = provider_sems.get(&key).cloned();
             async move {
+                // Hold a provider permit for the worker's whole lifetime; `None`
+                // means the throttle is disabled (unlimited).
+                let _permit = match sem {
+                    Some(s) => s.acquire_owned().await.ok(),
+                    None => None,
+                };
                 let started = std::time::Instant::now();
                 let result = exec_subagent(plan).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -1526,11 +1664,20 @@ impl<'a> AgentLoop<'a> {
         }))
         .buffer_unordered(max_parallel);
 
+        let root = self.root().to_path_buf();
         while let Some((id, label, sub_id, res, status, outcome)) = stream.next().await {
             self.ui.subagent_done(&label, status == "complete", &sub_id);
             if let Some(o) = outcome {
                 cowboy_core::crew::record_outcome(&o);
             }
+            // Roll the finished subagent's spend into the session total so the UI
+            // reflects delegated work (subagents run as separate processes; their
+            // cost would otherwise be invisible). Reported as each child lands.
+            let usage = read_subagent_usage(&root, &sub_id);
+            self.subagent_cost_usd += usage.cost_usd;
+            self.subagent_tokens_in += usage.tokens_in;
+            self.subagent_tokens_out += usage.tokens_out;
+            self.report_usage();
             results.insert(id, res);
         }
         self.ui.notice("↳ subagent(s) finished");
@@ -2020,6 +2167,68 @@ mod tests {
             ui.costs.last().copied().unwrap_or(0.0) > 0.0,
             "a priced model should report a running cost"
         );
+    }
+
+    #[test]
+    fn read_subagent_usage_takes_last_cost_and_tokens_from_journal() {
+        use cowboy_core::daemonproto::UiEventMsg;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let id = "sub-123";
+        let dir = crate::session::session_dir(root, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let journal = dir.join("events.jsonl");
+        // Interleave unrelated events with several Cost/Tokens updates; the helper
+        // must return the LAST of each (the child's combined running total).
+        let events = [
+            UiEventMsg::Tokens { input: 10, output: 2 },
+            UiEventMsg::Cost(0.01),
+            UiEventMsg::Notice("working".into()),
+            UiEventMsg::Tokens { input: 100, output: 40 },
+            UiEventMsg::Cost(0.25),
+            UiEventMsg::Final("done".into()),
+        ];
+        let lines: Vec<String> = events
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap())
+            .collect();
+        std::fs::write(&journal, lines.join("\n")).unwrap();
+
+        let usage = read_subagent_usage(root, id);
+        assert!((usage.cost_usd - 0.25).abs() < 1e-9, "last Cost wins");
+        assert_eq!(usage.tokens_in, 100);
+        assert_eq!(usage.tokens_out, 40);
+
+        // A subagent with no journal (e.g. unpriced / never started) → zeros.
+        let none = read_subagent_usage(root, "missing");
+        assert_eq!(none.cost_usd, 0.0);
+        assert_eq!((none.tokens_in, none.tokens_out), (0, 0));
+    }
+
+    #[test]
+    fn provider_key_groups_same_provider_models_together() {
+        use cowboy_core::config::ModelsConfig;
+        let yaml = "default: a\nmodels:\n  \
+                    a: { provider: fireworks, model: minimax-m3 }\n  \
+                    b: { provider: fireworks, model: other }\n  \
+                    c: { provider: openai, model: gpt }\n";
+        let defs = serde_yaml_ng::from_str::<ModelsConfig>(yaml).unwrap().models;
+        // Two different model NAMES on the same provider share a throttle key.
+        assert_eq!(provider_key(Some("a"), &defs, None), "fireworks");
+        assert_eq!(
+            provider_key(Some("a"), &defs, None),
+            provider_key(Some("b"), &defs, None),
+        );
+        // Different provider → different key.
+        assert_ne!(
+            provider_key(Some("a"), &defs, None),
+            provider_key(Some("c"), &defs, None),
+        );
+        // Unknown model keys on its own name (still groups identical models).
+        assert_eq!(provider_key(Some("zzz"), &defs, None), "zzz");
+        // Roster-less worker keys on the foreman's provider, else a sentinel.
+        assert_eq!(provider_key(None, &defs, Some("c")), "openai");
+        assert_eq!(provider_key(None, &defs, None), "<foreman>");
     }
 
     #[tokio::test]

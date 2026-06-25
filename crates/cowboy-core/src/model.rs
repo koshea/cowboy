@@ -25,7 +25,12 @@ use crate::error::{Error, Result};
 
 /// How many times to retry a rate-limited / transiently-failed chat request
 /// before giving up.
-const MAX_RETRIES: u32 = 5;
+const MAX_RETRIES: u32 = 6;
+
+/// Longest single wait we'll honor — for both our computed backoff and a value an
+/// API hands us — so one retry can't stall a session for minutes if a provider
+/// reports a far-off reset.
+const MAX_WAIT: Duration = Duration::from_secs(60);
 
 /// Retry a 429 (rate limit), 529 (overloaded), or any 5xx server error.
 fn is_retryable_status(s: reqwest::StatusCode) -> bool {
@@ -37,23 +42,114 @@ fn is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect()
 }
 
-/// Exponential backoff for retry `attempt` (0-based): 0.5s, 1s, 2s, … capped 16s.
-fn backoff(attempt: u32) -> Duration {
-    let secs = (0.5 * 2f64.powi(attempt as i32)).min(16.0);
-    Duration::from_millis((secs * 1000.0) as u64)
+/// A pseudo-random fraction in `[0, 1)` derived from the clock. Good enough to
+/// jitter backoff; not for anything security-sensitive. Parallel subagents are
+/// separate processes, so their clocks already decorrelate — this also spreads
+/// retries within a single process.
+fn jitter_fraction() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    f64::from(nanos % 1_000_000) / 1_000_000.0
 }
 
-/// Honor a numeric `Retry-After` header (seconds), capped at 60s.
+/// Jittered exponential backoff for retry `attempt` (0-based). Base doubles
+/// (1s, 2s, 4s, … capped at [`MAX_WAIT`]), then "equal jitter" spreads each wait
+/// over `[base/2, base]` so many callers throttled at once (e.g. a batch of
+/// parallel subagents on one provider) don't retry in lockstep and re-collide.
+/// Used only when the API gives us no explicit backpressure signal.
+fn backoff(attempt: u32) -> Duration {
+    let base = 2f64.powi(attempt as i32).min(MAX_WAIT.as_secs_f64());
+    let secs = base * 0.5 + base * 0.5 * jitter_fraction();
+    Duration::from_secs_f64(secs)
+}
+
+/// The API's own backpressure signal, if it sent one — always preferred over our
+/// guessed backoff. Checked in order: `Retry-After` (integer seconds or an
+/// HTTP-date), then the OpenAI-/Fireworks-style reset headers
+/// (`x-ratelimit-reset-requests`, `x-ratelimit-reset-tokens`, `ratelimit-reset`),
+/// whose value may be plain seconds or a unit string like `6m0s` / `880ms`.
+/// Clamped to [`MAX_WAIT`].
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    let secs: u64 = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(secs.min(60)))
+    let headers = resp.headers();
+    let get = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+
+    // `Retry-After`: integer seconds, else an HTTP-date.
+    if let Some(v) = get("retry-after") {
+        if let Ok(secs) = v.parse::<u64>() {
+            return Some(Duration::from_secs(secs).min(MAX_WAIT));
+        }
+        if let Some(d) = http_date_delay(v) {
+            return Some(d.min(MAX_WAIT));
+        }
+    }
+    // Rate-limit reset headers: a duration until the window reopens.
+    for name in [
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+        "ratelimit-reset",
+    ] {
+        if let Some(d) = get(name).and_then(parse_reset_value) {
+            return Some(d.min(MAX_WAIT));
+        }
+    }
+    None
+}
+
+/// Seconds from now until an HTTP-date (RFC 7231 / RFC 2822 form), or `None` if
+/// it doesn't parse or is already in the past.
+fn http_date_delay(s: &str) -> Option<Duration> {
+    let when = jiff::fmt::rfc2822::parse(s).ok()?.timestamp();
+    let secs = jiff::Timestamp::now().duration_until(when).as_secs();
+    (secs > 0).then(|| Duration::from_secs(secs as u64))
+}
+
+/// Parse a rate-limit reset value: either plain seconds (`30`, `1.5`) or a unit
+/// string of `<number><unit>` segments (`880ms`, `6m0s`, `1h30m`), units ms/s/m/h.
+/// `None` if it's neither (so the caller falls back to computed backoff).
+fn parse_reset_value(s: &str) -> Option<Duration> {
+    if let Ok(secs) = s.parse::<f64>() {
+        return (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs));
+    }
+    let mut total = 0f64;
+    let mut num = String::new();
+    let mut matched = false;
+    let mut chars = s.chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            chars.next();
+            continue;
+        }
+        let mut unit = String::new();
+        while let Some(&u) = chars.peek() {
+            if u.is_ascii_alphabetic() {
+                unit.push(u);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let n: f64 = num.parse().ok()?;
+        num.clear();
+        total += match unit.as_str() {
+            "ms" => n / 1000.0,
+            "s" => n,
+            "m" => n * 60.0,
+            "h" => n * 3600.0,
+            _ => return None,
+        };
+        matched = true;
+    }
+    // A trailing bare number (no unit) means the format wasn't what we expected.
+    (matched && num.is_empty()).then(|| Duration::from_secs_f64(total))
 }
 
 /// Role of a conversation message.
@@ -698,6 +794,50 @@ impl ModelClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_reset_value_handles_seconds_and_unit_strings() {
+        let secs = |d: Duration| d.as_secs_f64();
+        // Plain seconds (int and float).
+        assert_eq!(secs(parse_reset_value("30").unwrap()), 30.0);
+        assert!((secs(parse_reset_value("1.5").unwrap()) - 1.5).abs() < 1e-9);
+        // OpenAI/Fireworks unit strings.
+        assert!((secs(parse_reset_value("880ms").unwrap()) - 0.88).abs() < 1e-9);
+        assert_eq!(secs(parse_reset_value("6m0s").unwrap()), 360.0);
+        assert_eq!(secs(parse_reset_value("1h30m").unwrap()), 5400.0);
+        assert_eq!(secs(parse_reset_value("2s").unwrap()), 2.0);
+        // Garbage / unknown units → None (caller falls back to backoff).
+        assert!(parse_reset_value("soon").is_none());
+        assert!(parse_reset_value("5y").is_none());
+        assert!(parse_reset_value("").is_none());
+    }
+
+    #[test]
+    fn backoff_grows_jittered_and_is_capped() {
+        // Equal jitter: each wait is within (base/2, base], base = min(2^n, 60).
+        for attempt in 0..8 {
+            let base = (2f64.powi(attempt)).min(60.0);
+            let d = backoff(attempt as u32).as_secs_f64();
+            assert!(
+                d > base * 0.5 - 1e-6 && d <= base + 1e-6,
+                "attempt {attempt}: {d} not in ({}, {}]",
+                base * 0.5,
+                base
+            );
+        }
+        // Never exceeds the cap, even far out.
+        assert!(backoff(20).as_secs_f64() <= 60.0 + 1e-6);
+    }
+
+    #[test]
+    fn http_date_delay_is_future_only() {
+        // A date far in the past → None.
+        assert!(http_date_delay("Wed, 21 Oct 2015 07:28:00 GMT").is_none());
+        // A date far in the future parses to a positive delay.
+        assert!(http_date_delay("Fri, 31 Dec 2100 23:59:59 GMT").is_some());
+        // Non-date → None.
+        assert!(http_date_delay("nonsense").is_none());
+    }
 
     #[test]
     fn reasoning_is_round_tripped_into_the_request_body() {

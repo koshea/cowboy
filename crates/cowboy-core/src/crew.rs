@@ -131,6 +131,12 @@ pub struct Delegation {
     /// real backpressure). Not a quota.
     #[serde(default = "default_max_parallel")]
     pub max_parallel: u32,
+    /// Cap on concurrent workers hitting the *same provider* — a guard against a
+    /// batch of same-model subagents tripping a provider's rate limit (429s)
+    /// while different providers still run in parallel. `0` = unlimited. Bounded
+    /// further by `max_parallel`.
+    #[serde(default = "default_max_parallel_per_provider")]
+    pub max_parallel_per_provider: u32,
     /// How deep delegation may nest (foreman = depth 0).
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
@@ -144,6 +150,7 @@ impl Default for Delegation {
         Self {
             enabled: true,
             max_parallel: default_max_parallel(),
+            max_parallel_per_provider: default_max_parallel_per_provider(),
             max_depth: default_max_depth(),
             allow_recursive_delegation: false,
         }
@@ -562,6 +569,12 @@ fn default_true() -> bool {
 }
 fn default_max_parallel() -> u32 {
     4
+}
+/// Default per-provider concurrency cap. Conservative: a typical crew routes most
+/// work to one provider, so 2 in flight there keeps fan-out without dog-piling a
+/// per-model rate limit; distinct providers still run fully in parallel.
+fn default_max_parallel_per_provider() -> u32 {
+    2
 }
 fn default_max_depth() -> u32 {
     1
