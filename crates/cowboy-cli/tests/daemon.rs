@@ -270,6 +270,8 @@ fn create_and_list_worktrees_over_the_wire() {
     git(repo.path(), &["init", "-q"]);
     git(repo.path(), &["config", "user.email", "t@t"]);
     git(repo.path(), &["config", "user.name", "t"]);
+    // Don't inherit a developer's global commit.gpgsign (test identity has no key).
+    git(repo.path(), &["config", "commit.gpgsign", "false"]);
     std::fs::write(repo.path().join("README"), "hi").unwrap();
     git(repo.path(), &["add", "."]);
     git(repo.path(), &["commit", "-qm", "init"]);

@@ -450,6 +450,11 @@ pub struct ModelsConfig {
     /// Name of the default model (optional at the project level).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Name of the model used for auxiliary summarization — context compaction and
+    /// truncation recovery — resolved like `default`. When unset, those calls fall
+    /// back to the session's main model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summarizer: Option<String>,
     #[serde(default)]
     pub models: BTreeMap<String, ModelDef>,
 }
@@ -459,6 +464,7 @@ impl Default for ModelsConfig {
         Self {
             version: default_version(),
             default: None,
+            summarizer: None,
             models: BTreeMap::new(),
         }
     }

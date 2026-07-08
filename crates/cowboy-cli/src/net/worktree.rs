@@ -327,6 +327,9 @@ mod tests {
         git(dir.path(), &["init", "-q"]);
         git(dir.path(), &["config", "user.email", "t@t"]);
         git(dir.path(), &["config", "user.name", "t"]);
+        // Don't inherit a developer's global commit.gpgsign — a test identity has
+        // no signing key, so it would break the commit below.
+        git(dir.path(), &["config", "commit.gpgsign", "false"]);
         std::fs::write(dir.path().join("README"), "hi").unwrap();
         git(dir.path(), &["add", "."]);
         git(dir.path(), &["commit", "-qm", "init"]);

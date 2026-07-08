@@ -62,6 +62,14 @@ token counting (oldest history is pruned, or compacted into a summary); command
 output is additionally byte-capped (`agent.max_command_output_bytes`). Token and
 estimated-cost totals are tracked per session, with optional budgets.
 
+If a reasoning model burns its whole output budget thinking and returns no answer
+or tool call, Cowboy warns that its `max_tokens` may be too low, then tries to
+recover: it summarizes the truncated reasoning and retries the turn with a
+directive to act on those conclusions rather than re-deriving them. Both the
+compaction and recovery summaries use the optional
+[`summarizer`](../getting-started/configuration.md) model when configured,
+falling back to the main model otherwise.
+
 ## What a session records
 
 Under `.cowboy/sessions/<id>/`:

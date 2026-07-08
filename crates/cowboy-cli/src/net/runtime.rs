@@ -1611,6 +1611,8 @@ mod tests {
         assert!(git(&["init", "-q"], &main));
         assert!(git(&["config", "user.email", "t@t"], &main));
         assert!(git(&["config", "user.name", "t"], &main));
+        // Don't inherit a developer's global commit.gpgsign (test identity has no key).
+        assert!(git(&["config", "commit.gpgsign", "false"], &main));
         std::fs::write(main.join("f.txt"), "hi").unwrap();
         assert!(git(&["add", "."], &main));
         assert!(git(&["commit", "-qm", "init"], &main));

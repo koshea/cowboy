@@ -124,6 +124,9 @@ survives even if you don't finish.";
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
     model: Box<dyn ModelClient>,
+    /// Optional dedicated model for auxiliary summarization (compaction +
+    /// truncation recovery). `None` falls back to `model` — see [`Self::summarizer`].
+    summarizer: Option<Box<dyn ModelClient>>,
     runtime: AgentRuntime,
     tools: Vec<ToolDef>,
     behavior: AgentBehavior,
@@ -131,6 +134,12 @@ pub struct AgentLoop<'a> {
     /// Model context window (tokens) for history pruning.
     context_window: usize,
     pruned_notified: bool,
+    /// Consecutive summarize-and-reprime attempts after a reasoning-budget
+    /// truncation, reset to 0 whenever a turn produces content or a tool call.
+    /// Bounds recovery so a model that always truncates can't spin.
+    reprime_attempts: u32,
+    /// One-shot latch so the "output limit may be too low" warning fires once.
+    output_limit_warned: bool,
     /// Recursion depth for subagents (0 = top-level).
     subagent_depth: usize,
     /// The most recent turn's final message (for the session summary).
@@ -415,6 +424,21 @@ and any unresolved problems or next steps. Use terse bullet points; drop \
 pleasantries. This summary REPLACES the original messages, so omit nothing load-\
 bearing. Output only the summary.";
 
+/// Instruction for the truncation-recovery summary: distill the conclusions a
+/// cut-off reasoning trace already reached so the retry can act instead of
+/// re-deriving them from scratch.
+const REPRIME_SYSTEM: &str = "\
+An AI coding agent ran out of output-token budget mid-thought and produced no \
+answer or tool call. Below is its (truncated) reasoning. Distill ONLY the \
+conclusions it had already reached that bear on the immediate next action: what \
+it decided to do, which file/command/tool it settled on and with what arguments, \
+and any facts it established. Omit abandoned dead-ends and open questions it \
+never resolved. Terse bullet points. Output only the distilled conclusions.";
+
+/// Maximum consecutive summarize-and-reprime retries after a truncation before
+/// giving up and reporting `[incomplete]`.
+const MAX_REPRIME_ATTEMPTS: u32 = 2;
+
 /// Tokens reserved for the model's response + tool schemas when budgeting.
 const RESPONSE_HEADROOM: usize = 4096;
 /// Maximum subagent nesting depth (prevents runaway recursion).
@@ -456,12 +480,15 @@ impl<'a> AgentLoop<'a> {
         };
         Self {
             model,
+            summarizer: None,
             runtime,
             tools,
             behavior,
             cancel,
             context_window,
             pruned_notified: false,
+            reprime_attempts: 0,
+            output_limit_warned: false,
             subagent_depth,
             last_final: None,
             tokens_in: 0,
@@ -606,7 +633,8 @@ impl<'a> AgentLoop<'a> {
     /// Budgets are for the whole session, so subagent usage counts too.
     fn budget_reached(&self) -> Option<String> {
         let b = &self.behavior;
-        let used = self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
+        let used =
+            self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
         if b.token_budget > 0 && used >= b.token_budget {
             return Some(format!(
                 "token budget reached ({used} tokens ≥ {}); stopping",
@@ -629,7 +657,8 @@ impl<'a> AgentLoop<'a> {
             return;
         }
         let b = &self.behavior;
-        let used = self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
+        let used =
+            self.tokens_in + self.tokens_out + self.subagent_tokens_in + self.subagent_tokens_out;
         let spent = self.cost_usd + self.subagent_cost_usd;
         let warn = if b.token_budget > 0 && used as f64 >= 0.8 * b.token_budget as f64 {
             Some(format!(
@@ -729,17 +758,57 @@ impl<'a> AgentLoop<'a> {
         ));
     }
 
+    /// Run a one-shot summarization on the dedicated summarizer model, falling
+    /// back to the main model when none is configured. No tools, no streaming.
+    async fn run_summary(&self, system: &str, body: String) -> Result<String> {
+        let msgs = vec![Message::system(system), Message::user(body)];
+        let client = self.summarizer.as_deref().unwrap_or(self.model.as_ref());
+        let resp = client.chat(&msgs, &[], None).await?;
+        Ok(resp.content.unwrap_or_default())
+    }
+
+    /// One-shot warning that the model's configured output-token limit may be
+    /// too low: it's spending the whole budget on reasoning before it can answer.
+    fn warn_output_limit(&mut self) {
+        if self.output_limit_warned {
+            return;
+        }
+        self.output_limit_warned = true;
+        self.ui.notice(&format!(
+            "model exhausted its output-token budget while reasoning (max_tokens ≈ {}); \
+             it may be set too low — raise it in models.yaml or lower the reasoning effort",
+            self.model.max_output_tokens()
+        ));
+    }
+
+    /// Distill a truncated turn's reasoning into a directive that re-primes the
+    /// model to act. Returns `None` when there's no reasoning to salvage or the
+    /// summary comes back empty — the caller then reports `[incomplete]`.
+    async fn reprime_directive(&self, response: &ChatResponse) -> Option<String> {
+        let reasoning = response
+            .reasoning
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())?;
+        let summary = self
+            .run_summary(REPRIME_SYSTEM, reasoning.to_string())
+            .await
+            .ok()
+            .filter(|s| !s.trim().is_empty())?;
+        Some(format!(
+            "Your previous attempt ran out of thinking budget before you answered. \
+             Here is what you had already concluded:\n\n{summary}\n\n\
+             Do NOT reason further. Immediately output your final answer or the next \
+             tool call based on the above."
+        ))
+    }
+
     /// Ask the model to summarize a span of prior messages into a dense brief.
     async fn summarize(&self, old: &[Message]) -> Result<String> {
-        let msgs = vec![
-            Message::system(SUMMARY_SYSTEM),
-            Message::user(format!(
-                "{}\n\n---\nWrite the summary now.",
-                render_transcript(old)
-            )),
-        ];
-        let resp = self.model.chat(&msgs, &[], None).await?;
-        Ok(resp.content.unwrap_or_default())
+        self.run_summary(
+            SUMMARY_SYSTEM,
+            format!("{}\n\n---\nWrite the summary now.", render_transcript(old)),
+        )
+        .await
     }
 
     /// Last-resort pruning: drop the oldest messages (never the system message),
@@ -762,6 +831,13 @@ impl<'a> AgentLoop<'a> {
     /// Attach a session logger (records transcript, commands, final summary).
     pub fn with_logger(mut self, logger: Option<SessionLogger>) -> Self {
         self.logger = logger;
+        self
+    }
+
+    /// Attach a dedicated summarizer model for compaction and truncation
+    /// recovery. `None` (the default) uses the main model for those calls.
+    pub fn with_summarizer(mut self, summarizer: Option<Box<dyn ModelClient>>) -> Self {
+        self.summarizer = summarizer;
         self
     }
 
@@ -1094,17 +1170,42 @@ impl<'a> AgentLoop<'a> {
 
             if response.tool_calls.is_empty() {
                 // No tool call: treat any content as an implicit final answer.
-                let msg = response.content.unwrap_or_default();
+                let msg = response.content.clone().unwrap_or_default();
                 if !msg.is_empty() {
                     self.ui.final_message(&msg);
                     return Ok(Some(msg));
                 }
                 // Truncated mid-generation with nothing usable: a reasoning model
                 // can spend its entire output budget thinking and never emit an
-                // answer or tool call. Report it explicitly so the caller (a
-                // foreman reading a subagent's stdout, or the user) sees the
-                // cause instead of a silent empty result.
+                // answer or tool call. Warn once that its output limit may be too
+                // low, then try to salvage the wasted reasoning: distill it into
+                // conclusions-so-far and retry the turn with a directive to act
+                // now instead of re-deriving from scratch. Bounded by
+                // MAX_REPRIME_ATTEMPTS so a model that always truncates can't spin.
                 if response.truncated {
+                    self.warn_output_limit();
+                    if self.reprime_attempts < MAX_REPRIME_ATTEMPTS {
+                        if let Some(directive) = self.reprime_directive(&response).await {
+                            self.reprime_attempts += 1;
+                            // Drop the empty assistant turn we just recorded so the
+                            // giant truncated reasoning isn't re-sent; the compact
+                            // directive replaces it.
+                            self.messages.pop();
+                            self.ui.notice(
+                                "recovering: summarized truncated reasoning, retrying to wrap up",
+                            );
+                            let msg = Message::user(directive);
+                            if let Some(l) = &mut self.logger {
+                                l.log_message(&msg);
+                            }
+                            self.messages.push(msg);
+                            continue;
+                        }
+                    }
+                    // No reasoning to salvage, summary failed, or attempts spent:
+                    // report it explicitly so the caller (a foreman reading a
+                    // subagent's stdout, or the user) sees the cause instead of a
+                    // silent empty result.
                     let note = "model hit its output-token limit while reasoning \
                                 and produced no answer (no content, no tool call)";
                     self.ui.notice(note);
@@ -1116,6 +1217,11 @@ impl<'a> AgentLoop<'a> {
                 );
                 return Ok(None);
             }
+
+            // The turn produced a tool call — real progress — so a later
+            // truncation gets a fresh reprime budget rather than the tail of an
+            // earlier recovery.
+            self.reprime_attempts = 0;
 
             // Loop guard: re-issuing the identical tool call(s) yields the same
             // result and makes no progress (a degenerate model loop). Nudge after
@@ -1616,9 +1722,9 @@ impl<'a> AgentLoop<'a> {
         if per_provider > 0 {
             for (_, plan) in &plans {
                 let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
-                provider_sems
-                    .entry(key)
-                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(per_provider)));
+                provider_sems.entry(key).or_insert_with(|| {
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(per_provider))
+                });
             }
         }
 
@@ -2181,10 +2287,16 @@ mod tests {
         // Interleave unrelated events with several Cost/Tokens updates; the helper
         // must return the LAST of each (the child's combined running total).
         let events = [
-            UiEventMsg::Tokens { input: 10, output: 2 },
+            UiEventMsg::Tokens {
+                input: 10,
+                output: 2,
+            },
             UiEventMsg::Cost(0.01),
             UiEventMsg::Notice("working".into()),
-            UiEventMsg::Tokens { input: 100, output: 40 },
+            UiEventMsg::Tokens {
+                input: 100,
+                output: 40,
+            },
             UiEventMsg::Cost(0.25),
             UiEventMsg::Final("done".into()),
         ];
@@ -2212,7 +2324,9 @@ mod tests {
                     a: { provider: fireworks, model: minimax-m3 }\n  \
                     b: { provider: fireworks, model: other }\n  \
                     c: { provider: openai, model: gpt }\n";
-        let defs = serde_yaml_ng::from_str::<ModelsConfig>(yaml).unwrap().models;
+        let defs = serde_yaml_ng::from_str::<ModelsConfig>(yaml)
+            .unwrap()
+            .models;
         // Two different model NAMES on the same provider share a throttle key.
         assert_eq!(provider_key(Some("a"), &defs, None), "fireworks");
         assert_eq!(
@@ -3072,6 +3186,148 @@ mod tests {
         let msg = res.expect("truncation should yield a descriptive result, not None");
         assert!(msg.starts_with("[incomplete]"), "got: {msg}");
         assert_eq!(classify_subagent_result(&msg), "error");
+    }
+
+    #[tokio::test]
+    async fn truncation_reprime_recovers_by_summarizing_reasoning() {
+        // A turn truncates mid-thought (reasoning, no answer). The loop distills
+        // the reasoning into a directive and retries, and the second turn wraps
+        // up. Without a dedicated summarizer, the summary call falls back to the
+        // main model — so the queue is: truncated, summary, final answer.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: true,
+                reasoning: Some("I should edit foo.rs and run the tests".into()),
+                content: None,
+                tool_calls: vec![],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("conclusion: edit foo.rs, then test".into()),
+                tool_calls: vec![],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("all done".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do the task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("all done"));
+        // The distilled reasoning was injected as a directive to act now. (Inspect
+        // `agent` before `ui`, which `agent` borrows mutably.)
+        let injected = agent.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.contains("already concluded")
+                && m.content.contains("Do NOT reason further")
+        });
+        assert!(injected);
+        // Warned about the output limit and announced the recovery.
+        assert!(ui.notices.iter().any(|n| n.contains("output-token budget")));
+        assert!(ui.notices.iter().any(|n| n.contains("recovering")));
+    }
+
+    #[tokio::test]
+    async fn truncation_reprime_gives_up_after_cap() {
+        // Every turn truncates. After MAX_REPRIME_ATTEMPTS recoveries the loop
+        // stops with [incomplete] instead of spinning. Each attempt consumes a
+        // truncated turn plus its (main-model) summary call.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let trunc = || ChatResponse {
+            truncated: true,
+            reasoning: Some("still thinking hard".into()),
+            content: None,
+            tool_calls: vec![],
+        };
+        let summ = || ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some("concluded: keep going".into()),
+            tool_calls: vec![],
+        };
+        let model = ScriptedModel::new(vec![
+            trunc(),
+            summ(), // attempt 1
+            trunc(),
+            summ(),  // attempt 2
+            trunc(), // no attempts left -> [incomplete]
+        ]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do the task").await.unwrap();
+        let msg = res.expect("should yield [incomplete], not None");
+        assert!(msg.starts_with("[incomplete]"), "got: {msg}");
+        // Reprime was attempted exactly MAX_REPRIME_ATTEMPTS times.
+        let recoveries = ui
+            .notices
+            .iter()
+            .filter(|n| n.contains("recovering"))
+            .count();
+        assert_eq!(recoveries, MAX_REPRIME_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn reprime_uses_the_dedicated_summarizer_model() {
+        // With a summarizer configured, the distilled directive comes from IT, not
+        // the main model — so the main model's queue only holds the truncated turn
+        // and the final answer.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: true,
+                reasoning: Some("raw thinking".into()),
+                content: None,
+                tool_calls: vec![],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("wrapped up".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let summarizer = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some("SUMMARIZER_SAYS: edit foo.rs".into()),
+            tool_calls: vec![],
+        }]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_summarizer(Some(Box::new(summarizer)));
+        let res = agent.run("do the task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("wrapped up"));
+        // The directive carries the summarizer's output, proving it was used.
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.role == Role::User && m.content.contains("SUMMARIZER_SAYS: edit foo.rs")));
     }
 
     #[test]

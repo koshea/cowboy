@@ -189,6 +189,8 @@ fn make_project() -> assert_fs::TempDir {
     };
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
+    // Don't inherit a developer's global commit.gpgsign (test identity has no key).
+    git(&["config", "commit.gpgsign", "false"]);
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
     dir

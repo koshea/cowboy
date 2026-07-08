@@ -136,6 +136,7 @@ project lists merge by name (project wins); the default is `project.default`, fa
 ```yaml
 version: 1
 default: sonnet
+summarizer: haiku        # optional: model for summaries (compaction + recovery)
 models:
   sonnet:
     provider: litellm
@@ -156,6 +157,15 @@ agent cap (16k–32k is a good sweet spot — enough for a long file/edit withou
 letting one response run away). Cowboy reserves `max_tokens` of the window for the
 answer when pruning, so `prompt + output` never exceeds `context_window`; setting
 it accurately keeps requests valid even when the context is nearly full.
+
+**`summarizer`** (optional): names a model used for Cowboy's internal
+summarization — folding old history into a summary when the context window fills,
+and **truncation recovery**. When a reasoning model spends its whole `max_tokens`
+budget thinking and emits no answer or tool call, Cowboy warns that the output
+limit may be too low, distills the cut-off reasoning into conclusions-so-far, and
+retries the turn with a directive to act on them (bounded, so a model that always
+truncates can't spin). Point `summarizer` at a small/cheap model to make these
+auxiliary calls faster and cheaper; when unset, the session's main model is used.
 
 **`anthropic_cache`** (opt-in): when true, Cowboy adds Anthropic `cache_control`
 markers to the static system prompt and the latest message, so a gateway that

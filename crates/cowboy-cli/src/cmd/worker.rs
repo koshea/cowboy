@@ -292,6 +292,33 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         },
         None => Vec::new(),
     };
+    // Optional dedicated summarizer model (context compaction + truncation
+    // recovery). Project setting overrides user; on any resolution/build error we
+    // warn and fall back to the main model rather than failing the session.
+    let summarizer_name = project_models
+        .as_ref()
+        .and_then(|m| m.summarizer.clone())
+        .or_else(|| user_models.as_ref().and_then(|m| m.summarizer.clone()));
+    let summarizer: Option<Box<dyn ModelClient>> = match summarizer_name {
+        Some(name) => match resolve_model(
+            &providers,
+            user_models.as_ref(),
+            project_models.as_ref(),
+            Some(&name),
+        )
+        .and_then(|r| OpenAiClient::from_resolved(&r))
+        {
+            Ok(c) => Some(Box::new(c) as Box<dyn ModelClient>),
+            Err(e) => {
+                emitter.emit(UiEventMsg::Notice(format!(
+                    "summarizer model {name:?} unavailable ({e}); using the main model for summaries"
+                )));
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
@@ -301,6 +328,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         &mut ui,
     )
     .with_logger(logger)
+    .with_summarizer(summarizer)
     .with_memory_context(memory_ctx)
     .with_history(history)
     .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);

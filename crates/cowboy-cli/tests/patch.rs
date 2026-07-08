@@ -30,6 +30,11 @@ fn cowboy(dir: &std::path::Path) -> Command {
 fn repo_with_change() -> assert_fs::TempDir {
     let tmp = assert_fs::TempDir::new().unwrap();
     git(tmp.path(), &["init", "-q"]);
+    // Self-contained identity; don't inherit a developer's global commit.gpgsign
+    // (test identity has no signing key).
+    git(tmp.path(), &["config", "user.email", "t@t"]);
+    git(tmp.path(), &["config", "user.name", "t"]);
+    git(tmp.path(), &["config", "commit.gpgsign", "false"]);
     tmp.child("file.txt").write_str("original\n").unwrap();
     git(tmp.path(), &["add", "."]);
     git(tmp.path(), &["commit", "-q", "-m", "init"]);
