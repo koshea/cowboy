@@ -62,7 +62,6 @@ pub fn ruleset(cfg: &GatewayConfig) -> String {
     ip daddr 127.0.0.0/8 accept
     ct state established,related accept
 {filter_allow}    udp dport 53 accept
-    meta l4proto tcp accept
   }}
 }}
 table ip6 cowboy {{
@@ -193,6 +192,23 @@ mod tests {
         assert!(r.contains("policy drop"));
         assert!(r.contains("udp dport 53 accept"));
         assert!(r.contains("ct state established,related accept"));
+    }
+
+    #[test]
+    fn ruleset_filter_is_a_real_backstop_for_tcp() {
+        let r = ruleset(&cfg());
+        // The filter chain must NOT blanket-accept TCP. Redirected TCP arrives here
+        // with its destination already rewritten to loopback (nat output runs at
+        // -150, ahead of this hook), so `ip daddr 127.0.0.0/8 accept` carries it —
+        // meaning a blanket accept buys nothing and would let TCP leak in the one
+        // case that matters: the REDIRECT not applying. Verified live: with the
+        // REDIRECT in place the proxy is still reached; with it removed the
+        // connection is dropped instead of escaping.
+        assert!(
+            !r.contains("meta l4proto tcp accept"),
+            "TCP must not be blanket-accepted in the filter chain:\n{r}"
+        );
+        assert!(r.contains("ip daddr 127.0.0.0/8 accept"));
     }
 
     #[test]

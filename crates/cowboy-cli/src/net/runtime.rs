@@ -27,6 +27,10 @@ const MISE_DATA_DIR: &str = "/usr/local/share/mise";
 /// bundled images when `COWBOY_SRC` is not set.
 const COMPILE_REPO_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
+/// Sink for human-readable container bring-up status lines (see
+/// [`AgentRuntime::status_channel`]).
+pub(crate) type StatusTx = tokio::sync::mpsc::UnboundedSender<String>;
+
 /// A locally-built agent image: which Dockerfile + build context to use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DerivedImage {
@@ -57,6 +61,8 @@ pub struct AgentRuntime {
     /// TTL cache of resolved `source_command` secrets, so shell commands get a
     /// fresh-ish token without re-running the host command every time.
     secret_cache: std::sync::Mutex<Option<SecretCache>>,
+    /// Optional sink for bring-up status lines (see [`Self::status_channel`]).
+    status: Option<StatusTx>,
 }
 
 /// Cached `source_command` secrets with the instant they were resolved (for TTL).
@@ -113,7 +119,27 @@ impl AgentRuntime {
             user: Some(host_user()),
             gateway,
             secret_cache: std::sync::Mutex::new(None),
+            status: None,
         })
+    }
+
+    /// Attach a sink for container bring-up progress (image pull/build, container
+    /// create, gateway start). These phases can take minutes on a cold host and
+    /// otherwise happen *silently* inside the first command's exec — the agent
+    /// loop drains this channel into `AgentUi::notice` so the user sees why
+    /// nothing is streaming yet. Replaces any previous sink; when none is
+    /// attached, reporting is a no-op.
+    pub fn status_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.status = Some(tx);
+        rx
+    }
+
+    /// Report a bring-up phase to the status sink, if any (best-effort).
+    fn report(&self, msg: impl Into<String>) {
+        if let Some(tx) = &self.status {
+            let _ = tx.send(msg.into());
+        }
     }
 
     fn user(&self) -> &str {
@@ -355,6 +381,10 @@ impl AgentRuntime {
                 self.ensure_base_image().await?;
             }
             tracing::info!(%image, dockerfile = %d.dockerfile.display(), "building agent image");
+            self.report(format!(
+                "building the project agent image from {} (this can take a few minutes)…",
+                d.dockerfile.display()
+            ));
             return self
                 .docker
                 .build_image(&d.dockerfile, &d.context, image)
@@ -369,6 +399,9 @@ impl AgentRuntime {
 
         // Otherwise assume it's a registry image.
         tracing::info!(%image, "pulling agent image");
+        self.report(format!(
+            "pulling the agent image {image} (one-time download)…"
+        ));
         self.docker.pull_image(image).await
     }
 
@@ -381,6 +414,7 @@ impl AgentRuntime {
             DEFAULT_IMAGE,
             "agent.Dockerfile",
             default_image_source_root().as_deref(),
+            self.status.as_ref(),
         )
         .await
     }
@@ -401,6 +435,7 @@ impl AgentRuntime {
                 container = %self.container_name,
                 "agent container was created by a different cowboy version; recreating"
             );
+            self.report("cowboy was updated — recreating the agent container…");
             self.teardown_containers().await;
             return self.create().await;
         }
@@ -426,12 +461,21 @@ impl AgentRuntime {
                 Ok(())
             }
             ContainerState::Stopped => {
+                self.report("starting the agent container…");
                 self.docker.start(&self.container_name).await?;
                 // The agent is now running but UNSANDBOXED until the sidecar
-                // reinstalls the nft clamp in its fresh netns. If that fails, stop
-                // the agent again so it never serves a command with open egress.
+                // reinstalls the nft clamp in its fresh netns. `restart_sidecar`
+                // (not `start_sidecar`) because a sidecar left over from the
+                // agent's previous lifetime is still *Running* on the orphaned
+                // netns — reusing it would enforce nothing. If enforcement can't
+                // be installed, stop the agent again so it never serves a command
+                // with open egress.
                 if let Some(gw) = &self.gateway {
-                    if let Err(e) = gw.start_sidecar(&*self.docker, &self.container_name).await {
+                    self.report("starting the network gateway…");
+                    if let Err(e) = gw
+                        .restart_sidecar(&*self.docker, &self.container_name)
+                        .await
+                    {
                         let _ = self.docker.stop(&self.container_name).await;
                         return Err(e).context(
                             "network enforcement failed to start; stopped the agent to fail closed",
@@ -471,9 +515,16 @@ impl AgentRuntime {
         let _ = self.docker.remove(&self.container_name, true).await;
     }
 
-    /// Stop the agent container (idle teardown) to free its RAM. The gateway
-    /// sidecar shares the agent's netns, so it exits with the agent; the next
-    /// command restarts both via [`ensure_running`]. Best-effort.
+    /// Stop the agent container (idle teardown) to free its RAM; the next command
+    /// restarts both via [`ensure_running`]. Best-effort.
+    ///
+    /// The gateway sidecar must be stopped **with** the agent. Docker keeps a
+    /// `--network container:<agent>` sidecar *running* when the agent stops (its
+    /// netns is simply orphaned), and a restarted agent gets a **fresh** netns
+    /// with no nft clamp — so a still-`Running` sidecar would make
+    /// [`GatewayNetwork::start_sidecar`] short-circuit and leave the agent with
+    /// open egress. Stopping it here means its next state is `Stopped`, which
+    /// forces a recreate into the new netns.
     pub async fn stop(&self) {
         if matches!(
             self.docker.container_state(&self.container_name).await,
@@ -482,6 +533,14 @@ impl AgentRuntime {
             tracing::info!(container = %self.container_name, "stopping idle agent container");
             let _ = self.docker.stop(&self.container_name).await;
         }
+        if let Some(gw) = &self.gateway {
+            if matches!(
+                self.docker.container_state(&gw.gateway_name).await,
+                Ok(ContainerState::Running)
+            ) {
+                let _ = self.docker.stop(&gw.gateway_name).await;
+            }
+        }
     }
 
     async fn create(&self) -> Result<()> {
@@ -489,12 +548,15 @@ impl AgentRuntime {
         // Create the agent's egress network and verify the gateway image is
         // present BEFORE the agent starts — the agent must never run un-sandboxed.
         if let Some(gw) = &self.gateway {
-            gw.ensure_network(&*self.docker).await?;
+            gw.ensure_network(&*self.docker, self.status.as_ref())
+                .await?;
         }
         let spec = self.build_spec()?;
+        self.report("creating the agent container…");
         self.docker.run_detached(&spec).await?;
 
         if let Some(gw) = &self.gateway {
+            self.report("starting the network gateway…");
             // Start the gateway as a sidecar sharing the agent's netns; it applies
             // the nft REDIRECT that forces all agent egress through its policy
             // proxy. The agent lacks NET_ADMIN, so it cannot undo the rules.
@@ -965,14 +1027,76 @@ fn git_common_dir(root: &Path) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// Create (once) an empty file used to mask host-owned config inside the container.
-fn ensure_mask_file() -> Result<PathBuf> {
-    let path = std::env::temp_dir().join("cowboy-mask-empty");
-    if !path.exists() {
-        std::fs::write(&path, b"")
-            .with_context(|| format!("creating mask file {}", path.display()))?;
+/// A private (`0700`), user-owned directory for cowboy's runtime artifacts — the
+/// config mask file, the gateway's policy file.
+///
+/// These used to live at predictable paths in world-writable `/tmp`, where a local
+/// user could pre-create them. That mattered: the mask file is bind-mounted into
+/// the container, so a symlink there would make dockerd (root) mount *any* file the
+/// cowboy user can read — `providers.yaml` included — into the untrusted agent; and
+/// the policy file is the allow/deny list the gateway enforces. Owning the
+/// directory removes the class: no other user can create or replace entries in it.
+pub(crate) fn private_dir() -> Result<PathBuf> {
+    let dir = config::global_cache_dir()
+        .context("cannot resolve a cache directory for cowboy's runtime files")?
+        .join("run");
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Not a symlink someone else planted, and ours.
+        let md = std::fs::symlink_metadata(&dir)
+            .with_context(|| format!("inspecting {}", dir.display()))?;
+        if md.file_type().is_symlink() || !md.is_dir() {
+            anyhow::bail!(
+                "{} is not a real directory; refusing to use it",
+                dir.display()
+            );
+        }
+        // SAFETY: getuid() is always safe.
+        if md.uid() != unsafe { libc::getuid() } {
+            anyhow::bail!(
+                "{} is not owned by this user; refusing to use it",
+                dir.display()
+            );
+        }
+        // Fatal, not best-effort: the whole point is that others can't write here.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {} to owner-only", dir.display()))?;
     }
+    Ok(dir)
+}
+
+/// Create a file inside [`private_dir`] with `contents`, replacing any existing
+/// one. Fails rather than following a symlink or reusing a file we don't own.
+pub(crate) fn write_private_file(name: &str, contents: &[u8]) -> Result<PathBuf> {
+    let path = private_dir()?.join(name);
+    // Remove first so we never write *through* a pre-existing symlink, then create
+    // exclusively: if anything raced us to the name, this errors instead of using it.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clearing {}", path.display())),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    use std::io::Write;
+    f.write_all(contents)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
+}
+
+/// The empty file used to mask host-owned config inside the container.
+fn ensure_mask_file() -> Result<PathBuf> {
+    write_private_file("mask-empty", b"")
 }
 
 /// Ensure `image` is available locally: use it if it already exists, build it
@@ -985,17 +1109,27 @@ pub(crate) async fn ensure_image_available(
     image: &str,
     dockerfile: &str,
     source_root: Option<&Path>,
+    status: Option<&StatusTx>,
 ) -> Result<()> {
     if docker.image_exists(image).await? {
         return Ok(());
     }
+    let say = |msg: String| {
+        if let Some(tx) = status {
+            let _ = tx.send(msg);
+        }
+    };
     if let Some(src) = source_root {
         let path = src.join("docker").join(dockerfile);
         tracing::info!(%image, dockerfile = %path.display(),
             "building cowboy image from source (this may take a few minutes)");
+        say(format!(
+            "building {image} from source (this can take a few minutes)…"
+        ));
         return docker.build_image(&path, src, image).await;
     }
     tracing::info!(%image, "pulling cowboy image");
+    say(format!("pulling {image} (one-time download)…"));
     docker.pull_image(image).await
 }
 
@@ -1043,6 +1177,49 @@ mod tests {
     use super::*;
     use crate::net::docker::MockDockerCli;
     use cowboy_core::config::Mount;
+
+    /// The mask file is bind-mounted into the container, so its path must not be
+    /// one another local user can pre-create: a symlink there would make dockerd
+    /// (root) mount whatever it points at — `providers.yaml`, say — into the
+    /// untrusted agent.
+    #[test]
+    fn private_files_are_owner_only_and_never_follow_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_dir().expect("private dir");
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the runtime dir must be owner-only");
+        assert!(
+            !dir.starts_with("/tmp"),
+            "runtime files must not live in world-writable /tmp: {}",
+            dir.display()
+        );
+
+        // A pre-planted symlink at the target name is replaced, not written through.
+        let victim = dir.join("victim-do-not-clobber");
+        std::fs::write(&victim, b"precious").unwrap();
+        let name = "test-symlink-target";
+        let planted = dir.join(name);
+        let _ = std::fs::remove_file(&planted);
+        std::os::unix::fs::symlink(&victim, &planted).unwrap();
+
+        let written = write_private_file(name, b"payload").expect("write");
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious",
+            "the symlink target must be untouched"
+        );
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "payload");
+        assert!(!std::fs::symlink_metadata(&written)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let m = std::fs::metadata(&written).unwrap().permissions().mode() & 0o777;
+        assert_eq!(m, 0o600, "private files are owner-only");
+
+        let _ = std::fs::remove_file(&written);
+        let _ = std::fs::remove_file(&victim);
+    }
 
     #[test]
     fn resolve_source_expands_tilde_and_vars() {
@@ -1112,7 +1289,7 @@ mod tests {
             .find(|m| m.target == "/workspace/.cowboy/security.yaml")
             .expect("security.yaml must be masked");
         assert!(sec.read_only, "mask must be read-only");
-        assert!(sec.source.contains("cowboy-mask-empty"));
+        assert!(sec.source.ends_with("mask-empty"), "got {}", sec.source);
         assert!(spec
             .mounts
             .iter()
@@ -1348,6 +1525,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_running_reports_bringup_phases_to_the_status_sink() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Absent));
+        docker.expect_image_exists().returning(|_| Ok(false));
+        docker.expect_pull_image().returning(|_| Ok(()));
+        docker.expect_run_detached().returning(|_| Ok(()));
+        let (mut rt, _tmp) = fixture(false, docker);
+        let mut rx = rt.status_channel();
+        rt.ensure_running().await.unwrap();
+        let mut msgs = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+        // A cold bring-up narrates its slow phases: the image pull and the
+        // container create (no gateway in the non-isolated fixture).
+        assert!(msgs.iter().any(|m| m.contains("pulling the agent image")));
+        assert!(msgs
+            .iter()
+            .any(|m| m.contains("creating the agent container")));
+    }
+
+    #[tokio::test]
     async fn ensure_running_creates_when_absent_building_image_if_missing() {
         let mut docker = MockDockerCli::new();
         docker
@@ -1483,6 +1684,10 @@ mod tests {
                 Ok(ContainerState::Running) // agent is up
             }
         });
+        // Same-version container: not a recreate case.
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         docker.expect_remove().returning(|_, _| Ok(()));
         docker.expect_run_detached().returning(|_| Ok(()));
         // Proxy never reports a listener → the sidecar can't enforce.
@@ -1667,7 +1872,7 @@ mod tests {
             .returning(|_| Ok(true));
         docker.expect_build_image().never();
         docker.expect_pull_image().never();
-        ensure_image_available(&docker, "x:1", "agent.Dockerfile", None)
+        ensure_image_available(&docker, "x:1", "agent.Dockerfile", None, None)
             .await
             .unwrap();
     }
@@ -1694,6 +1899,7 @@ mod tests {
             "x:1",
             "agent.Dockerfile",
             Some(Path::new("/src/cowboy")),
+            None,
         )
         .await
         .unwrap();
@@ -1712,7 +1918,7 @@ mod tests {
             .times(1)
             .withf(|image| image == "x:1")
             .returning(|_| Ok(()));
-        ensure_image_available(&docker, "x:1", "gateway.Dockerfile", None)
+        ensure_image_available(&docker, "x:1", "gateway.Dockerfile", None, None)
             .await
             .unwrap();
     }

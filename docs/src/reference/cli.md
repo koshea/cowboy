@@ -512,6 +512,15 @@ Create a new ranch plan (writes a skeleton ranch.yaml to fill in)
 | `--goal` | The overall goal |
 
 
+### `cowboy ranch draft`
+
+Draft a ranch from a decomposition spec file (YAML/JSON with `title`, `goal`, and a `workstreams` list). Validates the dependency DAG and writes the draft ranch.yaml. Used by `cowboy ranch plan`: the agent authors the spec with the `write` tool, then runs this to validate and draft it
+
+| Arg | Description |
+|-----|-------------|
+| `<SPEC>` | Path to the decomposition spec (YAML or JSON) |
+
+
 ### `cowboy ranch plan`
 
 Decompose a goal into a ranch plan with the agent: it researches the codebase read-only and proposes workstreams + dependencies for you to review (writes a draft ranch.yaml; starts nothing)

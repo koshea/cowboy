@@ -534,6 +534,13 @@ pub struct ModelDef {
     /// understands `cache_control`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub anthropic_cache: bool,
+    /// Abort a streaming response when the provider sends *nothing* (not even an
+    /// SSE keep-alive) for this many seconds — a silent mid-stream stall would
+    /// otherwise hang the session's turn forever. `0` disables; unset uses the
+    /// client default (300s), generous enough for reasoning models that think
+    /// without streaming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_seconds: Option<u64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -559,6 +566,7 @@ pub struct ResolvedModel {
     pub input_cost_per_mtok: Option<f64>,
     pub output_cost_per_mtok: Option<f64>,
     pub anthropic_cache: bool,
+    pub stream_idle_timeout_seconds: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1206,7 @@ pub fn resolve_model(
         input_cost_per_mtok: def.input_cost_per_mtok,
         output_cost_per_mtok: def.output_cost_per_mtok,
         anthropic_cache: def.anthropic_cache,
+        stream_idle_timeout_seconds: def.stream_idle_timeout_seconds,
     })
 }
 

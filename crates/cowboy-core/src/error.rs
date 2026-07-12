@@ -37,6 +37,13 @@ pub enum Error {
     #[error("model error: {0}")]
     Model(String),
 
+    /// The provider says this model does not exist (a 404 `model_not_found`, or a
+    /// 400 naming an unknown model). Distinct from [`Self::Model`] because it is
+    /// **permanent** — retrying is pointless, but *rerouting* to another model is
+    /// not, so the agent loop can fall back instead of failing the session.
+    #[error("model unavailable: {0}")]
+    ModelUnavailable(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

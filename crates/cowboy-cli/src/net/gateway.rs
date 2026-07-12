@@ -79,17 +79,15 @@ impl GatewayNetwork {
         let mut policy = security.network_policy.clone();
         super::approvals::merge_into(&mut policy, &super::approvals::load(root));
 
-        let policy_file = std::env::temp_dir().join(format!("cowboy-policy-{hash:08x}.json"));
+        // The policy the gateway enforces. Written `0600` into cowboy's private,
+        // user-owned runtime dir — never a predictable path in world-writable /tmp,
+        // where another local user could pre-create it (as a symlink to clobber a
+        // file we can write, or mode-0666 so they could rewrite the allow/deny lists
+        // in the window before the gateway reads them).
         let json = serde_json::to_string_pretty(&policy).context("serializing network policy")?;
-        std::fs::write(&policy_file, json)
-            .with_context(|| format!("writing policy file {}", policy_file.display()))?;
-        // Owner-only: this shared-/tmp file isn't secret, but it shouldn't expose
-        // the project's network posture (allow/deny lists) to other local users.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&policy_file, std::fs::Permissions::from_mode(0o600));
-        }
+        let policy_file =
+            super::runtime::write_private_file(&format!("policy-{hash:08x}.json"), json.as_bytes())
+                .context("writing the gateway policy file")?;
 
         // Control channel: the gateway (sidecar, in the agent's netns) dials the
         // host over TCP for `ask` decisions. A deterministic per-project port; the
@@ -189,8 +187,14 @@ impl GatewayNetwork {
     }
 
     /// Create the agent's egress network and verify the gateway image is present.
-    /// Called **before** the agent starts so it never runs un-sandboxed.
-    pub async fn ensure_network(&self, docker: &dyn DockerCli) -> Result<()> {
+    /// Called **before** the agent starts so it never runs un-sandboxed. `status`
+    /// (when given) receives a progress line if the gateway image must be
+    /// built/pulled — the one slow step here.
+    pub async fn ensure_network(
+        &self,
+        docker: &dyn DockerCli,
+        status: Option<&super::runtime::StatusTx>,
+    ) -> Result<()> {
         if !docker.network_exists(&self.agent_net).await? {
             if let Err(e) = docker
                 .create_network(&NetworkSpec {
@@ -223,14 +227,16 @@ impl GatewayNetwork {
             GATEWAY_IMAGE,
             "gateway.Dockerfile",
             super::runtime::default_image_source_root().as_deref(),
+            status,
         )
         .await
         .context("ensuring the gateway image (refusing to run the agent unsandboxed)")
     }
 
-    /// Start (or restart) the gateway sidecar in the agent's netns. Must be called
-    /// after the agent container exists. A sidecar from a prior agent lifetime has
-    /// exited (its netns is gone), so a non-running one is removed and recreated.
+    /// Start the gateway sidecar in the agent's netns. Must be called after the
+    /// agent container exists. A `Running` sidecar is reused only when it is
+    /// enforcing *this* agent netns; callers on a restart path must use
+    /// [`Self::restart_sidecar`] instead (see its docs).
     pub async fn start_sidecar(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
         match docker.container_state(&self.gateway_name).await? {
             super::docker::ContainerState::Running => return Ok(()),
@@ -250,18 +256,55 @@ impl GatewayNetwork {
         self.wait_ready(docker).await
     }
 
-    /// Verify the sidecar is still alive and therefore enforcing. The gateway
-    /// applies its nft ruleset *before* it binds the proxy and exits on any
-    /// failure (see `cowboy-gateway/src/main.rs`), so a `Running` sidecar means
-    /// the netns clamp is installed. If it has died, the agent's egress is no
-    /// longer policed — bring the sidecar back (which re-applies the rules),
-    /// failing closed if it can't be restored. The caller must not run the agent
-    /// when this errors.
-    pub async fn ensure_enforcing(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
-        match docker.container_state(&self.gateway_name).await? {
-            super::docker::ContainerState::Running => Ok(()),
-            _ => self.start_sidecar(docker, agent).await,
+    /// Unconditionally recreate the sidecar in the agent's (new) netns. Use this
+    /// whenever the agent container has just been **started from stopped**: that
+    /// gives it a fresh netns with no nft clamp, while Docker leaves the old
+    /// `--network container:<agent>` sidecar *running* (attached to the orphaned
+    /// netns) — so [`Self::start_sidecar`]'s `Running` fast path would report
+    /// success while enforcing nothing and hand the agent open egress. Removing
+    /// first guarantees the clamp is reinstalled where it now matters.
+    pub async fn restart_sidecar(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
+        if !matches!(
+            docker.container_state(&self.gateway_name).await?,
+            super::docker::ContainerState::Absent
+        ) {
+            docker.remove(&self.gateway_name, true).await?;
         }
+        docker.run_detached(&self.gateway_spec(agent)).await?;
+        self.wait_ready(docker).await
+    }
+
+    /// Verify the sidecar is alive **and clamping the agent's current netns**, and
+    /// re-establish it otherwise. The gateway applies its nft ruleset *before* it
+    /// binds the proxy and exits on any failure (see `cowboy-gateway/src/main.rs`),
+    /// so a `Running` sidecar means a clamp is installed — but not necessarily
+    /// *where the agent now lives*: Docker gives a restarted container a brand-new
+    /// network sandbox while leaving the `--network container:` sidecar running on
+    /// the orphaned one. Comparing sandbox keys catches that (an agent restarted
+    /// by idle-stop, `docker restart`, or a daemon reboot), so the agent is never
+    /// served by a gateway that enforces nothing. Fails closed: the caller must not
+    /// run the agent when this errors.
+    pub async fn ensure_enforcing(&self, docker: &dyn DockerCli, agent: &str) -> Result<()> {
+        if !matches!(
+            docker.container_state(&self.gateway_name).await?,
+            super::docker::ContainerState::Running
+        ) {
+            return self.start_sidecar(docker, agent).await;
+        }
+        // Both keys must be present and identical. A missing key (older docker, an
+        // inspect race) is treated as "cannot prove it's enforcing" → recreate,
+        // which is safe (idempotent) and keeps this fail-closed.
+        let agent_ns = docker.container_sandbox_key(agent).await?;
+        let gw_ns = docker.container_sandbox_key(&self.gateway_name).await?;
+        if agent_ns.is_some() && agent_ns == gw_ns {
+            return Ok(());
+        }
+        tracing::warn!(
+            gateway = %self.gateway_name,
+            "gateway sidecar is not in the agent's current network namespace \
+             (the agent was restarted); recreating it to reinstall enforcement"
+        );
+        self.restart_sidecar(docker, agent).await
     }
 
     /// Block until the gateway's transparent proxy listener is bound in the
@@ -363,7 +406,7 @@ mod tests {
         // Image already present → ensure_image_available short-circuits.
         docker.expect_image_exists().returning(|_| Ok(true));
 
-        net.ensure_network(&docker)
+        net.ensure_network(&docker, None)
             .await
             .expect("racing duplicate network should be reused, not fatal");
     }
@@ -382,7 +425,7 @@ mod tests {
             .returning(|_| anyhow::bail!("Pool overlaps with other one on this address space"));
 
         let err = net
-            .ensure_network(&docker)
+            .ensure_network(&docker, None)
             .await
             .expect_err("a real conflict with a different network must be fatal");
         assert!(err.to_string().contains("overlaps"), "got: {err}");

@@ -121,6 +121,12 @@ you go, then `publish` it as an artifact by `path` and keep your final answer to
 short summary that points at the file. Save progress incrementally so partial work \
 survives even if you don't finish.";
 
+/// Builds a model client by name (host-owned credentials in, built client out),
+/// yielding the client, its context window, and its (input, output) per-1M-token
+/// USD pricing. Used to reroute when a model turns out to be unavailable.
+pub type ModelBuilder =
+    Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, (Option<f64>, Option<f64>))>>;
+
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
     model: Box<dyn ModelClient>,
@@ -175,6 +181,13 @@ pub struct AgentLoop<'a> {
     /// a row it has repeated. A (sub)agent re-issuing the identical call makes no
     /// progress and burns tokens, so we nudge then abort.
     last_tool_sig: Option<String>,
+    /// Digest of the last *executed* tool batch's results, and whether it differed
+    /// from the batch before it. The loop guard needs both: an identical call whose
+    /// result keeps changing is legitimate polling, not a loop. Only real executions
+    /// update these — the guard's own nudge messages must not reset the count, or it
+    /// could never escalate to an abort.
+    last_obs_sig: Option<String>,
+    last_obs_changed: bool,
     tool_repeat: u32,
     /// Plan mode: while on, file-mutating tools (`edit`/`write`) are refused so
     /// the agent proposes a plan and waits for the user to approve (`/go`). Host-
@@ -184,9 +197,19 @@ pub struct AgentLoop<'a> {
     /// are enabled; set via [`AgentLoop::enable_mcp`], which also adds the `mcp`
     /// tool and lists the servers in the system prompt.
     mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    /// (name, builder) for the model to reroute to when the configured one is
+    /// permanently unavailable at the provider. See [`Self::with_model_fallback`].
+    fallback_model: Option<(String, ModelBuilder)>,
+    /// One-shot latch: reroute at most once, so a fallback that is itself missing
+    /// can't ping-pong.
+    fallback_used: bool,
     messages: Vec<Message>,
     ui: &'a mut dyn AgentUi,
     logger: Option<SessionLogger>,
+    /// Container bring-up status lines from the runtime (image pulls/builds,
+    /// container + gateway starts), forwarded to the UI as notices — these
+    /// phases can take minutes on a cold host and would otherwise be silent.
+    runtime_status: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
 /// A planned subagent delegation, ready to execute. Owns everything it needs so
@@ -447,12 +470,13 @@ const MAX_SUBAGENT_DEPTH: usize = 2;
 impl<'a> AgentLoop<'a> {
     pub fn new(
         model: Box<dyn ModelClient>,
-        runtime: AgentRuntime,
+        mut runtime: AgentRuntime,
         behavior: AgentBehavior,
         context_window: usize,
         cancel: CancellationToken,
         ui: &'a mut dyn AgentUi,
     ) -> Self {
+        let runtime_status = runtime.status_channel();
         // Crew mode (roster + delegation enabled) gates the foreman guidance and
         // the `subagent` tool; in solo mode the selected model works alone.
         let crew_on = crate::cmd::crew::crew_enabled();
@@ -504,12 +528,17 @@ impl<'a> AgentLoop<'a> {
             lifecycle_started: false,
             setup_done: false,
             last_tool_sig: None,
+            last_obs_sig: None,
+            last_obs_changed: false,
             tool_repeat: 0,
             planning: false,
             mcp: None,
+            fallback_model: None,
+            fallback_used: false,
             messages: vec![Message::system(system)],
             ui,
             logger: None,
+            runtime_status,
         }
     }
 
@@ -548,6 +577,10 @@ impl<'a> AgentLoop<'a> {
         self.tokens_in += prompt_est;
         let mut out =
             cowboy_core::tokens::count(response.content.as_deref().unwrap_or_default()) as u64;
+        // Reasoning is billed as output and can dwarf the visible answer on the
+        // reasoning models this targets; omitting it made spend/budget read far
+        // below the truth.
+        out += cowboy_core::tokens::count(response.reasoning.as_deref().unwrap_or_default()) as u64;
         for tc in &response.tool_calls {
             out += (cowboy_core::tokens::count(&tc.arguments)
                 + cowboy_core::tokens::count(&tc.name)) as u64;
@@ -679,9 +712,19 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
-    /// Approximate token count of a message (content + tool-call arguments).
+    /// Approximate token count of a message (content + reasoning + tool calls).
+    ///
+    /// `reasoning` counts because it is **sent back** on every subsequent request
+    /// (`inject_reasoning_content`) to keep agentic reasoning models on plan. Not
+    /// counting it made `fit_context` believe a prompt fit when the real request
+    /// overflowed the context window.
     fn message_tokens(m: &Message) -> usize {
         let mut n = cowboy_core::tokens::count(&m.content) + 4;
+        n += m
+            .reasoning
+            .as_deref()
+            .map(cowboy_core::tokens::count)
+            .unwrap_or(0);
         for tc in &m.tool_calls {
             n += cowboy_core::tokens::count(&tc.arguments)
                 + cowboy_core::tokens::count(&tc.name)
@@ -731,9 +774,14 @@ impl<'a> AgentLoop<'a> {
                 break;
             }
         }
-        // Nothing before the kept tail to summarize (e.g. one huge turn): drop.
-        if keep_from <= 1 {
-            self.drop_oldest(budget);
+        // The tail from the last user message alone doesn't fit — i.e. ONE turn has
+        // outgrown the budget. This is the common case, not an exotic one: a
+        // one-shot `cowboy "do X"` (and every subagent) has a single user message,
+        // so there are no earlier turns to fold and the old code fell straight to
+        // `drop_oldest`, whose first victim was the task statement itself. Compact
+        // *inside* the turn instead, keeping the task pinned.
+        if keep_from <= self.pinned() {
+            self.compact_within_turn(budget, tail_budget).await;
             return;
         }
 
@@ -755,6 +803,64 @@ impl<'a> AgentLoop<'a> {
         self.messages = rebuilt;
         self.ui.notice(&format!(
             "compacted {folded} earlier messages into a summary"
+        ));
+    }
+
+    /// Leading messages that pruning and compaction must never remove: the system
+    /// prompt, plus the task statement (the first user message) when present. An
+    /// agent that loses its task keeps working with no idea what it's working on —
+    /// the classic goal-drift failure of a long autonomous run.
+    fn pinned(&self) -> usize {
+        if self.messages.len() > 1 && self.messages[1].role == Role::User {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// Fold the middle of an over-long *single turn* into a summary, keeping the
+    /// pinned head (system + task) and the most recent messages. Cuts only at a
+    /// boundary that isn't a tool result, so an assistant's tool calls are never
+    /// separated from their answers (which providers reject).
+    async fn compact_within_turn(&mut self, budget: usize, tail_budget: usize) {
+        let pin = self.pinned();
+        // The earliest safe cut whose tail fits — keeps as much recent context as
+        // the budget allows.
+        let cut = (pin..self.messages.len())
+            .filter(|&i| self.messages[i].role != Role::Tool)
+            .find(|&i| {
+                self.messages[i..]
+                    .iter()
+                    .map(Self::message_tokens)
+                    .sum::<usize>()
+                    <= tail_budget
+            });
+        let Some(cut) = cut.filter(|&c| c > pin) else {
+            // Nothing foldable (or no safe boundary): fall back to dropping, which
+            // still preserves the pinned head.
+            self.drop_oldest(budget);
+            return;
+        };
+
+        let old: Vec<Message> = self.messages[pin..cut].to_vec();
+        let folded = old.len();
+        let Ok(summary) = self.summarize(&old).await else {
+            self.drop_oldest(budget);
+            return;
+        };
+        if summary.trim().is_empty() {
+            self.drop_oldest(budget);
+            return;
+        }
+        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 1);
+        rebuilt.extend_from_slice(&self.messages[..pin]);
+        rebuilt.push(Message::system(format!(
+            "[Summary of earlier work on this task, compacted to save context]\n{summary}"
+        )));
+        rebuilt.extend_from_slice(&self.messages[cut..]);
+        self.messages = rebuilt;
+        self.ui.notice(&format!(
+            "compacted {folded} earlier messages from this turn into a summary"
         ));
     }
 
@@ -811,14 +917,18 @@ impl<'a> AgentLoop<'a> {
         .await
     }
 
-    /// Last-resort pruning: drop the oldest messages (never the system message),
-    /// skipping orphaned tool results, until within budget.
+    /// Last-resort pruning: drop the oldest messages, never the pinned head (the
+    /// system prompt **and the task**), skipping orphaned tool results, until
+    /// within budget.
     fn drop_oldest(&mut self, budget: usize) {
         let mut pruned = false;
-        while self.messages.len() > 2 && self.total_tokens() > budget {
-            self.messages.remove(1);
-            while self.messages.len() > 1 && self.messages[1].role == Role::Tool {
-                self.messages.remove(1);
+        let pin = self.pinned();
+        while self.messages.len() > pin + 1 && self.total_tokens() > budget {
+            self.messages.remove(pin);
+            // Removing an assistant turn orphans its tool results — drop those too,
+            // or the provider sees results with no matching call.
+            while self.messages.len() > pin && self.messages[pin].role == Role::Tool {
+                self.messages.remove(pin);
             }
             pruned = true;
         }
@@ -874,6 +984,17 @@ impl<'a> AgentLoop<'a> {
     ) -> Self {
         self.price_in = input_per_mtok;
         self.price_out = output_per_mtok;
+        self
+    }
+
+    /// Register the model to reroute to when the configured one turns out to be
+    /// **permanently unavailable** at the provider (a 404 `model_not_found` — e.g.
+    /// a roster entry naming a model id the provider has since retired). Without
+    /// this, such a model kills the session/subagent outright: the crew's
+    /// `fell_back` flag is decided at *routing* time and nothing reroutes on a
+    /// runtime error. Used once per session (see `fallback_used`).
+    pub fn with_model_fallback(mut self, name: String, build: ModelBuilder) -> Self {
+        self.fallback_model = Some((name, build));
         self
     }
 
@@ -940,6 +1061,30 @@ impl<'a> AgentLoop<'a> {
             return;
         }
 
+        // When setup will run commands below, bring the container up first,
+        // narrating the slow phases (image pull/build, gateway start) — done
+        // lazily inside the first command they read as a hang. Best-effort: on
+        // failure the setup/turn commands retry and surface the error in context.
+        if self.runtime.has_mise_config() || !self.behavior.setup.is_empty() {
+            {
+                let fut = self.runtime.ensure_running();
+                tokio::pin!(fut);
+                loop {
+                    tokio::select! {
+                        biased;
+                        Some(msg) = self.runtime_status.recv() => self.ui.notice(&msg),
+                        res = &mut fut => {
+                            if let Err(e) = res {
+                                self.ui.notice(&format!("container startup failed: {e:#}"));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            self.drain_runtime_status();
+        }
+
         // Toolchain: every container-up (cheap when the mise store is warm).
         if self.runtime.has_mise_config() {
             self.run_setup_command(
@@ -984,6 +1129,14 @@ impl<'a> AgentLoop<'a> {
         } else {
             self.ui
                 .notice("project setup incomplete — it'll retry on the next session");
+        }
+    }
+
+    /// Forward any queued container bring-up status lines to the UI (see
+    /// [`AgentRuntime::status_channel`]). Non-blocking.
+    fn drain_runtime_status(&mut self) {
+        while let Ok(msg) = self.runtime_status.try_recv() {
+            self.ui.notice(&msg);
         }
     }
 
@@ -1145,6 +1298,10 @@ impl<'a> AgentLoop<'a> {
                     self.ui.notice("interrupted");
                     return Ok(None);
                 }
+                // The provider doesn't serve this model (a retired/renamed id in
+                // the roster). Retrying can't help, but another model can: reroute
+                // once and re-run the turn, rather than failing the whole session.
+                Err(e) if self.model_unavailable(&e) && self.try_fallback_model() => continue,
                 Err(e) => {
                     self.ui.notice(&format!("model error: {e}"));
                     return Err(e);
@@ -1223,17 +1380,25 @@ impl<'a> AgentLoop<'a> {
             // earlier recovery.
             self.reprime_attempts = 0;
 
-            // Loop guard: re-issuing the identical tool call(s) yields the same
-            // result and makes no progress (a degenerate model loop). Nudge after
-            // a few repeats, abort if it persists — so a runaway costs seconds,
-            // not a hundred API calls.
+            // Loop guard: an identical tool call that ALSO returns an identical
+            // result makes no progress (a degenerate model loop). Nudge after a few
+            // repeats, abort if it persists — so a runaway costs seconds, not a
+            // hundred API calls.
+            //
+            // The result must be part of the test: a byte-identical call whose
+            // output *changes* is legitimate polling (`sleep 5 && curl health`,
+            // watching a build, waiting on a lock), and keying the guard on the call
+            // alone aborted those runs outright. `obs` is the digest of the previous
+            // iteration's tool results, so comparing it with the one before tells us
+            // whether repeating the call actually changed anything.
             let sig = tool_signature(&response.tool_calls);
-            if self.last_tool_sig.as_deref() == Some(sig.as_str()) {
+            let same_call = self.last_tool_sig.as_deref() == Some(sig.as_str());
+            if same_call && !self.last_obs_changed {
                 self.tool_repeat += 1;
             } else {
                 self.tool_repeat = 0;
-                self.last_tool_sig = Some(sig);
             }
+            self.last_tool_sig = Some(sig);
             const LOOP_NUDGE_AT: u32 = 3;
             const LOOP_ABORT_AT: u32 = 6;
             if self.tool_repeat >= LOOP_ABORT_AT {
@@ -1263,8 +1428,35 @@ impl<'a> AgentLoop<'a> {
                 continue;
             }
 
-            if let Some(final_msg) = self.handle_tool_calls(&response).await? {
-                return Ok(Some(final_msg));
+            let outcome = self.handle_tool_calls(&response).await;
+            // Record what this batch actually returned, so the next iteration can
+            // tell "same call, same result" (a loop) from "same call, new result"
+            // (polling). Done here — after a real execution — and never on the
+            // nudge/abort paths, which don't run the tools.
+            let obs = self.trailing_observation_sig();
+            self.last_obs_changed =
+                self.last_obs_sig.is_some() && obs.is_some() && obs != self.last_obs_sig;
+            if obs.is_some() {
+                self.last_obs_sig = obs;
+            }
+            match outcome {
+                Ok(Some(final_msg)) => return Ok(Some(final_msg)),
+                Ok(None) => {}
+                Err(e) => {
+                    // A tool arm bailed mid-turn: whatever calls it hadn't answered
+                    // must still get results, or the next turn ships an assistant
+                    // message with dangling tool calls and the provider 400s.
+                    self.seal_dangling_tool_calls(
+                        "not run: the turn ended early with an internal error",
+                    );
+                    return Err(e);
+                }
+            }
+            // The turn may have been cancelled while a tool ran (a cancelled shell
+            // exits 130 rather than erroring, so the loop reaches here); seal before
+            // the top-of-loop cancel check unwinds us.
+            if self.cancel.is_cancelled() {
+                self.seal_dangling_tool_calls("not run: the turn was interrupted");
             }
         }
 
@@ -1273,6 +1465,72 @@ impl<'a> AgentLoop<'a> {
             self.behavior.max_iterations
         ));
         Ok(None)
+    }
+
+    /// Digest of the tool results at the end of the history — i.e. what the
+    /// previous iteration's tool calls actually returned. `None` when the tail
+    /// isn't a tool-result run (nothing to compare). Used by the loop guard to tell
+    /// a stuck model from legitimate polling.
+    fn trailing_observation_sig(&self) -> Option<String> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let obs: Vec<&str> = self
+            .messages
+            .iter()
+            .rev()
+            .take_while(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        if obs.is_empty() {
+            return None;
+        }
+        let mut h = DefaultHasher::new();
+        obs.hash(&mut h);
+        Some(format!("{:016x}", h.finish()))
+    }
+
+    /// Whether this error means the configured model doesn't exist at the provider
+    /// (permanent — see `Error::ModelUnavailable`).
+    fn model_unavailable(&self, e: &anyhow::Error) -> bool {
+        matches!(
+            e.downcast_ref::<cowboy_core::error::Error>(),
+            Some(cowboy_core::error::Error::ModelUnavailable(_))
+        )
+    }
+
+    /// Reroute to the configured fallback model (once). Returns whether the swap
+    /// happened, so the caller can retry the turn; `false` means there's no
+    /// fallback, it's already been used, or it failed to build — in which case the
+    /// original error surfaces as before.
+    fn try_fallback_model(&mut self) -> bool {
+        if self.fallback_used {
+            return false;
+        }
+        let Some((name, build)) = &self.fallback_model else {
+            return false;
+        };
+        let name = name.clone();
+        match build(&name) {
+            Ok((client, cw, (price_in, price_out))) => {
+                self.fallback_used = true;
+                self.set_model(client, cw, price_in, price_out);
+                self.ui.notice(&format!(
+                    "the configured model is not available at the provider — \
+                     falling back to `{name}` and retrying (fix the model id in \
+                     models.yaml/crew.yaml to silence this)"
+                ));
+                self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::ModelFallback {
+                    model: name,
+                });
+                true
+            }
+            Err(e) => {
+                self.fallback_used = true; // don't spin on a broken fallback
+                self.ui
+                    .notice(&format!("fallback model `{name}` could not be built: {e}"));
+                false
+            }
+        }
     }
 
     /// Push a tool-result message (logged + added to history).
@@ -1284,6 +1542,44 @@ impl<'a> AgentLoop<'a> {
         self.messages.push(msg);
     }
 
+    /// Answer tool calls that will never run (the turn ended early), so the
+    /// assistant message that carried them has a result for **every** call id.
+    /// Providers reject a conversation containing an assistant turn with an
+    /// unanswered tool call, and this history is replayed on every later turn.
+    fn answer_unrun(&mut self, calls: &[cowboy_core::model::ToolCall], why: &str) {
+        for call in calls {
+            self.push_tool_result(&call.id, why);
+        }
+    }
+
+    /// Repair the message tail so it never ends with an assistant turn whose tool
+    /// calls lack results — the shape providers reject. Called before a turn is
+    /// abandoned (cancel/error), where the loop may have pushed the assistant
+    /// message but not yet every tool result. Mirrors `session::sanitize_history`,
+    /// which does the same on resume; without it, an interrupted turn poisons the
+    /// live conversation and every subsequent turn 400s.
+    fn seal_dangling_tool_calls(&mut self, why: &str) {
+        let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+        else {
+            return;
+        };
+        let answered: std::collections::HashSet<String> = self.messages[idx + 1..]
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        let unanswered: Vec<cowboy_core::model::ToolCall> = self.messages[idx]
+            .tool_calls
+            .iter()
+            .filter(|c| !answered.contains(&c.id))
+            .cloned()
+            .collect();
+        self.answer_unrun(&unanswered, why);
+    }
+
     /// Process this turn's tool calls. Returns `Some(message)` if `final` was
     /// called.
     async fn handle_tool_calls(&mut self, response: &ChatResponse) -> Result<Option<String>> {
@@ -1291,17 +1587,32 @@ impl<'a> AgentLoop<'a> {
         // them run *concurrently* (the gateway is the real backpressure; we only
         // cap local fan-out). Results are keyed by call id and consumed in order
         // by the sequential loop below, so tool-result ordering is preserved.
-        let sub_results = self.run_subagents(&response.tool_calls).await;
+        // Skipped entirely while planning: the pre-pass would otherwise spawn
+        // workers (which DO edit files) before the plan-mode gate below ever runs.
+        let sub_results = if self.planning {
+            Default::default()
+        } else {
+            self.run_subagents(&response.tool_calls).await
+        };
 
-        for call in &response.tool_calls {
-            // Plan mode gate: refuse file-mutating tools so the agent proposes a
-            // plan instead of editing. Host-enforced — independent of the prompt.
-            if self.planning && matches!(call.name.as_str(), tools::TOOL_EDIT | tools::TOOL_WRITE) {
+        for (i, call) in response.tool_calls.iter().enumerate() {
+            // Plan mode gate: refuse the tools that can change the workspace, so the
+            // agent proposes a plan instead of doing the work. Host-enforced —
+            // independent of the prompt. `shell` is included because it is trivially
+            // mutating (`sed -i`, `git commit`, `rm`), and `subagent` because a child
+            // worker is not bound by this session's plan mode.
+            if self.planning
+                && matches!(
+                    call.name.as_str(),
+                    tools::TOOL_EDIT | tools::TOOL_WRITE | tools::TOOL_SHELL | tools::TOOL_SUBAGENT
+                )
+            {
                 self.push_tool_result(
                     &call.id,
-                    "blocked: plan mode is on — do not modify files yet. Present your plan \
-                     (use the `plan` tool to list the steps), then stop; the user will \
-                     approve with /go before you make changes.",
+                    "blocked: plan mode is on — do not modify files, run commands, or \
+                     delegate work yet. Present your plan (use the `plan` tool to list \
+                     the steps), then stop; the user will approve with /go before you \
+                     make changes. Use `read`/`grep`-style tools to investigate.",
                 );
                 continue;
             }
@@ -1314,6 +1625,15 @@ impl<'a> AgentLoop<'a> {
                         l.write_final(&args.message);
                     }
                     self.ui.final_message(&args.message);
+                    // Answer this call and any the model batched after it. An
+                    // assistant turn whose tool calls aren't all answered is
+                    // rejected by strict providers on the NEXT turn (this history
+                    // persists across turns), which would brick the session.
+                    self.push_tool_result(&call.id, "final answer recorded.");
+                    self.answer_unrun(
+                        &response.tool_calls[i + 1..],
+                        "not run: the agent ended the turn with `final`",
+                    );
                     return Ok(Some(args.message));
                 }
                 tools::TOOL_SHELL => {
@@ -1322,7 +1642,22 @@ impl<'a> AgentLoop<'a> {
                     };
                     self.ui.command_start(&args.command);
                     let started = std::time::Instant::now();
-                    let (result, output) = self.run_shell_streaming(&args).await?;
+                    // A container/exec failure must NOT propagate with `?`: that
+                    // would return from the turn leaving this call unanswered and
+                    // corrupt the conversation for every later turn. Report it to
+                    // the model as a tool result instead (as `run_fileop` does) and
+                    // let it decide what to do.
+                    let (result, output) = match self.run_shell_streaming(&args).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            self.ui.command_end(-1, "");
+                            self.push_tool_result(
+                                &call.id,
+                                &format!("error: the command could not be run: {e:#}"),
+                            );
+                            continue;
+                        }
+                    };
                     let duration_ms = started.elapsed().as_millis();
                     self.ui.command_end(result.exit_code, "");
                     if let Some(l) = &mut self.logger {
@@ -1513,10 +1848,11 @@ impl<'a> AgentLoop<'a> {
                     self.messages.push(tool_msg);
                 }
                 other => {
-                    self.messages.push(Message::tool_result(
-                        &call.id,
-                        format!("error: unknown tool {other}"),
-                    ));
+                    // Via push_tool_result so it's LOGGED as well as pushed: an
+                    // unlogged result leaves a permanent hole in transcript.jsonl
+                    // (assistant tool call with no answer) that `--resume` can't
+                    // repair once later turns bury it.
+                    self.push_tool_result(&call.id, &format!("error: unknown tool {other}"));
                 }
             }
         }
@@ -1587,7 +1923,11 @@ impl<'a> AgentLoop<'a> {
         call_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(i32, String)> {
-        let (result, output) = match self.runtime.fileop(&payload.to_string()).await {
+        let outcome = self.runtime.fileop(&payload.to_string()).await;
+        // A fileop can trigger container bring-up too (e.g. after an idle stop);
+        // surface any status lines it queued, even though only after the fact.
+        self.drain_runtime_status();
+        let (result, output) = match outcome {
             Ok(v) => v,
             Err(e) => {
                 let msg = Message::tool_result(call_id, format!("error: {e}"));
@@ -1627,8 +1967,14 @@ impl<'a> AgentLoop<'a> {
         loop {
             tokio::select! {
                 biased;
+                // Container bring-up progress (exec_stream may be (re)starting the
+                // container — e.g. after an idle stop) surfaces as notices.
+                Some(msg) = self.runtime_status.recv() => self.ui.notice(&msg),
                 Some(chunk) = rx.recv() => self.ui.command_output(&chunk),
                 res = &mut fut => {
+                    while let Ok(msg) = self.runtime_status.try_recv() {
+                        self.ui.notice(&msg);
+                    }
                     while let Ok(chunk) = rx.try_recv() {
                         self.ui.command_output(&chunk);
                     }
@@ -1728,6 +2074,21 @@ impl<'a> AgentLoop<'a> {
             }
         }
 
+        // Remember every dispatched call so an interrupt can synthesize results
+        // for the ones still running (see the salvage arm below).
+        let dispatched: Vec<(String, String, String)> = plans
+            .iter()
+            .map(|(id, plan)| {
+                let label = plan
+                    .label
+                    .split(" → ")
+                    .next()
+                    .unwrap_or(&plan.label)
+                    .to_string();
+                (id.clone(), label, plan.id.clone())
+            })
+            .collect();
+
         // Execute concurrently (owned plans → no borrow of self), timing each and
         // capturing a coarse outcome for the crew history. Process completions as
         // they arrive so the background pane flips each subagent to done/failed
@@ -1771,7 +2132,48 @@ impl<'a> AgentLoop<'a> {
         .buffer_unordered(max_parallel);
 
         let root = self.root().to_path_buf();
-        while let Some((id, label, sub_id, res, status, outcome)) = stream.next().await {
+        let cancel = self.cancel.clone();
+        loop {
+            let item = tokio::select! {
+                biased;
+                // Interrupted mid-batch: keep every completed subagent's result
+                // (finished work must reach the transcript, or the foreman re-runs
+                // it all from scratch next turn) and synthesize a checkpoint
+                // marker for the rest. Dropping `stream` kills the still-running
+                // children via kill_on_drop.
+                _ = cancel.cancelled() => {
+                    let mut stopped = 0usize;
+                    for (id, label, sub_id) in &dispatched {
+                        if results.contains_key(id) {
+                            continue;
+                        }
+                        stopped += 1;
+                        self.ui.subagent_done(label, false, sub_id);
+                        results.insert(
+                            id.clone(),
+                            format!(
+                                "[interrupted] this subagent was stopped before it \
+                                 finished; whatever it completed (transcript, \
+                                 scratchpad, commands) is in .cowboy/sessions/{sub_id}/ \
+                                 — resume from that checkpoint rather than redoing \
+                                 work, and do NOT re-run subagents that returned \
+                                 results above"
+                            ),
+                        );
+                    }
+                    self.ui.notice(&format!(
+                        "interrupted — kept {} finished subagent result(s); \
+                         stopped {stopped} still running",
+                        dispatched.len() - stopped
+                    ));
+                    break;
+                }
+                item = stream.next() => item,
+            };
+            let Some((id, label, sub_id, res, status, outcome)) = item else {
+                self.ui.notice("↳ subagent(s) finished");
+                break;
+            };
             self.ui.subagent_done(&label, status == "complete", &sub_id);
             if let Some(o) = outcome {
                 cowboy_core::crew::record_outcome(&o);
@@ -1786,7 +2188,6 @@ impl<'a> AgentLoop<'a> {
             self.report_usage();
             results.insert(id, res);
         }
-        self.ui.notice("↳ subagent(s) finished");
         results
     }
 
@@ -2794,6 +3195,266 @@ mod tests {
         );
     }
 
+    /// Polling — the same command with *changing* output — is progress, not a
+    /// loop. The old guard keyed on the call alone and aborted these runs.
+    #[tokio::test]
+    async fn loop_guard_allows_polling_with_changing_output() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        docker
+            .expect_container_label()
+            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
+        // Each identical poll returns a DIFFERENT observation (a health check going
+        // from refused → starting → ok).
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        docker
+            .expect_exec_stream()
+            .returning(move |_, _, _, _, _, _, _| {
+                let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok((ExecResult { exit_code: 0 }, format!("attempt {i}")))
+            });
+        let m = ScriptedModel::new(vec![]);
+        {
+            let mut q = m.responses.lock().unwrap();
+            for i in 0..10 {
+                q.push_back(ChatResponse {
+                    truncated: false,
+                    reasoning: None,
+                    content: None,
+                    tool_calls: vec![tool_call(
+                        &i.to_string(),
+                        "shell",
+                        r#"{"command":"curl -s localhost:8080/health"}"#,
+                    )],
+                });
+            }
+            // Then it finishes normally.
+            q.push_back(ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"server is up"}"#)],
+            });
+        }
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(m),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("wait for the server").await.unwrap();
+        drop(agent);
+        assert_eq!(res.as_deref(), Some("server is up"));
+        assert!(
+            !ui.notices.iter().any(|n| n.contains("loop detected")),
+            "polling must not trip the loop guard: {:?}",
+            ui.notices
+        );
+        assert_eq!(ui.commands.len(), 10, "every poll should have run");
+    }
+
+    /// Every tool call in an assistant turn must end up with a result, including
+    /// the `final` call itself and anything batched after it — a conversation with
+    /// an unanswered tool call is rejected by strict providers on the NEXT turn.
+    #[tokio::test]
+    async fn final_answers_its_own_call_and_any_batched_after_it() {
+        let docker = MockDockerCli::new();
+        let m = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![
+                tool_call("f", "final", r#"{"message":"done"}"#),
+                tool_call("x", "read", r#"{"path":"never-read.txt"}"#),
+            ],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(m),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do it").await.unwrap();
+        assert_eq!(res.as_deref(), Some("done"));
+
+        let answered: std::collections::HashSet<&str> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert!(answered.contains("f"), "the `final` call must be answered");
+        assert!(
+            answered.contains("x"),
+            "a call batched after `final` never runs but must still be answered"
+        );
+    }
+
+    /// Plan mode is HOST-enforced: while planning, the agent must not be able to
+    /// mutate the workspace via `shell`, nor escape the gate by delegating to a
+    /// subagent (which is not itself in plan mode).
+    #[tokio::test]
+    async fn plan_mode_blocks_shell_and_subagent_not_just_edits() {
+        let mut docker = MockDockerCli::new();
+        docker
+            .expect_container_state()
+            .returning(|_| Ok(ContainerState::Running));
+        // The gate must stop the command before it ever reaches the container.
+        docker.expect_exec_stream().never();
+        let m = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![
+                tool_call("s", "shell", r#"{"command":"rm -rf src"}"#),
+                tool_call("d", "subagent", r#"{"task":"apply the refactor"}"#),
+            ],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(m),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.planning = true;
+        let _ = agent.run("plan a refactor").await;
+        let blocked: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect();
+        drop(agent);
+
+        assert!(ui.commands.is_empty(), "no command may run while planning");
+        assert_eq!(blocked.len(), 2, "both calls answered: {blocked:?}");
+        assert!(
+            blocked.iter().all(|c| c.starts_with("blocked: plan mode")),
+            "shell and subagent must both be refused: {blocked:?}"
+        );
+    }
+
+    /// A one-shot session has a single user message (the task). Pruning must never
+    /// remove it — an agent that loses its task drifts for the rest of the run.
+    #[test]
+    fn pruning_preserves_the_task_message() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent
+            .messages
+            .push(Message::user("THE TASK: migrate the db"));
+        for i in 0..60 {
+            agent.messages.push(Message::new(
+                Role::Assistant,
+                format!("some long intermediate step number {i} with plenty of words"),
+            ));
+        }
+        agent.drop_oldest(40); // tiny budget: forces heavy pruning
+        assert_eq!(agent.messages[0].role, Role::System, "system kept");
+        assert_eq!(
+            agent.messages[1].content,
+            "THE TASK: migrate the db",
+            "the task must survive pruning; messages: {:?}",
+            agent
+                .messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A model the provider no longer serves (404 model_not_found) must reroute to
+    /// the fallback and finish, not kill the session. This is the failure that made
+    /// a whole crew review collapse: the roster named a retired model id, and crew
+    /// `fell_back` is a routing-time flag that never re-evaluates at runtime.
+    #[tokio::test]
+    async fn unavailable_model_reroutes_to_the_fallback_and_continues() {
+        /// Always fails as if the provider retired this model.
+        struct GoneModel;
+        #[async_trait::async_trait]
+        impl ModelClient for GoneModel {
+            async fn chat(
+                &self,
+                _m: &[Message],
+                _t: &[ToolDef],
+                _d: Option<tokio::sync::mpsc::UnboundedSender<Delta>>,
+            ) -> Result<ChatResponse, cowboy_core::Error> {
+                Err(cowboy_core::Error::ModelUnavailable(
+                    "chat request failed (404 Not Found): model_not_found".into(),
+                ))
+            }
+        }
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(GoneModel),
+            runtime_with(MockDockerCli::new()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_model_fallback(
+            "backup".into(),
+            Box::new(|_name| {
+                // The healthy fallback answers immediately.
+                let m = ScriptedModel::new(vec![ChatResponse {
+                    truncated: false,
+                    reasoning: None,
+                    content: None,
+                    tool_calls: vec![tool_call("f", "final", r#"{"message":"rescued"}"#)],
+                }]);
+                Ok((Box::new(m) as Box<dyn ModelClient>, 200_000, (None, None)))
+            }),
+        );
+        let res = agent.run("do the work").await.unwrap();
+        drop(agent);
+
+        assert_eq!(
+            res.as_deref(),
+            Some("rescued"),
+            "the turn should complete on the fallback model"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("falling back to `backup`")),
+            "the reroute must be surfaced, not silent: {:?}",
+            ui.notices
+        );
+    }
+
+    #[test]
+    fn message_tokens_counts_reasoning_because_it_is_sent_back() {
+        // Reasoning is round-tripped to the provider on every later request, so it
+        // consumes context and is billed — it must be counted.
+        let mut m = Message::new(Role::Assistant, "short answer");
+        let plain = AgentLoop::message_tokens(&m);
+        m.reasoning = Some("a very long chain of thought ".repeat(50));
+        let with_reasoning = AgentLoop::message_tokens(&m);
+        assert!(
+            with_reasoning > plain + 100,
+            "reasoning must be counted ({plain} → {with_reasoning})"
+        );
+    }
+
     #[test]
     fn with_history_inserts_after_system_in_order() {
         let history = vec![
@@ -3090,6 +3751,48 @@ mod tests {
         assert!(results.contains_key("a") && results.contains_key("b"));
         assert!(!results.contains_key("c"));
         assert!(results["a"].contains("depth limit"));
+    }
+
+    #[tokio::test]
+    async fn interrupted_subagent_batch_salvages_results_instead_of_dropping_them() {
+        // An interrupt mid-batch must not throw away the batch: every dispatched
+        // call still gets a tool result (here a checkpoint marker, since nothing
+        // finished — the biased select sees the pre-cancelled token before the
+        // stream is first polled, so no child process ever spawns). Without this,
+        // the transcript ends the turn with dangling subagent calls and the
+        // foreman re-runs everything from scratch next turn.
+        let docker = MockDockerCli::new();
+        let mut ui = RecordingUi::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            runtime_with(docker),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            cancel,
+            &mut ui,
+        );
+        let calls = vec![tool_call(
+            "a",
+            "subagent",
+            r#"{"task":"x","category":"tests","effort":"small"}"#,
+        )];
+        let results = agent.run_subagents(&calls).await;
+        let res = results
+            .get("a")
+            .expect("interrupted call still gets a result");
+        assert!(
+            res.contains("[interrupted]") && res.contains(".cowboy/sessions/"),
+            "should point at the child's checkpoint, got: {res}"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("interrupted — kept 0 finished subagent result(s)")),
+            "salvage notice should report what was kept/stopped: {:?}",
+            ui.notices
+        );
     }
 
     #[tokio::test]

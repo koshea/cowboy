@@ -260,7 +260,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         if let Some(gw) = runtime.gateway_handle() {
             tokio::spawn(async move {
                 let docker = CliDocker::new();
-                if let Err(e) = gw.ensure_network(&docker).await {
+                if let Err(e) = gw.ensure_network(&docker, None).await {
                     tracing::debug!(error = %e, "eager control-network create failed; control server will retry its bind");
                 }
             });
@@ -319,6 +319,17 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         None => None,
     };
 
+    // Where to reroute if the session's model turns out not to exist at the
+    // provider (a retired id still named in models.yaml/crew.yaml): the configured
+    // *default* model, when that's a different name than the one we're running.
+    // Without this a stale roster entry kills every subagent routed to it — crew
+    // fallback is decided at routing time and never re-evaluated at runtime.
+    let default_model_name = project_models
+        .as_ref()
+        .and_then(|m| m.default.clone())
+        .or_else(|| user_models.as_ref().and_then(|m| m.default.clone()));
+    let fallback_name = default_model_name.filter(|d| Some(d) != model_override.as_ref());
+
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
@@ -332,6 +343,22 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     .with_memory_context(memory_ctx)
     .with_history(history)
     .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
+
+    if let Some(name) = fallback_name {
+        let providers = providers.clone();
+        let user = user_models.clone();
+        let project = project_models.clone();
+        agent = agent.with_model_fallback(
+            name,
+            Box::new(move |n: &str| {
+                let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(n))?;
+                let cw = r.context_window as usize;
+                let pricing = (r.input_cost_per_mtok, r.output_cost_per_mtok);
+                let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
+                Ok((client, cw, pricing))
+            }),
+        );
+    }
 
     // Connect this session to any user-configured MCP servers (host-side trusted
     // integrations). Adds the `mcp` tool + lists the servers in the system prompt;

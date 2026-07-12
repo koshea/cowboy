@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use hickory_proto::op::{Message, ResponseCode};
+use hickory_proto::op::{Message, MessageType, ResponseCode};
 use hickory_proto::rr::RData;
 use tokio::net::UdpSocket;
 
@@ -198,6 +198,19 @@ fn classify_query(query: &[u8]) -> QueryGate {
 }
 
 /// Forward an approved query upstream, record answers, and relay the response.
+///
+/// The response is what authorizes egress: `record_answers` maps the returned IPs
+/// to the allow-listed name, and the transparent proxy later admits a connection
+/// to those IPs *because* of that mapping. The agent shares this netns and can
+/// send UDP to loopback, and it authored the query (so it knows the transaction id
+/// and question) — a spoofed answer would therefore let it bind any IP it likes to
+/// an allowed name. Three defences, all required:
+///   1. `connect()` the upstream socket, so the kernel drops datagrams from any
+///      source other than the resolver;
+///   2. re-read until a reply actually matches the query we sent (id + question),
+///      so a datagram that races in from the resolver's own address can't carry a
+///      different answer;
+///   3. only ever record answers from a reply that passed (1) and (2).
 async fn forward(
     sock: &UdpSocket,
     client: SocketAddr,
@@ -205,23 +218,56 @@ async fn forward(
     upstream: SocketAddr,
     state: &GatewayState,
 ) -> Result<()> {
+    const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     let bind: SocketAddr = if upstream.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
     } else {
         "[::]:0".parse().unwrap()
     };
     let up = UdpSocket::bind(bind).await?;
-    up.send_to(query, upstream).await?;
+    // Connected UDP: the kernel delivers only datagrams whose source is `upstream`,
+    // which alone defeats the off-path spray (the agent cannot spoof the resolver's
+    // source address — the netns has no NET_RAW).
+    up.connect(upstream).await?;
+    up.send(query).await?;
 
-    let mut resp = vec![0u8; 4096];
-    let len = tokio::time::timeout(std::time::Duration::from_secs(5), up.recv(&mut resp)).await??;
-    let resp = &resp[..len];
+    let sent = Message::from_vec(query).context("forwarding an unparseable query")?;
+    let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
+    loop {
+        let mut resp = vec![0u8; 4096];
+        let len = tokio::time::timeout_at(deadline, up.recv(&mut resp)).await??;
+        let resp = &resp[..len];
 
-    if let Ok(msg) = Message::from_vec(resp) {
+        let Ok(msg) = Message::from_vec(resp) else {
+            continue; // garbage from the resolver: keep waiting for a real reply
+        };
+        if !reply_matches(&sent, &msg) {
+            tracing::debug!("discarding a DNS reply that does not match the query");
+            continue;
+        }
         state.dns().record_answers(&msg);
+        sock.send_to(resp, client).await?;
+        return Ok(());
     }
-    sock.send_to(resp, client).await?;
-    Ok(())
+}
+
+/// Whether `reply` actually answers `sent`: same transaction id, and the same
+/// single question (name + type + class). Guards the IP→name map against a reply
+/// that answers a *different* question than the one policy approved.
+fn reply_matches(sent: &Message, reply: &Message) -> bool {
+    if sent.metadata.id != reply.metadata.id || reply.metadata.message_type != MessageType::Response
+    {
+        return false;
+    }
+    match (sent.queries.as_slice(), reply.queries.as_slice()) {
+        ([q], [r]) => {
+            q.name() == r.name()
+                && q.query_type() == r.query_type()
+                && q.query_class() == r.query_class()
+        }
+        _ => false,
+    }
 }
 
 /// Build a REFUSED response that echoes the query's id, op_code, and question(s).
@@ -259,6 +305,57 @@ mod tests {
             m.add_query(Query::query(Name::from_ascii(name).unwrap(), *rt));
         }
         m.to_vec().unwrap()
+    }
+
+    /// Build a response for `query`, optionally lying about the id or the
+    /// question, carrying one A record for `ip`.
+    fn reply_for(query: &[u8], id: Option<u16>, qname: Option<&str>, ip: &str) -> Message {
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::Record;
+        let sent = Message::from_vec(query).unwrap();
+        let q = &sent.queries[0];
+        let name = match qname {
+            Some(n) => Name::from_ascii(n).unwrap(),
+            None => q.name().clone(),
+        };
+        let mut m = Message::new(
+            id.unwrap_or(sent.metadata.id),
+            MessageType::Response,
+            OpCode::Query,
+        );
+        m.add_query(Query::query(name.clone(), q.query_type()));
+        m.add_answer(Record::from_rdata(
+            name,
+            60,
+            RData::A(A(ip.parse().unwrap())),
+        ));
+        m
+    }
+
+    /// The agent authors the query, so it knows the transaction id — the reply
+    /// check must therefore bind an answer to the *exact* question that policy
+    /// approved, or a forged/mismatched answer could map an attacker IP onto an
+    /// allow-listed name and buy the agent egress to it.
+    #[test]
+    fn reply_matches_only_the_exact_query_it_answers() {
+        let q = query_bytes(&[("allowed.example.", RecordType::A)]);
+        let sent = Message::from_vec(&q).unwrap();
+
+        let good = reply_for(&q, None, None, "93.184.216.34");
+        assert!(reply_matches(&sent, &good), "the resolver's real answer");
+
+        // Wrong transaction id.
+        let wrong_id = reply_for(&q, Some(0x9999), None, "6.6.6.6");
+        assert!(!reply_matches(&sent, &wrong_id));
+
+        // Right id, but answering a DIFFERENT name than the one we gated.
+        let wrong_name = reply_for(&q, None, Some("evil.example."), "6.6.6.6");
+        assert!(!reply_matches(&sent, &wrong_name));
+
+        // A query (not a response) echoed back.
+        let mut not_a_response = good.clone();
+        not_a_response.metadata.message_type = MessageType::Query;
+        assert!(!reply_matches(&sent, &not_a_response));
     }
 
     #[test]

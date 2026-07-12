@@ -37,6 +37,26 @@ fn is_retryable_status(s: reqwest::StatusCode) -> bool {
     matches!(s.as_u16(), 429 | 529) || s.is_server_error()
 }
 
+/// Whether a failed response means "this model does not exist here" — a permanent
+/// condition that a different *model* can satisfy but a retry never will.
+///
+/// Gateways differ: some return 404 with `model_not_found`, others a 400 whose
+/// body names the offending model. Match on the body's error code/message rather
+/// than the status alone, so a generic 404 (bad base_url path) isn't mistaken for
+/// a missing model and silently rerouted.
+fn is_model_not_found(status: reqwest::StatusCode, body: &str) -> bool {
+    if !matches!(status.as_u16(), 400 | 404) {
+        return false;
+    }
+    let b = body.to_ascii_lowercase();
+    b.contains("model_not_found")
+        || b.contains("model not found")
+        || b.contains("does not exist")
+        || b.contains("is not available")
+        || b.contains("unknown model")
+        || b.contains("invalid model")
+}
+
 /// Retry transient connection/timeout errors (not request-construction errors).
 fn is_transient(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect()
@@ -290,7 +310,16 @@ pub struct OpenAiClient {
     extra: BTreeMap<String, serde_json::Value>,
     /// Inject Anthropic `cache_control` markers (opt-in per model).
     anthropic_cache: bool,
+    /// Abort a streaming response after this long with no bytes from the
+    /// provider (zero = disabled). Guards against silent mid-stream stalls,
+    /// which would otherwise hang the caller forever.
+    stream_idle: Duration,
 }
+
+/// Default idle-stream bound. Generous: a reasoning model that thinks without
+/// streaming (and a gateway that forwards no keep-alives) can legitimately be
+/// silent for a while — but nothing healthy is silent for five minutes.
+const DEFAULT_STREAM_IDLE: Duration = Duration::from_secs(300);
 
 impl OpenAiClient {
     /// Build from a fully-resolved model (provider credentials joined with the
@@ -323,6 +352,10 @@ impl OpenAiClient {
             stop: model.stop.clone(),
             extra: model.extra.clone(),
             anthropic_cache: model.anthropic_cache,
+            stream_idle: model
+                .stream_idle_timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(DEFAULT_STREAM_IDLE),
         })
     }
 }
@@ -703,9 +736,17 @@ impl ModelClient for OpenAiClient {
                 Ok(r) => {
                     let code = r.status();
                     let text = r.text().await.unwrap_or_default();
-                    return Err(Error::Model(format!(
-                        "chat request failed ({code}): {text}"
-                    )));
+                    let msg = format!("chat request failed ({code}): {text}");
+                    // A model the provider doesn't serve is a PERMANENT failure of
+                    // this model, not of the request — surface it as such so callers
+                    // can reroute to another model instead of failing the session
+                    // (a deprecated model id would otherwise kill every subagent
+                    // routed to it, with no fallback).
+                    return Err(if is_model_not_found(code, &text) {
+                        Error::ModelUnavailable(msg)
+                    } else {
+                        Error::Model(msg)
+                    });
                 }
                 Err(e) if is_transient(&e) && attempt < MAX_RETRIES => {
                     let delay = backoff(attempt);
@@ -728,7 +769,27 @@ impl ModelClient for OpenAiClient {
         let mut truncated = false;
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // Bound the wait for the next frame: a provider whose stream stalls
+            // silently mid-response (observed with wafer/MiniMax-M3: reasoning
+            // deltas, then nothing, forever) must error out, not hang the turn.
+            // Any bytes on the wire — including SSE keep-alive comments — reset
+            // the clock, so slow-but-alive streams are unaffected.
+            let item = if self.stream_idle.is_zero() {
+                stream.next().await
+            } else {
+                match tokio::time::timeout(self.stream_idle, stream.next()).await {
+                    Ok(item) => item,
+                    Err(_) => {
+                        return Err(Error::Model(format!(
+                            "model stream stalled: no data from the provider for {}s \
+                             (tune with `stream_idle_timeout_seconds` on the model; 0 disables)",
+                            self.stream_idle.as_secs()
+                        )))
+                    }
+                }
+            };
+            let Some(chunk) = item else { break };
             buf.push_str(&String::from_utf8_lossy(&chunk.map_err(oa_err)?));
             // SSE: process complete `\n`-terminated lines, leaving any partial
             // line in the buffer for the next chunk.

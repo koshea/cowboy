@@ -1233,6 +1233,15 @@ async fn start_session(
     let key = Daemon::lease_key(&root);
     // Acquire the worktree lease up front (exclusive sessions only). On conflict
     // bail before spawning so two writable workers never share a worktree.
+    // Take the lease AND register the session in ONE critical section. Registering
+    // after the spawn (as this used to) left a window in which the lease's holder
+    // had no session record: `holder_state` reads that as `Gone`, so a concurrent
+    // start could reclaim the worktree *without* `force` and spawn a second
+    // exclusive worker onto it, and the vacuum's liveness sweep could drop the
+    // lease outright. The pid is unknown until the child exists, so it's filled in
+    // afterwards; the record is what makes the holder resolvable in the meantime.
+    let sock;
+    let journal;
     let id = {
         let mut d = daemon.lock().await;
         d.next_seq += 1;
@@ -1250,12 +1259,37 @@ async fn start_session(
                     },
                 };
             }
-            d.save();
         }
+        sock = runtime_dir().join(format!("s-{id}.sock"));
+        journal = root.join(".cowboy/sessions").join(&id).join("events.jsonl");
+        d.state.sessions.insert(
+            id.clone(),
+            SessionInfo {
+                id: id.clone(),
+                root: root.clone(),
+                task: task.clone(),
+                status: SessionStatus::Starting,
+                pid: None, // set once the child is spawned, below
+                branch: None,
+                container_name: None,
+                worker_sock: Some(sock.clone()),
+                journal_path: Some(journal.clone()),
+                lease_mode: Some(mode),
+                started_ms: now_ms(),
+                last_heartbeat_ms: now_ms(),
+                turn: 0,
+                tokens: (0, 0),
+                attached_clients: 0,
+                diffstat: String::new(),
+                running_command: None,
+                blocked_reason: None,
+                ranch_id: ranch_id.clone(),
+                workstream_id: workstream_id.clone(),
+            },
+        );
+        d.save();
         id
     };
-    let sock = runtime_dir().join(format!("s-{id}.sock"));
-    let journal = root.join(".cowboy/sessions").join(&id).join("events.jsonl");
 
     // Capture worker stdout/stderr to a host-only logfile (NOT under the workspace
     // mount, so the agent can't read it) instead of discarding it — otherwise a
@@ -1310,9 +1344,11 @@ async fn start_session(
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            // Don't leave an orphan lease behind a worker that never ran.
+            // Don't leave an orphan lease (or a phantom session) behind a worker
+            // that never ran.
             let mut d = daemon.lock().await;
             d.release(&key, &id);
+            d.state.sessions.remove(&id);
             d.save();
             return DaemonResp::Err {
                 message: format!("spawning worker: {e}"),
@@ -1323,31 +1359,9 @@ async fn start_session(
 
     {
         let mut d = daemon.lock().await;
-        d.state.sessions.insert(
-            id.clone(),
-            SessionInfo {
-                id: id.clone(),
-                root: root.clone(),
-                task,
-                status: SessionStatus::Starting,
-                pid,
-                branch: None,
-                container_name: None,
-                worker_sock: Some(sock.clone()),
-                journal_path: Some(journal),
-                lease_mode: Some(mode),
-                started_ms: now_ms(),
-                last_heartbeat_ms: now_ms(),
-                turn: 0,
-                tokens: (0, 0),
-                attached_clients: 0,
-                diffstat: String::new(),
-                running_command: None,
-                blocked_reason: None,
-                ranch_id,
-                workstream_id,
-            },
-        );
+        if let Some(s) = d.state.sessions.get_mut(&id) {
+            s.pid = pid;
+        }
         d.save();
     }
 

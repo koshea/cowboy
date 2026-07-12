@@ -34,10 +34,22 @@ run rather than leave the agent un-sandboxed.
   agent's TCP to the in-process proxy and **all** of its DNS (`:53`) to the
   resolver — the DNS redirect runs ahead of Docker's own embedded resolver
   (`127.0.0.11`), so queries can't slip around the gateway. A `filter output` chain
-  then **drops by default**, so the residue the REDIRECT can't carry (non-DNS UDP,
-  ICMP) can't leak. The gateway's own root-uid egress is exempt so it can reach
-  upstream and the host control channel; the agent is kept non-root so it never
-  inherits that exemption. Approved Compose subnets bypass the proxy.
+  then **drops by default** — for TCP too, not just the residue the REDIRECT can't
+  carry (non-DNS UDP, ICMP). Redirected TCP reaches the proxy because the REDIRECT
+  has already rewritten its destination to loopback by the time the filter hook
+  sees it, so the chain needs no TCP exemption and stays a genuine backstop: if the
+  REDIRECT ever failed to apply, the traffic is dropped rather than escaping. The
+  gateway's own root-uid egress is exempt so it can reach upstream and the host
+  control channel; the agent is kept non-root so it never inherits that exemption.
+  Approved Compose subnets bypass the proxy.
+- **DNS answers are bound to the query that was approved**: the resolver forwards
+  on a *connected* UDP socket (so the kernel drops datagrams from anyone but the
+  upstream resolver) and accepts a reply only if its transaction id **and** question
+  match what was sent. This matters because the agent authors the query — it knows
+  the transaction id — and shares the netns, so an unvalidated reply would let it
+  forge an answer mapping any IP onto an allow-listed name and buy itself egress to
+  that IP. Only a reply that passes both checks is recorded in the `ip → {domains}`
+  map that authorizes connections.
 - **Transparent proxy** (`:8443`, every port): authorizes a connection by the
   hostname(s) **the gateway itself resolved** for the destination IP — *not* the
   client-presented SNI/Host, which the (untrusted) agent controls. It still sniffs

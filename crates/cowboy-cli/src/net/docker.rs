@@ -175,6 +175,12 @@ pub trait DockerCli: Send + Sync {
     /// The value of a container label (`None` if the container or label is
     /// absent). Used to detect a container left by a different cowboy version.
     async fn container_label(&self, name: &str, key: &str) -> Result<Option<String>>;
+    /// The container's network sandbox key (the netns path Docker created for it),
+    /// or `None` when absent/not running. A container gets a **new** sandbox on
+    /// every start, so comparing the agent's key with the sidecar's is how we
+    /// detect a gateway still attached to a dead netns (see
+    /// `GatewayNetwork::ensure_enforcing`).
+    async fn container_sandbox_key(&self, name: &str) -> Result<Option<String>>;
     async fn run_detached(&self, spec: &ContainerSpec) -> Result<()>;
     /// Run a one-shot container to completion (`docker run --rm`), returning its
     /// exit code. Used for the route-setup helper.
@@ -513,6 +519,20 @@ impl DockerCli for CliDocker {
                 status_code: 404, ..
             }) => Ok(None),
             Err(e) => Err(e).context("docker inspect (label)"),
+        }
+    }
+
+    async fn container_sandbox_key(&self, name: &str) -> Result<Option<String>> {
+        let docker = self.client().await?;
+        match docker.inspect_container(name, None).await {
+            Ok(info) => Ok(info
+                .network_settings
+                .and_then(|n| n.sandbox_key)
+                .filter(|k| !k.is_empty())),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(e).context("docker inspect (sandbox key)"),
         }
     }
 

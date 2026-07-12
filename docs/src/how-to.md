@@ -161,12 +161,14 @@ When you want to see the approach *before* the agent touches your code:
 /go also add a test       # approve with an extra instruction
 ```
 
-While plan mode is on, Cowboy **refuses `edit`/`write` host-side** — not just by
-prompting the model. The agent reads/greps, fills the plan pane, and presents a
-plan; if it tries to edit, it's told to wait. The status bar shows `🧭 plan mode`
-the whole time so you always know edits are gated. `/go` lifts the gate and the
-same conversation continues into execution; keep refining with more messages
-before you approve.
+While plan mode is on, Cowboy **refuses `edit`, `write`, `shell`, and `subagent`
+host-side** — not just by prompting the model. All four matter: `shell` mutates
+trivially (`sed -i`, `git commit`, `rm`), and a delegated `subagent` is a fresh
+worker that would not itself be in plan mode. The agent can still read and search,
+fill the plan pane, and present a plan; if it tries to act, it's told to wait. The
+status bar shows `🧭 plan mode` the whole time so you always know changes are gated.
+`/go` lifts the gate and the same conversation continues into execution; keep
+refining with more messages before you approve.
 
 **Too big for one session?** Type `/ranch` to promote the discussion into a
 multi-workstream ranch plan — the agent reuses what you've discussed, decomposes

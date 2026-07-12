@@ -393,19 +393,29 @@ async fn serve_client(
     let writer = Arc::new(AsyncMutex::new(w));
     let mut reader = BufReader::new(r);
 
-    // First line: optional Hello{since_seq}.
+    // First line: optional Hello{since_seq, read_only}.
+    //
+    // `read_only` is honoured HERE, per connection. It used to be parsed and
+    // dropped, with filtering left to the client — so anything speaking the
+    // protocol (the web UI, a future client, a buggy bridge) could attach
+    // "watch-only" and still drive, end, or `/accept` the session. Enforce it at
+    // the boundary that actually owns the session instead of trusting the peer.
     let mut first = String::new();
-    let since = if reader.read_line(&mut first).await? == 0 {
+    let (since, read_only) = if reader.read_line(&mut first).await? == 0 {
         return Ok(());
     } else {
         match serde_json::from_str::<ClientMsg>(first.trim()) {
-            Ok(ClientMsg::Hello { since_seq, .. }) => since_seq.unwrap_or(0),
+            Ok(ClientMsg::Hello {
+                since_seq,
+                read_only,
+                ..
+            }) => (since_seq.unwrap_or(0), read_only),
             // A non-Hello first line is treated as input + a full replay.
             Ok(other) => {
                 let _ = cmd_tx.send(other);
-                0
+                (0, false)
             }
-            Err(_) => 0,
+            Err(_) => (0, false),
         }
     };
 
@@ -479,6 +489,16 @@ async fn serve_client(
                             {
                                 let _ = tx.send(answer);
                             }
+                        }
+                        // A read-only client may watch and detach, and may answer a
+                        // prompt it was asked (handled above) — but it must not
+                        // drive the session: no messages, interrupts, model
+                        // switches, sign-offs, or ends.
+                        other if read_only => {
+                            tracing::debug!(
+                                msg = ?std::mem::discriminant(&other),
+                                "dropping a mutating message from a read-only client"
+                            );
                         }
                         other => {
                             let _ = cmd_tx.send(other);
@@ -619,6 +639,61 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("command_start"));
+    }
+
+    /// A client that attached read-only may watch, but must not drive the session.
+    /// Enforcement lives here (worker-side), not in the client: the flag used to be
+    /// parsed and discarded, so any peer speaking the protocol could attach
+    /// "watch-only" and still end or redirect the session.
+    #[tokio::test]
+    async fn read_only_client_cannot_drive_the_session() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (mut ui, mut cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        w.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: true,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot { .. } => {}
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+
+        // Mutating messages from this connection must be dropped, not forwarded.
+        for msg in [
+            ClientMsg::Message("do something destructive".into()),
+            ClientMsg::End,
+            ClientMsg::SwitchModel("expensive".into()),
+        ] {
+            w.write_all(encode_line(&msg).as_bytes()).await.unwrap();
+        }
+        w.flush().await.unwrap();
+
+        // It can still WATCH: a live event proves the connection is alive and
+        // serving, and gives the reader time to have processed the writes above.
+        ui.tool_use("still streaming");
+        match read_msg(&mut reader).await {
+            ServerMsg::Event {
+                event: UiEventMsg::ToolUse(s),
+                ..
+            } => assert_eq!(s, "still streaming"),
+            other => panic!("read-only client must still receive events, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no message from a read-only client may reach the agent loop"
+        );
     }
 
     /// Two clients that connect at different points still observe the same

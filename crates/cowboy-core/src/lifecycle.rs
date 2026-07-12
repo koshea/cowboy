@@ -42,6 +42,12 @@ pub enum LifecycleEvent {
     HandoffCreated {
         artifact_id: String,
     },
+    /// The configured model was unavailable at the provider and the session
+    /// rerouted to this one. Journaled so a stale roster entry is visible after
+    /// the fact rather than silently absorbed.
+    ModelFallback {
+        model: String,
+    },
     /// A subagent was routed through the crew roster and launched.
     SubagentRouted {
         category: String,

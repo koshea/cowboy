@@ -76,7 +76,9 @@ they don't pile up or hold much RAM:
 - **Idle detached sessions free their RAM** — a detached session with no attached
   client stops its container after `agent.idle_container_timeout_seconds`
   (default 30 min; `0` disables); the next command restarts it. The session stays
-  resumable.
+  resumable. The gateway sidecar stops and restarts *with* the agent: a restarted
+  container gets a brand-new network namespace, so enforcement is reinstalled into
+  it rather than reusing a sidecar left clamping the old one.
 
 ## `agent.yaml` (mounted, agent-editable)
 
@@ -100,7 +102,10 @@ commands:
 
 **Startup setup.** When a session comes up, cowboy eagerly (before the first
 message) brings the container up and — if the repo uses [mise](https://mise.jdx.dev)
-— runs a visible `mise install`, then any `agent.setup` commands. `setup` runs
+— runs a visible `mise install`, then any `agent.setup` commands. The bring-up
+itself is narrated too: image pulls/builds, container creation, and the network
+gateway start each print a status line, so a cold first run (which downloads the
+agent image) doesn't look like a hang. `setup` runs
 **once per worktree** (a marker at `.cowboy/sessions/.worktree-setup`, gitignored,
 keyed to the commands — change them and it re-runs; delete it to force one). It's
 streamed to the UI and stays interruptible, so a slow setup never blocks ending the
@@ -172,6 +177,21 @@ markers to the static system prompt and the latest message, so a gateway that
 understands Anthropic prompt caching reuses the cached prefix across turns (big
 latency/cost win for Claude). Only enable it for Anthropic models behind a gateway
 that supports `cache_control` — it's ignored or rejected elsewhere.
+
+**`stream_idle_timeout_seconds`** (optional, default 300): abort a streaming
+response if the provider sends *nothing* (not even an SSE keep-alive) for this
+long — a silently stalled stream would otherwise hang the turn forever. Any bytes
+on the wire reset the clock, so slow-but-alive models are unaffected. Set `0` to
+disable, or raise it for models that think for long stretches without streaming.
+
+**Fallback when a model disappears.** Providers retire and rename model ids. If the
+model a session (or a crew-routed subagent) is running turns out not to exist at
+the provider — a `404 model_not_found` — Cowboy reroutes **once** to the configured
+`default` model, says so in the transcript, and journals a `model_fallback`
+lifecycle event, rather than failing the session. This is a safety net, not a fix:
+the notice tells you which id to correct in `models.yaml` / `crew.yaml`. Note that
+the crew roster's own fallback is a *routing-time* choice, so it cannot help here —
+only this runtime reroute can.
 
 Manage with `cowboy models setup` / `list` / `use [-g] <name>`. Works with any
 OpenAI-compatible backend. Cowboy does not manage or endorse a gateway.

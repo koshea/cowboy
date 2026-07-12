@@ -27,6 +27,7 @@ fn profile(base_url: String) -> ResolvedModel {
         input_cost_per_mtok: None,
         output_cost_per_mtok: None,
         anthropic_cache: false,
+        stream_idle_timeout_seconds: None,
     }
 }
 
@@ -330,6 +331,95 @@ async fn chat_is_cancelled_by_dropping_the_future() {
     // Dropping the future on timeout cancels the in-flight request.
     let res = tokio::time::timeout(std::time::Duration::from_millis(300), fut).await;
     assert!(res.is_err(), "expected cancellation (timeout), got {res:?}");
+}
+
+#[tokio::test]
+async fn a_retired_model_id_surfaces_as_permanently_unavailable() {
+    // A provider that no longer serves the model returns 404 model_not_found.
+    // Retrying can't fix that, but rerouting to another model can — so it must be
+    // a distinct error the agent loop can act on, not a generic model error.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+            "error": {"code": "model_not_found", "message": "Model 'gone-v9' is not available"}
+        })))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let err = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, cowboy_core::Error::ModelUnavailable(_)),
+        "a missing model must be ModelUnavailable (reroutable), got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_generic_404_is_not_treated_as_a_missing_model() {
+    // A 404 from a wrong base_url path must NOT be mistaken for a retired model
+    // and silently rerouted — that would hide a misconfiguration.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("404 page not found"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let err = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, cowboy_core::Error::Model(_)),
+        "a generic 404 stays a plain model error, got: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn mid_stream_stall_errors_after_the_idle_timeout() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // wiremock can't stall mid-body, so hand-roll the failure with a raw socket:
+    // a valid chunked SSE response that sends one delta and then goes silent with
+    // the connection held open — exactly the observed provider stall.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 65536];
+        let _ = sock.read(&mut buf).await; // consume the request (best-effort)
+        let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                    transfer-encoding: chunked\r\n\r\n";
+        sock.write_all(head.as_bytes()).await.unwrap();
+        let event = format!("data: {}\n\n", content_chunk("started…"));
+        let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+        sock.write_all(chunk.as_bytes()).await.unwrap();
+        sock.flush().await.unwrap();
+        // Stall: never send the terminating chunk, keep the socket open.
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+
+    let mut p = profile(format!("http://{addr}/v1"));
+    p.stream_idle_timeout_seconds = Some(1);
+    let client = OpenAiClient::from_resolved(&p).unwrap();
+    let start = std::time::Instant::now();
+    let err = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("stalled"),
+        "a silent stream must surface as a stall error, got: {err}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "the stall must be detected promptly, not hang"
+    );
 }
 
 #[tokio::test]

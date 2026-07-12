@@ -29,8 +29,14 @@ fn main() {
     // opt-in flag is toggled.
     println!("cargo:rerun-if-changed={}", dist.display());
     println!("cargo:rerun-if-changed={}", web_ui.join("src").display());
-    println!("cargo:rerun-if-changed={}", web_ui.join("index.html").display());
-    println!("cargo:rerun-if-changed={}", web_ui.join("Cargo.toml").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        web_ui.join("index.html").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        web_ui.join("Cargo.toml").display()
+    );
     println!("cargo:rerun-if-env-changed=COWBOY_WEB_UI");
 
     // (1) An existing bundle always wins — don't rebuild over CI's work.
@@ -116,7 +122,9 @@ fn ensure_trunk() -> Result<PathBuf, String> {
         .is_ok_and(|s| s.success());
 
     let install = if has_binstall {
-        println!("cargo:warning=trunk not found; installing a prebuilt binary (cargo binstall trunk)…");
+        println!(
+            "cargo:warning=trunk not found; installing a prebuilt binary (cargo binstall trunk)…"
+        );
         Command::new(&cargo)
             .args(["binstall", "--no-confirm", "trunk"])
             .status()
@@ -132,7 +140,11 @@ fn ensure_trunk() -> Result<PathBuf, String> {
             .map_err(|e| format!("failed to run `cargo install trunk`: {e}"))?
     };
     if !install.success() {
-        let how = if has_binstall { "cargo binstall trunk" } else { "cargo install trunk" };
+        let how = if has_binstall {
+            "cargo binstall trunk"
+        } else {
+            "cargo install trunk"
+        };
         return Err(format!("`{how}` exited with {install}"));
     }
 
@@ -145,7 +157,11 @@ fn ensure_trunk() -> Result<PathBuf, String> {
 /// `trunk` on PATH, falling back to `$CARGO_HOME/bin` (or `~/.cargo/bin`), where
 /// a just-installed binary lands even if PATH hasn't picked it up yet.
 fn find_trunk() -> Option<PathBuf> {
-    if Command::new("trunk").arg("--version").status().is_ok_and(|s| s.success()) {
+    if Command::new("trunk")
+        .arg("--version")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
         return Some(PathBuf::from("trunk"));
     }
     let cargo_bin = std::env::var_os("CARGO_HOME")
