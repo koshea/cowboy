@@ -107,6 +107,69 @@ presence of a setuid binary. `NoNewPrivs` is set either way. `nft` is denied in
 both configurations, but the empty bounding set is the stronger guarantee, and
 `CAP_NET_ADMIN` reaching an agent command would let it rewrite the ruleset.
 
+## `--die-with-parent` is load-bearing, not tidiness
+
+bwrap keeps *itself* as a monitor outside the new PID namespace and forks the
+actual PID 1. Killing the monitor therefore does **not** take down the sandbox:
+measured directly, a `setsid`'d grandchild survived. With `--die-with-parent`,
+killing the monitor propagates to PID 1 and the kernel reaps the whole namespace —
+the same test then left nothing behind.
+
+This is why the sandbox executor needs no equivalent of the Docker path's
+machinery for this. There, the command's pgid had to be written to a file inside
+the container and `/proc/*/environ` swept for a per-exec `COWBOY_EXEC_TAG` marker
+to catch descendants that re-`setsid`ed out of the recorded group. Here, one signal
+to bwrap is sufficient and complete.
+
+## The sandbox root must be remounted read-only
+
+bwrap builds the new root on a tmpfs and auto-creates directories for bind
+targets, so `/`, `/etc` and `/var` are **writable** by default even when every bind
+inside them is read-only. Verified by probing: `touch /etc/EVIL` succeeded. That
+would let the agent drop an `/etc/ld.so.preload`.
+
+`--remount-ro /` as the final mount operation fixes it, and separate mounts keep
+their own flags, so `/workspace`, `/tmp` and `/run` stay writable. Confirmed by
+probe: `/ /etc /usr /var /opt` read-only, `/run /workspace /tmp` writable, and the
+read-only binds still readable.
+
+`oifname`-style reasoning does not apply here, but the same lesson does: the
+ordering is the mechanism. `--remount-ro /` placed before the binds would do
+nothing.
+
+## The shim needs a fixed bind path
+
+bwrap cannot apply Landlock, so it execs the `cowboy` binary as a shim which does
+(see `crates/cowboy-cli/src/sandbox/shim.rs`). The binary must therefore be
+reachable *inside* the sandbox, and its host path generally is not: the project is
+bound at `/workspace`, so a development build at `<project>/target/debug/cowboy`
+does not exist at that path inside.
+
+It is bound read-only at `/.cowboy-shim`. A fixed top-level path because `/run`
+and `/tmp` are tmpfs mounted after the binds (deliberately, so nothing can shadow
+them), and `/usr` is a read-only bind of the host's, so no mount point can be
+created inside it.
+
+The shim receives its instructions as JSON on **stdin**, not argv, because argv is
+visible in `/proc/<pid>/cmdline` to anything that can see the process.
+
+## Beware the vacuously-passing sandbox test
+
+`crates/cowboy-cli/tests/sandbox_exec.rs` self-skips when bubblewrap or
+unprivileged user namespaces are unavailable, so that `--ignored` stays safe to run
+anywhere. The first version of its capability probe ran `/bin/true` in a sandbox
+that bound only `/usr` — where `/bin` is a symlink that does not exist — so the
+probe reported "unsupported" and **all ten tests skipped while reporting `ok`**.
+
+Two safeguards now: the probe includes the merged-`/usr` symlinks it needs (without
+`/lib64` the dynamic linker is missing and even `/usr/bin/true` cannot start), and
+`COWBOY_SANDBOX_TESTS=required` turns a skip into a failure. The wall-clock time is
+the tell — the suite takes ~2s when it runs and ~0.01s when it skips.
+
+Relatedly, that file counts processes by reading `/proc` directly rather than
+using `pgrep -f`, whose pattern also matches the shell that invoked it. Same trap
+as `pkill -f cowboyd`, which is why the repo forbids it.
+
 ## SELinux is not a risk on this host
 
 It appears in `/sys/kernel/security/lsm`, which was flagged as a risk during

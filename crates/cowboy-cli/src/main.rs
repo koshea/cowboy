@@ -20,7 +20,7 @@ async fn main() -> Result<()> {
         None => cmd::session::run(cli.task, start_flags, resume).await,
         Some(Command::Init(args)) => cmd::init::run(args),
         Some(Command::Doctor) => cmd::doctor::run().await,
-        Some(Command::Sandbox(args)) => cmd::sandbox::run(args),
+        Some(Command::Sandbox(args)) => cmd::sandbox::run(args).await,
         Some(Command::Shell) => cmd::run::shell().await,
         Some(Command::Run { command }) => cmd::run::run(command).await,
         Some(Command::Patch(args)) => cmd::patch::run(args).await,
@@ -65,6 +65,7 @@ async fn main() -> Result<()> {
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
+        Some(Command::XSandboxShim) => cowboy_cli::sandbox::shim::run(),
         Some(Command::XSessionWorker(a)) => {
             cmd::worker::run(cmd::worker::WorkerArgs {
                 root: a.root,

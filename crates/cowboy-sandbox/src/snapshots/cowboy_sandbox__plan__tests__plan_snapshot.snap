@@ -3,6 +3,7 @@ source: crates/cowboy-sandbox/src/plan.rs
 expression: plan.render(&denylist)
 ---
 filesystem
+  ro  /usr/bin/cowboy -> /.cowboy-shim   (lockdown shim (cowboy binary))
   ro  /usr -> /usr   (host toolchain)
   ro  /etc/ssl -> /etc/ssl   (toolchain configuration)
   ro  /etc/resolv.conf -> /etc/resolv.conf   (toolchain configuration)
@@ -15,7 +16,7 @@ filesystem
   proc /proc   dev /dev
 
 landlock
-  6 read-only, 3 read-write paths
+  7 read-only, 3 read-write paths
   tcp connect allowed: 8443
   ipc scoping: true
 

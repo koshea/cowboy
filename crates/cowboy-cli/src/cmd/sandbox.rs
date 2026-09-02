@@ -14,10 +14,66 @@ use cowboy_sandbox::{Denylist, HostProbe};
 
 use crate::cli::{SandboxArgs, SandboxCommand};
 
-pub fn run(args: SandboxArgs) -> Result<()> {
+pub async fn run(args: SandboxArgs) -> Result<()> {
     match args.command {
         SandboxCommand::Plan => plan(),
+        SandboxCommand::Exec { command } => exec(command).await,
     }
+}
+
+/// Load the effective security config for this project, personal overlay merged.
+fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
+    let paths = ConfigPaths::for_root(root);
+    let mut security = SecurityConfig::load(&paths.security)
+        .with_context(|| format!("loading {}", paths.security.display()))?;
+    // Merge the personal overlay so this matches what a session would actually
+    // get; without it the boundary shown here would be narrower than the real one.
+    cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(root));
+    Ok(security)
+}
+
+/// Run one command in the sandbox with no network access.
+///
+/// Deliberately `NetMode::Isolated`: this path exists to inspect and test
+/// confinement, and until the egress transport is installed a sandbox with an
+/// inherited namespace would have the host's connectivity.
+async fn exec(command: Vec<String>) -> Result<()> {
+    let root = crate::cmd::project_root()?;
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let security = load(&root)?;
+    let mask = crate::net::runtime::ensure_mask_file()?;
+    let probe = RealHost;
+    let plan = crate::sandbox::exec::plan_for(&root, &security, &mask, &probe)?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Print as it arrives; a build should not look hung while it works.
+    let printer = tokio::spawn(async move {
+        use std::io::Write;
+        while let Some(chunk) = rx.recv().await {
+            print!("{chunk}");
+            let _ = std::io::stdout().flush();
+        }
+    });
+
+    let request = crate::sandbox::exec::ExecRequest {
+        plan: &plan,
+        command: &command.join(" "),
+        cwd: None,
+        timeout_secs: 0,
+        net: crate::sandbox::bwrap::NetMode::Isolated,
+    };
+    let (result, _) = crate::sandbox::exec::run_streaming(
+        request,
+        tokio_util::sync::CancellationToken::new(),
+        tx,
+    )
+    .await?;
+    printer.await.ok();
+
+    if result.exit_code != 0 {
+        std::process::exit(result.exit_code);
+    }
+    Ok(())
 }
 
 /// The real host, as seen by the plan builder.
@@ -50,12 +106,7 @@ impl HostProbe for RealHost {
 fn plan() -> Result<()> {
     let root = crate::cmd::project_root()?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let paths = ConfigPaths::for_root(&root);
-    let mut security = SecurityConfig::load(&paths.security)
-        .with_context(|| format!("loading {}", paths.security.display()))?;
-    // Merge the personal overlay so the rendered plan matches what a session would
-    // actually get — otherwise this would understate the boundary.
-    cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(&root));
+    let security = load(&root)?;
 
     let probe = RealHost;
     // A representative mask path; the executor creates the real one per session.

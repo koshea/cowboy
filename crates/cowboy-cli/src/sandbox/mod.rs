@@ -9,6 +9,10 @@
 //! replaces it. The trait is kept after Docker is removed because it is also the
 //! seam the follow-up portability work plugs into.
 
+pub mod bwrap;
+pub mod exec;
+pub mod shim;
+pub mod stream;
 pub mod transport;
 
 use std::path::Path;

@@ -1165,7 +1165,7 @@ pub(crate) fn write_private_file(name: &str, contents: &[u8]) -> Result<PathBuf>
 }
 
 /// The empty file used to mask host-owned config inside the container.
-fn ensure_mask_file() -> Result<PathBuf> {
+pub(crate) fn ensure_mask_file() -> Result<PathBuf> {
     write_private_file("mask-empty", b"")
 }
 

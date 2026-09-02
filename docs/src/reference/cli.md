@@ -638,6 +638,15 @@ Run a command inside the agent container
 Inspect the sandbox boundary for this project
 
 
+### `cowboy sandbox exec`
+
+Run one command inside the sandbox, with no network access
+
+| Arg | Description |
+|-----|-------------|
+| `<COMMAND>` | The command and its arguments |
+
+
 ### `cowboy sandbox plan`
 
 Print the confinement plan for this project: what the agent can read, write, and reach, and which paths can never be granted at runtime
@@ -776,6 +785,11 @@ Summarize a branch's changes + mergeability vs HEAD (read-only)
 ## `cowboy x-fileop`
 
 Internal: in-container worker for the structured file tools (reads a JSON request on stdin). Not for direct use
+
+
+## `cowboy x-sandbox-shim`
+
+Internal: the in-sandbox shim that applies Landlock + seccomp then execs the agent's command. Reads its request from stdin as JSON
 
 
 ## `cowboy x-session-worker`

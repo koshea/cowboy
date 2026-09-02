@@ -156,6 +156,15 @@ pub struct SandboxPlan {
     pub limits: ResourceLimits,
 }
 
+/// Where the `cowboy` binary is bound inside the sandbox, for bwrap to exec as
+/// the lockdown shim.
+///
+/// A fixed top-level path because it must not be shadowed: `/run` and `/tmp` are
+/// tmpfs mounted *after* the binds (so nothing can shadow them), and `/usr` is a
+/// read-only bind of the host's, so a mount point cannot be created inside it. The
+/// leading dot keeps it out of the way of anything a project might use.
+pub const SHIM_PATH: &str = "/.cowboy-shim";
+
 /// Host directories exposed read-only so the agent can use the machine's own
 /// toolchain. This is the flexibility the Docker image could not offer: the agent
 /// gets the compilers, language runtimes and CLIs the user actually has, at the
@@ -225,6 +234,14 @@ impl SandboxPlan {
         let workdir = sec.container.workdir.clone();
         let denylist = Denylist::build(probe, inputs.root);
         let mut binds = Vec::new();
+
+        // 0. The lockdown shim: the cowboy binary itself, read-only. bwrap cannot
+        //    apply Landlock, so it execs this instead of the command directly, and
+        //    it must therefore be reachable inside the sandbox. Read-only, and the
+        //    denylist separately prevents any runtime grant making it writable.
+        if let Some(exe) = probe.self_exe() {
+            binds.push(Bind::ro(exe, SHIM_PATH, "lockdown shim (cowboy binary)"));
+        }
 
         // 1. The host's own toolchain, read-only.
         for dir in HOST_TOOLCHAIN_DIRS {

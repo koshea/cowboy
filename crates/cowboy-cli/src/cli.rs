@@ -220,6 +220,11 @@ pub enum Command {
     #[command(name = "x-fileop", hide = true)]
     XFileop,
 
+    /// Internal: the in-sandbox shim that applies Landlock + seccomp then execs
+    /// the agent's command. Reads its request from stdin as JSON.
+    #[command(name = "x-sandbox-shim", hide = true)]
+    XSandboxShim,
+
     /// Internal: headless session worker spawned by the daemon. Not for direct
     /// use.
     #[command(name = "x-session-worker", hide = true)]
@@ -264,6 +269,13 @@ pub enum SandboxCommand {
     /// Print the confinement plan for this project: what the agent can read,
     /// write, and reach, and which paths can never be granted at runtime.
     Plan,
+
+    /// Run one command inside the sandbox, with no network access.
+    Exec {
+        /// The command and its arguments.
+        #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Args)]
