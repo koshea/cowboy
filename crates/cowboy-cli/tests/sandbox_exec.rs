@@ -160,6 +160,7 @@ async fn run_cancellable(
         cwd: None,
         timeout_secs,
         net: NetMode::Isolated,
+        session: None,
     };
     let (res, out) = run_streaming(req, cancel, tx).await.unwrap();
     (res.exit_code, out)
@@ -405,6 +406,7 @@ async fn landlock_denies_writes_even_when_the_mount_view_allows_them() {
         cwd: None,
         timeout_secs: 60,
         net: NetMode::Isolated,
+        session: None,
     };
     let (_res, out) = run_streaming(req, tokio_util::sync::CancellationToken::new(), tx)
         .await

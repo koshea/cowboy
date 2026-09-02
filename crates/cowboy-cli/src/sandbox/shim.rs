@@ -13,7 +13,6 @@
 //! The lockdown itself lands in the next slice; today the shim establishes the
 //! plumbing and execs the command.
 
-use std::io::Read;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
@@ -46,12 +45,7 @@ pub struct ShimRequest {
 /// Never returns on success — it becomes the command, so there is no shim process
 /// left to inspect or signal, and the exit status is the command's own.
 pub fn run() -> Result<()> {
-    let mut raw = String::new();
-    std::io::stdin()
-        .read_to_string(&mut raw)
-        .context("reading the shim request from stdin")?;
-    let req: ShimRequest =
-        serde_json::from_str(&raw).context("parsing the shim request as JSON")?;
+    let req = read_request().context("reading the shim request from stdin")?;
 
     apply_lockdown(&req)?;
 
@@ -63,6 +57,38 @@ pub fn run() -> Result<()> {
         .exec();
     // `exec` only returns on failure.
     Err(anyhow::Error::new(err).context("exec of the sandboxed command failed"))
+}
+
+/// Read exactly one newline-terminated JSON object from stdin.
+///
+/// Deliberately unbuffered, one byte at a time. A `BufReader` would read past the
+/// newline into its buffer and silently swallow the start of whatever follows —
+/// which matters because anything after the request line belongs to the *command*'s
+/// stdin (the structured file tools send their payload that way, so that multi-line
+/// content never has to survive shell quoting). Reading no further than the newline
+/// leaves fd 0 positioned exactly at the payload for the exec'd command to inherit.
+///
+/// A few hundred single-byte reads is nothing next to the process spawn around it.
+fn read_request() -> Result<ShimRequest> {
+    use std::io::Read;
+    let mut stdin = std::io::stdin().lock();
+    let mut line = Vec::with_capacity(4096);
+    let mut byte = [0u8; 1];
+    loop {
+        match stdin.read(&mut byte) {
+            Ok(0) => break, // EOF without a newline: parse what we have
+            Ok(_) if byte[0] == b'\n' => break,
+            Ok(_) => line.push(byte[0]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    serde_json::from_slice(&line).with_context(|| {
+        format!(
+            "parsing the shim request as JSON ({} bytes read)",
+            line.len()
+        )
+    })
 }
 
 /// Apply the kernel-level lockdown described by `req`.

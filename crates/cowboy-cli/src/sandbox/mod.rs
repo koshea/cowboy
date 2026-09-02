@@ -12,6 +12,8 @@
 pub mod bwrap;
 pub mod exec;
 pub mod lockdown;
+pub mod native;
+pub mod session;
 pub mod shim;
 pub mod stream;
 pub mod transport;

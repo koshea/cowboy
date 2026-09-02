@@ -389,6 +389,25 @@ impl SandboxPlan {
             "/run".to_string(),
             "/var/tmp".to_string(),
         ];
+
+        // The special filesystems are mounted *before* the binds, so that a grant
+        // for a path under /tmp is not silently shadowed by the tmpfs. That means
+        // order no longer prevents a bind from shadowing them, so refuse it here
+        // instead: a bind over /proc would let the agent present a fabricated /proc
+        // to its own tooling, and one over /dev could hand it a device node of its
+        // choosing.
+        for b in &binds {
+            for special in [&proc_at, &dev_at] {
+                if &b.target == special || Path::new(special).starts_with(&b.target) {
+                    return Err(Error::SecurityInvariant(format!(
+                        "bind target {} would shadow {special}, which must be the kernel's own. \
+                         Remove it from .cowboy/security.yaml.",
+                        b.target
+                    )));
+                }
+            }
+        }
+
         let landlock = landlock_for(&binds, &proc_at, &dev_at, &tmpfs);
 
         Ok(Self {
@@ -773,6 +792,23 @@ mod tests {
 
     /// A config with nothing at the workdir is a mistake worth naming, not a
     /// session with an empty project directory.
+    /// The special filesystems are mounted before the binds now, so order no
+    /// longer stops a bind shadowing them — this check does.
+    #[test]
+    fn refuses_a_bind_that_would_shadow_proc_or_dev() {
+        for target in ["/proc", "/dev", "/"] {
+            let mut sec = SecurityConfig::default();
+            sec.container.mounts.push(Mount {
+                source: "/srv/proj".into(),
+                target: target.into(),
+                mode: "rw".into(),
+            });
+            let err = plan_with(&sec, &[], &host())
+                .expect_err(&format!("a bind over {target} must be refused"));
+            assert!(matches!(err, Error::SecurityInvariant(_)), "{err}");
+        }
+    }
+
     #[test]
     fn refuses_config_with_no_mount_at_the_workdir() {
         let mut sec = SecurityConfig::default();

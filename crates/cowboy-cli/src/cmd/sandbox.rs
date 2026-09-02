@@ -61,6 +61,7 @@ async fn exec(command: Vec<String>) -> Result<()> {
         cwd: None,
         timeout_secs: 0,
         net: crate::sandbox::bwrap::NetMode::Isolated,
+        session: None,
     };
     let (result, _) = crate::sandbox::exec::run_streaming(
         request,

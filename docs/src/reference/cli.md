@@ -787,6 +787,11 @@ Summarize a branch's changes + mergeability vs HEAD (read-only)
 Internal: in-container worker for the structured file tools (reads a JSON request on stdin). Not for direct use
 
 
+## `cowboy x-sandbox-holder`
+
+Internal: holds a session's namespaces open. Runs inside them, brings loopback up, and exits when its stdin closes
+
+
 ## `cowboy x-sandbox-shim`
 
 Internal: the in-sandbox shim that applies Landlock + seccomp then execs the agent's command. Reads its request from stdin as JSON

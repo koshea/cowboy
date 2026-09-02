@@ -246,6 +246,83 @@ its user namespace and could rewrite the nftables ruleset that egress policy dep
 on. Both sets are checked: an empty effective set alone still leaves a capability
 regainable.
 
+## Session namespaces vs per-command namespaces
+
+Split by lifetime, not by convenience:
+
+| Namespace | Lifetime | Why |
+|---|---|---|
+| user, net, ipc, uts | session | A dev server started by one command must be reachable from the next, which needs a shared network namespace. |
+| mount | per command | Rebuilt from the current grant set, so an approved path is simply in the next command's bind list. |
+| pid | per command | Killing bwrap then reaps exactly that command's processes and nothing else. |
+
+Commands deliberately do **not** share a PID namespace, contrary to the initial
+plan. Sharing it would break the clean per-command reap — `--die-with-parent` only
+cascades when bwrap is that namespace's own PID 1 — and would let one command see
+and signal another's processes. Measured: two commands in one session reach the same
+loopback service while each sees only its own handful of PIDs.
+
+Loopback is **down** in a fresh network namespace, so the session holder brings it
+up before signalling readiness. Without that, every connection to `127.0.0.1` inside
+the sandbox fails. The holder can do it because it holds `CAP_NET_ADMIN` in its own
+user namespace; no agent process ever does.
+
+The namespaces are kept alive by a holder process which blocks reading its stdin, so
+if the worker dies the read returns EOF and the session tears itself down — no
+orphaned namespaces after a crash. The holder binary is passed in explicitly rather
+than taken from `current_exe()`: those differ whenever cowboy is not the running
+program, and in an integration test `current_exe()` is the test harness, which gets
+launched with an argument it does not understand and fails with no useful message.
+
+Per command, the `setns` calls happen in the forked child via `pre_exec`, never
+inline. Doing it on a thread of the worker would move the worker itself into the
+sandbox's network namespace and cut it off from the model provider. The user
+namespace must be joined first; joining only the network namespace fails with
+`EPERM`, because the privilege to do so comes from membership of the owning user
+namespace.
+
+## Special filesystems must be mounted before the binds
+
+Originally `--proc`, `--dev` and the tmpfs mounts came *after* the binds, on the
+reasoning that then no bind could shadow them. That ordering silently broke runtime
+grants: a grant for a path under `/tmp` — a temporary directory, which is exactly
+what one reaches for — was shadowed by the `--tmpfs /tmp` applied afterwards. The
+grant appeared in `cowboy sandbox plan` and then did not exist inside the sandbox.
+
+The order is now special filesystems first, binds after. Since ordering no longer
+prevents shadowing, the plan refuses any bind whose target is, or contains, `/proc`
+or `/dev`: a bind over `/proc` would let the agent present a fabricated `/proc` to
+its own tooling, and one over `/dev` could hand it a device node of its choosing.
+`--remount-ro /` still comes last of all.
+
+## Every running process is stale for a new grant
+
+A Landlock domain is fixed when a process starts and can only ever be narrowed, so
+*any* process already running when a grant is approved cannot see it. There is no
+such thing as a running process that already has a brand-new grant.
+
+This started out as a generation comparison at grant time, which a test kept
+refusing to express as a passing property — because the property was false: the
+comparison was always true. The notice now simply names every running process.
+Generations survive only where they earn it: `stale_processes()` reports staleness
+*afterwards*, so `cowboy proc list` can keep showing it until the process is
+restarted, rather than only at the moment of approval.
+
+The behaviour is correct but invisible, and the failure is baffling from the
+outside — a dev server that keeps failing to read a folder every new command reads
+fine. So it is said out loud, naming the processes and what to do about them.
+
+## The shim's request shares stdin with the command's payload
+
+The shim reads its JSON request from stdin, and the structured file tools also need
+to pass a payload on stdin so that multi-line content never has to survive shell
+quoting. Both use the same pipe: the request is one newline-terminated line,
+followed by the payload.
+
+The shim therefore reads **one byte at a time** up to the newline. A `BufReader`
+would read past it into its buffer and silently swallow the start of the payload.
+A few hundred single-byte reads is nothing next to the process spawn around it.
+
 ## Beware the vacuously-passing sandbox test
 
 `crates/cowboy-cli/tests/sandbox_exec.rs` self-skips when bubblewrap or

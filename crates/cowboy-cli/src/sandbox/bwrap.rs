@@ -130,6 +130,23 @@ pub fn build_argv(
         a.push(link.into());
     }
 
+    // Special filesystems FIRST, so a bind can be made *inside* one of them.
+    //
+    // This ordering is load-bearing and was originally the other way round. With
+    // the tmpfs mounted after the binds, a grant for a path under /tmp (a temporary
+    // directory, say) was silently shadowed by the tmpfs: it appeared in
+    // `cowboy sandbox plan` and then did not exist inside the sandbox. The plan
+    // separately refuses any bind that would shadow /proc or /dev, so nothing is
+    // lost by no longer relying on order for that.
+    push!("--proc");
+    a.push(plan.proc_at.clone().into());
+    push!("--dev");
+    a.push(plan.dev_at.clone().into());
+    for t in &plan.tmpfs {
+        push!("--tmpfs");
+        a.push(t.clone().into());
+    }
+
     for b in &plan.binds {
         // `try` variants: an optional path that vanished between planning and now
         // should not abort the command. Required paths are validated while building
@@ -140,16 +157,6 @@ pub fn build_argv(
         }
         a.push(b.source.clone().into_os_string());
         a.push(b.target.clone().into());
-    }
-
-    // After the binds so a bind cannot shadow them.
-    push!("--proc");
-    a.push(plan.proc_at.clone().into());
-    push!("--dev");
-    a.push(plan.dev_at.clone().into());
-    for t in &plan.tmpfs {
-        push!("--tmpfs");
-        a.push(t.clone().into());
     }
 
     push!("--chdir");
@@ -263,16 +270,22 @@ mod tests {
         assert!(proj < mask, "the mask must come after the project bind");
     }
 
-    /// `--proc` and `--dev` after the binds, so no bind can shadow them.
+    /// The special filesystems come BEFORE the binds, so a grant for a path under
+    /// /tmp can be mounted inside the tmpfs. With the old order the tmpfs shadowed
+    /// it: the grant showed up in `cowboy sandbox plan` and then did not exist
+    /// inside the sandbox. The plan refuses binds that would shadow /proc or /dev,
+    /// so nothing relies on order for that.
     #[test]
-    fn proc_and_dev_come_after_binds() {
+    fn special_filesystems_are_mounted_before_binds() {
         let a = argv_strings(NetMode::Isolated);
-        let last_bind = a
+        let first_bind = a
             .iter()
-            .rposition(|s| s == "--ro-bind-try" || s == "--bind-try")
+            .position(|s| s == "--ro-bind-try" || s == "--bind-try")
             .unwrap();
-        assert!(a.iter().position(|s| s == "--proc").unwrap() > last_bind);
-        assert!(a.iter().position(|s| s == "--dev").unwrap() > last_bind);
+        for flag in ["--proc", "--dev", "--tmpfs"] {
+            let i = a.iter().position(|s| s == flag).unwrap();
+            assert!(i < first_bind, "{flag} must precede the binds");
+        }
     }
 
     /// Without this the sandbox root tmpfs is writable, letting the agent create

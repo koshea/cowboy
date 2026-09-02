@@ -225,6 +225,11 @@ pub enum Command {
     #[command(name = "x-sandbox-shim", hide = true)]
     XSandboxShim,
 
+    /// Internal: holds a session's namespaces open. Runs inside them, brings
+    /// loopback up, and exits when its stdin closes.
+    #[command(name = "x-sandbox-holder", hide = true)]
+    XSandboxHolder,
+
     /// Internal: headless session worker spawned by the daemon. Not for direct
     /// use.
     #[command(name = "x-session-worker", hide = true)]
