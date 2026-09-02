@@ -8,11 +8,12 @@ use cowboy_core::config::{AgentConfig, ConfigPaths, ProcessDef, SecurityConfig};
 use crate::cli::{ProcArgs, ProcCommand};
 use crate::net::docker::CliDocker;
 use crate::net::runtime::AgentRuntime;
+use crate::sandbox::Sandbox;
 
 const CONTROL_TIMEOUT: u64 = 30;
 
 struct Proc {
-    runtime: AgentRuntime,
+    runtime: Box<dyn Sandbox>,
     procs: std::collections::BTreeMap<String, ProcessDef>,
     proc_dir: String,
     workdir: String,
@@ -44,7 +45,7 @@ pub async fn run(args: ProcArgs) -> Result<()> {
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
 
     let ctx = Proc {
-        runtime,
+        runtime: Box::new(runtime),
         procs: agent_cfg.processes,
         proc_dir,
         workdir,

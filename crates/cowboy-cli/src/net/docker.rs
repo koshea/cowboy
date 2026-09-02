@@ -159,10 +159,10 @@ pub struct NetworkSpec {
 }
 
 /// Result of a streamed command execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecResult {
-    pub exit_code: i32,
-}
+///
+/// Re-exported from the sandbox seam: it is part of the sandbox contract, not of
+/// the Docker backend specifically.
+pub use crate::sandbox::ExecResult;
 
 /// Docker operations cowboy needs. bollard-backed, behind a mockable trait.
 #[cfg_attr(test, mockall::automock)]

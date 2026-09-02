@@ -13,8 +13,7 @@ use super::tools::{
     WriteArgs,
 };
 use super::ui::AgentUi;
-use crate::net::docker::ExecResult;
-use crate::net::runtime::AgentRuntime;
+use crate::sandbox::{ExecResult, Sandbox};
 use crate::session::SessionLogger;
 
 /// Process-unique counter so concurrent subagents spawned in the same millisecond
@@ -133,7 +132,7 @@ pub struct AgentLoop<'a> {
     /// Optional dedicated model for auxiliary summarization (compaction +
     /// truncation recovery). `None` falls back to `model` — see [`Self::summarizer`].
     summarizer: Option<Box<dyn ModelClient>>,
-    runtime: AgentRuntime,
+    runtime: Box<dyn Sandbox>,
     tools: Vec<ToolDef>,
     behavior: AgentBehavior,
     cancel: CancellationToken,
@@ -470,12 +469,15 @@ const MAX_SUBAGENT_DEPTH: usize = 2;
 impl<'a> AgentLoop<'a> {
     pub fn new(
         model: Box<dyn ModelClient>,
-        mut runtime: AgentRuntime,
+        runtime: impl Sandbox + 'static,
         behavior: AgentBehavior,
         context_window: usize,
         cancel: CancellationToken,
         ui: &'a mut dyn AgentUi,
     ) -> Self {
+        // Boxed here rather than by callers so the many construction sites (and
+        // tests) stay unchanged when the sandbox backend does.
+        let mut runtime: Box<dyn Sandbox> = Box::new(runtime);
         let runtime_status = runtime.status_channel();
         // Crew mode (roster + delegation enabled) gates the foreman guidance and
         // the `subagent` tool; in solo mode the selected model works alone.
@@ -2288,7 +2290,7 @@ impl<'a> AgentLoop<'a> {
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
-            container_name: self.runtime.container_name().to_string(),
+            container_name: self.runtime.session_name().to_string(),
             id,
             child_depth: self.subagent_depth + 1,
             task,
@@ -2360,6 +2362,7 @@ mod tests {
     use super::*;
     use crate::agent::ui::AgentUi;
     use crate::net::docker::{ContainerState, ExecResult, MockDockerCli};
+    use crate::net::runtime::AgentRuntime;
     use cowboy_core::config::{Mount, SecurityConfig};
     use cowboy_core::model::{ChatResponse, ToolCall};
     use std::sync::Mutex;

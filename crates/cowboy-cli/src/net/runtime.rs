@@ -784,6 +784,76 @@ impl AgentRuntime {
     }
 }
 
+/// The Docker backend's implementation of the sandbox seam.
+///
+/// A thin forwarding layer: the inherent methods above predate the trait and are
+/// still used directly by the Docker-specific paths (gateway bring-up, container
+/// teardown) that have no equivalent in a host-native sandbox. This impl exists so
+/// the agent loop and `cmd/*` depend on the seam rather than on Docker.
+#[async_trait::async_trait]
+impl crate::sandbox::Sandbox for AgentRuntime {
+    fn root(&self) -> &Path {
+        self.root()
+    }
+
+    fn session_name(&self) -> &str {
+        self.container_name()
+    }
+
+    fn status_channel(&mut self) -> crate::sandbox::StatusRx {
+        self.status_channel()
+    }
+
+    fn has_mise_config(&self) -> bool {
+        self.has_mise_config()
+    }
+
+    async fn ensure_running(&self) -> Result<()> {
+        self.ensure_running().await
+    }
+
+    async fn stop(&self) {
+        self.stop().await
+    }
+
+    async fn exec_stream(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: u64,
+        cancel: tokio_util::sync::CancellationToken,
+        chunks: crate::sandbox::StatusTx,
+    ) -> Result<(ExecResult, String)> {
+        self.exec_stream(command, cwd, timeout_secs, cancel, chunks)
+            .await
+    }
+
+    async fn run_capture(
+        &self,
+        command: &str,
+        cwd: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<(ExecResult, String)> {
+        self.run_capture(command, cwd, timeout_secs).await
+    }
+
+    async fn run(&self, argv: &[String]) -> Result<ExecResult> {
+        self.run(argv).await
+    }
+
+    async fn shell(&self) -> Result<ExecResult> {
+        self.shell().await
+    }
+
+    async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)> {
+        self.fileop(payload).await
+    }
+
+    async fn stop_all_processes(&self) -> Result<()> {
+        self.stop_all_processes().await
+    }
+}
+
 /// The agent container's `uid:gid` — the host user, so files it writes in the
 /// mounted workspace are owned correctly. With network isolation the agent must
 /// never be uid 0 (it would inherit the gateway's `skuid 0` egress exemption);
