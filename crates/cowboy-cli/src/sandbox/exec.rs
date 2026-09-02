@@ -86,7 +86,6 @@ pub async fn run_streaming(
         command: build_command(&req),
         read_only: to_strings(&req.plan.landlock.read_only),
         read_write: to_strings(&req.plan.landlock.read_write),
-        connect_tcp: req.plan.landlock.connect_tcp.clone(),
         scope_ipc: req.plan.landlock.scope_ipc,
         deny_syscalls: req
             .plan

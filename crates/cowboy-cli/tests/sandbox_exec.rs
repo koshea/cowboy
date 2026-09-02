@@ -359,3 +359,223 @@ fn processes_matching(needle: &str) -> usize {
     }
     n
 }
+
+// ---------------------------------------------------------------------------
+// Kernel-level lockdown: Landlock, seccomp, capabilities
+// ---------------------------------------------------------------------------
+
+/// Landlock's whole purpose: it is enforced against the *process*, so it still
+/// holds when the mount view is wrong.
+///
+/// This is the only test that can distinguish the two layers. Normally the Landlock
+/// rules are derived from the bind list so they agree by construction; here the
+/// project is left bound read-write while being removed from the Landlock
+/// read-write set, simulating exactly the mistake Landlock exists to contain.
+#[tokio::test]
+async fn landlock_denies_writes_even_when_the_mount_view_allows_them() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let root = p.path();
+
+    let mut plan = plan_for(&root);
+    // Sanity: the bind really is read-write, so a failure below is Landlock's doing
+    // and not the mount view's.
+    let bind = plan
+        .binds
+        .iter()
+        .find(|b| b.target == plan.workdir)
+        .expect("project bind");
+    assert_eq!(bind.mode, cowboy_sandbox::BindMode::ReadWrite);
+
+    // Remove the *sandbox-internal* path: Landlock rules are resolved inside the
+    // sandbox, so the workdir is what identifies the project there.
+    let workdir = std::path::PathBuf::from(&plan.workdir);
+    let before = plan.landlock.read_write.len();
+    plan.landlock.read_write.retain(|p| p != &workdir);
+    assert_eq!(
+        plan.landlock.read_write.len(),
+        before - 1,
+        "the test must actually remove the project's Landlock rule, or it proves nothing"
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let req = ExecRequest {
+        plan: &plan,
+        command: "echo nope > /workspace/should-not-exist.txt 2>&1; echo exit=$?",
+        cwd: None,
+        timeout_secs: 60,
+        net: NetMode::Isolated,
+    };
+    let (_res, out) = run_streaming(req, tokio_util::sync::CancellationToken::new(), tx)
+        .await
+        .unwrap();
+    assert!(
+        !root.join("should-not-exist.txt").exists(),
+        "Landlock did not prevent the write: {out}"
+    );
+}
+
+/// The read-only toolchain must still be *executable*, or nothing in `/usr` could
+/// run and the sandbox would be useless.
+#[tokio::test]
+async fn read_only_paths_remain_executable() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let (code, out) = run(&p.path(), "/usr/bin/env true && echo executed", 60).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("executed"), "{out}");
+}
+
+/// io_uring is the reason the seccomp deny-list exists: operations are submitted as
+/// ring entries rather than syscalls, so `IORING_OP_CONNECT` and `IORING_OP_OPENAT`
+/// would never pass through a filter on `connect`/`openat`.
+///
+/// Refusing `io_uring_setup` is what closes that hole, and it closes it completely:
+/// with no ring, *no* `IORING_OP_*` is reachable at all. That is why this asserts on
+/// ring creation rather than on the individual operations — the operations cannot be
+/// attempted without a ring to submit them to.
+#[tokio::test]
+async fn io_uring_cannot_be_created_so_no_ring_operation_is_reachable() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    // Call the syscall directly; the number is fixed on x86_64 (425).
+    let probe = r#"python3 -c '
+import ctypes, os
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+buf = (ctypes.c_ubyte * 256)()
+rc = libc.syscall(425, 8, ctypes.byref(buf))
+if rc >= 0:
+    print("RING CREATED (BAD)")
+else:
+    print("io_uring_setup denied:", os.strerror(ctypes.get_errno()))
+'"#;
+    let (code, out) = run(&p.path(), probe, 60).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("io_uring_setup denied"),
+        "io_uring must be unavailable, otherwise the seccomp filter is bypassable: {out}"
+    );
+    assert!(!out.contains("RING CREATED"), "{out}");
+}
+
+#[tokio::test]
+async fn raw_sockets_are_denied() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    // SOCK_RAW with flags OR'd in, which an exact-match filter would miss.
+    let probe = r#"python3 -c '
+import socket
+for extra in (0, socket.SOCK_CLOEXEC, socket.SOCK_NONBLOCK):
+    try:
+        socket.socket(socket.AF_INET, socket.SOCK_RAW | extra, socket.IPPROTO_ICMP)
+        print("RAW ALLOWED (BAD) extra=", extra)
+    except OSError as e:
+        print("raw denied:", e.errno)
+'"#;
+    let (code, out) = run(&p.path(), probe, 60).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(!out.contains("RAW ALLOWED"), "{out}");
+    assert_eq!(
+        out.matches("raw denied").count(),
+        3,
+        "every SOCK_RAW variant must be denied, including with flags: {out}"
+    );
+}
+
+/// Ordinary TCP must still work, or the deny-list is too broad to be usable.
+#[tokio::test]
+async fn ordinary_stream_sockets_still_work() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let probe = r#"python3 -c '
+import socket, threading, time
+srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+port = srv.getsockname()[1]
+threading.Thread(target=lambda: srv.accept(), daemon=True).start()
+time.sleep(0.2)
+c = socket.socket(); c.settimeout(2); c.connect(("127.0.0.1", port))
+print("loopback tcp OK")
+'"#;
+    let (code, out) = run(&p.path(), probe, 60).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("loopback tcp OK"),
+        "the agent must be able to reach services it starts: {out}"
+    );
+}
+
+/// With an empty capability bounding set and `NO_NEW_PRIVS`, a setuid binary
+/// confers nothing. Both matter: an empty effective set alone would still leave a
+/// capability regainable.
+#[tokio::test]
+async fn no_capabilities_and_no_new_privs() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let (code, out) = run(
+        &p.path(),
+        "grep -E '^(CapEff|CapBnd|NoNewPrivs):' /proc/self/status",
+        60,
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    for line in out.lines() {
+        if let Some(v) = line.strip_prefix("CapEff:") {
+            assert_eq!(
+                v.trim().trim_start_matches('0'),
+                "",
+                "CapEff must be 0: {out}"
+            );
+        }
+        if let Some(v) = line.strip_prefix("CapBnd:") {
+            assert_eq!(
+                v.trim().trim_start_matches('0'),
+                "",
+                "CapBnd must be 0 too, or a capability could be regained: {out}"
+            );
+        }
+    }
+    assert!(out.contains("NoNewPrivs:\t1"), "{out}");
+}
+
+/// The shim refuses to run if capabilities were not dropped, so a future change to
+/// the bwrap argv cannot silently hand the agent `CAP_NET_ADMIN` — with which it
+/// could rewrite the nftables ruleset that egress policy depends on.
+#[tokio::test]
+async fn the_shim_refuses_to_run_with_capabilities() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let _ = &p;
+    let shim = Host.self_exe().unwrap();
+    // Only `command` is required; everything else defaults.
+    let request = serde_json::json!({ "command": "echo should-not-run" });
+
+    // Run the shim directly on the host, where the bounding set is NOT empty.
+    let mut child = std::process::Command::new(&shim)
+        .arg("x-sandbox-shim")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "the shim should have refused: {stderr}"
+    );
+    assert!(
+        stderr.contains("CapBnd") || stderr.contains("capabilities"),
+        "the refusal should name the capability check: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("should-not-run"),
+        "the command must not have run"
+    );
+}

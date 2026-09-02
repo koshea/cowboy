@@ -1140,14 +1140,17 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
 /// Create a file inside [`private_dir`] with `contents`, replacing any existing
 /// one. Fails rather than following a symlink or reusing a file we don't own.
 pub(crate) fn write_private_file(name: &str, contents: &[u8]) -> Result<PathBuf> {
-    let path = private_dir()?.join(name);
-    // Remove first so we never write *through* a pre-existing symlink, then create
-    // exclusively: if anything raced us to the name, this errors instead of using it.
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("clearing {}", path.display())),
-    }
+    let dir = private_dir()?;
+    let path = dir.join(name);
+    // Write to a unique temporary name and rename into place.
+    //
+    // Never open the destination directly: a pre-existing symlink there would make
+    // us write *through* it to a file of someone else's choosing. Creating a fresh
+    // name exclusively and renaming avoids that, and unlike `remove` + `create_new`
+    // it is atomic and safe when two callers race — that pattern fails the loser
+    // with `AlreadyExists`, which showed up as a flaky test once a second caller
+    // existed.
+    let tmp = dir.join(format!("{name}.{}.{}", std::process::id(), now_nanos()));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1156,12 +1159,30 @@ pub(crate) fn write_private_file(name: &str, contents: &[u8]) -> Result<PathBuf>
         opts.mode(0o600);
     }
     let mut f = opts
-        .open(&path)
-        .with_context(|| format!("creating {}", path.display()))?;
+        .open(&tmp)
+        .with_context(|| format!("creating {}", tmp.display()))?;
     use std::io::Write;
-    f.write_all(contents)
-        .with_context(|| format!("writing {}", path.display()))?;
+    let write = f
+        .write_all(contents)
+        .with_context(|| format!("writing {}", tmp.display()));
+    if write.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        write?;
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("installing {}", path.display()));
+    }
     Ok(path)
+}
+
+/// Nanoseconds since the epoch, for a unique temporary filename.
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 /// The empty file used to mask host-owned config inside the container.
@@ -1247,6 +1268,34 @@ mod tests {
     use super::*;
     use crate::net::docker::MockDockerCli;
     use cowboy_core::config::Mount;
+
+    /// Concurrent callers must both succeed. The previous `remove` + `create_new`
+    /// implementation failed the loser of the race with `AlreadyExists`, which
+    /// surfaced as a flaky test as soon as a second caller of `ensure_mask_file`
+    /// existed.
+    #[test]
+    fn write_private_file_is_safe_under_concurrency() {
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| write_private_file("race-probe", b"")))
+            .collect();
+        for (i, t) in threads.into_iter().enumerate() {
+            let r = t.join().expect("thread panicked");
+            assert!(r.is_ok(), "concurrent writer {i} failed: {:?}", r.err());
+        }
+        // No temporary files left behind.
+        let dir = private_dir().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                let n = e.file_name();
+                let n = n.to_string_lossy();
+                n.starts_with("race-probe.")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temp files leaked: {leftovers:?}");
+        let _ = std::fs::remove_file(dir.join("race-probe"));
+    }
 
     /// The mask file is bind-mounted into the container, so its path must not be
     /// one another local user can pre-create: a symlink there would make dockerd

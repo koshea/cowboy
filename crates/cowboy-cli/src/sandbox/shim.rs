@@ -30,9 +30,6 @@ pub struct ShimRequest {
     /// Paths the Landlock domain may read and write.
     #[serde(default)]
     pub read_write: Vec<String>,
-    /// TCP ports the sandbox may connect to.
-    #[serde(default)]
-    pub connect_tcp: Vec<u16>,
     /// Scope the domain against signalling and abstract sockets outside it.
     #[serde(default)]
     pub scope_ipc: bool,
@@ -72,11 +69,8 @@ pub fn run() -> Result<()> {
 ///
 /// Fails closed: any error here must abort before the command runs, since the
 /// alternative is executing untrusted code with less confinement than intended.
-fn apply_lockdown(_req: &ShimRequest) -> Result<()> {
-    // Landlock, seccomp, and no-new-privs land in the next slice. bwrap has
-    // already unshared the namespaces and emptied the capability bounding set by
-    // the time we get here.
-    Ok(())
+fn apply_lockdown(req: &ShimRequest) -> Result<()> {
+    super::lockdown::apply(req)
 }
 
 #[cfg(test)]
@@ -90,7 +84,6 @@ mod tests {
             command: "echo hi".into(),
             read_only: vec!["/usr".into()],
             read_write: vec!["/workspace".into()],
-            connect_tcp: vec![8443],
             scope_ipc: true,
             deny_syscalls: vec!["io_uring_setup".into()],
             deny_raw_sockets: true,

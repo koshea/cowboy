@@ -60,13 +60,16 @@ impl Bind {
 pub struct LandlockRules {
     pub read_only: Vec<PathBuf>,
     pub read_write: Vec<PathBuf>,
-    /// TCP ports the sandbox may `connect()` to. Landlock gates ports, not
-    /// addresses — which is enough here only because the sandbox network namespace
-    /// can reach nothing but its own loopback anyway.
-    pub connect_tcp: Vec<u16>,
     /// Scope the domain against signalling and abstract-socket-connecting outside
     /// it (Landlock ABI 6). Hardening only: no trust boundary depends on it.
     pub scope_ipc: bool,
+    // Deliberately no TCP port rules. Landlock gates bind/connect by *port*, not
+    // address, so it cannot distinguish the agent's own dev server from the
+    // internet: denying binds breaks `agent.yaml` processes, and allowing only the
+    // relay port stops the agent reaching those processes. It would also add
+    // nothing — the sandbox network namespace has no host-connected device, so all
+    // egress is already forced through the transport into the policy engine. See
+    // `cowboy_cli::sandbox::lockdown`.
 }
 
 /// The seccomp filter applied immediately before exec.
@@ -379,13 +382,20 @@ impl SandboxPlan {
 
         let limits = resolve_limits(sec);
         let env = build_env(sec, &workdir, &limits);
-        let landlock = landlock_for(&binds, inputs.relay_port);
+        let proc_at = "/proc".to_string();
+        let dev_at = "/dev".to_string();
+        let tmpfs = vec![
+            "/tmp".to_string(),
+            "/run".to_string(),
+            "/var/tmp".to_string(),
+        ];
+        let landlock = landlock_for(&binds, &proc_at, &dev_at, &tmpfs);
 
         Ok(Self {
             binds,
-            proc_at: "/proc".into(),
-            dev_at: "/dev".into(),
-            tmpfs: vec!["/tmp".into(), "/run".into(), "/var/tmp".into()],
+            proc_at,
+            dev_at,
+            tmpfs,
             symlinks: USR_SYMLINKS
                 .iter()
                 .map(|(t, l)| (t.to_string(), l.to_string()))
@@ -427,15 +437,7 @@ impl SandboxPlan {
             self.landlock.read_only.len(),
             self.landlock.read_write.len()
         ));
-        s.push_str(&format!(
-            "  tcp connect allowed: {}\n",
-            self.landlock
-                .connect_tcp
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        s.push_str("  network: not gated here (port-only rules cannot express it)\n");
         s.push_str(&format!("  ipc scoping: {}\n", self.landlock.scope_ipc));
 
         s.push_str("\nseccomp\n");
@@ -463,25 +465,36 @@ impl SandboxPlan {
     }
 }
 
-/// Landlock rules mirroring the bind list.
+/// Landlock rules for the sandbox-internal view.
 ///
-/// Derived from the binds rather than written separately, so the two cannot
-/// disagree about what is writable.
-fn landlock_for(binds: &[Bind], relay_port: u16) -> LandlockRules {
+/// **Uses bind targets, not sources.** The shim applies these from *inside* the
+/// sandbox, so paths must be as they appear there. Deriving them from the host-side
+/// sources looks plausible and silently does nothing useful: `/usr` happens to have
+/// the same path inside and out, so a toolchain read appears to work, while the
+/// project (`/srv/x` outside, `/workspace` inside) gets no rule at all and every
+/// write is denied.
+///
+/// The special filesystems must be included too. They are not binds, so deriving
+/// rules only from the bind list leaves `/proc`, `/dev` and the tmpfs mounts
+/// unreadable — which breaks anything that reads `/proc/self/*`.
+fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str, tmpfs: &[String]) -> LandlockRules {
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
     for b in binds {
         match b.mode {
-            BindMode::ReadOnly => read_only.push(b.source.clone()),
-            BindMode::ReadWrite => read_write.push(b.source.clone()),
+            BindMode::ReadOnly => read_only.push(PathBuf::from(&b.target)),
+            BindMode::ReadWrite => read_write.push(PathBuf::from(&b.target)),
         }
     }
-    // Writable scratch. `/tmp` is a fresh tmpfs per command, not the host's.
-    read_write.push(PathBuf::from("/tmp"));
+    // Virtual and scratch filesystems, writable. Each is created fresh for every
+    // command, and `/proc/sys` needs privileges we do not have regardless, so
+    // finer-grained rules here would cost compatibility for no gain.
+    read_write.push(PathBuf::from(proc_at));
+    read_write.push(PathBuf::from(dev_at));
+    read_write.extend(tmpfs.iter().map(PathBuf::from));
     LandlockRules {
         read_only,
         read_write,
-        connect_tcp: vec![relay_port],
         scope_ipc: true,
     }
 }
@@ -884,25 +897,57 @@ mod tests {
         assert_eq!(b.mode, BindMode::ReadOnly);
     }
 
-    /// Landlock is derived from the binds so the two cannot disagree about what is
-    /// writable.
+    /// Landlock rules are derived from the binds so the two cannot disagree about
+    /// what is writable — but they must use the **sandbox-internal** targets,
+    /// because the shim applies them from inside the sandbox. Host sources silently
+    /// produce a domain that allows nothing useful: `/usr` has the same path either
+    /// side so a toolchain read appears to work, while the project gets no rule.
     #[test]
-    fn landlock_mirrors_the_bind_list() {
+    fn landlock_uses_sandbox_paths_not_host_paths() {
         let plan = plan_with(&SecurityConfig::default(), &[], &host()).unwrap();
-        assert!(plan
-            .landlock
-            .read_write
-            .contains(&PathBuf::from("/srv/proj")));
+        assert!(
+            plan.landlock
+                .read_write
+                .contains(&PathBuf::from("/workspace")),
+            "the project must be writable by its in-sandbox path: {:?}",
+            plan.landlock.read_write
+        );
+        assert!(
+            !plan
+                .landlock
+                .read_write
+                .contains(&PathBuf::from("/srv/proj")),
+            "the host path is meaningless inside the sandbox"
+        );
         assert!(plan.landlock.read_only.contains(&PathBuf::from("/usr")));
         assert!(!plan.landlock.read_write.contains(&PathBuf::from("/usr")));
     }
 
-    /// Landlock gates ports, not addresses. That is sufficient only because the
-    /// sandbox netns can reach nothing but its own loopback.
+    /// The virtual and scratch filesystems are not binds, so rules derived from the
+    /// bind list alone leave them unreadable — which breaks anything reading
+    /// `/proc/self/*`.
     #[test]
-    fn landlock_permits_only_the_relay_port() {
+    fn landlock_includes_the_special_filesystems() {
         let plan = plan_with(&SecurityConfig::default(), &[], &host()).unwrap();
-        assert_eq!(plan.landlock.connect_tcp, vec![8443]);
+        for p in ["/proc", "/dev", "/tmp", "/run", "/var/tmp"] {
+            assert!(
+                plan.landlock.read_write.contains(&PathBuf::from(p)),
+                "{p} must be in the Landlock domain: {:?}",
+                plan.landlock.read_write
+            );
+        }
+    }
+
+    /// Landlock must NOT gate TCP: port-only rules cannot distinguish the agent's
+    /// own dev server from the internet, so denying binds breaks `agent.yaml`
+    /// processes and allowing only the relay port stops the agent reaching them.
+    /// Egress is the transport's job.
+    #[test]
+    fn landlock_does_not_gate_the_network() {
+        let plan = plan_with(&SecurityConfig::default(), &[], &host()).unwrap();
+        assert!(plan.landlock.scope_ipc, "ipc scoping is still wanted");
+        let rendered = plan.render(&Denylist::build(&host(), Path::new("/srv/proj")));
+        assert!(rendered.contains("not gated here"), "{rendered}");
     }
 
     /// io_uring would otherwise be a hole straight through the seccomp filter.

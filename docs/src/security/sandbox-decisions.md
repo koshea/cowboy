@@ -153,6 +153,99 @@ created inside it.
 The shim receives its instructions as JSON on **stdin**, not argv, because argv is
 visible in `/proc/<pid>/cmdline` to anything that can see the process.
 
+## Landlock rules must use sandbox paths, and this fails silently
+
+The shim applies the Landlock domain from *inside* the finished sandbox, so its
+paths are resolved in the sandbox's mount namespace. Deriving them from the
+host-side bind **sources** is the obvious mistake and an almost invisible one:
+`/usr` has the same path inside and out, so reading the toolchain keeps working,
+while the project (`/srv/x` outside, `/workspace` inside) gets no rule at all and
+every write is denied. The rules must come from the bind **targets**.
+
+Two things made it worse and are now fixed:
+
+- The special filesystems are not binds. Rules derived from the bind list alone
+  leave `/proc`, `/dev` and the tmpfs mounts outside the domain, so anything
+  reading `/proc/self/*` fails.
+- The rule-adding code originally dropped failed rules with
+  `filter_map(|r| r.ok())`. Since every rule failed to resolve, the domain ended up
+  with no allow rules — denying everything, which looks exactly like working
+  confinement. Missing paths are now a hard error: they are sandbox-internal
+  targets bwrap has just created, so absence is a bug, and the plan has already
+  skipped optional host paths that were not present.
+
+## Landlock does not gate the network here
+
+Landlock gates TCP bind and connect by **port, not address**, which makes it
+unusable for this sandbox:
+
+- Handling `BindTcp` with no allowed ports denies every `bind()`. Verified:
+  binding `127.0.0.1:3000` returned `EACCES`, which would break every dev server
+  declared in `agent.yaml`.
+- Handling `ConnectTcp` with only the relay port allowed would stop the agent
+  reaching a service it started itself on any other loopback port.
+- Allowing enough ports to fix both leaves the rule enforcing nothing meaningful,
+  because a port number cannot distinguish "my own dev server" from "the internet".
+
+It would also be redundant. The sandbox network namespace holds no host-connected
+device, so every outbound connection is already forced through the nftables
+redirect into the relay and the policy engine. Containment does not depend on a
+port rule, so the only thing adding one achieves is breaking functionality.
+
+Landlock is therefore **filesystem-only** here, plus ABI 6 scoping as hardening.
+`cowboy sandbox plan` says so explicitly rather than listing a port allowlist that
+does not exist.
+
+## Why the ABI is a hard requirement
+
+`CompatLevel::HardRequirement` with a pinned `ABI::V6`, not best-effort. A
+best-effort domain on an older kernel would enforce a subset while reporting
+success, which is the failure mode that makes "graceful degradation" dangerous in a
+security boundary. `restrict_self`'s status is checked as well, so a non-enforcing
+ruleset aborts the command.
+
+The residual gap is deliberate: accesses introduced *after* ABI 6 are not handled
+and so are unrestricted. Pinning keeps enforcement identical across kernel upgrades
+rather than silently tightening (and breaking builds) or silently loosening.
+
+## seccomp is deny-by-exception, and io_uring is why it exists
+
+An allowlist would have to enumerate every syscall a compiler, linker, test runner
+and package manager might make, where one omission breaks a build in a way that is
+very hard to attribute. The deny-list targets primitives with no legitimate use from
+a build: module loading, kexec, bpf, perf, `ptrace`/`process_vm_*`, clock setting,
+`userfaultfd`, and the io_uring family.
+
+io_uring is the load-bearing entry. Its operations are submitted as ring entries
+rather than syscalls, so `IORING_OP_CONNECT` and `IORING_OP_OPENAT` never pass
+through a filter on `connect`/`openat`. Landlock's LSM hooks *do* cover io_uring for
+filesystem access, so file confinement holds either way — but the syscall half is
+bypassable unless the ring is refused. Denying `io_uring_setup` closes it
+completely: with no ring, no ring operation is reachable, which is why the test
+asserts on ring creation rather than on individual operations.
+
+Denials return `EPERM` rather than killing the process, so a denied syscall surfaces
+as an ordinary error the command can report instead of a `SIGSYS` death that looks
+like a crash in the user's build.
+
+Syscall numbers are hand-maintained via `libc::SYS_*` rather than pulled from
+`libseccomp`, avoiding a C dependency; they were taken from this machine's
+`asm/unistd_64.h`, not from memory. A name with no known number is a hard error —
+an incomplete filter must not be installed silently.
+
+`SOCK_RAW` is matched with a masked comparison, because `SOCK_CLOEXEC` and
+`SOCK_NONBLOCK` are OR'd into the same argument and an exact comparison would let
+`SOCK_RAW | SOCK_CLOEXEC` straight through.
+
+## The shim verifies its own capabilities
+
+Before applying anything, the shim reads `/proc/self/status` and refuses to run if
+`CapEff` or `CapBnd` is non-zero. bwrap should already have emptied both, but if a
+future change to the argv stopped doing so, the agent would hold `CAP_NET_ADMIN` in
+its user namespace and could rewrite the nftables ruleset that egress policy depends
+on. Both sets are checked: an empty effective set alone still leaves a capability
+regainable.
+
 ## Beware the vacuously-passing sandbox test
 
 `crates/cowboy-cli/tests/sandbox_exec.rs` self-skips when bubblewrap or

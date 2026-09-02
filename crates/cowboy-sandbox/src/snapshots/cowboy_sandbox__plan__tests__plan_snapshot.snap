@@ -16,8 +16,8 @@ filesystem
   proc /proc   dev /dev
 
 landlock
-  7 read-only, 3 read-write paths
-  tcp connect allowed: 8443
+  7 read-only, 7 read-write paths
+  network: not gated here (port-only rules cannot express it)
   ipc scoping: true
 
 seccomp

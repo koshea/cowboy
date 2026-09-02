@@ -98,6 +98,12 @@ tls-parser = "0.12"
 socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"
 
+# sandbox enforcement (Linux-only, applied in-process by the shim just before exec)
+# landlock: the official landlock-lsm crate. seccompiler: rust-vmm's pure-Rust
+# seccomp-bpf compiler, so no libseccomp C dependency.
+landlock = "0.4.7"
+seccompiler = "0.5.0"
+
 # observability / utils
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
