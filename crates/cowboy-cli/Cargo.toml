@@ -37,6 +37,7 @@ async-trait.workspace = true
 futures.workspace = true
 tokio-util.workspace = true
 libc.workspace = true
+nix.workspace = true
 landlock.workspace = true
 seccompiler.workspace = true
 rpassword.workspace = true
@@ -53,6 +54,7 @@ qrcode.workspace = true   # terminal QR of the `cowboy web` access URL
 bollard = "0.21.0"
 
 [dev-dependencies]
+async-trait.workspace = true
 assert_cmd.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true

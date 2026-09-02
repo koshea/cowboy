@@ -9,11 +9,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use cowboy_core::config::{ProcessDef, SecurityConfig};
+use cowboy_gateway::state::GatewayState;
 use cowboy_sandbox::plan::{Grant, PlanInputs, SandboxPlan};
 use cowboy_sandbox::{Denylist, HostProbe};
 
@@ -51,17 +52,39 @@ pub struct NativeSandbox {
     status: Mutex<Option<StatusTx>>,
     probe: Box<dyn HostProbe + Send + Sync>,
     session_name: String,
+    /// The policy engine that answers the relay.
+    ///
+    /// Constructed up front rather than attached later: a sandbox with no engine
+    /// would leave every connection blocked waiting for a verdict that never comes,
+    /// so there is no useful half-configured state to represent.
+    policy_engine: Arc<GatewayState>,
 }
 
 impl NativeSandbox {
+    /// Build a sandbox.
+    ///
+    /// `approver` decides `ask` verdicts. Pass `cowboy_gateway::DenyAll` for a
+    /// non-interactive caller — explicitly, so that failing closed is a choice made
+    /// at the call site rather than a consequence of forgetting to wire a UI.
     pub fn new(
         root: PathBuf,
         security: SecurityConfig,
         probe: Box<dyn HostProbe + Send + Sync>,
+        approver: Arc<dyn cowboy_gateway::Approver>,
     ) -> Result<Self> {
         let mask_file = crate::net::runtime::ensure_mask_file()?;
         let session_name = format!("cowboy-{:08x}", crate::net::runtime::project_hash(&root));
+        // Persisted project/global approvals are merged in here, in one place, so the
+        // policy the engine enforces is the same one `cowboy sandbox plan` describes.
+        let mut policy = security.network_policy.clone();
+        crate::net::approvals::merge_into(&mut policy, &crate::net::approvals::load(&root));
+        let policy_engine = Arc::new(GatewayState::new(
+            policy,
+            cowboy_gateway::dns::DnsMap::new(),
+            approver,
+        ));
         Ok(Self {
+            policy_engine,
             root,
             security,
             mask_file,
@@ -184,7 +207,18 @@ impl NativeSandbox {
                 .probe
                 .self_exe()
                 .context("cannot locate the cowboy binary to hold the session namespaces")?;
-            *guard = Some(SessionSandbox::start(&self.session_name, &exe)?);
+            let (session, engine_end) = SessionSandbox::start(&self.session_name, &exe)?;
+            // Serve the relay channel on a dedicated thread. It must be running
+            // before any command does, or the first connection blocks on a verdict.
+            let engine = self.policy_engine.clone();
+            let handle = tokio::runtime::Handle::current();
+            std::thread::Builder::new()
+                .name("cowboy-egress-broker".into())
+                .spawn(move || {
+                    crate::sandbox::transport::broker::serve_blocking(engine_end, engine, handle);
+                })
+                .context("spawning the egress policy broker")?;
+            *guard = Some(session);
         }
         Ok(guard)
     }
@@ -404,6 +438,7 @@ mod tests {
             root.to_path_buf(),
             SecurityConfig::default(),
             Box::new(probe),
+            Arc::new(cowboy_gateway::DenyAll),
         )
         .unwrap()
     }

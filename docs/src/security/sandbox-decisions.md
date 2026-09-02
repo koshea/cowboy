@@ -366,6 +366,65 @@ The *properties* they covered are still real and are now only covered at unit le
 The end-to-end versions must be rebuilt against the sandbox transport, and that is
 an obligation of the transport work — not something to be quietly lost.
 
+## A successful `connect()` is not evidence of egress
+
+Under transparent interception every `connect()` from the sandbox succeeds, because
+it is connecting to the relay on loopback. The real destination has not been
+contacted at that point and the policy has not even been consulted. A refusal appears
+only when the relay closes the connection, which the client sees as a reset on its
+first read.
+
+This bit during Task 7's manual demo: a probe that called `connect()` and printed
+success reported `1.1.1.1:443`, `1.1.1.1:9999` and even the black-hole gateway as all
+reachable, which looked exactly like a total interception failure. Attempting a
+transfer showed all three correctly refused.
+
+Any diagnostic or test that checks reachability must attempt a data transfer.
+`tests/sandbox_egress.rs` does, and says so where the helper is defined.
+
+## The relay never creates an outbound socket
+
+For each intercepted connection the relay reports the original destination and, if
+allowed, receives an **already-connected descriptor** created by the policy engine in
+the host network namespace. A passed descriptor keeps the namespace it was created in
+— verified directly: inside a fresh network namespace a process's own `connect()`
+fails with `ENETUNREACH`, while a descriptor passed to it over `SCM_RIGHTS` carries a
+real HTTP response.
+
+That removes a whole class of bug rather than merely avoiding one. The container
+design had to exempt the gateway's own egress from its own redirect rule, by uid, or
+the gateway's upstream connections would be redirected back into itself. Here there
+is nothing to exempt, so there is no exemption to get wrong — which matters because
+in this topology the obvious exemption (`skuid 0`) would have matched the agent.
+
+## The relay channel is the enforcement boundary
+
+Everything else about the sandbox is enforced by the kernel. This channel is
+different: the relay *reports* each connection's original destination and the engine
+trusts that report. Forging it would defeat every domain rule with namespaces,
+Landlock and seccomp all perfectly intact.
+
+It is an **anonymous `socketpair`**, inherited across fork. It has no name in the
+filesystem and none in any abstract namespace, so it cannot be opened, connected to,
+or enumerated — reaching it requires already holding the descriptor. Backed by three
+independent controls: the relay is in a different PID namespace from every agent
+command (so it is not even visible in `/proc`), agent commands have an empty
+capability bounding set, and `ptrace` is refused by seccomp (with yama
+`ptrace_scope=1` restricting it to descendants anyway — and the relay is nobody's
+descendant).
+
+Deliberately **not** dependent on `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`. A named
+abstract socket would need that scope to be safe, which would make a Landlock ABI
+feature load-bearing for the one boundary that must never degrade. A nameless socket
+needs no such rule. There is a test asserting the socket has neither kind of name.
+
+Two further properties, both tested: connecting directly to the relay's port yields
+no original destination and is refused rather than proxied (a connection that did not
+pass through the nat hook has nothing to honour, and guessing would make the relay an
+open proxy); and requests are serialized, because a `SEQPACKET` pair has no request
+ids and interleaving two exchanges would let one connection receive another's
+descriptor.
+
 ## Beware the vacuously-passing sandbox test
 
 `crates/cowboy-cli/tests/sandbox_exec.rs` self-skips when bubblewrap or

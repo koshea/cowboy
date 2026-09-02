@@ -115,10 +115,13 @@ impl Project {
 }
 
 fn sandbox(root: &Path) -> NativeSandbox {
+    // DenyAll: these tests exercise the sandbox lifecycle, not policy, and an
+    // explicit fail-closed approver keeps them from depending on a UI.
     NativeSandbox::new(
         root.to_path_buf(),
         SecurityConfig::default(),
         Box::new(Host),
+        std::sync::Arc::new(cowboy_gateway::DenyAll),
     )
     .unwrap()
 }

@@ -13,6 +13,7 @@ use cowboy_sandbox::plan::{PlanInputs, SandboxPlan};
 use cowboy_sandbox::{Denylist, HostProbe};
 
 use crate::cli::{SandboxArgs, SandboxCommand};
+use crate::sandbox::Sandbox;
 
 pub async fn run(args: SandboxArgs) -> Result<()> {
     match args.command {
@@ -32,18 +33,22 @@ fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
     Ok(security)
 }
 
-/// Run one command in the sandbox with no network access.
+/// Run one command in the sandbox.
 ///
-/// Deliberately `NetMode::Isolated`: this path exists to inspect and test
-/// confinement, and until the egress transport is installed a sandbox with an
-/// inherited namespace would have the host's connectivity.
+/// Uses the full session: namespaces, egress interception, and the policy engine.
+/// The approver is `DenyAll`, so an `ask` denies — this is a one-off CLI path with no
+/// UI attached, and the alternative to saying so explicitly is a prompt nobody can
+/// answer silently becoming an allow.
 async fn exec(command: Vec<String>) -> Result<()> {
     let root = crate::cmd::project_root()?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
     let security = load(&root)?;
-    let mask = crate::net::runtime::ensure_mask_file()?;
-    let probe = RealHost;
-    let plan = crate::sandbox::exec::plan_for(&root, &security, &mask, &probe)?;
+    let sandbox = crate::sandbox::native::NativeSandbox::new(
+        root,
+        security,
+        Box::new(RealHost),
+        std::sync::Arc::new(cowboy_gateway::DenyAll),
+    )?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // Print as it arrives; a build should not look hung while it works.
@@ -55,21 +60,17 @@ async fn exec(command: Vec<String>) -> Result<()> {
         }
     });
 
-    let request = crate::sandbox::exec::ExecRequest {
-        plan: &plan,
-        command: &command.join(" "),
-        cwd: None,
-        timeout_secs: 0,
-        net: crate::sandbox::bwrap::NetMode::Isolated,
-        session: None,
-    };
-    let (result, _) = crate::sandbox::exec::run_streaming(
-        request,
-        tokio_util::sync::CancellationToken::new(),
-        tx,
-    )
-    .await?;
+    let (result, _) = sandbox
+        .exec_stream(
+            &command.join(" "),
+            None,
+            0,
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        )
+        .await?;
     printer.await.ok();
+    sandbox.stop().await;
 
     if result.exit_code != 0 {
         std::process::exit(result.exit_code);

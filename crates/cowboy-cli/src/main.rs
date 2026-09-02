@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
         Some(Command::XFileop) => cmd::fileop::run(),
         Some(Command::XSandboxShim) => cowboy_cli::sandbox::shim::run(),
-        Some(Command::XSandboxHolder) => cowboy_cli::sandbox::session::run_holder(),
+        Some(Command::XSandboxHolder) => cowboy_cli::sandbox::session::run_holder().await,
         Some(Command::XSessionWorker(a)) => {
             cmd::worker::run(cmd::worker::WorkerArgs {
                 root: a.root,

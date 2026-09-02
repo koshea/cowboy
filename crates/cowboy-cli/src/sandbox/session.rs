@@ -21,11 +21,14 @@
 
 use std::ffi::CString;
 use std::io::{BufRead, BufReader, Read};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
+
+use super::transport::{EgressTransport, NftTransport, TransportConfig};
 
 /// Printed by the holder once its namespaces exist and loopback is up.
 const READY: &str = "cowboy-sandbox-ready";
@@ -47,7 +50,12 @@ impl SessionSandbox {
     /// would be launched with an argument it does not understand and fail with no
     /// useful message. It also keeps this agreeing with the binary the plan binds as
     /// the lockdown shim.
-    pub fn start(name: &str, holder_exe: &Path) -> Result<Self> {
+    /// Returns the session and the **policy engine's end** of the relay channel.
+    /// The caller must serve that end; until it does, every connection the sandbox
+    /// makes blocks waiting for a verdict — the right failure direction.
+    pub fn start(name: &str, holder_exe: &Path) -> Result<(Self, OwnedFd)> {
+        let (engine_end, relay_end) =
+            super::transport::channel::pair().context("creating the relay channel")?;
         let mut cmd = Command::new("unshare");
         cmd.args(["--user", "--map-root-user", "--net", "--ipc", "--uts", "--"]);
         cmd.arg(holder_exe).arg("x-sandbox-holder");
@@ -58,10 +66,29 @@ impl SessionSandbox {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
+        // Hand the relay its end of the channel on a fixed descriptor. Rust marks
+        // descriptors CLOEXEC, so it must be duplicated onto the agreed number in the
+        // child — and dup2 clears CLOEXEC, which is what lets it survive the exec.
+        let relay_raw = relay_end.as_raw_fd();
+        let target = super::transport::channel::CHANNEL_FD;
+        // SAFETY: `pre_exec` runs between fork and exec; dup2 is async-signal-safe
+        // and touches only this child's descriptor table.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::dup2(relay_raw, target) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
         let mut holder = cmd.spawn().context(
             "starting the sandbox session holder (is util-linux `unshare` installed, and are \
              unprivileged user namespaces enabled?)",
         )?;
+        // Our copy is not needed once the child holds it, and keeping it open would
+        // stop the broker ever seeing end-of-stream when the relay exits.
+        drop(relay_end);
         let pid = holder.id();
 
         // Wait for readiness before anyone tries to join: the namespaces do not
@@ -101,11 +128,14 @@ impl SessionSandbox {
             );
         }
 
-        Ok(Self {
-            holder,
-            pid,
-            name: name.to_string(),
-        })
+        Ok((
+            Self {
+                holder,
+                pid,
+                name: name.to_string(),
+            },
+            engine_end,
+        ))
     }
 
     pub fn name(&self) -> &str {
@@ -195,19 +225,86 @@ fn join(path: &CString, kind: i32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `cowboy x-sandbox-holder` — keeps the session's namespaces alive.
+/// `cowboy x-sandbox-holder` — sets up the session's network and serves as its relay.
 ///
-/// Runs *inside* the new namespaces (started via `unshare`). It brings loopback up,
-/// signals readiness, then blocks on stdin so that closing it — or the parent dying
-/// — ends the session.
-pub fn run_holder() -> Result<()> {
-    // Loopback is DOWN in a fresh network namespace, so without this every
-    // connection to 127.0.0.1 inside the sandbox fails. The holder can do it
-    // because it holds CAP_NET_ADMIN in its own user namespace; no agent process
-    // ever does.
-    let out = Command::new("ip")
+/// Runs *inside* the new namespaces (started via `unshare`), where it holds
+/// `CAP_NET_ADMIN` in its own user namespace and can therefore do the one-time setup
+/// no agent process is ever able to: bring loopback up, create the black-hole device,
+/// and load the interception ruleset.
+///
+/// Readiness is signalled **after** all of that and after the relay is listening, so
+/// there is no window in which a command could run before enforcement exists. Then it
+/// blocks on stdin, so closing it — or the worker dying — ends the session.
+///
+/// It is also the relay. That keeps the topology small and gets the isolation for
+/// free: the holder does not unshare a PID namespace, while every agent command runs
+/// in its own, so no agent process can see the holder at all — which is what protects
+/// the channel it holds to the policy engine.
+pub async fn run_holder() -> Result<()> {
+    {
+        // Loopback is DOWN in a fresh network namespace, so without this every
+        // connection to 127.0.0.1 inside the sandbox fails — including the agent's
+        // to the relay.
+        bring_loopback_up().await?;
+
+        // The relay channel arrives on a known descriptor. Its absence means the
+        // worker did not set up a policy path, so there is nothing to enforce with:
+        // refuse rather than come up with unpoliced networking.
+        let channel = take_channel_fd().context(
+            "the relay channel was not passed to the holder; refusing to \
+                      bring up a session with no policy path",
+        )?;
+
+        let cfg = TransportConfig::default();
+        let transport = NftTransport::new(cfg.clone());
+        transport
+            .install(&cfg)
+            .await
+            .context("installing egress interception")?;
+        transport
+            .verify()
+            .await
+            .context("verifying egress interception")?;
+
+        // Listen before signalling readiness: a command that started first would
+        // find the redirect in place but nothing accepting on the other end.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.relay_port))
+            .await
+            .with_context(|| format!("binding the relay on 127.0.0.1:{}", cfg.relay_port))?;
+        tokio::spawn(async move {
+            if let Err(e) = super::transport::relay::serve(listener, channel).await {
+                tracing::error!(error = %e, "relay exited");
+            }
+        });
+
+        println!("{READY}");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        // Block until stdin closes. Reading (rather than sleeping forever) is what
+        // ties the session's lifetime to its parent's.
+        tokio::task::spawn_blocking(|| {
+            let mut buf = [0u8; 1];
+            loop {
+                match std::io::stdin().read(&mut buf) {
+                    Ok(0) => return, // parent gone
+                    Ok(_) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+        .await
+        .ok();
+        Ok(())
+    }
+}
+
+async fn bring_loopback_up() -> Result<()> {
+    let out = tokio::process::Command::new("ip")
         .args(["link", "set", "lo", "up"])
         .output()
+        .await
         .context("running `ip link set lo up` (is iproute2 installed?)")?;
     if !out.status.success() {
         bail!(
@@ -215,22 +312,23 @@ pub fn run_holder() -> Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
+    Ok(())
+}
 
-    println!("{READY}");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
-    // Block until stdin closes. Reading (rather than sleeping forever) is what ties
-    // the session's lifetime to its parent's.
-    let mut buf = [0u8; 1];
-    loop {
-        match std::io::stdin().read(&mut buf) {
-            Ok(0) => return Ok(()), // parent gone
-            Ok(_) => continue,
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => return Ok(()),
-        }
+/// Adopt the relay channel from its inherited descriptor.
+///
+/// Returns `None` when nothing was passed, which the caller treats as fatal.
+fn take_channel_fd() -> Option<OwnedFd> {
+    use std::os::fd::FromRawFd;
+    // Confirm something is actually there before claiming ownership: adopting a
+    // closed descriptor would fail later and much less clearly.
+    // SAFETY: fcntl with F_GETFD only queries the descriptor.
+    let ok = unsafe { libc::fcntl(super::transport::channel::CHANNEL_FD, libc::F_GETFD) } != -1;
+    if !ok {
+        return None;
     }
+    // SAFETY: the worker passed this descriptor and does not use it in the child.
+    Some(unsafe { OwnedFd::from_raw_fd(super::transport::channel::CHANNEL_FD) })
 }
 
 #[cfg(test)]

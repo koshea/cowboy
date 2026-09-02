@@ -679,6 +679,7 @@ dependencies = [
  "landlock",
  "libc",
  "mockall",
+ "nix 0.31.3",
  "predicates",
  "qrcode",
  "ratatui",
@@ -2379,6 +2380,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

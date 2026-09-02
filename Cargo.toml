@@ -104,6 +104,9 @@ httparse = "1"
 # seccomp-bpf compiler, so no libseccomp C dependency.
 landlock = "0.4.7"
 seccompiler = "0.5.0"
+# `socket` + `uio` only: SCM_RIGHTS fd passing and sendmsg/recvmsg. Hand-rolling
+# those with raw libc is a lot of delicate unsafe for no benefit.
+nix = { version = "0.31.3", default-features = false, features = ["socket", "uio", "net"] }
 
 # observability / utils
 tracing = "0.1"
