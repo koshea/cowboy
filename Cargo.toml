@@ -22,6 +22,7 @@ repository = "https://github.com/koshea/cowboy"
 cowboy-core = { path = "crates/cowboy-core" }
 cowboy-proto = { path = "crates/cowboy-proto" }
 cowboy-sandbox = { path = "crates/cowboy-sandbox" }
+cowboy-gateway = { path = "crates/cowboy-gateway" }
 cowboy-tui = { path = "crates/cowboy-tui" }
 
 # cli / runtime

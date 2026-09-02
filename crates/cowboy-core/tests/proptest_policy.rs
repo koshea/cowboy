@@ -11,6 +11,7 @@ fn attempt(host: Option<String>, port: u16) -> NetworkAttempt {
         host,
         ip: None,
         port,
+        command_pid: None,
     }
 }
 

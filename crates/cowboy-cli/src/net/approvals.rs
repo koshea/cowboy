@@ -113,6 +113,7 @@ mod tests {
             host: Some("example.com".into()),
             ip: None,
             port: 443,
+            command_pid: None,
         };
         append_in(cfg.path(), proj.path(), &attempt).unwrap();
         append_in(cfg.path(), proj.path(), &attempt).unwrap(); // dedup

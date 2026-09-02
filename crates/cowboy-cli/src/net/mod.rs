@@ -1,12 +1,11 @@
-//! Host-side networking: Docker orchestration, the gateway control socket, and
-//! Docker Compose detection.
+//! Host-side networking: Docker orchestration and Compose detection.
 //!
-//! Orchestration and the control socket land in Slice C. Compose detection is
-//! used by `doctor`/`init` to offer network approval.
+//! The gateway control socket used to live here. It is gone: the policy engine now
+//! runs in the worker process, so an `ask` is a channel send rather than an
+//! authenticated TCP round trip. See `crate::sandbox::policy`.
 
 pub mod approvals;
 pub mod compose;
-pub mod control;
 pub mod docker;
 pub mod gateway;
 pub mod runtime;

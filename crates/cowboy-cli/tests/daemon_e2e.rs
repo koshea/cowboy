@@ -16,7 +16,6 @@
 //! startup but, with no task, never calls it), so they supply a fake one.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -27,9 +26,7 @@ use cowboy_core::daemonproto::{
     ClientMsg, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode, ServerMsg,
     SessionStatus, UiEventMsg,
 };
-use cowboy_core::netproto::{
-    encode_line, ApprovalScope, GatewayMessage, HostMessage, NetworkAttempt, Protocol, Verdict,
-};
+use cowboy_core::netproto::encode_line;
 
 // ---------------------------------------------------------------------------
 // Prerequisites / skip helpers
@@ -330,16 +327,6 @@ impl Client {
     }
 }
 
-/// Compute a worker's host control TCP address (matches the gateway's formula in
-/// `net::gateway`: bridge IP `10.88.{octet}.1`, port `9000 + hash%1000`).
-fn control_addr_for(root: &Path) -> String {
-    let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let hash = cowboy_cli::net::runtime::project_hash(&canon);
-    let octet = (hash % 200 + 20) as u8;
-    let port = 9000 + (hash % 1000) as u16;
-    format!("10.88.{octet}.1:{port}")
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -370,128 +357,6 @@ fn e2e_same_worktree_collision_is_denied() {
     // Wind down the first session.
     Client::connect(&ws1).send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(500));
-}
-
-/// A network approval crosses the worker: the gateway asks over the TCP control
-/// channel (authenticating with the session token), the attached client allows,
-/// the gateway gets the verdict. With no client attached the same ask is denied
-/// (fail closed). Needs Docker — the worker binds the control server on the
-/// gateway's bridge IP, which only exists once the gateway network is up.
-#[test]
-#[ignore = "real Docker + worker: exercises the TCP control channel"]
-fn e2e_approval_routes_through_worker_and_fails_closed() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
-        return;
-    }
-    let docker_before = cowboy_docker_objects();
-    let env = Env::fake();
-    let _d = env.spawn_daemon();
-    let sock = env.sock();
-    assert!(wait_pong(&sock));
-    let proj = make_project();
-
-    let ws = match start(&sock, proj.path(), None) {
-        DaemonResp::Started { worker_sock, .. } => worker_sock,
-        other => panic!("expected Started, got {other:?}"),
-    };
-
-    // The worker binds the TCP control server on the gateway bridge IP shortly
-    // after starting; connect as a faked gateway and authenticate with the token
-    // the e2e daemon pinned.
-    let ctrl = control_addr_for(proj.path());
-    let mut gw = None;
-    for _ in 0..200 {
-        if let Ok(s) = TcpStream::connect(&ctrl) {
-            gw = Some(s);
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let gw = gw.expect("worker control server should appear");
-    gw.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    let mut gw_w = gw.try_clone().unwrap();
-    let mut gw_r = BufReader::new(gw);
-    // Authenticate first (the host drops the connection otherwise).
-    gw_w.write_all(
-        encode_line(&GatewayMessage::Hello {
-            token: E2E_CONTROL_TOKEN.into(),
-        })
-        .as_bytes(),
-    )
-    .unwrap();
-
-    let attempt = NetworkAttempt {
-        protocol: Protocol::Tls,
-        host: Some("example.com".into()),
-        ip: None,
-        port: 443,
-    };
-
-    // With a client attached, the ask is routed and the client's verdict wins.
-    let mut client = Client::connect(&ws);
-    client.hello(None);
-    assert!(matches!(client.recv(), Some(ServerMsg::Snapshot { .. })));
-    gw_w.write_all(
-        encode_line(&GatewayMessage::Ask {
-            id: 1,
-            reason: None,
-            attempt: attempt.clone(),
-        })
-        .as_bytes(),
-    )
-    .unwrap();
-
-    // Client sees the approval prompt and allows it.
-    let approval_id = loop {
-        match client.recv() {
-            Some(ServerMsg::Approval { id, dest }) => {
-                assert_eq!(dest, "example.com:443");
-                break id;
-            }
-            Some(_) => continue,
-            None => panic!("client never received the approval prompt"),
-        }
-    };
-    client.send(&ClientMsg::ApprovalReply {
-        id: approval_id,
-        verdict: Verdict::Allow,
-        scope: ApprovalScope::Session,
-    });
-
-    let mut line = String::new();
-    gw_r.read_line(&mut line).unwrap();
-    match serde_json::from_str::<HostMessage>(line.trim()).unwrap() {
-        HostMessage::Decision { id, verdict, .. } => {
-            assert_eq!(id, 1);
-            assert_eq!(verdict, Verdict::Allow);
-        }
-    }
-
-    // Drop the client; with zero approvers the next ask fails closed.
-    drop(client);
-    std::thread::sleep(Duration::from_millis(300));
-    gw_w.write_all(
-        encode_line(&GatewayMessage::Ask {
-            id: 2,
-            reason: None,
-            attempt,
-        })
-        .as_bytes(),
-    )
-    .unwrap();
-    line.clear();
-    gw_r.read_line(&mut line).unwrap();
-    match serde_json::from_str::<HostMessage>(line.trim()).unwrap() {
-        HostMessage::Decision { id, verdict, .. } => {
-            assert_eq!(id, 2);
-            assert_eq!(verdict, Verdict::Deny, "zero-client ask must fail closed");
-        }
-    }
-
-    Client::connect(&ws).send(&ClientMsg::End);
-    std::thread::sleep(Duration::from_millis(500));
-    reap_new_docker(&docker_before);
 }
 
 /// Killing a worker out from under the daemon marks the session `Stale`; then

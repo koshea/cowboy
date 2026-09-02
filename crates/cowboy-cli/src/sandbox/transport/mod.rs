@@ -13,6 +13,8 @@
 //! the policy engine instead of merely unroutable. That inversion is why this can
 //! be pluggable at all — see `docs/src/security/sandbox-decisions.md`.
 
+pub mod nft;
+
 use anyhow::Result;
 
 /// A kernel feature a transport needs, for `cowboy doctor` to report.

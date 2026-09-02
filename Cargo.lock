@@ -670,6 +670,7 @@ dependencies = [
  "clap",
  "clipboard-rs",
  "cowboy-core",
+ "cowboy-gateway",
  "cowboy-sandbox",
  "cowboy-tui",
  "crossterm",
@@ -731,6 +732,7 @@ name = "cowboy-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "cowboy-core",
  "hickory-proto",
  "httparse",
@@ -742,7 +744,6 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

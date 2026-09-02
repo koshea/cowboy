@@ -19,6 +19,7 @@ fn attempt(host: Option<&str>, ip: Option<&str>, port: u16) -> NetworkAttempt {
         host: host.map(String::from),
         ip: ip.map(|s| s.parse().unwrap()),
         port,
+        command_pid: None,
     }
 }
 

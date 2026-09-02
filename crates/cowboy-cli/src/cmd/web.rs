@@ -35,8 +35,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 
-use crate::net::control::ct_eq;
-
 /// Resolves a session id to its attach target. Injected so the WS bridge is
 /// testable without a live daemon: production asks the daemon, tests point at a
 /// fake worker socket. `None` = unknown/unreachable session.
@@ -299,6 +297,26 @@ fn authed(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> b
         .and_then(|v| v.strip_prefix("Bearer "))
         .or(query_token);
     presented.is_some_and(|t| ct_eq(t, &state.token))
+}
+
+/// Constant-time token comparison.
+///
+/// A byte-wise `==` short-circuits on the first difference, which is a timing oracle
+/// for a token an attacker can guess a byte at a time. Length may leak; the token is
+/// a fixed-length UUID.
+///
+/// Lived in the gateway control channel until that was deleted. `cowboy web` is now
+/// its only consumer, so it lives here rather than in a module of one function.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 async fn health() -> &'static str {

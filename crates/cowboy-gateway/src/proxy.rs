@@ -101,6 +101,7 @@ async fn handle_connect(mut client: TcpStream, state: Arc<GatewayState>) -> Resu
         host: Some(target.host.clone()),
         ip: None,
         port: target.port,
+        command_pid: None,
     };
     if state.decide(&attempt).await != Verdict::Allow {
         let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n").await;

@@ -21,9 +21,9 @@ use crate::agent::tui::SessionCtx;
 use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi};
 use crate::cli::StartFlags;
 use crate::cmd::daemon;
-use crate::net::control;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
+use crate::sandbox::policy::ChannelApprover;
 use crate::style;
 
 pub async fn run(
@@ -200,6 +200,11 @@ pub async fn run(
             }),
             None => Vec::new(),
         };
+        // The network policy the engine will enforce, with previously persisted
+        // project/global approvals merged in — the same merge the Docker path did
+        // when writing the gateway's policy file, minus the file.
+        let mut network_policy = security.network_policy.clone();
+        crate::net::approvals::merge_into(&mut network_policy, &crate::net::approvals::load(&root));
         let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security)?;
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
@@ -208,11 +213,19 @@ pub async fn run(
                 signal_cancel.cancel();
             }
         });
-        let control = runtime.control_endpoint();
         let session_dir = logger.as_ref().map(|l| l.dir().to_path_buf());
-        if let Some((addr, token)) = control {
-            tokio::spawn(run_control_autodeny(addr, token, session_dir));
-        }
+        // The policy engine runs here, in-process. Non-interactive runs have no one
+        // to ask, so every `ask` denies — stated explicitly rather than left to a
+        // missing listener. Task: the relay attaches to this engine once the sandbox
+        // transport is up; until then it decides nothing because nothing asks it.
+        let approver = autodeny_approver(session_dir.clone());
+        let policy_engine = std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
+            network_policy.clone(),
+            cowboy_gateway::dns::DnsMap::new(),
+            approver,
+        ));
+        log_policy_in_force(&network_policy);
+        let _ = &policy_engine;
         // A subagent journals to its session's `events.jsonl` (so the parent/UI can
         // watch it live) and still prints its final answer to stdout for capture; a
         // top-level one-shot run uses the console UI.
@@ -683,39 +696,64 @@ pub(crate) fn verdict_str(v: Verdict) -> &'static str {
     }
 }
 
-/// Non-interactive control pipeline: deny all asks (fail closed), log events.
-async fn run_control_autodeny(addr: String, token: String, session_dir: Option<PathBuf>) {
-    let (approvals_tx, mut approvals_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => {
-                let _ = control::serve_on(listener, token, approvals_tx, events_tx).await;
-            }
-            Err(e) => tracing::error!(%addr, error = %e, "control server bind failed"),
-        }
-    });
+/// Non-interactive policy pipeline: deny every `ask`, log every decision.
+///
+/// Returns the [`Approver`](cowboy_gateway::Approver) the policy engine should use.
+/// Previously this bound a TCP listener and waited for the in-container gateway to
+/// connect and authenticate; now the engine runs in this process, so it is just two
+/// channels and the loops that drain them.
+fn autodeny_approver(session_dir: Option<PathBuf>) -> std::sync::Arc<ChannelApprover> {
+    // Annotated: `log_network` takes `&str`, so without this the event channel's
+    // payload infers as the unsized `str` rather than `String`.
+    let (approvals_tx, mut approvals_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::sandbox::policy::ApprovalRequest>();
+    let (events_tx, mut events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::sandbox::policy::NetworkEvent>();
+
     let ev_dir = session_dir.clone();
     tokio::spawn(async move {
         while let Some((attempt, verdict, reason)) = events_rx.recv().await {
             log_network(&ev_dir, &attempt, verdict, &reason);
         }
     });
-    while let Some(req) = approvals_rx.recv().await {
-        log_approval(
-            &session_dir,
-            &req.attempt,
-            Verdict::Deny,
-            ApprovalScope::Once,
-        );
-        log_network(
-            &session_dir,
-            &req.attempt,
-            Verdict::Deny,
-            "fail-closed (no approver)",
-        );
-        let _ = req.reply.send((Verdict::Deny, ApprovalScope::Once));
-    }
+    tokio::spawn(async move {
+        while let Some(req) = approvals_rx.recv().await {
+            log_approval(
+                &session_dir,
+                &req.attempt,
+                Verdict::Deny,
+                ApprovalScope::Once,
+            );
+            log_network(
+                &session_dir,
+                &req.attempt,
+                Verdict::Deny,
+                "fail-closed (no approver)",
+            );
+            let _ = req.reply.send((Verdict::Deny, ApprovalScope::Once));
+        }
+    });
+
+    std::sync::Arc::new(ChannelApprover::new(approvals_tx, events_tx))
+}
+
+/// Record the egress policy actually in force at session start.
+///
+/// Worth logging: when a request is later blocked, the first question is always
+/// "what were the rules?", and the answer used to be spread across security.yaml,
+/// the personal overlay, and persisted approvals.
+pub(crate) fn log_policy_in_force(policy: &cowboy_core::config::NetworkPolicy) {
+    tracing::info!(
+        default_external = ?policy.default_external,
+        default_private_lan = ?policy.default_private_lan,
+        default_host = ?policy.default_host,
+        allow_domains = policy.allow.domains.len(),
+        allow_cidrs = policy.allow.cidrs.len(),
+        deny_domains = policy.deny.domains.len(),
+        deny_cidrs = policy.deny.cidrs.len(),
+        dns_enforced = policy.dns.enforce,
+        "network policy in force"
+    );
 }
 
 pub(crate) fn log_network(

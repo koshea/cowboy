@@ -241,6 +241,7 @@ mod tests {
             host: host.map(String::from),
             ip: ip.map(|s| s.parse().unwrap()),
             port,
+            command_pid: None,
         }
     }
 

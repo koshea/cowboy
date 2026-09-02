@@ -1,5 +1,5 @@
 //! Gateway decision state: ties together the policy, the DNS map, the scope
-//! cache, and the host control client into a single `decide` entry point.
+//! cache, and the host approver into a single `decide` entry point.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -8,15 +8,17 @@ use std::sync::Mutex;
 use cowboy_core::netproto::{NetworkAttempt, Protocol, Verdict};
 use cowboy_core::policy;
 
-use crate::control::ControlClient;
 use crate::dns::DnsMap;
 use crate::dns_policy::{self, RateTracker};
+use crate::Approver;
 
-/// Shared gateway state.
+/// Shared policy-engine state.
 pub struct GatewayState {
     policy: cowboy_core::config::NetworkPolicy,
     dns: DnsMap,
-    control: ControlClient,
+    /// Who to ask about an `ask` verdict. A trait rather than a network client: the
+    /// engine now runs host-side, so asking is a function call.
+    approver: std::sync::Arc<dyn Approver>,
     /// Cache of approved/denied destinations from prior `ask` decisions.
     cache: Mutex<HashMap<String, Verdict>>,
     /// Per-parent DNS query-rate tracker (tunnel signal).
@@ -27,13 +29,13 @@ impl GatewayState {
     pub fn new(
         policy: cowboy_core::config::NetworkPolicy,
         dns: DnsMap,
-        control: ControlClient,
+        approver: std::sync::Arc<dyn Approver>,
     ) -> Self {
         let dns_rate = RateTracker::new(policy.dns.max_subdomains_per_min);
         Self {
             policy,
             dns,
-            control,
+            approver,
             cache: Mutex::new(HashMap::new()),
             dns_rate,
         }
@@ -63,6 +65,9 @@ impl GatewayState {
             host,
             ip: Some(ip),
             port,
+            // Filled in by the relay, which is the only thing that knows which
+            // sandboxed command opened the connection.
+            command_pid: None,
         };
 
         // No resolved name: decide by IP alone (CIDR/classify).
@@ -136,7 +141,7 @@ impl GatewayState {
     ) -> Verdict {
         match verdict {
             Verdict::Allow | Verdict::Deny => {
-                self.control.event(attempt, verdict, reason).await;
+                self.approver.event(attempt, verdict, reason).await;
                 verdict
             }
             Verdict::Ask => {
@@ -150,7 +155,7 @@ impl GatewayState {
                 {
                     return cached;
                 }
-                let decided = self.control.ask(attempt, Some(&reason)).await;
+                let decided = self.approver.ask(attempt, Some(&reason)).await;
                 // Cache concrete decisions (not a re-ask).
                 if decided != Verdict::Ask {
                     self.cache
@@ -189,6 +194,7 @@ impl GatewayState {
             host: Some(qname.trim_end_matches('.').to_string()),
             ip: None,
             port: 53,
+            command_pid: None,
         };
 
         // 1. Record-type gate (TXT/NULL/ANY/… carry tunnels/C2).
@@ -254,8 +260,58 @@ mod tests {
     use cowboy_core::config::{DefaultVerdict, NetworkPolicy};
     use cowboy_core::netproto::Protocol;
 
+    /// An approver that records what it was asked and answers a fixed verdict.
+    ///
+    /// Now that asking is a function call rather than a TCP round trip, tests can
+    /// assert on *what the user would have been shown* — not just the outcome.
+    struct FakeApprover {
+        answer: Verdict,
+        asked: Mutex<Vec<(NetworkAttempt, Option<String>)>>,
+        events: Mutex<Vec<(NetworkAttempt, Verdict, String)>>,
+    }
+
+    impl FakeApprover {
+        fn answering(answer: Verdict) -> Self {
+            Self {
+                answer,
+                asked: Mutex::new(Vec::new()),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Approver for FakeApprover {
+        async fn ask(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> Verdict {
+            self.asked
+                .lock()
+                .unwrap()
+                .push((attempt.clone(), reason.map(String::from)));
+            self.answer
+        }
+        async fn event(&self, attempt: &NetworkAttempt, verdict: Verdict, reason: String) {
+            self.events
+                .lock()
+                .unwrap()
+                .push((attempt.clone(), verdict, reason));
+        }
+    }
+
+    /// State with the fail-closed approver: nobody to ask means deny.
     fn state(policy: NetworkPolicy) -> GatewayState {
-        GatewayState::new(policy, DnsMap::new(), ControlClient::new(None, None))
+        GatewayState::new(policy, DnsMap::new(), std::sync::Arc::new(crate::DenyAll))
+    }
+
+    /// State with a recording approver that answers `answer`.
+    fn state_with(
+        policy: NetworkPolicy,
+        answer: Verdict,
+    ) -> (GatewayState, std::sync::Arc<FakeApprover>) {
+        let approver = std::sync::Arc::new(FakeApprover::answering(answer));
+        (
+            GatewayState::new(policy, DnsMap::new(), approver.clone()),
+            approver,
+        )
     }
 
     fn attempt(host: Option<&str>, ip: Option<&str>, port: u16) -> NetworkAttempt {
@@ -264,6 +320,7 @@ mod tests {
             host: host.map(String::from),
             ip: ip.map(|s| s.parse().unwrap()),
             port,
+            command_pid: None,
         }
     }
 
@@ -288,14 +345,52 @@ mod tests {
         );
     }
 
+    /// With no one to ask, an `ask` must deny. This is the whole reason the
+    /// approver is a trait with an explicit `DenyAll`: a non-interactive run has a
+    /// truthful thing to pass instead of skipping the check.
     #[tokio::test]
-    async fn ask_without_control_socket_fails_closed() {
-        // default_external = ask, no control socket -> deny.
+    async fn ask_with_no_approver_fails_closed() {
         let s = state(NetworkPolicy::default());
         assert_eq!(
             s.decide(&attempt(Some("unknown.test"), None, 443)).await,
             Verdict::Deny
         );
+    }
+
+    /// An approved `ask` allows, and the approver is told which destination it is
+    /// being asked about.
+    #[tokio::test]
+    async fn an_approved_ask_allows_and_names_the_destination() {
+        let (s, approver) = state_with(NetworkPolicy::default(), Verdict::Allow);
+        assert_eq!(
+            s.decide(&attempt(Some("unknown.test"), None, 443)).await,
+            Verdict::Allow
+        );
+        let asked = approver.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1, "exactly one question");
+        assert_eq!(asked[0].0.host.as_deref(), Some("unknown.test"));
+        assert_eq!(asked[0].0.port, 443);
+    }
+
+    /// A decision the policy made on its own is reported, so the activity view and
+    /// the session log can show it without the connection waiting on anything.
+    #[tokio::test]
+    async fn a_policy_decision_is_reported_as_an_event() {
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("github.com".into());
+        p.allow.ports = vec![443];
+        let (s, approver) = state_with(p, Verdict::Deny);
+        assert_eq!(
+            s.decide(&attempt(Some("github.com"), None, 443)).await,
+            Verdict::Allow
+        );
+        assert!(
+            approver.asked.lock().unwrap().is_empty(),
+            "an allow-listed destination must not prompt"
+        );
+        let events = approver.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].1, Verdict::Allow);
     }
 
     #[tokio::test]

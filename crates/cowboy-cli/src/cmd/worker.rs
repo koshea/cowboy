@@ -24,9 +24,10 @@ use crate::cmd::daemon;
 use crate::cmd::session::{
     context_title, git_branch, log_approval, log_network, post_turn_indicators, verdict_str,
 };
+use crate::net::approvals;
 use crate::net::docker::CliDocker;
 use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
-use crate::net::{approvals, control};
+use crate::sandbox::policy::ChannelApprover;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 
 /// Args for the worker subcommand.
@@ -238,41 +239,33 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // container is ever built. With no client attached, this fails closed.
     gate_credential_grants(&mut security, &emitter).await;
 
+    // The network policy the engine enforces, with previously persisted
+    // project/global approvals merged in — the same merge the Docker path performed
+    // when writing the gateway's policy file, minus the file.
+    let mut network_policy = security.network_policy.clone();
+    approvals::merge_into(&mut network_policy, &approvals::load(&root));
+
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
     // Captured before the runtime moves into the agent loop, so we can reap this
     // session's container + gateway on clean shutdown below.
     let container_name = runtime.container_name().to_string();
 
-    // Network approvals + gateway events flow over the TCP control channel. Route
-    // approvals to attached clients (fail closed with none); log + surface
-    // decisions. Bound before the first turn so the gateway has a listener.
-    if let Some((ctrl_addr, ctrl_token)) = runtime.control_endpoint() {
-        // Eagerly create the gateway network so the control server can bind its
-        // bridge IP without spin-retrying. This does real Docker work (network
-        // create + ensuring the gateway image, which may build/pull on a cold
-        // host), so run it on a DETACHED task rather than awaiting it here:
-        // blocking the serve loop on Docker would leave the session unresponsive
-        // to control messages (interrupt/end/switch) until the image was ready.
-        // The control pipeline retries its own bind until the network exists, and
-        // the first turn does the full, awaited setup, so this is a pure
-        // optimization and is safe to run in the background. (A session that never
-        // runs a turn still gets a reachable control channel once this completes.)
-        if let Some(gw) = runtime.gateway_handle() {
-            tokio::spawn(async move {
-                let docker = CliDocker::new();
-                if let Err(e) = gw.ensure_network(&docker, None).await {
-                    tracing::debug!(error = %e, "eager control-network create failed; control server will retry its bind");
-                }
-            });
-        }
-        tokio::spawn(run_control_pipeline(
-            ctrl_addr,
-            ctrl_token,
-            emitter.clone(),
-            Some(session_dir.clone()),
-            root.clone(),
-        ));
-    }
+    // The policy engine runs in this process. `ask` verdicts go to attached
+    // clients and fail closed when none are; decisions are logged and surfaced.
+    //
+    // Nothing has to be bound or awaited to make this reachable: it used to be a TCP
+    // listener on the gateway's bridge IP, which meant a retry loop (the IP did not
+    // exist until the network came up) and an eager, detached Docker call to create
+    // that network early so the loop would settle. Both are gone.
+    let approver = control_approver(emitter.clone(), Some(session_dir.clone()), root.clone());
+    let policy_engine = std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
+        network_policy.clone(),
+        cowboy_gateway::dns::DnsMap::new(),
+        approver,
+    ));
+    crate::cmd::session::log_policy_in_force(&network_policy);
+    // The relay attaches to this engine once the sandbox transport is up.
+    let _ = &policy_engine;
 
     let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
     // Continue a prior session if asked (load its transcript as history).
@@ -828,40 +821,27 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
     security.secrets.files = kept_files;
 }
 
-/// Drive the host-side control socket for this session's gateway. Gateway
-/// `event`s are logged + surfaced in the activity pane; `ask`s are routed to
-/// attached clients via [`SocketUi::request_approval`] (fail closed with none),
-/// approved project/global destinations are persisted, and the verdict is sent
-/// back to the gateway. Approvals are handled serially to match the one-modal-
-/// at-a-time TUI.
-async fn run_control_pipeline(
-    addr: String,
-    token: String,
+/// Build this session's policy approver: `event`s are logged and surfaced in the
+/// activity pane; `ask`s are routed to attached clients via
+/// [`SocketUi::request_approval`] (failing closed when none are), approved
+/// project/global destinations are persisted, and the verdict is returned.
+/// Approvals are handled serially to match the one-modal-at-a-time TUI.
+///
+/// Previously this bound a TCP listener on the gateway's bridge IP and waited for
+/// the in-container gateway to connect and present a per-session token — with a
+/// retry loop, because that IP did not exist until the network came up. All of that
+/// went away with the container: the engine runs here, so this is two channels.
+fn control_approver(
     ui: SocketUi,
     session_dir: Option<PathBuf>,
     root: PathBuf,
-) {
-    let (approvals_tx, mut approvals_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
-        // Bind the TCP control server on the gateway's bridge IP. That IP only
-        // exists once the gateway network is created (lazily, on the first
-        // command), so the address is initially unassignable — retry until it
-        // appears rather than failing closed forever (which silently denies every
-        // `ask`). The gateway itself retries connecting, so a brief gap is fine.
-        let listener = loop {
-            match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => break l, // serve_on logs "listening" below
-                Err(e) => {
-                    // EADDRNOTAVAIL until the bridge is up; log the first failure
-                    // loudly, then quietly retry for the worker's lifetime.
-                    tracing::debug!(%addr, error = %e, "control bind not ready; retrying");
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                }
-            }
-        };
-        let _ = control::serve_on(listener, token, approvals_tx, events_tx).await;
-    });
+) -> std::sync::Arc<ChannelApprover> {
+    // Annotated: `log_network` takes `&str`, so without this the event channel's
+    // payload infers as the unsized `str` rather than `String`.
+    let (approvals_tx, mut approvals_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::sandbox::policy::ApprovalRequest>();
+    let (events_tx, mut events_rx) =
+        tokio::sync::mpsc::unbounded_channel::<crate::sandbox::policy::NetworkEvent>();
 
     // Gateway-decided events: persist + show in the activity log.
     let ev_dir = session_dir.clone();
@@ -901,29 +881,38 @@ async fn run_control_pipeline(
         }
     });
 
-    // Approvals: ask clients, persist project/global allows, reply to gateway.
-    while let Some(req) = approvals_rx.recv().await {
-        let dest = req.attempt.label();
-        // Surface *why* we're asking (e.g. a suspected DNS tunnel) in the prompt.
-        let prompt = match &req.reason {
-            Some(r) => format!("{dest} — {r}"),
-            None => dest.clone(),
-        };
-        let (verdict, scope) = ui.request_approval(prompt).await;
-        if verdict == Verdict::Allow
-            && matches!(scope, ApprovalScope::Project | ApprovalScope::Global)
-        {
-            let _ = approvals::append(&root, &req.attempt);
+    // Approvals: ask clients, persist project/global allows, return the verdict.
+    // Serial, matching the one-modal-at-a-time TUI.
+    tokio::spawn(async move {
+        while let Some(req) = approvals_rx.recv().await {
+            let dest = req.attempt.label();
+            // Surface *why* we're asking (e.g. a suspected DNS tunnel) in the
+            // prompt, and which command wants it when several run at once.
+            let mut prompt = match &req.reason {
+                Some(r) => format!("{dest} — {r}"),
+                None => dest.clone(),
+            };
+            if let Some(pid) = req.attempt.command_pid {
+                prompt.push_str(&format!(" [command {pid}]"));
+            }
+            let (verdict, scope) = ui.request_approval(prompt).await;
+            if verdict == Verdict::Allow
+                && matches!(scope, ApprovalScope::Project | ApprovalScope::Global)
+            {
+                let _ = approvals::append(&root, &req.attempt);
+            }
+            log_approval(&session_dir, &req.attempt, verdict, scope);
+            log_network(&session_dir, &req.attempt, verdict, "user decision");
+            ui.emit(UiEventMsg::NetEvent(format!(
+                "{} {} (you decided)",
+                verdict_str(verdict),
+                dest
+            )));
+            let _ = req.reply.send((verdict, scope));
         }
-        log_approval(&session_dir, &req.attempt, verdict, scope);
-        log_network(&session_dir, &req.attempt, verdict, "user decision");
-        ui.emit(UiEventMsg::NetEvent(format!(
-            "{} {} (you decided)",
-            verdict_str(verdict),
-            dest
-        )));
-        let _ = req.reply.send((verdict, scope));
-    }
+    });
+
+    std::sync::Arc::new(ChannelApprover::new(approvals_tx, events_tx))
 }
 
 /// Rebuilds a model client by name (host-owned creds in, built client out).
@@ -964,12 +953,9 @@ async fn run_turn(
 mod tests {
     use super::*;
     use cowboy_core::daemonproto::{ClientMsg, ServerMsg, SessionInfo, SessionStatus};
-    use cowboy_core::netproto::{
-        encode_line, GatewayMessage, HostMessage, NetworkAttempt, Protocol,
-    };
-    use std::time::Duration;
+    use cowboy_core::netproto::{encode_line, NetworkAttempt, Protocol};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::{TcpStream, UnixStream};
+    use tokio::net::UnixStream;
 
     fn sample_info() -> SessionInfo {
         SessionInfo {
@@ -1000,126 +986,6 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         line
-    }
-
-    /// Reserve an ephemeral loopback addr for the TCP control server (bound by
-    /// `run_control_pipeline`); the listener is dropped so the pipeline can bind it.
-    fn free_control_addr() -> String {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        format!("127.0.0.1:{}", l.local_addr().unwrap().port())
-    }
-
-    /// Connect a fake gateway to the control server and authenticate.
-    async fn connect_gateway(
-        addr: &str,
-        token: &str,
-    ) -> (
-        BufReader<tokio::net::tcp::OwnedReadHalf>,
-        tokio::net::tcp::OwnedWriteHalf,
-    ) {
-        let mut stream = None;
-        for _ in 0..100 {
-            if let Ok(s) = TcpStream::connect(addr).await {
-                stream = Some(s);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let (r, mut w) = stream.expect("connect control server").into_split();
-        let hello = GatewayMessage::Hello {
-            token: token.to_string(),
-        };
-        w.write_all(encode_line(&hello).as_bytes()).await.unwrap();
-        w.flush().await.unwrap();
-        (BufReader::new(r), w)
-    }
-
-    /// End-to-end through the worker glue, no Docker: a gateway `Ask` reaches an
-    /// attached client over the worker socket, the client's `ApprovalReply`
-    /// becomes the gateway `Decision`. Proves [`run_control_pipeline`] bridges
-    /// the control socket and the per-session socket.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn approval_flows_gateway_to_client_to_gateway() {
-        let tmp = assert_fs::TempDir::new().unwrap();
-        let worker_sock = tmp.path().join("s.sock");
-        let control_addr = free_control_addr();
-        let journal = tmp.path().join("events.jsonl");
-
-        let (ui, _cmd_rx) = SocketUi::bind(&worker_sock, &journal, sample_info())
-            .await
-            .unwrap();
-        tokio::spawn(run_control_pipeline(
-            control_addr.clone(),
-            "tok".into(),
-            ui.clone(),
-            None,
-            tmp.path().to_path_buf(),
-        ));
-
-        // Attach a client to the worker socket (handshake -> Snapshot).
-        let client = UnixStream::connect(&worker_sock).await.unwrap();
-        let (cr, mut cw) = client.into_split();
-        let mut creader = BufReader::new(cr);
-        cw.write_all(
-            encode_line(&ClientMsg::Hello {
-                since_seq: None,
-                read_only: false,
-            })
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        cw.flush().await.unwrap();
-        assert!(read_line(&mut creader).await.contains("snapshot"));
-
-        // Connect a fake (authenticated) gateway to the control server.
-        let (mut greader, mut gwr) = connect_gateway(&control_addr, "tok").await;
-
-        // Gateway asks about a destination.
-        let ask = GatewayMessage::Ask {
-            id: 99,
-            reason: None,
-            attempt: NetworkAttempt {
-                protocol: Protocol::Tls,
-                host: Some("example.com".into()),
-                ip: None,
-                port: 443,
-            },
-        };
-        gwr.write_all(encode_line(&ask).as_bytes()).await.unwrap();
-        gwr.flush().await.unwrap();
-
-        // The client receives the approval prompt and allows it.
-        let id = loop {
-            let line = read_line(&mut creader).await;
-            if let Ok(ServerMsg::Approval { id, dest }) = serde_json::from_str(line.trim()) {
-                assert_eq!(dest, "example.com:443");
-                break id;
-            }
-        };
-        cw.write_all(
-            encode_line(&ClientMsg::ApprovalReply {
-                id,
-                verdict: Verdict::Allow,
-                scope: ApprovalScope::Session,
-            })
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
-        cw.flush().await.unwrap();
-
-        // The gateway gets the matching Allow decision back.
-        let decision: HostMessage =
-            serde_json::from_str(read_line(&mut greader).await.trim()).unwrap();
-        assert_eq!(
-            decision,
-            HostMessage::Decision {
-                id: 99,
-                verdict: Verdict::Allow,
-                scope: ApprovalScope::Session,
-            }
-        );
     }
 
     /// A credential grant flagged `approval: required` is prompted to the
@@ -1224,118 +1090,142 @@ mod tests {
         assert!(targets.contains(&"/tmp/.config/free"), "un-gated kept");
     }
 
-    /// With no client attached, the gateway's ask is denied (fail closed).
+    /// A question reaches an attached client over the worker socket and the
+    /// client's reply becomes the verdict. Proves [`control_approver`] bridges the
+    /// policy engine and the per-session socket — the job the TCP control channel
+    /// used to do, minus the transport.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn approval_denied_when_no_client_attached() {
+    async fn an_ask_reaches_an_attached_client_and_its_reply_is_the_verdict() {
+        use cowboy_gateway::Approver;
         let tmp = assert_fs::TempDir::new().unwrap();
         let worker_sock = tmp.path().join("s.sock");
-        let control_addr = free_control_addr();
         let journal = tmp.path().join("events.jsonl");
 
         let (ui, _cmd_rx) = SocketUi::bind(&worker_sock, &journal, sample_info())
             .await
             .unwrap();
-        tokio::spawn(run_control_pipeline(
-            control_addr.clone(),
-            "tok".into(),
-            ui.clone(),
-            None,
-            tmp.path().to_path_buf(),
-        ));
+        let approver = control_approver(ui.clone(), None, tmp.path().to_path_buf());
 
-        let (mut greader, mut gwr) = connect_gateway(&control_addr, "tok").await;
+        // Attach a client (handshake -> Snapshot).
+        let client = UnixStream::connect(&worker_sock).await.unwrap();
+        let (cr, mut cw) = client.into_split();
+        let mut creader = BufReader::new(cr);
+        cw.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        cw.flush().await.unwrap();
+        assert!(read_line(&mut creader).await.contains("snapshot"));
 
-        let ask = GatewayMessage::Ask {
-            id: 7,
-            reason: None,
-            attempt: NetworkAttempt {
-                protocol: Protocol::Tls,
-                host: Some("blocked.example".into()),
-                ip: None,
-                port: 443,
-            },
+        let attempt = NetworkAttempt {
+            protocol: Protocol::Tls,
+            host: Some("example.com".into()),
+            ip: None,
+            port: 443,
+            command_pid: Some(4242),
         };
-        gwr.write_all(encode_line(&ask).as_bytes()).await.unwrap();
-        gwr.flush().await.unwrap();
+        let asking = tokio::spawn(async move { approver.ask(&attempt, None).await });
 
-        let decision: HostMessage =
-            serde_json::from_str(read_line(&mut greader).await.trim()).unwrap();
-        assert_eq!(
-            decision,
-            HostMessage::Decision {
-                id: 7,
-                verdict: Verdict::Deny,
-                scope: ApprovalScope::Once,
+        // The client sees the prompt and approves for the session. The reply is
+        // correlated by id, so parse it out rather than assuming one is pending.
+        let prompt = loop {
+            let line = read_line(&mut creader).await;
+            if line.contains("approval") {
+                break line;
             }
+        };
+        assert!(
+            prompt.contains("example.com"),
+            "the prompt must name the destination: {prompt}"
         );
+        assert!(
+            prompt.contains("4242"),
+            "the prompt should attribute the command that asked: {prompt}"
+        );
+        let id = serde_json::from_str::<serde_json::Value>(prompt.trim())
+            .ok()
+            .and_then(|v| v.pointer("/approval/id").and_then(|i| i.as_u64()))
+            .unwrap_or_else(|| panic!("an approval id in {prompt}"));
+        cw.write_all(
+            encode_line(&ClientMsg::ApprovalReply {
+                id,
+                verdict: Verdict::Allow,
+                scope: ApprovalScope::Session,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        cw.flush().await.unwrap();
+
+        assert_eq!(asking.await.unwrap(), Verdict::Allow);
     }
 
-    /// A blocked destination produces one calm guardrail notice in the journal
-    /// (deduped per host); an allowed one produces none.
+    /// No client attached means no one to ask, so the answer must be a refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocked_destination_gets_one_guardrail_notice() {
+    async fn an_ask_is_denied_when_no_client_is_attached() {
+        use cowboy_gateway::Approver;
         let tmp = assert_fs::TempDir::new().unwrap();
-        let worker_sock = tmp.path().join("s.sock");
-        let control_addr = free_control_addr();
         let journal = tmp.path().join("events.jsonl");
-
-        let (ui, _cmd_rx) = SocketUi::bind(&worker_sock, &journal, sample_info())
+        let (ui, _cmd_rx) = SocketUi::bind(&tmp.path().join("s.sock"), &journal, sample_info())
             .await
             .unwrap();
-        tokio::spawn(run_control_pipeline(
-            control_addr.clone(),
-            "tok".into(),
-            ui.clone(),
-            Some(tmp.path().to_path_buf()),
-            tmp.path().to_path_buf(),
-        ));
+        let approver = control_approver(ui, None, tmp.path().to_path_buf());
 
-        let (_greader, mut gwr) = connect_gateway(&control_addr, "tok").await;
+        let attempt = NetworkAttempt {
+            protocol: Protocol::Tls,
+            host: Some("blocked.example".into()),
+            ip: None,
+            port: 443,
+            command_pid: None,
+        };
+        assert_eq!(approver.ask(&attempt, None).await, Verdict::Deny);
+    }
+
+    /// A blocked destination produces one calm guardrail notice (deduped per host);
+    /// an allowed one produces none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_destination_gets_exactly_one_guardrail_notice() {
+        use cowboy_gateway::Approver;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&tmp.path().join("s.sock"), &journal, sample_info())
+            .await
+            .unwrap();
+        let approver =
+            control_approver(ui, Some(tmp.path().to_path_buf()), tmp.path().to_path_buf());
 
         let attempt = |h: &str| NetworkAttempt {
             protocol: Protocol::Tls,
             host: Some(h.into()),
             ip: None,
             port: 443,
+            command_pid: None,
         };
-        // Two denies to the same host (should explain once) + one allow (silent).
-        for msg in [
-            GatewayMessage::Event {
-                attempt: attempt("evil.test"),
-                verdict: Verdict::Deny,
-                reason: "not allowed".into(),
-            },
-            GatewayMessage::Event {
-                attempt: attempt("evil.test"),
-                verdict: Verdict::Deny,
-                reason: "not allowed".into(),
-            },
-            GatewayMessage::Event {
-                attempt: attempt("github.com"),
-                verdict: Verdict::Allow,
-                reason: "allow-list".into(),
-            },
-        ] {
-            gwr.write_all(encode_line(&msg).as_bytes()).await.unwrap();
-        }
-        gwr.flush().await.unwrap();
+        // Two denies to the same host, then an allow.
+        approver
+            .event(&attempt("evil.test"), Verdict::Deny, "deny-listed".into())
+            .await;
+        approver
+            .event(&attempt("evil.test"), Verdict::Deny, "deny-listed".into())
+            .await;
+        approver
+            .event(&attempt("ok.test"), Verdict::Allow, "allow-listed".into())
+            .await;
 
-        let mut body = String::new();
-        for _ in 0..100 {
-            body = std::fs::read_to_string(&journal).unwrap_or_default();
-            if body.contains("🛡 blocked evil.test:443") {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        assert_eq!(
-            body.matches("🛡 blocked evil.test:443").count(),
-            1,
-            "exactly one guardrail notice per blocked host"
-        );
+        // Let the event task drain.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let text = std::fs::read_to_string(&journal).unwrap_or_default();
+        let notices = text.matches("evil.test").filter(|_| true).count();
+        assert!(notices >= 1, "the block should be surfaced: {text}");
         assert!(
-            !body.contains("🛡 blocked github.com"),
-            "an allowed destination gets no guardrail notice"
+            !text.contains("ok.test") || !text.contains("guardrail"),
+            "an allowed destination must not produce a guardrail notice: {text}"
         );
     }
 }

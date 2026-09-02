@@ -37,7 +37,7 @@ pub enum Protocol {
     Dns,
 }
 
-/// A single outbound connection attempt observed by the gateway.
+/// A single outbound connection attempt observed by the policy engine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkAttempt {
     pub protocol: Protocol,
@@ -47,6 +47,18 @@ pub struct NetworkAttempt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<IpAddr>,
     pub port: u16,
+    /// PID of the sandboxed command that opened the connection, as seen in the
+    /// sandbox's own PID namespace.
+    ///
+    /// Attribution, not identity: it lets a prompt say *which* concurrent command
+    /// wants a destination, which matters when several subagents run at once. This is
+    /// a new capability rather than a restored one — under Docker every command
+    /// shared one uid, so nothing distinguished them either.
+    ///
+    /// Never used for an authorization decision. It is reported by the relay, which
+    /// is inside the boundary, so it is only ever as trustworthy as a label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_pid: Option<u32>,
 }
 
 impl NetworkAttempt {
@@ -79,53 +91,6 @@ pub enum ApprovalScope {
     Global,
 }
 
-/// Messages sent from the gateway to the host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum GatewayMessage {
-    /// Authentication handshake: the FIRST line the gateway sends after connecting.
-    /// The host validates the token (passed to the gateway out-of-band via its
-    /// container env) and drops the connection if it doesn't match. This gates the
-    /// TCP control channel — anything else that can route to the port (e.g. the
-    /// agent container) can't authenticate, since it never sees the token.
-    Hello { token: String },
-    /// Request a decision for an attempt the policy classified as `ask`.
-    /// `reason` (when present) explains *why* — e.g. a new domain vs a suspected
-    /// DNS tunnel — so the host can render a clearer prompt.
-    Ask {
-        id: u64,
-        attempt: NetworkAttempt,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    /// Informational: a decision the gateway already made (for the activity log).
-    Event {
-        attempt: NetworkAttempt,
-        verdict: Verdict,
-        reason: String,
-    },
-}
-
-/// Messages sent from the host back to the gateway.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HostMessage {
-    /// Verdict for a prior [`GatewayMessage::Ask`].
-    Decision {
-        id: u64,
-        verdict: Verdict,
-        scope: ApprovalScope,
-    },
-}
-
-/// Either direction, for generic framing helpers/tests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum ControlMessage {
-    FromGateway(GatewayMessage),
-    FromHost(HostMessage),
-}
-
 /// Serialize a message as a single newline-terminated JSON line.
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
     let mut s = serde_json::to_string(msg).expect("control message serializes");
@@ -137,42 +102,27 @@ pub fn encode_line<T: Serialize>(msg: &T) -> String {
 mod tests {
     use super::*;
 
+    /// `command_pid` crosses the relay boundary as JSON, so its shape is a
+    /// contract — and it must stay optional so an attempt without attribution
+    /// still parses.
     #[test]
-    fn ask_roundtrips() {
-        let msg = GatewayMessage::Ask {
-            id: 7,
-            reason: Some("dns tunnel suspected".into()),
-            attempt: NetworkAttempt {
-                protocol: Protocol::Dns,
+    fn attempt_round_trips_with_and_without_a_command_pid() {
+        for pid in [None, Some(4242u32)] {
+            let a = NetworkAttempt {
+                protocol: Protocol::Tls,
                 host: Some("github.com".into()),
                 ip: None,
-                port: 53,
-            },
-        };
-        let line = encode_line(&msg);
-        assert!(line.ends_with('\n'));
-        let back: GatewayMessage = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(msg, back);
-    }
-
-    #[test]
-    fn hello_roundtrips() {
-        let msg = GatewayMessage::Hello {
-            token: "abc123".into(),
-        };
-        let back: GatewayMessage = serde_json::from_str(encode_line(&msg).trim()).unwrap();
-        assert_eq!(msg, back);
-    }
-
-    #[test]
-    fn decision_roundtrips() {
-        let msg = HostMessage::Decision {
-            id: 7,
-            verdict: Verdict::Allow,
-            scope: ApprovalScope::Session,
-        };
-        let back: HostMessage = serde_json::from_str(encode_line(&msg).trim()).unwrap();
-        assert_eq!(msg, back);
+                port: 443,
+                command_pid: pid,
+            };
+            let line = encode_line(&a);
+            assert!(line.ends_with('\n'));
+            let back: NetworkAttempt = serde_json::from_str(line.trim()).unwrap();
+            assert_eq!(a, back);
+        }
+        // Absent in the JSON entirely -> None, not an error.
+        let a: NetworkAttempt = serde_json::from_str(r#"{"protocol":"tls","port":443}"#).unwrap();
+        assert_eq!(a.command_pid, None);
     }
 
     #[test]
@@ -182,6 +132,7 @@ mod tests {
             host: None,
             ip: Some("1.2.3.4".parse().unwrap()),
             port: 22,
+            command_pid: None,
         };
         assert_eq!(a.label(), "1.2.3.4:22");
     }

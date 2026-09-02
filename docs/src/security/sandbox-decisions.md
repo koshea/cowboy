@@ -323,6 +323,49 @@ The shim therefore reads **one byte at a time** up to the newline. A `BufReader`
 would read past it into its buffer and silently swallow the start of the payload.
 A few hundred single-byte reads is nothing next to the process spawn around it.
 
+## What deleting the control channel removed
+
+The policy engine used to run *inside* the sandbox, in its own container, which
+meant it could not be trusted with a decision: every `ask` had to be shipped to the
+host over TCP and a verdict shipped back. Because the agent shared the Docker bridge
+and could reach that port, the channel needed authenticating. Moving the engine into
+the worker deleted the whole apparatus rather than porting it:
+
+- the TCP listener, and the retry loop it needed because the bridge IP did not exist
+  until the Docker network came up;
+- the eager, detached network-create that existed only to make that retry loop settle
+  sooner;
+- the per-session token, the `Hello` handshake, and the constant-time comparison
+  guarding it (`ct_eq` survives, since `cowboy web` still needs it, and now lives
+  next to its one remaining caller);
+- the "bind the bridge IP, never `0.0.0.0`" reasoning;
+- the `policy-<hash>.json` file written to the runtime dir for the container to read,
+  and the care needed to keep it out of a world-writable path;
+- the `GatewayMessage`/`HostMessage`/`ControlMessage` wire types.
+
+What replaced it is an `Approver` trait. `DenyAll` makes the fail-closed default
+explicit, so a non-interactive run has something truthful to pass rather than being
+tempted to skip the check. Because asking is now a function call, the tests can also
+assert on *what the user would have been shown* — not just the resulting verdict.
+
+`command_pid` was added to `NetworkAttempt` so a prompt can say which concurrent
+command wants a destination. That is a new capability, not a restored one: under
+Docker every command shared one uid, so nothing distinguished them either. It is
+reported by the relay, which is inside the boundary, so it is a label only and never
+feeds an authorization decision.
+
+### Coverage deliberately dropped, to be restored
+
+Three tests were deleted because they exercised machinery that no longer exists:
+`gateway_e2e.rs` (allow-listed reachable, un-listed blocked, metadata denied,
+non-80/443 dropped), `gateway_approval_e2e.rs` (an approval unblocks an otherwise
+denied destination), and `daemon_e2e::e2e_approval_routes_through_worker_and_fails_closed`
+(the TCP control channel).
+
+The *properties* they covered are still real and are now only covered at unit level.
+The end-to-end versions must be rebuilt against the sandbox transport, and that is
+an obligation of the transport work — not something to be quietly lost.
+
 ## Beware the vacuously-passing sandbox test
 
 `crates/cowboy-cli/tests/sandbox_exec.rs` self-skips when bubblewrap or
