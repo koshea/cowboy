@@ -4,6 +4,7 @@ members = [
     "crates/cowboy-cli",
     "crates/cowboy-core",
     "crates/cowboy-proto",
+    "crates/cowboy-sandbox",
     "crates/cowboy-tui",
     "crates/cowboy-gateway",
 ]
@@ -20,6 +21,7 @@ repository = "https://github.com/koshea/cowboy"
 # internal
 cowboy-core = { path = "crates/cowboy-core" }
 cowboy-proto = { path = "crates/cowboy-proto" }
+cowboy-sandbox = { path = "crates/cowboy-sandbox" }
 cowboy-tui = { path = "crates/cowboy-tui" }
 
 # cli / runtime

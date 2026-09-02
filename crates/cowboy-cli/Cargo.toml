@@ -18,6 +18,7 @@ path = "src/bin/cowboyd.rs"
 
 [dependencies]
 cowboy-core.workspace = true
+cowboy-sandbox.workspace = true
 cowboy-tui.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

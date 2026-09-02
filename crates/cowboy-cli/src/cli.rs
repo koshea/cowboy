@@ -101,6 +101,9 @@ pub enum Command {
     /// Check Docker, Linux support, model config, network gateway, and Compose.
     Doctor,
 
+    /// Inspect the sandbox boundary for this project.
+    Sandbox(SandboxArgs),
+
     /// Open an interactive shell inside the agent container.
     Shell,
 
@@ -248,6 +251,19 @@ pub struct SessionWorkerArgs {
     pub ranch_id: Option<String>,
     #[arg(long)]
     pub workstream_id: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SandboxArgs {
+    #[command(subcommand)]
+    pub command: SandboxCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SandboxCommand {
+    /// Print the confinement plan for this project: what the agent can read,
+    /// write, and reach, and which paths can never be granted at runtime.
+    Plan,
 }
 
 #[derive(Debug, Args)]

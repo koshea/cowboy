@@ -1073,7 +1073,7 @@ fn resolve_source(root: &Path, source: &str) -> PathBuf {
 /// the worktree's gitdir reference resolves in the container. `None` for a
 /// normal repo (its `.git` dir is already inside the workspace mount) or a
 /// non-git directory.
-fn git_common_dir(root: &Path) -> Option<PathBuf> {
+pub(crate) fn git_common_dir(root: &Path) -> Option<PathBuf> {
     // Only linked worktrees have a `.git` *file*; a normal repo has a directory
     // that's already covered by the /workspace mount.
     if !root.join(".git").is_file() {

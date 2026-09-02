@@ -13,6 +13,7 @@
 
 - [The boundary](security/model.md)
 - [Network gateway](security/network.md)
+- [Sandbox design decisions](security/sandbox-decisions.md)
 
 # Using Cowboy
 

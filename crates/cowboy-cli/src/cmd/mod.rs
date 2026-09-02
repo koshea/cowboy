@@ -21,6 +21,7 @@ pub mod proc;
 pub mod ranch;
 pub mod review;
 pub mod run;
+pub mod sandbox;
 pub mod secrets;
 pub mod session;
 pub mod sessions;

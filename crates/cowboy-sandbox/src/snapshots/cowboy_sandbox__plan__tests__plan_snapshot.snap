@@ -1,0 +1,50 @@
+---
+source: crates/cowboy-sandbox/src/plan.rs
+expression: plan.render(&denylist)
+---
+filesystem
+  ro  /usr -> /usr   (host toolchain)
+  ro  /etc/ssl -> /etc/ssl   (toolchain configuration)
+  ro  /etc/resolv.conf -> /etc/resolv.conf   (toolchain configuration)
+  rw  /srv/proj -> /workspace   (the project)
+  rw  /srv/main/.git/worktrees/wt -> /srv/main/.git/worktrees/wt   (shared git dir (linked worktree))
+  ro  /srv/other-repo -> /srv/other-repo   (runtime grant (approved by the user))
+  ro  /run/cowboy/mask -> /workspace/.cowboy/security.yaml   (mask host-owned config)
+  ro  /run/cowboy/mask -> /workspace/.cowboy/models.yaml   (mask host-owned config)
+  tmpfs /tmp, /run, /var/tmp
+  proc /proc   dev /dev
+
+landlock
+  6 read-only, 3 read-write paths
+  tcp connect allowed: 8443
+  ipc scoping: true
+
+seccomp
+  24 syscalls denied (incl. io_uring_setup), raw sockets denied: true
+
+limits
+  memory Some(4096) MiB, cpus Some(2.0), pids Some(4096), build jobs Some(2)
+
+never grantable at any approval scope (21 paths)
+  /home/dev/.aws
+  /home/dev/.cargo/credentials.toml
+  /home/dev/.config/BraveSoftware
+  /home/dev/.config/chromium
+  /home/dev/.config/cowboy
+  /home/dev/.config/gcloud
+  /home/dev/.config/gh
+  /home/dev/.config/google-chrome
+  /home/dev/.docker/config.json
+  /home/dev/.git-credentials
+  /home/dev/.gitconfig
+  /home/dev/.gnupg
+  /home/dev/.kube
+  /home/dev/.local/share/keyrings
+  /home/dev/.mozilla
+  /home/dev/.netrc
+  /home/dev/.npmrc
+  /home/dev/.password-store
+  /home/dev/.pypirc
+  /home/dev/.ssh
+  /usr/bin/cowboy
+  (plus .cowboy/, security.yaml, models.yaml, providers.yaml anywhere)

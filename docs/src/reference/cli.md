@@ -633,6 +633,16 @@ Run a command inside the agent container
 | `<COMMAND>` | The command and its arguments |
 
 
+## `cowboy sandbox`
+
+Inspect the sandbox boundary for this project
+
+
+### `cowboy sandbox plan`
+
+Print the confinement plan for this project: what the agent can read, write, and reach, and which paths can never be granted at runtime
+
+
 ## `cowboy secrets`
 
 Grant host credentials (gh, gcloud, kubectl, …) into the container

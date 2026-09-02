@@ -670,6 +670,7 @@ dependencies = [
  "clap",
  "clipboard-rs",
  "cowboy-core",
+ "cowboy-sandbox",
  "cowboy-tui",
  "crossterm",
  "futures",
@@ -748,6 +749,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "cowboy-sandbox"
+version = "0.1.0"
+dependencies = [
+ "cowboy-core",
+ "insta",
+ "pretty_assertions",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{expand_path, ConfigPaths, SecretEnv, SecretMount, SecurityConfig};
+use cowboy_core::presets::{preset, NAMES as PRESETS};
 use cowboy_core::usersecrets;
 
 use crate::cli::{SecretsAddArgs, SecretsCommand};
@@ -30,70 +31,6 @@ fn project_key() -> Result<String> {
     let canon = std::fs::canonicalize(&root).unwrap_or(root);
     Ok(repo_key(&canon))
 }
-
-/// A known-tool preset: read-only file grants, env vars sourced from a host
-/// command (for keyring-backed tokens), and the network it needs.
-struct Preset {
-    files: &'static [(&'static str, &'static str)],
-    /// (container env name, host command whose stdout is the value).
-    env_cmd: &'static [(&'static str, &'static str)],
-    domains: &'static [&'static str],
-    note: &'static str,
-}
-
-fn preset(name: &str) -> Option<Preset> {
-    Some(match name {
-        "gh" => Preset {
-            files: &[("~/.config/gh", "/tmp/.config/gh")],
-            // gh keeps the token in the OS keyring (not hosts.yml), so mounting
-            // the config isn't enough — pull a fresh token from `gh auth token`.
-            env_cmd: &[("GH_TOKEN", "gh auth token")],
-            domains: &["api.github.com", "github.com"],
-            note: "your GitHub CLI auth (config read-only + GH_TOKEN from the keyring).",
-        },
-        "gcloud" => Preset {
-            files: &[("~/.config/gcloud", "/tmp/.config/gcloud")],
-            env_cmd: &[],
-            domains: &[
-                "accounts.google.com",
-                "oauth2.googleapis.com",
-                "*.googleapis.com",
-            ],
-            note: "your gcloud config + application-default credentials (read-only). \
-                   Token refresh needs write access — set read_only: false if it fails.",
-        },
-        "kubectl" => Preset {
-            files: &[("~/.kube", "/tmp/.kube")],
-            env_cmd: &[],
-            domains: &[],
-            note: "your kubeconfig (read-only). Also allow your cluster's API server host.",
-        },
-        "aws" => Preset {
-            files: &[("~/.aws", "/tmp/.aws")],
-            env_cmd: &[],
-            domains: &["*.amazonaws.com"],
-            note: "your AWS credentials/config (read-only).",
-        },
-        "git" => Preset {
-            files: &[
-                ("~/.gitconfig", "/tmp/.gitconfig"),
-                ("~/.git-credentials", "/tmp/.git-credentials"),
-            ],
-            env_cmd: &[],
-            domains: &["github.com"],
-            note: "your git config + stored credentials (read-only).",
-        },
-        "ssh" => Preset {
-            files: &[("~/.ssh", "/tmp/.ssh")],
-            env_cmd: &[],
-            domains: &[],
-            note: "WARNING: exposes your SSH PRIVATE KEYS to the agent (read-only).",
-        },
-        _ => return None,
-    })
-}
-
-const PRESETS: &[&str] = &["gh", "gcloud", "kubectl", "aws", "git", "ssh"];
 
 /// Grants gathered from a preset and/or explicit flags.
 #[derive(Default)]

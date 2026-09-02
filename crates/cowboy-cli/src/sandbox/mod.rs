@@ -16,6 +16,15 @@ use std::path::Path;
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// Loopback port inside the sandbox where the egress relay accepts intercepted
+/// TCP. Fixed rather than per-session: it is only ever reachable from inside one
+/// network namespace, so there is nothing for a unique port to protect against,
+/// and a constant keeps the Landlock rule and the nft rule obviously in agreement.
+pub const RELAY_PORT: u16 = 8443;
+
+/// Loopback port inside the sandbox where the relay accepts DNS queries.
+pub const DNS_PORT: u16 = 5354;
+
 /// Result of a command execution inside the sandbox.
 ///
 /// Lives here rather than beside the Docker client because it is part of the

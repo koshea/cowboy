@@ -13,6 +13,7 @@ pub mod memory;
 pub mod model;
 pub mod model_defaults;
 pub mod policy;
+pub mod presets;
 
 // The wire protocol types live in `cowboy-proto` (dependency-light + wasm-safe so
 // the Yew web client shares them). Re-exported here so existing
