@@ -207,17 +207,37 @@ impl NativeSandbox {
                 .probe
                 .self_exe()
                 .context("cannot locate the cowboy binary to hold the session namespaces")?;
-            let (session, engine_end) = SessionSandbox::start(&self.session_name, &exe)?;
-            // Serve the relay channel on a dedicated thread. It must be running
-            // before any command does, or the first connection blocks on a verdict.
-            let engine = self.policy_engine.clone();
+            let (session, channels) = SessionSandbox::start(&self.session_name, &exe)?;
+            // Serve both relay channels on dedicated threads. They must be running
+            // before any command does, or the first connection blocks on a verdict
+            // and the first lookup on a response.
             let handle = tokio::runtime::Handle::current();
+            let engine = self.policy_engine.clone();
+            let connect = channels.connect;
             std::thread::Builder::new()
                 .name("cowboy-egress-broker".into())
-                .spawn(move || {
-                    crate::sandbox::transport::broker::serve_blocking(engine_end, engine, handle);
+                .spawn({
+                    let handle = handle.clone();
+                    move || {
+                        crate::sandbox::transport::broker::serve_blocking(connect, engine, handle);
+                    }
                 })
                 .context("spawning the egress policy broker")?;
+
+            // The upstream resolver is read here, on the host, and the sandbox is
+            // never told which one it is: it sends every query to a loopback port and
+            // the answer comes back from this side.
+            let upstream = cowboy_gateway::dns::host_resolver();
+            let engine = self.policy_engine.clone();
+            let resolve = channels.resolve;
+            std::thread::Builder::new()
+                .name("cowboy-dns-broker".into())
+                .spawn(move || {
+                    crate::sandbox::transport::broker::serve_dns_blocking(
+                        resolve, engine, handle, upstream,
+                    );
+                })
+                .context("spawning the dns policy broker")?;
             *guard = Some(session);
         }
         Ok(guard)

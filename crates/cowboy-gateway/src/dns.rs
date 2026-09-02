@@ -1,12 +1,17 @@
 //! Policy-enforcing forwarding DNS resolver.
 //!
-//! The agent can only resolve names through the gateway (its `--dns` points here
-//! and direct egress to other resolvers is dropped). Every query is gated by the
-//! policy *before* it leaves: only names the policy Allows or the user approves are
-//! forwarded upstream; denied/unknown names, disallowed record types, and suspected
-//! tunnels are answered REFUSED locally and never sent out. This closes DNS as an
-//! exfiltration channel. Answers are still recorded as `ip -> domain` so the
-//! transparent TCP path can map a connection's IP back to the requested hostname.
+//! The sandbox can only resolve names through here: its network namespace holds no
+//! route to any resolver, and every packet to port 53 is redirected to the relay,
+//! which forwards the query bytes to this code on the host. Every query is gated by
+//! the policy *before* it leaves: only names the policy Allows or the user approves
+//! are forwarded upstream; denied names, disallowed record types, and suspected
+//! tunnels are answered REFUSED without a byte going out. This closes DNS as an
+//! exfiltration channel.
+//!
+//! It is also what makes domain rules work at all. Answers are recorded as
+//! `ip -> name`, and the relay admits a connection because the resolver mapped that
+//! IP to an allowed name — so `allow: github.com` is enforced here, at resolution,
+//! not by trusting anything the agent later says about where it is connecting.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -20,6 +25,10 @@ use tokio::net::UdpSocket;
 
 use crate::state::GatewayState;
 use cowboy_core::netproto::Verdict;
+
+/// Largest DNS datagram we send or accept. Matches the usual EDNS0 ceiling with
+/// room to spare; a larger response arrives truncated and the client retries.
+pub const MAX_DATAGRAM: usize = 4096;
 
 /// How long a resolved `IP → name` mapping is trusted for connect-time
 /// attribution. The resolve→connect window is seconds; this is generous enough to
@@ -111,61 +120,40 @@ impl DnsMap {
     }
 }
 
-/// Run the policy-enforcing forwarding DNS server until cancelled. Binds UDP on
-/// `bind` and forwards approved queries to `upstream`.
-pub async fn serve(bind: SocketAddr, upstream: SocketAddr, state: Arc<GatewayState>) -> Result<()> {
-    let sock = Arc::new(
-        UdpSocket::bind(bind)
-            .await
-            .with_context(|| format!("binding DNS listener on {bind}"))?,
-    );
-    tracing::info!(%bind, %upstream, "dns resolver listening (policy-enforced)");
-
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let (len, client) = match sock.recv_from(&mut buf).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(error = %e, "dns recv error");
-                continue;
-            }
-        };
-        let query = buf[..len].to_vec();
-        let sock = sock.clone();
-        let state = state.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_query(&sock, client, &query, upstream, &state).await {
-                tracing::debug!(error = %e, "dns handling failed");
-            }
-        });
-    }
-}
-
-async fn handle_query(
-    sock: &UdpSocket,
-    client: SocketAddr,
-    query: &[u8],
-    upstream: SocketAddr,
-    state: &GatewayState,
-) -> Result<()> {
+/// Decide and, if allowed, resolve one query — the whole policy-enforcing resolver
+/// as a single host-side function.
+///
+/// Returns the response datagram to hand back to the client, or `None` when the
+/// query must simply be dropped. Deliberately takes bytes and returns bytes rather
+/// than owning a socket: the query arrives from the sandbox over the relay channel,
+/// while `upstream` must be dialled in the **host** network namespace, so the two
+/// ends live in different namespaces and no single socket could serve both.
+///
+/// Every decision in here is host-side and therefore outside the agent's reach. The
+/// sandbox end of this path is a dumb pipe: it forwards bytes and returns bytes, and
+/// has no way to resolve a name this function refuses.
+pub async fn resolve(query: &[u8], upstream: SocketAddr, state: &GatewayState) -> Option<Vec<u8>> {
     match classify_query(query) {
         // Unparseable → drop (fail-closed; never forward).
         QueryGate::Drop => {
             tracing::debug!("dropping unparseable DNS query");
-            Ok(())
+            None
         }
         // 0 or many questions → refuse locally.
-        QueryGate::Refuse => {
-            sock.send_to(&refused(query), client).await?;
-            Ok(())
-        }
+        QueryGate::Refuse => Some(refused(query)),
         QueryGate::Resolve { qname, qtype } => match state.decide_dns(&qname, &qtype).await {
-            Verdict::Allow => forward(sock, client, query, upstream, state).await,
+            Verdict::Allow => match forward(query, upstream, state).await {
+                Ok(response) => Some(response),
+                Err(e) => {
+                    // An upstream failure is not a policy decision, so it must not
+                    // masquerade as one: dropping lets the client's own resolver
+                    // retry, where REFUSED would be cached as an answer.
+                    tracing::debug!(error = %e, "dns upstream failed");
+                    None
+                }
+            },
             // Deny (or an unresolved ask) → refuse locally; never touch upstream.
-            _ => {
-                sock.send_to(&refused(query), client).await?;
-                Ok(())
-            }
+            _ => Some(refused(query)),
         },
     }
 }
@@ -197,27 +185,26 @@ fn classify_query(query: &[u8]) -> QueryGate {
     }
 }
 
-/// Forward an approved query upstream, record answers, and relay the response.
+/// Forward an approved query upstream, record answers, and return the response.
 ///
 /// The response is what authorizes egress: `record_answers` maps the returned IPs
-/// to the allow-listed name, and the transparent proxy later admits a connection
-/// to those IPs *because* of that mapping. The agent shares this netns and can
-/// send UDP to loopback, and it authored the query (so it knows the transaction id
-/// and question) — a spoofed answer would therefore let it bind any IP it likes to
-/// an allowed name. Three defences, all required:
+/// to the allow-listed name, and the relay later admits a connection to those IPs
+/// *because* of that mapping. So a forged answer would let the agent bind any IP it
+/// likes to an allowed name, and this is the code that must make that impossible.
+///
+/// The sandbox cannot reach this socket at all — it is created here, in the host
+/// network namespace, and the agent's namespace has no route to it. What remains is
+/// off-path spoofing by anything between here and the resolver, and the fact that
+/// the agent *authored* the query, so it knows the transaction id and question it
+/// would need to forge. Two defences, both required:
 ///   1. `connect()` the upstream socket, so the kernel drops datagrams from any
 ///      source other than the resolver;
-///   2. re-read until a reply actually matches the query we sent (id + question),
-///      so a datagram that races in from the resolver's own address can't carry a
-///      different answer;
-///   3. only ever record answers from a reply that passed (1) and (2).
-async fn forward(
-    sock: &UdpSocket,
-    client: SocketAddr,
-    query: &[u8],
-    upstream: SocketAddr,
-    state: &GatewayState,
-) -> Result<()> {
+///   2. re-read until a reply actually matches the query we sent (id + question), so
+///      a datagram that races in from the resolver's own address cannot carry an
+///      answer to a different question than the one policy approved.
+///
+/// Only a reply that passed both is recorded, and only its A/AAAA records.
+async fn forward(query: &[u8], upstream: SocketAddr, state: &GatewayState) -> Result<Vec<u8>> {
     const UPSTREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
     let bind: SocketAddr = if upstream.is_ipv4() {
@@ -226,20 +213,18 @@ async fn forward(
         "[::]:0".parse().unwrap()
     };
     let up = UdpSocket::bind(bind).await?;
-    // Connected UDP: the kernel delivers only datagrams whose source is `upstream`,
-    // which alone defeats the off-path spray (the agent cannot spoof the resolver's
-    // source address — the netns has no NET_RAW).
+    // Connected UDP: the kernel delivers only datagrams whose source is `upstream`.
     up.connect(upstream).await?;
     up.send(query).await?;
 
     let sent = Message::from_vec(query).context("forwarding an unparseable query")?;
     let deadline = tokio::time::Instant::now() + UPSTREAM_TIMEOUT;
     loop {
-        let mut resp = vec![0u8; 4096];
+        let mut resp = vec![0u8; MAX_DATAGRAM];
         let len = tokio::time::timeout_at(deadline, up.recv(&mut resp)).await??;
-        let resp = &resp[..len];
+        resp.truncate(len);
 
-        let Ok(msg) = Message::from_vec(resp) else {
+        let Ok(msg) = Message::from_vec(&resp) else {
             continue; // garbage from the resolver: keep waiting for a real reply
         };
         if !reply_matches(&sent, &msg) {
@@ -247,8 +232,7 @@ async fn forward(
             continue;
         }
         state.dns().record_answers(&msg);
-        sock.send_to(resp, client).await?;
-        return Ok(());
+        return Ok(resp);
     }
 }
 
@@ -281,6 +265,38 @@ fn refused(query: &[u8]) -> Vec<u8> {
         resp.add_query(q.clone());
     }
     resp.to_vec().unwrap_or_default()
+}
+
+/// The resolver this machine uses, read from `/etc/resolv.conf`.
+///
+/// Deliberately no fallback to a public resolver. Silently sending a user's lookups
+/// to a third party because their config could not be read would be a surprising
+/// default, and DNS failing is already the safe direction: names stop resolving, so
+/// nothing new becomes reachable.
+///
+/// A loopback stub (`127.0.0.53`, systemd-resolved) is fine — this is dialled from
+/// the host network namespace, where that stub is exactly the right answer.
+pub fn host_resolver() -> Option<SocketAddr> {
+    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    upstream_from_resolv_conf(&text)
+}
+
+/// Parse the first usable `nameserver` line. Split out so it is testable without
+/// depending on the machine's configuration.
+pub fn upstream_from_resolv_conf(text: &str) -> Option<SocketAddr> {
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("nameserver") {
+            continue;
+        }
+        // Strip any scope suffix (`fe80::1%eth0`), which is not part of the address.
+        let addr = parts.next()?.split('%').next().unwrap_or_default();
+        if let Ok(ip) = addr.parse::<IpAddr>() {
+            return Some(SocketAddr::new(ip, 53));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -435,5 +451,179 @@ mod tests {
         assert!(names.contains(&"allowed.example".to_string()));
         assert!(names.contains(&"other.example".to_string()));
         assert_eq!(names.len(), 2, "duplicate name is deduped");
+    }
+
+    #[test]
+    fn the_first_nameserver_is_taken_from_resolv_conf() {
+        let text = "# a comment\nsearch example.com\nnameserver 127.0.0.53\nnameserver 1.1.1.1\n";
+        assert_eq!(
+            upstream_from_resolv_conf(text),
+            Some("127.0.0.53:53".parse().unwrap()),
+            "a loopback stub is correct here: this is dialled from the host namespace"
+        );
+    }
+
+    #[test]
+    fn resolv_conf_oddities_do_not_yield_a_wrong_resolver() {
+        // No nameserver at all → None, and the caller must refuse rather than
+        // silently substitute a public resolver.
+        assert_eq!(upstream_from_resolv_conf("options edns0\n"), None);
+        assert_eq!(upstream_from_resolv_conf(""), None);
+        // A commented-out nameserver is not a nameserver.
+        assert_eq!(upstream_from_resolv_conf("#nameserver 1.1.1.1\n"), None);
+        // A scope suffix is not part of the address.
+        assert_eq!(
+            upstream_from_resolv_conf("nameserver fe80::1%eth0\n"),
+            Some("[fe80::1]:53".parse().unwrap())
+        );
+        // Garbage is skipped in favour of the next usable line.
+        assert_eq!(
+            upstream_from_resolv_conf("nameserver not-an-ip\nnameserver 9.9.9.9\n"),
+            Some("9.9.9.9:53".parse().unwrap())
+        );
+    }
+
+    /// A stand-in upstream resolver: answers every query with one A record for
+    /// `answer`, echoing the id and question so `reply_matches` accepts it.
+    async fn fake_upstream(answer: &'static str) -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DATAGRAM];
+            while let Ok((len, from)) = sock.recv_from(&mut buf).await {
+                let reply = reply_for(&buf[..len], None, None, answer);
+                let _ = sock.send_to(&reply.to_vec().unwrap(), from).await;
+            }
+        });
+        addr
+    }
+
+    fn response_code(bytes: &[u8]) -> ResponseCode {
+        Message::from_vec(bytes).unwrap().response_code
+    }
+
+    fn policy_allowing(domain: &str) -> cowboy_core::config::NetworkPolicy {
+        let mut p = cowboy_core::config::NetworkPolicy::default();
+        p.allow.domains.push(domain.into());
+        p
+    }
+
+    fn state(policy: cowboy_core::config::NetworkPolicy) -> Arc<GatewayState> {
+        Arc::new(GatewayState::new(
+            policy,
+            DnsMap::new(),
+            Arc::new(crate::DenyAll),
+        ))
+    }
+
+    /// The payoff of the whole DNS path: resolving an allow-listed name is what
+    /// makes a *domain* rule enforceable, because the answer is what authorizes the
+    /// connection that follows.
+    #[tokio::test]
+    async fn an_allowed_name_resolves_and_its_answer_authorizes_the_ip() {
+        let upstream = fake_upstream("93.184.216.34").await;
+        let state = state(policy_allowing("allowed.example"));
+
+        let query = query_bytes(&[("allowed.example.", RecordType::A)]);
+        let response = resolve(&query, upstream, &state)
+            .await
+            .expect("an allowed name must resolve");
+        assert_eq!(response_code(&response), ResponseCode::NoError);
+
+        let names = state.dns().lookup_all("93.184.216.34".parse().unwrap());
+        assert!(
+            names.contains(&"allowed.example".to_string()),
+            "the answer must map the IP to the allowed name, or the connection to it \
+             cannot be authorized; got {names:?}"
+        );
+    }
+
+    /// A denied name is refused *here*, without a byte leaving — otherwise the query
+    /// itself is the exfiltration channel, and there is no later connection to gate.
+    #[tokio::test]
+    async fn a_denied_name_is_refused_without_reaching_upstream() {
+        // Deliberately an address with no listener: if the implementation ever
+        // forwarded, this would time out rather than answer promptly.
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut policy = policy_allowing("allowed.example");
+        policy.deny.domains.push("evil.example".into());
+        let state = state(policy);
+
+        let query = query_bytes(&[("secrets.evil.example.", RecordType::A)]);
+        let response =
+            tokio::time::timeout(Duration::from_millis(500), resolve(&query, dead, &state))
+                .await
+                .expect("must refuse locally, not wait on upstream")
+                .expect("a REFUSED answer, not a drop");
+        assert_eq!(response_code(&response), ResponseCode::Refused);
+    }
+
+    /// Deliberate and worth pinning, because it reads like a hole and is not one: an
+    /// *unknown* name resolves. A resolver that parked a query on a human prompt
+    /// would simply time out, and resolving is not egress — the connection to
+    /// whatever it resolved to is gated at connect time, where prompting works and
+    /// the verdict can be cached per host.
+    #[tokio::test]
+    async fn an_unknown_name_resolves_because_the_gate_is_at_connect_time() {
+        let upstream = fake_upstream("93.184.216.34").await;
+        let state = state(policy_allowing("allowed.example"));
+
+        let query = query_bytes(&[("unknown.example.", RecordType::A)]);
+        let response = resolve(&query, upstream, &state)
+            .await
+            .expect("an unknown name resolves");
+        assert_eq!(response_code(&response), ResponseCode::NoError);
+    }
+
+    /// TXT is the classic tunnel carrier and is refused even for a name the policy
+    /// otherwise allows.
+    #[tokio::test]
+    async fn a_tunnel_prone_record_type_is_refused_even_for_an_allowed_name() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let state = state(policy_allowing("allowed.example"));
+
+        let query = query_bytes(&[("allowed.example.", RecordType::TXT)]);
+        let response =
+            tokio::time::timeout(Duration::from_millis(500), resolve(&query, dead, &state))
+                .await
+                .expect("must refuse locally")
+                .expect("a REFUSED answer");
+        assert_eq!(response_code(&response), ResponseCode::Refused);
+    }
+
+    /// Unparseable input is dropped rather than answered: there is no id or question
+    /// to echo, and inventing one would be worse than silence.
+    #[tokio::test]
+    async fn unparseable_input_is_dropped() {
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let state = state(cowboy_core::config::NetworkPolicy::default());
+        assert!(resolve(b"not a dns message", dead, &state).await.is_none());
+    }
+
+    /// An upstream that never answers must not turn into a REFUSED response: that
+    /// would be cached by the client as a policy answer. Dropping lets it retry.
+    #[tokio::test]
+    async fn an_upstream_failure_is_dropped_not_reported_as_a_refusal() {
+        let state = state(policy_allowing("allowed.example"));
+        let query = query_bytes(&[("allowed.example.", RecordType::A)]);
+
+        // A resolver that replies with garbage, so `forward` never gets a match and
+        // the read deadline is what ends it.
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 512];
+            while let Ok((_, from)) = sock.recv_from(&mut buf).await {
+                let _ = sock.send_to(b"garbage", from).await;
+            }
+        });
+
+        tokio::time::pause();
+        let task = tokio::spawn(async move { resolve(&query, addr, &state).await });
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            task.await.unwrap().is_none(),
+            "an upstream failure must be a drop, not a synthesized refusal"
+        );
     }
 }

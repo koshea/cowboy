@@ -23,11 +23,12 @@
 //! feature load-bearing for the one boundary that must never degrade. A nameless
 //! socket needs no such rule.
 //!
-//! What crosses it: a request describing one connection, and a reply that is either
-//! a refusal or an already-connected file descriptor. The descriptor is created by
-//! the engine in the **host** network namespace, and a passed descriptor keeps the
-//! namespace it was created in — verified, and the reason the relay never needs to
-//! create an outbound socket of its own. That in turn is why there is no uid
+//! What crosses it: on one channel, a request describing one connection and a reply
+//! that is either a refusal or an already-connected file descriptor; on the other, a
+//! DNS query as opaque bytes and the response bytes to hand back. The descriptor is
+//! created by the engine in the **host** network namespace, and a passed descriptor
+//! keeps the namespace it was created in — verified, and the reason the relay never
+//! needs to create an outbound socket of its own. That in turn is why there is no uid
 //! exemption in the nftables ruleset to get wrong.
 
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -35,15 +36,29 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The file descriptor the relay inherits the channel on.
+/// The file descriptors the relay inherits its channels on.
 ///
-/// Fixed by convention rather than passed in an environment variable, because the
-/// environment of a process is readable and this is one less thing to name.
-pub const CHANNEL_FD: RawFd = 3;
+/// Fixed by convention rather than passed in environment variables, because the
+/// environment of a process is readable and this is two fewer things to name.
+///
+/// There are **two** channels, not one multiplexed channel, and the reason is
+/// framing. A `SEQPACKET` pair carries no request ids, so a reply belongs to
+/// whichever exchange holds the socket — which means each channel must be used one
+/// exchange at a time. Sharing a single channel would therefore put every connection
+/// decision behind whatever DNS query happened to be waiting on an upstream resolver
+/// (seconds, in the bad case). The alternative, adding request ids and a
+/// demultiplexer, puts framing logic on the boundary that decides egress; a second
+/// nameless socket costs a descriptor and no logic at all.
+pub const CONNECT_FD: RawFd = 3;
+pub const RESOLVE_FD: RawFd = 4;
 
-/// Largest datagram we will read. Requests carry a small peek of the client's first
-/// bytes, which is all the protocol classifier needs.
-pub const MAX_MESSAGE: usize = 8192;
+/// Largest datagram we will read. Requests carry either a small peek of the client's
+/// first bytes or a DNS message, both bounded well below this.
+///
+/// Sized so a maximum DNS datagram survives hex encoding (which doubles it) with room
+/// for the JSON around it. A `SEQPACKET` read into a buffer smaller than the datagram
+/// would *truncate* it, which on this boundary would be silent corruption.
+pub const MAX_MESSAGE: usize = 16384;
 
 /// How many bytes of the client's first write the relay peeks and forwards.
 ///
@@ -81,6 +96,33 @@ pub struct ConnectReply {
     pub allowed: bool,
     /// Why, for the relay's log and for the error the client ultimately sees.
     pub reason: String,
+}
+
+/// One DNS query the sandbox wants answered.
+///
+/// The query travels as **opaque bytes**. Nothing inside the sandbox parses it, gates
+/// it, or rewrites it: the relay reads a datagram off its loopback socket and forwards
+/// it, so there is no DNS policy inside the boundary to bypass. Every decision —
+/// record type, name, tunnel shape, and which upstream to ask — is made on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveRequest {
+    #[serde(with = "hex_bytes")]
+    pub query: Vec<u8>,
+    /// Which sandboxed command asked, if it could be determined. A label, never
+    /// authoritative — same as [`ConnectRequest::command_pid`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_pid: Option<u32>,
+}
+
+/// The engine's answer to a query.
+///
+/// An empty response means "send nothing back": the query was unparseable or the
+/// upstream failed, and the client's own resolver should retry rather than cache a
+/// synthesized refusal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveReply {
+    #[serde(with = "hex_bytes")]
+    pub response: Vec<u8>,
 }
 
 /// Hex rather than base64 to avoid a dependency for a field this small.
@@ -122,6 +164,17 @@ pub fn pair() -> Result<(OwnedFd, OwnedFd)> {
     )
     .context("creating the relay channel socketpair")?;
     Ok((a, b))
+}
+
+/// The policy engine's ends of the relay's two channels.
+///
+/// Held by the worker. Until both are served, anything the sandbox tries blocks
+/// waiting for a verdict — the right failure direction.
+pub struct EngineChannels {
+    /// Connection decisions, answered with a connected descriptor.
+    pub connect: OwnedFd,
+    /// DNS queries, answered with response bytes.
+    pub resolve: OwnedFd,
 }
 
 /// Send `msg`, optionally passing `fd` alongside it.
@@ -245,6 +298,37 @@ mod tests {
             encode(&r).is_err(),
             "silently truncating a boundary message would be worse than failing"
         );
+    }
+
+    /// A `SEQPACKET` read into too small a buffer truncates the datagram silently, so
+    /// the largest DNS message the resolver will handle must fit *after* hex encoding
+    /// doubles it. This is the check that keeps [`MAX_MESSAGE`] honest.
+    #[test]
+    fn a_maximum_size_dns_message_fits_a_channel_datagram() {
+        let r = ResolveRequest {
+            query: vec![0xab; cowboy_gateway::dns::MAX_DATAGRAM],
+            command_pid: Some(1),
+        };
+        let bytes = encode(&r).expect("a maximum-size DNS datagram must fit");
+        assert!(bytes.len() <= MAX_MESSAGE);
+        assert_eq!(decode::<ResolveRequest>(&bytes).unwrap(), r);
+
+        let reply = ResolveReply {
+            response: vec![0xcd; cowboy_gateway::dns::MAX_DATAGRAM],
+        };
+        let bytes = encode(&reply).expect("a maximum-size DNS response must fit");
+        assert_eq!(decode::<ResolveReply>(&bytes).unwrap(), reply);
+    }
+
+    /// An empty response is the "drop it" signal, so it must survive the round trip
+    /// as *empty* rather than becoming an error or a stray byte.
+    #[test]
+    fn an_empty_dns_response_round_trips_as_a_drop() {
+        let reply = ResolveReply {
+            response: Vec::new(),
+        };
+        let bytes = encode(&reply).unwrap();
+        assert!(decode::<ResolveReply>(&bytes).unwrap().response.is_empty());
     }
 
     #[test]

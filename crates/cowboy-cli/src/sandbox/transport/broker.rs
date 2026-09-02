@@ -1,9 +1,16 @@
-//! The host side of the relay channel: decide, dial, hand back a descriptor.
+//! The host side of the relay channels: decide, dial, hand back a descriptor — and
+//! answer DNS.
 //!
-//! Runs in the worker, on the trusted side of the boundary. For each request it
-//! classifies the connection, asks the policy engine, and — only on `Allow` — dials
-//! the destination **in the host network namespace** and passes the connected
-//! descriptor back.
+//! Runs in the worker, on the trusted side of the boundary. For each connection
+//! request it classifies, asks the policy engine, and — only on `Allow` — dials the
+//! destination **in the host network namespace** and passes the connected descriptor
+//! back. For each DNS query it applies the resolver's policy and returns response
+//! bytes.
+//!
+//! Both sit here rather than in the relay for the same reason: the sandbox must hold
+//! no policy, no allow-list, and no resolver address, so there is nothing inside the
+//! boundary to subvert. The relay forwards bytes and receives descriptors; every
+//! decision is made on this side.
 //!
 //! Where authorization comes from matters. The peeked bytes are used to *classify*
 //! (is this TLS, is it HTTP) and to notice a name that disagrees with what the
@@ -21,7 +28,7 @@ use anyhow::{Context, Result};
 use cowboy_core::netproto::{Protocol, Verdict};
 use cowboy_gateway::state::GatewayState;
 
-use super::channel::{self, ConnectReply, ConnectRequest};
+use super::channel::{self, ConnectReply, ConnectRequest, ResolveReply, ResolveRequest};
 
 /// Answer relay requests until the relay goes away.
 ///
@@ -82,6 +89,92 @@ pub fn serve_blocking(
             }
         }
     }
+}
+
+/// Answer relay DNS requests until the relay goes away.
+///
+/// A second thread rather than a branch in [`serve_blocking`], because a query can
+/// wait seconds on an upstream resolver and connection decisions must not queue
+/// behind it. Both threads are the same shape: read a request, decide on the host,
+/// reply.
+pub fn serve_dns_blocking(
+    channel_fd: OwnedFd,
+    state: Arc<GatewayState>,
+    runtime: tokio::runtime::Handle,
+    upstream: Option<SocketAddr>,
+) {
+    if upstream.is_none() {
+        // Worth saying once and loudly: the sandbox will resolve nothing, so nothing
+        // becomes reachable by name. That is the safe direction, but it looks like a
+        // bug from inside, so name the cause.
+        tracing::warn!(
+            "no resolver found in /etc/resolv.conf; DNS in the sandbox will fail. \
+             Names will not resolve, so only IP/CIDR rules can match."
+        );
+    }
+    loop {
+        let received = match channel::recv(channel_fd.as_fd()) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                tracing::debug!("resolve channel closed; dns broker exiting");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "resolve channel read failed; dns broker exiting");
+                return;
+            }
+        };
+        let (bytes, stray) = received;
+        if stray.is_some() {
+            tracing::warn!("relay passed an unexpected descriptor with a query; dropping it");
+        }
+
+        let request: ResolveRequest = match channel::decode(&bytes) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "undecodable resolve request; dropping");
+                let _ = drop_query(channel_fd.as_fd());
+                continue;
+            }
+        };
+
+        // Every gate — record type, name, tunnel shape — is inside `dns::resolve`,
+        // on this side of the boundary.
+        let response = match upstream {
+            Some(up) => {
+                let state = state.clone();
+                runtime
+                    .block_on(async move {
+                        cowboy_gateway::dns::resolve(&request.query, up, &state).await
+                    })
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+
+        let reply = ResolveReply { response };
+        match channel::encode(&reply) {
+            Ok(msg) => {
+                if let Err(e) = channel::send(channel_fd.as_fd(), &msg, None) {
+                    tracing::warn!(error = %e, "could not return a DNS response to the relay");
+                }
+            }
+            Err(e) => {
+                // An oversized response must not leave the relay waiting forever.
+                tracing::warn!(error = %e, "DNS response too large for the channel; dropping");
+                let _ = drop_query(channel_fd.as_fd());
+            }
+        }
+    }
+}
+
+/// Tell the relay to send nothing back. Every request must get exactly one reply, or
+/// the relay's channel lock is held until the session ends.
+fn drop_query(sock: std::os::fd::BorrowedFd<'_>) -> Result<()> {
+    let reply = ResolveReply {
+        response: Vec::new(),
+    };
+    channel::send(sock, &channel::encode(&reply)?, None)
 }
 
 enum Decision {

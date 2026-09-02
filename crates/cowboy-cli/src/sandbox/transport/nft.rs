@@ -33,6 +33,20 @@ use super::TransportConfig;
 ///   nowhere.
 /// - `filter output` then drops by default, which is what stops the residue the
 ///   nat hook cannot carry — non-DNS UDP and ICMP.
+///
+/// Rule order carries meaning. DNS is redirected **before** the loopback bypass,
+/// because a resolver address is very often on loopback: this host's
+/// `/etc/resolv.conf` names the systemd-resolved stub at `127.0.0.53`, and that file
+/// is visible in the sandbox. Bypassing loopback first would have sent every lookup
+/// to an address with no listener inside the namespace — resolution would simply have
+/// failed, and only IP rules would ever have matched. Catching port 53 wherever it is
+/// aimed also means the agent cannot pick a different resolver by writing its own
+/// `resolv.conf` or passing `dig @…`.
+///
+/// TCP port 53 goes to the resolver port too, where nothing listens, rather than to
+/// the relay. Sending it to the relay would treat DNS-over-TCP as an ordinary
+/// connection to the resolver and dial it on the host — carrying queries straight past
+/// every DNS gate. A refused connection is the correct answer.
 pub fn ruleset(cfg: &TransportConfig) -> String {
     let relay = cfg.relay_port;
     let dns = cfg.dns_port;
@@ -40,9 +54,9 @@ pub fn ruleset(cfg: &TransportConfig) -> String {
         "table ip cowboy {{
   chain out {{
     type nat hook output priority dstnat; policy accept;
-    ip daddr 127.0.0.0/8 return
     udp dport 53 dnat to 127.0.0.1:{dns}
     tcp dport 53 dnat to 127.0.0.1:{dns}
+    ip daddr 127.0.0.0/8 return
     meta l4proto tcp dnat to 127.0.0.1:{relay}
   }}
   chain filt {{
@@ -193,6 +207,44 @@ mod tests {
         assert!(
             !r.contains("oifname"),
             "the oif is decided pre-DNAT, so matching it does not work:\n{r}"
+        );
+    }
+
+    /// The regression this ordering fixes. A resolver address is usually on loopback
+    /// (`127.0.0.53` for systemd-resolved, `127.0.0.1` for a local `unbound`), and the
+    /// host's `resolv.conf` is visible in the sandbox — so with the loopback bypass
+    /// first, every lookup went to an address with nothing listening and DNS simply
+    /// did not work. Catching port 53 first also means the agent cannot choose its own
+    /// resolver.
+    #[test]
+    fn dns_is_redirected_before_the_loopback_bypass() {
+        let r = ruleset(&cfg());
+        let out = r.split("chain out").nth(1).unwrap();
+        let udp53 = out.find("udp dport 53").expect("a udp/53 rule");
+        let tcp53 = out.find("tcp dport 53").expect("a tcp/53 rule");
+        let bypass = out
+            .find("ip daddr 127.0.0.0/8 return")
+            .expect("the loopback bypass");
+        assert!(
+            udp53 < bypass && tcp53 < bypass,
+            "a loopback resolver would never reach the relay:\n{out}"
+        );
+    }
+
+    /// DNS-over-TCP must dead-end, not be treated as an ordinary connection. Sent to
+    /// the relay it would be dialled on the host as a plain TCP connection to the
+    /// resolver, carrying queries past every DNS gate.
+    #[test]
+    fn dns_over_tcp_does_not_fall_through_to_the_relay() {
+        let r = ruleset(&cfg());
+        assert!(
+            r.contains("tcp dport 53 dnat to 127.0.0.1:5354"),
+            "tcp/53 must go to the resolver port, not the relay:\n{r}"
+        );
+        let out = r.split("chain out").nth(1).unwrap();
+        assert!(
+            out.find("tcp dport 53").unwrap() < out.find("meta l4proto tcp dnat").unwrap(),
+            "the catch-all TCP rule must not claim port 53 first:\n{out}"
         );
     }
 

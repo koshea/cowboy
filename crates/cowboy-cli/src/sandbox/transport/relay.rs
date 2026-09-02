@@ -19,9 +19,11 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use super::channel::{self, ConnectReply, ConnectRequest, PEEK_BYTES};
+use super::channel::{
+    self, ConnectReply, ConnectRequest, ResolveReply, ResolveRequest, PEEK_BYTES,
+};
 
 /// Serve intercepted TCP for the lifetime of the session.
 ///
@@ -66,7 +68,7 @@ async fn handle(
         dst_ip: original.ip().to_string(),
         dst_port: original.port(),
         peek,
-        command_pid: command_pid_for(peer),
+        command_pid: command_pid_for(peer, ProcNet::Tcp),
     };
 
     let (reply, upstream) = {
@@ -99,6 +101,69 @@ async fn handle(
         Ok((up, down)) => tracing::trace!(dest = %original, up, down, "relay closed"),
         Err(e) => tracing::debug!(dest = %original, error = %e, "relay copy ended"),
     }
+    Ok(())
+}
+
+/// Serve intercepted DNS for the lifetime of the session.
+///
+/// A **dumb pipe, deliberately**. It reads a datagram, forwards the bytes, and writes
+/// back whatever bytes come home. It does not parse DNS, does not know which names
+/// are allowed, and does not know which upstream resolver exists — all of that is on
+/// the host, so there is no DNS policy inside the boundary for the agent to reach.
+///
+/// The one thing it must get right is not mixing up clients: each query is answered
+/// to the address it came from, and the channel is used one exchange at a time.
+pub async fn serve_dns(sock: UdpSocket, channel_fd: OwnedFd) -> Result<()> {
+    let sock = Arc::new(sock);
+    let channel = Arc::new(tokio::sync::Mutex::new(channel_fd));
+    let mut buf = vec![0u8; cowboy_gateway::dns::MAX_DATAGRAM];
+    loop {
+        let (len, client) = match sock.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "dns recv failed");
+                continue;
+            }
+        };
+        let query = buf[..len].to_vec();
+        let sock = sock.clone();
+        let channel = channel.clone();
+        // A task per query so a slow upstream does not stop the socket draining;
+        // they serialize on the channel, which is the most a SEQPACKET pair allows.
+        tokio::spawn(async move {
+            if let Err(e) = resolve_one(&sock, client, query, channel).await {
+                tracing::debug!(error = %e, "dns query not answered");
+            }
+        });
+    }
+}
+
+async fn resolve_one(
+    sock: &UdpSocket,
+    client: SocketAddr,
+    query: Vec<u8>,
+    channel: Arc<tokio::sync::Mutex<OwnedFd>>,
+) -> Result<()> {
+    let request = ResolveRequest {
+        query,
+        command_pid: command_pid_for(client, ProcNet::Udp),
+    };
+    let reply = {
+        let guard = channel.lock().await;
+        let fd: BorrowedFd<'_> = guard.as_fd();
+        channel::send(fd, &channel::encode(&request)?, None)?;
+        let (bytes, stray) = channel::recv(fd)?.context("the policy engine went away")?;
+        if stray.is_some() {
+            tracing::warn!("the engine passed a descriptor with a DNS reply; dropping it");
+        }
+        channel::decode::<ResolveReply>(&bytes)?
+    };
+    // An empty response means drop: the client's resolver retries, rather than
+    // caching something we invented.
+    if reply.response.is_empty() {
+        return Ok(());
+    }
+    sock.send_to(&reply.response, client).await?;
     Ok(())
 }
 
@@ -148,23 +213,39 @@ async fn peek_first_bytes(client: &TcpStream) -> Vec<u8> {
     }
 }
 
-/// Best-effort: which sandboxed process owns the connection from `peer`.
+/// Best-effort: which sandboxed process owns the traffic from `peer`.
 ///
-/// Matches the connection's local port in `/proc/net/tcp` to a socket inode, then
-/// finds the process holding that inode. Only ever a label for the prompt, so every
-/// failure path returns `None` rather than an error — and it is looked up before the
-/// verdict is known, which is the only point where the socket is still open.
-fn command_pid_for(peer: SocketAddr) -> Option<u32> {
-    let inode = socket_inode_for_local_port(peer.port())?;
+/// Finds the socket in the session network namespace whose local port is the client's,
+/// then the process holding that socket's inode. Only ever a label for the prompt, so
+/// every failure path returns `None` rather than an error — and it is looked up while
+/// the socket is still open, which is the only point where it can be.
+fn command_pid_for(peer: SocketAddr, proto: ProcNet) -> Option<u32> {
+    let inode = socket_inode_for_local_port(proto, peer.port())?;
     pid_holding_inode(inode)
 }
 
-/// Find the socket inode whose *remote* port matches the client's local port.
+/// Which table to search. TCP and UDP have separate ones with the same layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcNet {
+    Tcp,
+    Udp,
+}
+
+impl ProcNet {
+    fn path(self) -> &'static str {
+        match self {
+            ProcNet::Tcp => "/proc/net/tcp",
+            ProcNet::Udp => "/proc/net/udp",
+        }
+    }
+}
+
+/// Find the inode of the *client's* socket by its local port.
 ///
-/// From the relay's side of the connection the client's port appears as the remote
-/// end, so we scan for it there.
-fn socket_inode_for_local_port(port: u16) -> Option<u64> {
-    let text = std::fs::read_to_string("/proc/net/tcp").ok()?;
+/// The client here is the agent's process, so its own socket is the one whose
+/// `local_address` port matches — not the relay's end, which has the relay's port.
+fn socket_inode_for_local_port(proto: ProcNet, port: u16) -> Option<u64> {
+    let text = std::fs::read_to_string(proto.path()).ok()?;
     for line in text.lines().skip(1) {
         let f: Vec<&str> = line.split_whitespace().collect();
         if f.len() < 10 {
@@ -238,7 +319,8 @@ mod tests {
     fn parsing_proc_net_tcp_finds_a_port() {
         // The lookup is best-effort; assert it does not panic on real input and
         // returns nothing for a port that cannot be in use.
-        assert_eq!(socket_inode_for_local_port(0), None);
+        assert_eq!(socket_inode_for_local_port(ProcNet::Tcp, 0), None);
+        assert_eq!(socket_inode_for_local_port(ProcNet::Udp, 0), None);
     }
 
     #[test]

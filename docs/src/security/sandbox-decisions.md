@@ -467,3 +467,90 @@ controls back that up:
 
 Deliberately **not** dependent on `LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`, so no
 Landlock ABI feature is load-bearing for this boundary.
+
+
+## DNS is redirected before the loopback bypass
+
+The nat chain's first job used to be `ip daddr 127.0.0.0/8 return`, so that the
+agent's own loopback traffic (its dev server, and the relay itself) is not
+rewritten. Put DNS after that rule and DNS silently does not work, because a
+resolver address is usually *on* loopback: this host's `/etc/resolv.conf` names
+the systemd-resolved stub at `127.0.0.53`, and that file is visible inside the
+sandbox. Every lookup went to a loopback address with nothing listening.
+
+Port 53 is therefore matched **first**, wherever it is aimed. That has a second
+benefit: the agent cannot choose a different resolver by writing its own
+`resolv.conf` or by passing `dig @8.8.8.8`. There is a test for exactly that — a
+query addressed to `8.8.8.8` comes back REFUSED, which only the host-side resolver
+could have produced (the real `8.8.8.8` would answer NXDOMAIN).
+
+The sandbox is never told which resolver is in use. It sends every query to a
+loopback port; the address of the real upstream is read from `/etc/resolv.conf` on
+the host and never crosses the boundary.
+
+## DNS over TCP dead-ends on purpose
+
+`tcp dport 53` is redirected to the resolver port, where only a UDP socket is
+bound, so it is refused. The tempting alternative — letting it fall through to the
+catch-all TCP rule — would be a hole: the broker would dial it on the host as an
+ordinary TCP connection to a resolver, carrying queries past the record-type gate,
+the name gate, and tunnel detection. A refused connection is the correct answer.
+
+This matches the container era, where TCP/53 was also redirected to a UDP-only
+resolver. The cost is no large-response fallback; with EDNS0 in play, truncation is
+rare.
+
+## The DNS path has its own channel
+
+There are two anonymous socketpairs, not one multiplexed channel. A `SEQPACKET`
+pair carries no request ids, so a reply belongs to whoever holds the socket, which
+means one exchange at a time. On a single shared channel every connection decision
+would queue behind whatever DNS query was waiting on an upstream resolver — seconds,
+in the bad case, and `npm install` issues a lot of both.
+
+The alternative was request ids and a demultiplexer, which puts framing logic on
+the boundary that decides egress policy. A second nameless socket costs one file
+descriptor and no logic, and the trust argument for it is identical to the first.
+
+A related trap: the descriptor numbers the kernel hands out are not ours to choose,
+so a source descriptor may *already* be 3 or 4. `dup2`ing them into place naively
+can clobber the other channel. Both are staged to high numbers with
+`F_DUPFD_CLOEXEC` first.
+
+## The relay is a dumb pipe for DNS
+
+Nothing inside the sandbox parses DNS, gates it, or knows which names are allowed.
+The relay reads a datagram off its loopback socket, forwards the bytes, and writes
+back whatever bytes come home. Record-type gating, name evaluation, tunnel
+detection, transaction-id and question matching, and the `IP → name` map all live on
+the host, in `cowboy_gateway::dns::resolve`.
+
+That function is what makes **domain rules enforceable at all**. Before it, only
+IP and CIDR rules could match, because nothing recorded which name an address
+belonged to. A connection is allowed to an IP because the resolver recorded an
+allowed name for it — never because the client said so, since the agent writes the
+SNI and the `Host` header itself.
+
+### An upstream failure is a drop, not a refusal
+
+`resolve` returns no bytes when the query is unparseable or the upstream does not
+answer, and the relay then sends nothing. Synthesizing REFUSED would be worse than
+silence: the client's resolver caches a refusal as an answer, so a transient
+upstream blip would look like a policy decision for as long as the cache lives.
+
+### An unknown name resolves
+
+This reads like a hole and is not one. A resolver that parked a query on a human
+prompt would simply time out, and resolving is not egress: the connection to
+whatever the name resolved to is gated at connect time, where prompting works and a
+verdict can be cached per host. Only *denied* names, disallowed record types, and
+tunnel-shaped names are refused at the DNS layer — a tunnel's payload **is** the
+query, so there is no later connection to gate.
+
+### No resolver configured means no resolution
+
+If `/etc/resolv.conf` names no usable nameserver, the DNS broker refuses every
+query and says so once, loudly. It deliberately does not fall back to a public
+resolver: silently sending a user's lookups to a third party because their config
+could not be read would be a surprising default, and failing is already the safe
+direction — names stop resolving, so nothing new becomes reachable.

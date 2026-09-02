@@ -28,6 +28,7 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
+use super::transport::channel::{self, EngineChannels};
 use super::transport::{EgressTransport, NftTransport, TransportConfig};
 
 /// Printed by the holder once its namespaces exist and loopback is up.
@@ -50,12 +51,15 @@ impl SessionSandbox {
     /// would be launched with an argument it does not understand and fail with no
     /// useful message. It also keeps this agreeing with the binary the plan binds as
     /// the lockdown shim.
-    /// Returns the session and the **policy engine's end** of the relay channel.
-    /// The caller must serve that end; until it does, every connection the sandbox
-    /// makes blocks waiting for a verdict — the right failure direction.
-    pub fn start(name: &str, holder_exe: &Path) -> Result<(Self, OwnedFd)> {
-        let (engine_end, relay_end) =
-            super::transport::channel::pair().context("creating the relay channel")?;
+    /// Returns the session and the **policy engine's ends** of the relay channels.
+    /// The caller must serve them; until it does, every connection and every lookup
+    /// the sandbox attempts blocks waiting for a verdict — the right failure
+    /// direction.
+    pub fn start(name: &str, holder_exe: &Path) -> Result<(Self, EngineChannels)> {
+        let (engine_connect, relay_connect) =
+            channel::pair().context("creating the relay connect channel")?;
+        let (engine_resolve, relay_resolve) =
+            channel::pair().context("creating the relay resolve channel")?;
         let mut cmd = Command::new("unshare");
         cmd.args(["--user", "--map-root-user", "--net", "--ipc", "--uts", "--"]);
         cmd.arg(holder_exe).arg("x-sandbox-holder");
@@ -66,17 +70,34 @@ impl SessionSandbox {
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
-        // Hand the relay its end of the channel on a fixed descriptor. Rust marks
-        // descriptors CLOEXEC, so it must be duplicated onto the agreed number in the
-        // child — and dup2 clears CLOEXEC, which is what lets it survive the exec.
-        let relay_raw = relay_end.as_raw_fd();
-        let target = super::transport::channel::CHANNEL_FD;
-        // SAFETY: `pre_exec` runs between fork and exec; dup2 is async-signal-safe
-        // and touches only this child's descriptor table.
+        // Hand the relay its ends of the channels on fixed descriptors. Rust marks
+        // descriptors CLOEXEC, so they must be duplicated onto the agreed numbers in
+        // the child — and dup2 clears CLOEXEC, which is what lets them survive the
+        // exec.
+        let sources = [
+            (relay_connect.as_raw_fd(), channel::CONNECT_FD),
+            (relay_resolve.as_raw_fd(), channel::RESOLVE_FD),
+        ];
+        // SAFETY: `pre_exec` runs between fork and exec; fcntl, dup2 and close are
+        // async-signal-safe and touch only this child's descriptor table.
         unsafe {
             cmd.pre_exec(move || {
-                if libc::dup2(relay_raw, target) == -1 {
-                    return Err(std::io::Error::last_os_error());
+                // Move both sources clear of the target numbers first. A source may
+                // *already* be 3 or 4 — the numbers the kernel hands out are not ours
+                // to choose — and a naive dup2 would then clobber the other channel.
+                let mut staged = [0; 2];
+                for (i, (src, _)) in sources.iter().enumerate() {
+                    let high = libc::fcntl(*src, libc::F_DUPFD_CLOEXEC, 16);
+                    if high == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    staged[i] = high;
+                }
+                for (i, (_, target)) in sources.iter().enumerate() {
+                    if libc::dup2(staged[i], *target) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::close(staged[i]);
                 }
                 Ok(())
             });
@@ -86,9 +107,10 @@ impl SessionSandbox {
             "starting the sandbox session holder (is util-linux `unshare` installed, and are \
              unprivileged user namespaces enabled?)",
         )?;
-        // Our copy is not needed once the child holds it, and keeping it open would
-        // stop the broker ever seeing end-of-stream when the relay exits.
-        drop(relay_end);
+        // Our copies are not needed once the child holds them, and keeping them open
+        // would stop the brokers ever seeing end-of-stream when the relay exits.
+        drop(relay_connect);
+        drop(relay_resolve);
         let pid = holder.id();
 
         // Wait for readiness before anyone tries to join: the namespaces do not
@@ -134,7 +156,10 @@ impl SessionSandbox {
                 pid,
                 name: name.to_string(),
             },
-            engine_end,
+            EngineChannels {
+                connect: engine_connect,
+                resolve: engine_resolve,
+            },
         ))
     }
 
@@ -239,7 +264,11 @@ fn join(path: &CString, kind: i32) -> std::io::Result<()> {
 /// It is also the relay. That keeps the topology small and gets the isolation for
 /// free: the holder does not unshare a PID namespace, while every agent command runs
 /// in its own, so no agent process can see the holder at all — which is what protects
-/// the channel it holds to the policy engine.
+/// the channels it holds to the policy engine.
+///
+/// Two listeners, both dumb pipes: TCP for intercepted connections, UDP for DNS.
+/// Neither holds any policy, and the DNS one does not even hold the address of a
+/// resolver — it forwards query bytes to the host and returns whatever comes back.
 pub async fn run_holder() -> Result<()> {
     {
         // Loopback is DOWN in a fresh network namespace, so without this every
@@ -247,12 +276,18 @@ pub async fn run_holder() -> Result<()> {
         // to the relay.
         bring_loopback_up().await?;
 
-        // The relay channel arrives on a known descriptor. Its absence means the
+        // The relay channels arrive on known descriptors. Their absence means the
         // worker did not set up a policy path, so there is nothing to enforce with:
-        // refuse rather than come up with unpoliced networking.
-        let channel = take_channel_fd().context(
-            "the relay channel was not passed to the holder; refusing to \
-                      bring up a session with no policy path",
+        // refuse rather than come up with unpoliced networking. Both are required —
+        // coming up with connections policed but DNS unpoliced would leave the query
+        // itself as an open exfiltration channel.
+        let connect_channel = take_channel_fd(channel::CONNECT_FD).context(
+            "the relay connect channel was not passed to the holder; refusing to \
+             bring up a session with no policy path",
+        )?;
+        let resolve_channel = take_channel_fd(channel::RESOLVE_FD).context(
+            "the relay resolve channel was not passed to the holder; refusing to \
+             bring up a session whose DNS would be unpoliced",
         )?;
 
         let cfg = TransportConfig::default();
@@ -271,9 +306,17 @@ pub async fn run_holder() -> Result<()> {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", cfg.relay_port))
             .await
             .with_context(|| format!("binding the relay on 127.0.0.1:{}", cfg.relay_port))?;
+        let resolver = tokio::net::UdpSocket::bind(("127.0.0.1", cfg.dns_port))
+            .await
+            .with_context(|| format!("binding the resolver on 127.0.0.1:{}", cfg.dns_port))?;
         tokio::spawn(async move {
-            if let Err(e) = super::transport::relay::serve(listener, channel).await {
+            if let Err(e) = super::transport::relay::serve(listener, connect_channel).await {
                 tracing::error!(error = %e, "relay exited");
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = super::transport::relay::serve_dns(resolver, resolve_channel).await {
+                tracing::error!(error = %e, "dns relay exited");
             }
         });
 
@@ -315,20 +358,19 @@ async fn bring_loopback_up() -> Result<()> {
     Ok(())
 }
 
-/// Adopt the relay channel from its inherited descriptor.
+/// Adopt a relay channel from its inherited descriptor.
 ///
 /// Returns `None` when nothing was passed, which the caller treats as fatal.
-fn take_channel_fd() -> Option<OwnedFd> {
+fn take_channel_fd(fd: std::os::fd::RawFd) -> Option<OwnedFd> {
     use std::os::fd::FromRawFd;
     // Confirm something is actually there before claiming ownership: adopting a
     // closed descriptor would fail later and much less clearly.
     // SAFETY: fcntl with F_GETFD only queries the descriptor.
-    let ok = unsafe { libc::fcntl(super::transport::channel::CHANNEL_FD, libc::F_GETFD) } != -1;
-    if !ok {
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
         return None;
     }
     // SAFETY: the worker passed this descriptor and does not use it in the child.
-    Some(unsafe { OwnedFd::from_raw_fd(super::transport::channel::CHANNEL_FD) })
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 #[cfg(test)]
