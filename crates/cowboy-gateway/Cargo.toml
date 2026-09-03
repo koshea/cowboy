@@ -10,10 +10,7 @@ async-trait.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tls-parser.workspace = true
-socket2.workspace = true
 httparse.workspace = true
 hickory-proto.workspace = true
 

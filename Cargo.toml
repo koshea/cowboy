@@ -38,7 +38,7 @@ libc = "0.2"
 # `rust-embed` bakes the trunk-built WASM bundle into the binary (debug-embed so
 # it's embedded in dev builds too; an empty/absent dist falls back to a placeholder).
 axum = { version = "0.8", features = ["ws"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 rust-embed = { version = "8", features = ["debug-embed"] }
 # Terminal QR of the access URL so a phone can scan it (no image deps).
 qrcode = { version = "0.14", default-features = false }
@@ -58,7 +58,7 @@ reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 # MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess
 # transport for local servers + streamable-HTTP (over reqwest) for remote ones. No
 # server/macros features (we never expose an MCP server).
-rmcp = { version = "1", default-features = false, features = [
+rmcp = { version = "3", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
@@ -88,15 +88,13 @@ similar = "3"
 # Display-width of strings (wide CJK / emoji) for aligning Markdown table columns.
 unicode-width = "0.2"
 
-# Note: process-group termination is done in-container (proc supervisor uses
-# `setsid` + `kill -<pgid>`), and `cowboy shell` uses `docker exec -it` for the
-# container PTY — so `process-wrap`/`portable-pty` (local-process crates) are
-# not needed for the docker-exec model.
+# Note: no `process-wrap`/`portable-pty`. Each command runs under its own bwrap in a
+# private PID namespace, so one signal to bwrap reaps the whole tree, and the
+# interactive shell inherits the terminal directly.
 
 # gateway networking (DNS forwarder is a small UDP relay over hickory-proto)
 hickory-proto = "0.26"
 tls-parser = "0.12"
-socket2 = { version = "0.5", features = ["all"] }
 httparse = "1"
 
 # sandbox enforcement (Linux-only, applied in-process by the shim just before exec)

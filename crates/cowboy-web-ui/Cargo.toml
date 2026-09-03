@@ -15,12 +15,10 @@ license = "MIT"
 cowboy-proto = { path = "../cowboy-proto" }
 yew = { version = "0.23", features = ["csr"] }
 gloo-net = { version = "0.7", default-features = false, features = ["http", "websocket", "json"] }
-wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 futures = "0.3"
-gloo-timers = { version = "0.3", features = ["futures"] }
-serde = { version = "1", features = ["derive"] }
+gloo-timers = { version = "0.4", features = ["futures"] }
 serde_json = "1"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 web-sys = { version = "0.3", features = ["Window", "Location", "HtmlTextAreaElement", "KeyboardEvent", "Element"] }

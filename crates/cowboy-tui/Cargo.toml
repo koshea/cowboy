@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 ratatui.workspace = true
 crossterm.workspace = true
-anyhow.workspace = true
 ratatui-textarea.workspace = true
 ansi-to-tui.workspace = true
 throbber-widgets-tui.workspace = true
