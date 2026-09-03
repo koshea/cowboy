@@ -554,3 +554,79 @@ query and says so once, loudly. It deliberately does not fall back to a public
 resolver: silently sending a user's lookups to a third party because their config
 could not be read would be a surprising default, and failing is already the safe
 direction — names stop resolving, so nothing new becomes reachable.
+
+
+## Grants are stored outside the workspace
+
+This is the same rule network approvals already followed, and for the same reason.
+The workspace is mounted read-write into the sandbox, so a grants file kept in
+`.cowboy/` would let a malicious model or a hostile repository widen its own
+filesystem access by writing the file. Grants live host-side, under
+`~/.config/cowboy/grants/` — a project file keyed by the root's hash, plus one
+global file.
+
+The agent therefore cannot grant itself anything. It can only *ask*, with
+`request_path`, and the user answers.
+
+### Being host-side is not enough: the denylist runs at use, not at write
+
+Both grant files are hand-editable, and a global grant outlives the project it was
+made in — a global grant naming `~/work` is fine until some project keeps
+credentials under it. So every grant is re-checked against the credential denylist
+when the plan is built, per command, whatever its origin. A refused entry is
+dropped and reported (once, since this runs per command) rather than failing the
+command, so a stale entry cannot wedge a session.
+
+The user's approval is deliberately **not** the control for credential stores.
+The model chooses the path and writes the justification, so a plausible-sounding
+request for `~/.ssh` is precisely the attack; `request_path` refuses it after
+approval and points at `cowboy secrets add`, which is a deliberate, host-side act.
+
+A test bug worth recording, because it is the failure mode this design is meant to
+survive: the first version of the end-to-end test faked `HostProbe::home()` but not
+`HostProbe::expand()`, so the denylist expanded `~/.aws` against the *real* home and
+the fake credential store was not covered — the sandbox read it, and the test
+correctly failed. An implementation where those two disagree silently shrinks the
+denylist, so the trait now says they must agree.
+
+## `cowboy grant` needs no channel to the worker
+
+A grant takes effect on the next command of a session that is *already running*,
+including one started from a different terminal, and there is no IPC involved. The
+sandbox rebuilds its plan per command and re-reads the store as it does, so writing
+the file is the whole mechanism.
+
+This is worth naming because the obvious design — a `DaemonReq` variant routed to
+the worker, which mutates the live sandbox — is more code, adds a wire message to
+the protocol, and only works while a daemon session exists. Reading a small file
+per command costs nothing measurable and works in every case, including
+`cowboy sandbox exec` and a session that has not started yet.
+
+It also means `cowboy sandbox plan` must include saved grants, or it would describe
+a narrower boundary than commands actually run in. That is the one thing that
+command must never do.
+
+## Lifetime: there is no "once" for a filesystem grant
+
+`ApprovalScope::Once` maps onto a session-lifetime grant. A grant is a mount and a
+Landlock rule established when a command starts, so the smallest unit that can be
+expressed is one command — and a grant that evaporated after a single command would
+just make the agent ask again mid-task. Mapping it rather than adding a fourth
+lifetime keeps one scope type across network and filesystem decisions.
+
+Global scope is not offered in the interactive prompt. Granting a path to *every*
+project is a decision to make deliberately at the CLI (`cowboy grant --global`),
+not while a task is in flight.
+
+## The grant prompt reuses `ask_user`, not the approval modal
+
+`request_path` asks through `AgentUi::ask_user` with three options, rather than the
+`ServerMsg::Approval` modal the network path uses. The modal would have given a
+scope picker for free, but it lives on `SocketUi` alone — so the tool would have
+worked over the daemon socket and silently denied in the console and TUI paths,
+which is the worst kind of difference. `ask_user` is on the trait and implemented by
+every UI, so one code path serves all of them with no new wire message.
+
+Anything that is not an explicit approval denies, including the empty string a
+non-interactive or unattended session returns. A boundary must not widen because
+nobody was watching.

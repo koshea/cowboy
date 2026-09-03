@@ -6,7 +6,7 @@
 //! ago is simply an entry in the next plan. Docker could not do this, because a
 //! container's mounts are fixed when it is created.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,7 @@ use cowboy_sandbox::{Denylist, HostProbe};
 
 use super::bwrap::NetMode;
 use super::exec::{self, ExecRequest};
+use super::grants;
 use super::session::SessionSandbox;
 use super::{ExecResult, Sandbox, StatusRx, StatusTx};
 
@@ -49,6 +50,13 @@ pub struct NativeSandbox {
     /// with; a mismatch means their Landlock domain predates a grant.
     grant_generation: AtomicU64,
     processes: Mutex<BTreeMap<String, Background>>,
+    /// Paths whose persisted grant was refused and already reported, so the notice
+    /// is not repeated for every command in a session.
+    reported_denials: Mutex<BTreeSet<PathBuf>>,
+    /// Where persisted grants are read from and written to. Held as a field rather
+    /// than looked up per call so tests can point it at a temp directory instead of
+    /// the developer's real config.
+    grants_dir: PathBuf,
     status: Mutex<Option<StatusTx>>,
     probe: Box<dyn HostProbe + Send + Sync>,
     session_name: String,
@@ -92,15 +100,40 @@ impl NativeSandbox {
             grants: Mutex::new(Vec::new()),
             grant_generation: AtomicU64::new(0),
             processes: Mutex::new(BTreeMap::new()),
+            reported_denials: Mutex::new(BTreeSet::new()),
+            grants_dir: grants::dir(),
             status: Mutex::new(None),
             probe,
             session_name,
         })
     }
 
+    /// Read and write persisted grants under `dir` instead of the host config dir.
+    ///
+    /// Production callers use the default. This exists so tests can point at a temp
+    /// directory: one that read the developer's real `global.json` would behave
+    /// differently on every machine, and one that wrote there would leave grants
+    /// behind on a real project.
+    pub fn with_grants_dir(mut self, dir: PathBuf) -> Self {
+        self.grants_dir = dir;
+        self
+    }
+
     /// Build the plan for the *next* command, from the current grant set.
+    ///
+    /// The set is assembled here, per command, from two sources: grants approved in
+    /// this session, and grants persisted host-side for this project or globally.
+    /// Reading the persisted file every time is what lets `cowboy grant` in another
+    /// terminal affect a session that is already running — the next command simply
+    /// has a longer bind list — with no IPC to the worker at all.
+    ///
+    /// **Every grant is denylist-checked here**, whatever its origin. Checking only
+    /// at approval time would not be enough: a global grant outlives the project it
+    /// was made in, and both files are hand-editable. A denied entry is dropped and
+    /// reported rather than failing the command, so a stale entry cannot wedge a
+    /// session — but it is reported *once* per path, because this runs per command.
     pub fn plan(&self) -> Result<SandboxPlan> {
-        let grants = self.grants.lock().expect("grants poisoned").clone();
+        let grants = self.effective_grants();
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -111,30 +144,87 @@ impl NativeSandbox {
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }
 
-    /// Approve a path for subsequent commands.
+    /// Session grants first, then persisted ones, minus anything the denylist
+    /// refuses. Session grants lead so an in-session decision wins over a stale
+    /// persisted entry for the same path.
+    fn effective_grants(&self) -> Vec<Grant> {
+        let denylist = Denylist::build(self.probe.as_ref(), &self.root);
+        let session = self.grants.lock().expect("grants poisoned").clone();
+        let mut out: Vec<Grant> = Vec::with_capacity(session.len());
+        for grant in session
+            .into_iter()
+            .chain(grants::load_in(&self.grants_dir, &self.root))
+        {
+            if out.iter().any(|g: &Grant| g.path == grant.path) {
+                continue;
+            }
+            if let Some(reason) = denylist.check(&grant.path) {
+                self.report_denied_grant(&grant, &reason);
+                continue;
+            }
+            out.push(grant);
+        }
+        out
+    }
+
+    /// Report a refused grant once. `plan()` runs per command, so an unconditional
+    /// message would repeat on every step of a task.
+    fn report_denied_grant(&self, grant: &Grant, reason: &cowboy_sandbox::DenyReason) {
+        let first = self
+            .reported_denials
+            .lock()
+            .expect("reported denials poisoned")
+            .insert(grant.path.clone());
+        if first {
+            self.report(format!(
+                "ignoring the saved grant for {}: {}. Remove it with `cowboy grant --remove {}`.",
+                grant.path.display(),
+                reason.explain(),
+                grant.path.display()
+            ));
+        }
+        tracing::warn!(path = %grant.path.display(), "refusing a persisted grant");
+    }
+
+    /// Approve a path for subsequent commands, remembering it for `persistence`.
     ///
-    /// Re-checked against the denylist here as well as at approval time: this is the
-    /// call a persisted or hand-edited grant also passes through, so it is the one
-    /// that has to hold.
-    pub fn add_grant(&self, path: PathBuf, read_only: bool) -> Result<()> {
+    /// Re-checked against the denylist here as well as in [`Self::plan`]: this is the
+    /// call an interactive approval comes through, and refusing at the point of
+    /// approval gives the user an error they can act on rather than a grant that
+    /// silently does nothing.
+    pub fn add_grant(
+        &self,
+        path: PathBuf,
+        read_only: bool,
+        persistence: grants::Persistence,
+    ) -> Result<()> {
         let denylist = Denylist::build(self.probe.as_ref(), &self.root);
         if let Some(reason) = denylist.check(&path) {
             anyhow::bail!("{}", reason.explain());
         }
+        let grant = Grant { path, read_only };
+        if persistence != grants::Persistence::Session {
+            grants::add_in(&self.grants_dir, &self.root, &grant, persistence)
+                .with_context(|| format!("saving the grant for {}", grant.path.display()))?;
+        }
         {
-            let mut grants = self.grants.lock().expect("grants poisoned");
-            if grants.iter().any(|g| g.path == path) {
-                return Ok(());
+            let mut held = self.grants.lock().expect("grants poisoned");
+            match held.iter_mut().find(|g| g.path == grant.path) {
+                // Already granted with the same access: nothing changes, and in
+                // particular no running process needs warning about.
+                Some(existing) if existing.read_only == grant.read_only => return Ok(()),
+                Some(existing) => existing.read_only = grant.read_only,
+                None => held.push(grant),
             }
-            grants.push(Grant { path, read_only });
         }
         self.grant_generation.fetch_add(1, Ordering::SeqCst);
         self.warn_about_stale_processes();
         Ok(())
     }
 
+    /// The grants in force for the next command, including persisted ones.
     pub fn grants(&self) -> Vec<Grant> {
-        self.grants.lock().expect("grants poisoned").clone()
+        self.effective_grants()
     }
 
     /// Running processes whose Landlock domain predates the current grant set, and
@@ -340,6 +430,24 @@ impl NativeSandbox {
 
 #[async_trait]
 impl Sandbox for NativeSandbox {
+    fn add_grant(
+        &self,
+        path: &Path,
+        read_only: bool,
+        persistence: grants::Persistence,
+    ) -> Result<()> {
+        // The inherent method takes an owned path; forward to it so there is one
+        // implementation of the denylist check and the staleness warning.
+        NativeSandbox::add_grant(self, path.to_path_buf(), read_only, persistence)
+    }
+
+    fn granted_paths(&self) -> Vec<(PathBuf, bool)> {
+        self.effective_grants()
+            .into_iter()
+            .map(|g| (g.path, g.read_only))
+            .collect()
+    }
+
     fn root(&self) -> &Path {
         &self.root
     }
@@ -452,15 +560,27 @@ mod tests {
     use super::*;
     use cowboy_sandbox::probe::FakeHost;
 
-    fn sandbox(root: &Path) -> NativeSandbox {
+    /// A sandbox whose grant store is a fresh temp directory.
+    ///
+    /// The `TempDir` is returned and must be kept alive: it is the guard that stops
+    /// the test reading (or writing) the developer's real `~/.config/cowboy/grants`,
+    /// where a stray `global.json` would change what every plan here contains.
+    fn sandbox_with_store(root: &Path) -> (NativeSandbox, assert_fs::TempDir) {
+        let store = assert_fs::TempDir::new().unwrap();
         let probe = FakeHost::new().with_existing(["/usr", root.to_str().unwrap()]);
-        NativeSandbox::new(
+        let s = NativeSandbox::new(
             root.to_path_buf(),
             SecurityConfig::default(),
             Box::new(probe),
             Arc::new(cowboy_gateway::DenyAll),
         )
         .unwrap()
+        .with_grants_dir(store.path().to_path_buf());
+        (s, store)
+    }
+
+    fn sandbox(root: &Path) -> NativeSandbox {
+        sandbox_with_store(root).0
     }
 
     /// Construction must not create namespaces, or `cowboy sandbox plan` and the
@@ -481,7 +601,12 @@ mod tests {
             .iter()
             .any(|b| b.source == Path::new("/srv/other")));
 
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
 
         let after = s.plan().unwrap();
         let b = after
@@ -492,22 +617,205 @@ mod tests {
         assert_eq!(b.mode, cowboy_sandbox::BindMode::ReadOnly);
     }
 
-    /// The denylist applies here too — this is the path a persisted grant takes.
+    /// The denylist applies here too — a refusal at approval time is an error the
+    /// user can act on.
     #[test]
     fn a_denylisted_grant_is_refused() {
         let s = sandbox(Path::new("/srv/proj"));
         let err = s
-            .add_grant(PathBuf::from("/home/dev/.aws"), true)
+            .add_grant(
+                PathBuf::from("/home/dev/.aws"),
+                true,
+                grants::Persistence::Session,
+            )
             .expect_err("credentials must be refused");
         assert!(err.to_string().contains("cowboy secrets add"), "{err}");
         assert!(s.grants().is_empty());
     }
 
+    /// The one that actually holds the line. A grant file is host-owned but
+    /// hand-editable, and a *global* grant outlives the project it was made in — so
+    /// checking only at approval time would let an entry naming credentials be
+    /// honoured forever after. Every grant is re-checked when the plan is built.
+    #[test]
+    fn a_persisted_grant_naming_credentials_is_refused_when_used() {
+        let (mut s, store) = sandbox_with_store(Path::new("/srv/proj"));
+        let mut rx = s.status_channel();
+
+        // Write it straight into the store, bypassing `add_grant` — exactly what a
+        // hand-edited file (or one written by an older, laxer version) looks like.
+        grants::add_in(
+            store.path(),
+            Path::new("/srv/proj"),
+            &Grant {
+                path: PathBuf::from("/home/dev/.aws"),
+                read_only: true,
+            },
+            grants::Persistence::Global,
+        )
+        .unwrap();
+
+        let plan = s.plan().unwrap();
+        assert!(
+            !plan
+                .binds
+                .iter()
+                .any(|b| b.source == Path::new("/home/dev/.aws")),
+            "a saved grant for a credential store must not reach the bind list: {:?}",
+            plan.binds
+        );
+        let msg = rx.try_recv().expect("the refusal must be reported");
+        assert!(
+            msg.contains(".aws"),
+            "the notice should name the path: {msg}"
+        );
+        assert!(
+            msg.contains("--remove"),
+            "the notice should say how to clear it: {msg}"
+        );
+    }
+
+    /// The refusal is reported once, not on every command — `plan()` runs per command
+    /// and a repeated notice would bury the session's real output.
+    #[test]
+    fn a_refused_grant_is_reported_only_once() {
+        let (mut s, store) = sandbox_with_store(Path::new("/srv/proj"));
+        let mut rx = s.status_channel();
+        grants::add_in(
+            store.path(),
+            Path::new("/srv/proj"),
+            &Grant {
+                path: PathBuf::from("/home/dev/.aws"),
+                read_only: true,
+            },
+            grants::Persistence::Project,
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            let _ = s.plan().unwrap();
+        }
+        assert!(rx.try_recv().is_ok(), "reported the first time");
+        assert!(
+            rx.try_recv().is_err(),
+            "and not again for every later command"
+        );
+    }
+
+    /// A grant saved for the project is in force for a new session without being
+    /// re-approved — and, because the plan is rebuilt per command, it also reaches a
+    /// session that was already running when `cowboy grant` wrote it.
+    #[test]
+    fn a_persisted_grant_is_in_force_without_being_re_approved() {
+        let (s, store) = sandbox_with_store(Path::new("/srv/proj"));
+        assert!(!s
+            .plan()
+            .unwrap()
+            .binds
+            .iter()
+            .any(|b| b.source == Path::new("/srv/other")));
+
+        // Stands in for `cowboy grant /srv/other` running in another terminal.
+        grants::add_in(
+            store.path(),
+            Path::new("/srv/proj"),
+            &Grant {
+                path: PathBuf::from("/srv/other"),
+                read_only: false,
+            },
+            grants::Persistence::Project,
+        )
+        .unwrap();
+
+        let b = s
+            .plan()
+            .unwrap()
+            .binds
+            .into_iter()
+            .find(|b| b.source == Path::new("/srv/other"))
+            .expect("the saved grant should apply to the next command");
+        assert_eq!(b.mode, cowboy_sandbox::BindMode::ReadWrite);
+    }
+
+    /// A session decision wins over a stale saved entry for the same path, so
+    /// tightening access in-session is not undone by what is on disk.
+    #[test]
+    fn a_session_grant_wins_over_a_persisted_one_for_the_same_path() {
+        let (s, store) = sandbox_with_store(Path::new("/srv/proj"));
+        grants::add_in(
+            store.path(),
+            Path::new("/srv/proj"),
+            &Grant {
+                path: PathBuf::from("/srv/other"),
+                read_only: false,
+            },
+            grants::Persistence::Project,
+        )
+        .unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
+
+        let matching: Vec<_> = s
+            .plan()
+            .unwrap()
+            .binds
+            .into_iter()
+            .filter(|b| b.source == Path::new("/srv/other"))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "one bind per path, not two: {matching:?}"
+        );
+        assert_eq!(matching[0].mode, cowboy_sandbox::BindMode::ReadOnly);
+    }
+
+    /// Approving at project scope writes it down; approving for the session does not.
+    #[test]
+    fn only_a_persistent_scope_is_written_to_the_store() {
+        let (s, store) = sandbox_with_store(Path::new("/srv/proj"));
+        s.add_grant(
+            PathBuf::from("/srv/session-only"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
+        assert!(grants::load_in(store.path(), Path::new("/srv/proj")).is_empty());
+
+        s.add_grant(
+            PathBuf::from("/srv/kept"),
+            true,
+            grants::Persistence::Project,
+        )
+        .unwrap();
+        assert_eq!(
+            grants::load_in(store.path(), Path::new("/srv/proj"))
+                .into_iter()
+                .map(|g| g.path)
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/srv/kept")]
+        );
+    }
+
     #[test]
     fn granting_the_same_path_twice_is_idempotent() {
         let s = sandbox(Path::new("/srv/proj"));
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
         assert_eq!(s.grants().len(), 1);
     }
 
@@ -527,7 +835,12 @@ mod tests {
             },
         );
 
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
 
         let msg = rx.try_recv().expect("a notice should have been emitted");
         assert!(
@@ -558,7 +871,12 @@ mod tests {
             );
         }
 
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
 
         let msg = rx.try_recv().expect("a notice should have been emitted");
         assert!(msg.contains("web") && msg.contains("worker"), "{msg}");
@@ -583,7 +901,12 @@ mod tests {
             "no grants yet, nothing stale"
         );
 
-        s.add_grant(PathBuf::from("/srv/other"), true).unwrap();
+        s.add_grant(
+            PathBuf::from("/srv/other"),
+            true,
+            grants::Persistence::Session,
+        )
+        .unwrap();
         assert_eq!(s.stale_processes(), vec!["web".to_string()]);
 
         // Restarting it clears the staleness.

@@ -21,6 +21,7 @@ pub const TOOL_HANDOFF: &str = "handoff";
 pub const TOOL_BLOCKED: &str = "blocked";
 pub const TOOL_UNBLOCK: &str = "unblock";
 pub const TOOL_DECISION: &str = "decision";
+pub const TOOL_REQUEST_PATH: &str = "request_path";
 pub const TOOL_PROPOSE_SCOPE_CHANGE: &str = "propose_scope_change";
 /// Conditional: added only when ≥1 MCP server is enabled (see [`mcp_definition`]).
 pub const TOOL_MCP: &str = "mcp";
@@ -212,6 +213,21 @@ pub struct BlockedArgs {
     pub waiting_on: Option<Vec<String>>,
 }
 
+/// Arguments for the `request_path` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RequestPathArgs {
+    /// The host path you need, e.g. `/home/me/other-project` or `~/datasets`.
+    pub path: String,
+    /// Why you need it, in one line. Shown to the user verbatim — this is what they
+    /// decide on, so be specific ("the shared proto definitions the client imports",
+    /// not "for the task").
+    pub reason: String,
+    /// Whether read-only access is enough. Ask for read-only unless you must write:
+    /// it is far more likely to be approved. Defaults to read-only.
+    #[serde(default)]
+    pub read_only: Option<bool>,
+}
+
 /// Arguments for the `propose_scope_change` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ProposeScopeChangeArgs {
@@ -395,6 +411,20 @@ pub fn definitions() -> Vec<ToolDef> {
             parameters: schema_for::<DecisionArgs>(),
         },
         ToolDef {
+            name: TOOL_REQUEST_PATH.into(),
+            description: "Ask the user for access to a host path outside the workspace. Use this \
+                          when a command failed because a file or directory does not exist or \
+                          cannot be read, and you believe the path is legitimately needed \
+                          (a sibling repository, a dataset, a shared toolchain). The user \
+                          approves or denies; on approval the path is available to the NEXT \
+                          command, so re-run the command that failed. Already-running processes \
+                          keep their old view and must be restarted. Credential stores \
+                          (~/.aws, ~/.ssh, ~/.gnupg, browser profiles, …) are always refused — \
+                          for those, tell the user to run `cowboy secrets add`."
+                .into(),
+            parameters: schema_for::<RequestPathArgs>(),
+        },
+        ToolDef {
             name: TOOL_BLOCKED.into(),
             description: "Declare that you cannot proceed and need an external input \
                           (a decision, a dependency's artifact, access). Give a clear `reason` \
@@ -474,6 +504,7 @@ mod tests {
                 "artifact",
                 "handoff",
                 "decision",
+                "request_path",
                 "blocked",
                 "unblock",
                 "propose_scope_change",

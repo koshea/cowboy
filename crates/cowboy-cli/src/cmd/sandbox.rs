@@ -111,17 +111,25 @@ fn plan() -> Result<()> {
     let security = load(&root)?;
 
     let probe = RealHost;
+    let denylist = Denylist::build(&probe, &root);
+    // Include saved grants, and drop any the denylist now refuses — exactly what
+    // `NativeSandbox::plan` does per command. Rendering `&[]` here would make this
+    // command describe a narrower boundary than the one commands actually run in,
+    // which is the one thing it must never do.
+    let grants: Vec<_> = crate::sandbox::grants::load_in(&crate::sandbox::grants::dir(), &root)
+        .into_iter()
+        .filter(|g| denylist.check(&g.path).is_none())
+        .collect();
     // A representative mask path; the executor creates the real one per session.
     let mask = PathBuf::from("<mask: empty read-only file>");
     let inputs = PlanInputs {
         root: &root,
         security: &security,
-        grants: &[],
+        grants: &grants,
         mask_file: &mask,
         relay_port: crate::sandbox::RELAY_PORT,
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
-    let denylist = Denylist::build(&probe, &root);
     println!("project {}\n", root.display());
     print!("{}", plan.render(&denylist));
     Ok(())

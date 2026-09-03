@@ -21,6 +21,7 @@ async fn main() -> Result<()> {
         Some(Command::Init(args)) => cmd::init::run(args),
         Some(Command::Doctor) => cmd::doctor::run().await,
         Some(Command::Sandbox(args)) => cmd::sandbox::run(args).await,
+        Some(Command::Grant(args)) => cmd::grant::run(args),
         Some(Command::Shell) => cmd::run::shell().await,
         Some(Command::Run { command }) => cmd::run::run(command).await,
         Some(Command::Patch(args)) => cmd::patch::run(args).await,

@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::tools::{
     self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
-    McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, ShellArgs, SubagentArgs,
-    WriteArgs,
+    McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, RequestPathArgs, ShellArgs,
+    SubagentArgs, WriteArgs,
 };
 use super::ui::AgentUi;
 use crate::sandbox::{ExecResult, Sandbox};
@@ -67,6 +67,17 @@ host has not approved that destination, NOT that the destination is down. Do not
 retry the same blocked host with different tools or flags; instead state plainly \
 which host:port you need and why, and let the user approve it (or proceed without \
 network). If a command cannot access something, observe the failure and continue.
+
+Your filesystem view is also enforced outside your control: you see the project \
+and the host toolchain, not the whole machine. A path outside the project reads as \
+\"No such file or directory\" or \"Permission denied\" even when it exists. If you \
+genuinely need one — a sibling repository, a dataset, a shared toolchain — use \
+`request_path` with the path and a specific reason; the user approves or denies. \
+On approval it is visible to the NEXT command, so re-run the one that failed. Do \
+not retry the same path with different tools first, and do not ask twice for a \
+path that was denied. Credential stores (~/.aws, ~/.ssh, ~/.gnupg, browser \
+profiles) are always refused: if a task needs credentials, say so and tell the \
+user about `cowboy secrets add`.
 
 For a multi-step task, use the `plan` tool to keep a short, visible checklist: \
 lay out the steps up front, keep exactly one step \"in_progress\" at a time, and \
@@ -1762,6 +1773,17 @@ impl<'a> AgentLoop<'a> {
                     }
                     self.messages.push(tool_msg);
                 }
+                tools::TOOL_REQUEST_PATH => {
+                    let Some(args) = self.parse_or_report::<RequestPathArgs>(call) else {
+                        continue;
+                    };
+                    let observation = self.run_request_path(&args);
+                    let tool_msg = Message::tool_result(&call.id, observation);
+                    if let Some(l) = &mut self.logger {
+                        l.log_message(&tool_msg);
+                    }
+                    self.messages.push(tool_msg);
+                }
                 tools::TOOL_BLOCKED => {
                     let Some(args) = self.parse_or_report::<BlockedArgs>(call) else {
                         continue;
@@ -2408,6 +2430,11 @@ mod tests {
         costs: Vec<f64>,
         plans: Vec<Vec<(String, String)>>,
         blocked: Vec<Option<String>>,
+        /// Questions the agent put to the user, so a test can assert on what the
+        /// user would have been shown, not only on the outcome.
+        asks: Vec<String>,
+        /// The answer to give. `None` keeps the historical "yes".
+        ask_answer: Option<String>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
@@ -2430,8 +2457,9 @@ mod tests {
         fn final_message(&mut self, message: &str) {
             self.finals.push(message.to_string());
         }
-        fn ask_user(&mut self, _question: &str, _options: &[String]) -> String {
-            "yes".to_string()
+        fn ask_user(&mut self, question: &str, _options: &[String]) -> String {
+            self.asks.push(question.to_string());
+            self.ask_answer.clone().unwrap_or_else(|| "yes".to_string())
         }
         fn notice(&mut self, msg: &str) {
             self.notices.push(msg.to_string());
@@ -4159,5 +4187,234 @@ mod tests {
         assert!(partial.contains("Found 2 real issues"));
         assert!(partial.contains("[x] Review auth"));
         assert!(partial.contains("[ ] Review export"));
+    }
+    // -----------------------------------------------------------------------
+    // request_path: the agent asks, the user decides
+    // -----------------------------------------------------------------------
+
+    /// A native sandbox whose grant store is a temp directory, plus the project root
+    /// and the store guard (both must outlive the loop).
+    fn native_for_grants() -> (
+        crate::sandbox::native::NativeSandbox,
+        assert_fs::TempDir,
+        assert_fs::TempDir,
+    ) {
+        let project = assert_fs::TempDir::new().unwrap();
+        std::fs::create_dir_all(project.path().join(".cowboy")).unwrap();
+        let store = assert_fs::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let sandbox = crate::sandbox::native::NativeSandbox::new(
+            root,
+            SecurityConfig::default(),
+            Box::new(crate::cmd::sandbox::RealHost),
+            std::sync::Arc::new(cowboy_gateway::DenyAll),
+        )
+        .unwrap()
+        .with_grants_dir(store.path().to_path_buf());
+        (sandbox, project, store)
+    }
+
+    fn request_path_response(path: &std::path::Path, read_only: bool) -> ChatResponse {
+        ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call(
+                "1",
+                "request_path",
+                &serde_json::json!({
+                    "path": path.to_str().unwrap(),
+                    "reason": "the shared proto definitions the client imports",
+                    "read_only": read_only,
+                })
+                .to_string(),
+            )],
+        }
+    }
+
+    fn finished(message: &str) -> ChatResponse {
+        ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call(
+                "2",
+                "final",
+                &serde_json::json!({"message": message}).to_string(),
+            )],
+        }
+    }
+
+    /// The whole point: an approved request widens the *next* command's view.
+    #[tokio::test]
+    async fn an_approved_request_path_grants_the_path() {
+        let wanted = assert_fs::TempDir::new().unwrap();
+        let wanted_path = std::fs::canonicalize(wanted.path()).unwrap();
+        let (sandbox, _project, _store) = native_for_grants();
+
+        let model = ScriptedModel::new(vec![
+            request_path_response(&wanted_path, true),
+            finished("done"),
+        ]);
+        let mut ui = RecordingUi {
+            ask_answer: Some("allow for this session".into()),
+            ..Default::default()
+        };
+        {
+            let mut agent = AgentLoop::new(
+                Box::new(model),
+                sandbox,
+                cowboy_core::config::AgentBehavior::default(),
+                200_000,
+                CancellationToken::new(),
+                &mut ui,
+            );
+            agent.run("read the protos").await.unwrap();
+            let granted = agent.runtime.granted_paths();
+            assert_eq!(granted.len(), 1, "the path should be granted: {granted:?}");
+            assert_eq!(granted[0].0, wanted_path);
+            assert!(granted[0].1, "read-only was what was asked for");
+        }
+
+        // The user must have been shown the resolved path and the agent's reason —
+        // that is what they are deciding on.
+        let asked = ui.asks.join("\n");
+        assert!(
+            asked.contains(wanted_path.to_str().unwrap()),
+            "the prompt must name the path: {asked}"
+        );
+        assert!(
+            asked.contains("proto definitions"),
+            "the prompt must carry the agent's reason: {asked}"
+        );
+        assert!(
+            asked.contains("read-only"),
+            "the prompt must state the access being asked for: {asked}"
+        );
+    }
+
+    /// Fail closed. An answer that is not an explicit approval — including the empty
+    /// string a non-interactive or unattended session returns — grants nothing.
+    #[tokio::test]
+    async fn an_unanswered_or_denied_request_path_grants_nothing() {
+        for answer in ["", "deny", "no", "maybe later"] {
+            let wanted = assert_fs::TempDir::new().unwrap();
+            let wanted_path = std::fs::canonicalize(wanted.path()).unwrap();
+            let (sandbox, _project, _store) = native_for_grants();
+            let model = ScriptedModel::new(vec![
+                request_path_response(&wanted_path, true),
+                finished("done"),
+            ]);
+            let mut ui = RecordingUi {
+                ask_answer: Some(answer.into()),
+                ..Default::default()
+            };
+            let mut agent = AgentLoop::new(
+                Box::new(model),
+                sandbox,
+                cowboy_core::config::AgentBehavior::default(),
+                200_000,
+                CancellationToken::new(),
+                &mut ui,
+            );
+            agent.run("read the protos").await.unwrap();
+            assert!(
+                agent.runtime.granted_paths().is_empty(),
+                "answer {answer:?} must not widen the boundary"
+            );
+        }
+    }
+
+    /// The user's approval is not the control for credentials. The model chose the
+    /// path and wrote the reason, so a plausible-sounding request for `~/.ssh` is
+    /// exactly the attack — the denylist refuses it *after* approval.
+    ///
+    /// The home directory is faked and the store created for real on disk, so this
+    /// asserts the same thing on every machine instead of quietly skipping wherever
+    /// `~/.ssh` happens not to exist.
+    #[tokio::test]
+    async fn an_approved_request_for_credentials_is_still_refused() {
+        let home = assert_fs::TempDir::new().unwrap();
+        let ssh = home.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let ssh = std::fs::canonicalize(&ssh).unwrap();
+        let fake_home = std::fs::canonicalize(home.path()).unwrap();
+
+        let project = assert_fs::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(project.path()).unwrap();
+        let store = assert_fs::TempDir::new().unwrap();
+        let probe = cowboy_sandbox::probe::FakeHost::new()
+            .with_home(&fake_home)
+            .with_existing(["/usr", root.to_str().unwrap()]);
+        let sandbox = crate::sandbox::native::NativeSandbox::new(
+            root,
+            SecurityConfig::default(),
+            Box::new(probe),
+            std::sync::Arc::new(cowboy_gateway::DenyAll),
+        )
+        .unwrap()
+        .with_grants_dir(store.path().to_path_buf());
+
+        let model = ScriptedModel::new(vec![request_path_response(&ssh, true), finished("done")]);
+        let mut ui = RecordingUi {
+            ask_answer: Some("allow and remember for this project".into()),
+            ..Default::default()
+        };
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        {
+            agent.run("read my ssh key").await.unwrap();
+            assert!(
+                agent.runtime.granted_paths().is_empty(),
+                "an approved credential path must still be refused"
+            );
+            assert!(
+                crate::sandbox::grants::load_in(store.path(), agent.runtime.root()).is_empty(),
+                "and nothing may be written down either"
+            );
+        }
+
+        assert!(
+            !ui.asks.is_empty(),
+            "the request must actually have reached the user, or this proves nothing"
+        );
+        assert!(
+            ui.notices.iter().any(|n| n.contains("refused")),
+            "the refusal must be surfaced: {:?}",
+            ui.notices
+        );
+    }
+
+    /// A path that does not exist is an error the agent can act on, not a grant and
+    /// not a prompt — there is nothing for the user to decide about.
+    #[tokio::test]
+    async fn requesting_a_nonexistent_path_reports_an_error_without_asking() {
+        let (sandbox, _project, _store) = native_for_grants();
+        let model = ScriptedModel::new(vec![
+            request_path_response(std::path::Path::new("/nope/definitely/not/here"), true),
+            finished("done"),
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("read that folder").await.unwrap();
+        assert!(agent.runtime.granted_paths().is_empty());
+        assert!(
+            ui.asks.is_empty(),
+            "the user should not be asked about a path that does not exist: {:?}",
+            ui.asks
+        );
     }
 }

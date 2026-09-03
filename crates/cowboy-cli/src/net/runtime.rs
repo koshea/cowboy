@@ -792,6 +792,29 @@ impl AgentRuntime {
 /// the agent loop and `cmd/*` depend on the seam rather than on Docker.
 #[async_trait::async_trait]
 impl crate::sandbox::Sandbox for AgentRuntime {
+    /// Not available in a container: its mounts are fixed when it is created, which
+    /// is precisely the limitation the host-native sandbox exists to remove. Reported
+    /// as an error rather than silently doing nothing, so the agent tells the user
+    /// something actionable instead of retrying a command that will fail again.
+    fn add_grant(
+        &self,
+        path: &std::path::Path,
+        _read_only: bool,
+        _persistence: crate::sandbox::grants::Persistence,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "this session runs in a container, whose mounts are fixed when it starts, so {} \
+             cannot be granted while it runs. Add it under `container.mounts` in \
+             .cowboy/security.yaml and start a new session.",
+            path.display()
+        )
+    }
+
+    /// A container has no runtime grants — only the mounts it was created with.
+    fn granted_paths(&self) -> Vec<(std::path::PathBuf, bool)> {
+        Vec::new()
+    }
+
     fn root(&self) -> &Path {
         self.root()
     }

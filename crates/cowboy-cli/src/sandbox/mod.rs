@@ -11,6 +11,7 @@
 
 pub mod bwrap;
 pub mod exec;
+pub mod grants;
 pub mod lockdown;
 pub mod native;
 pub mod policy;
@@ -19,7 +20,7 @@ pub mod shim;
 pub mod stream;
 pub mod transport;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -118,4 +119,25 @@ pub trait Sandbox: Send + Sync {
 
     /// Stop the managed background processes declared in `agent.yaml`.
     async fn stop_all_processes(&self) -> Result<()>;
+
+    /// Grant access to a host path for subsequent commands, remembering it for
+    /// `persistence`.
+    ///
+    /// Part of the seam because it is the capability the container could not offer:
+    /// a container's mounts are fixed when it is created, so "let me at that folder"
+    /// meant editing config and restarting. Implementations must refuse anything the
+    /// credential denylist covers, whatever the caller says — the user's approval is
+    /// not the control there, since the path may have been chosen by the model.
+    fn add_grant(
+        &self,
+        path: &Path,
+        read_only: bool,
+        persistence: grants::Persistence,
+    ) -> Result<()>;
+
+    /// Paths granted beyond the configured mounts, and whether each is read-only.
+    ///
+    /// Lets a caller answer "do I already have this?" without asking the user again,
+    /// and lets the boundary be reported without reaching for the implementation.
+    fn granted_paths(&self) -> Vec<(PathBuf, bool)>;
 }

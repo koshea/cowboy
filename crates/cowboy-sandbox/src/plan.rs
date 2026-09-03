@@ -206,7 +206,11 @@ const ETC_ALLOW: &[&str] = &[
 ];
 
 /// A path granted at runtime, after host-side approval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because grants persist between sessions — see
+/// `cowboy_cli::sandbox::grants`, which stores them **outside** the workspace so the
+/// agent cannot grant itself a path.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Grant {
     pub path: PathBuf,
     pub read_only: bool,

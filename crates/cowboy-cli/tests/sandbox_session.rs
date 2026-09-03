@@ -16,7 +16,22 @@ use cowboy_cli::sandbox::Sandbox;
 use cowboy_core::config::{ProcessDef, SecurityConfig};
 use cowboy_sandbox::HostProbe;
 
-struct Host;
+/// The real host, optionally with a faked home directory.
+///
+/// Faking the home is what lets a test put a credential store on disk and assert the
+/// denylist refuses it, without writing anything into the developer's actual `~`.
+struct Host {
+    home: Option<PathBuf>,
+}
+
+impl Host {
+    fn real() -> Self {
+        Self { home: None }
+    }
+    fn with_home(home: PathBuf) -> Self {
+        Self { home: Some(home) }
+    }
+}
 
 impl HostProbe for Host {
     fn exists(&self, path: &Path) -> bool {
@@ -25,11 +40,21 @@ impl HostProbe for Host {
     fn git_common_dir(&self, _root: &Path) -> Option<PathBuf> {
         None
     }
+    /// Must agree with [`Self::home`]: the denylist resolves `~/.aws` and friends
+    /// through here, so a faked home that this ignored would silently shrink the
+    /// denylist — which is exactly the bug the first version of this had.
     fn expand(&self, raw: &str) -> Option<PathBuf> {
-        cowboy_core::config::expand_path(raw).ok()
+        match (&self.home, raw.strip_prefix("~/")) {
+            (Some(h), Some(rest)) => Some(h.join(rest)),
+            (Some(h), None) if raw == "~" => Some(h.clone()),
+            _ => cowboy_core::config::expand_path(raw).ok(),
+        }
     }
     fn home(&self) -> Option<PathBuf> {
-        cowboy_core::config::expand_path("~").ok()
+        match &self.home {
+            Some(h) => Some(h.clone()),
+            None => cowboy_core::config::expand_path("~").ok(),
+        }
     }
     fn self_exe(&self) -> Option<PathBuf> {
         let dir = std::env::current_exe()
@@ -46,7 +71,7 @@ fn unsupported() -> Option<String> {
     if cowboy_cli::sandbox::bwrap::resolve_bwrap().is_err() {
         return Some("bubblewrap not available".into());
     }
-    if Host.self_exe().is_none() {
+    if Host::real().self_exe().is_none() {
         return Some("the cowboy binary is not built alongside the test".into());
     }
     if which("unshare").is_none() {
@@ -115,15 +140,31 @@ impl Project {
 }
 
 fn sandbox(root: &Path) -> NativeSandbox {
+    sandbox_with_store(root).0
+}
+
+/// A sandbox whose persisted-grant store is a temp directory.
+///
+/// The returned `TempDir` must be kept alive for the test: it is what stops the test
+/// reading the developer's real global grants (which would change what the sandbox
+/// can see from machine to machine) or writing into their config dir.
+fn sandbox_with_store(root: &Path) -> (NativeSandbox, assert_fs::TempDir) {
+    sandbox_with_probe(root, Host::real())
+}
+
+fn sandbox_with_probe(root: &Path, probe: Host) -> (NativeSandbox, assert_fs::TempDir) {
+    let store = assert_fs::TempDir::new().unwrap();
     // DenyAll: these tests exercise the sandbox lifecycle, not policy, and an
     // explicit fail-closed approver keeps them from depending on a UI.
-    NativeSandbox::new(
+    let s = NativeSandbox::new(
         root.to_path_buf(),
         SecurityConfig::default(),
-        Box::new(Host),
+        Box::new(probe),
         std::sync::Arc::new(cowboy_gateway::DenyAll),
     )
     .unwrap()
+    .with_grants_dir(store.path().to_path_buf());
+    (s, store)
 }
 
 async fn run(s: &NativeSandbox, command: &str) -> (i32, String) {
@@ -225,7 +266,12 @@ async fn a_grant_applies_to_the_next_command_but_not_the_current_one() {
         "the path must not be reachable before it is granted: {before}"
     );
 
-    s.add_grant(outside_path.clone(), true).unwrap();
+    s.add_grant(
+        outside_path.clone(),
+        true,
+        cowboy_cli::sandbox::grants::Persistence::Session,
+    )
+    .unwrap();
 
     let (code, after) = run(&s, &probe).await;
     assert_eq!(code, 0, "{after}");
@@ -255,8 +301,12 @@ async fn a_running_process_is_reported_as_stale_after_a_grant() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let outside = assert_fs::TempDir::new().unwrap();
-    s.add_grant(std::fs::canonicalize(outside.path()).unwrap(), true)
-        .unwrap();
+    s.add_grant(
+        std::fs::canonicalize(outside.path()).unwrap(),
+        true,
+        cowboy_cli::sandbox::grants::Persistence::Session,
+    )
+    .unwrap();
 
     let mut found = None;
     while let Ok(msg) = notices.try_recv() {
@@ -323,4 +373,99 @@ fn processes_matching(needle: &str) -> usize {
         }
     }
     n
+}
+
+/// The `cowboy grant` story: a grant recorded in the store by *another process* is
+/// picked up by a session that is already running, with no message sent to it.
+///
+/// This is why the plan is rebuilt per command rather than cached — it is what makes
+/// `cowboy grant ~/other-repo` in a second terminal work on the very next command
+/// instead of needing a restart or a control channel to the worker.
+#[tokio::test]
+async fn a_grant_written_by_another_process_reaches_a_running_session() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let (s, store) = sandbox_with_store(&p.path());
+
+    let outside = assert_fs::TempDir::new().unwrap();
+    let outside_path = std::fs::canonicalize(outside.path()).unwrap();
+    std::fs::write(outside_path.join("marker.txt"), "granted-out-of-band").unwrap();
+    let probe = format!("cat {}/marker.txt 2>&1", outside_path.display());
+
+    // Bring the session up and confirm the path is not reachable yet, so the session
+    // is definitely already running when the grant appears.
+    let (_, before) = run(&s, &probe).await;
+    assert!(
+        !before.contains("granted-out-of-band"),
+        "not reachable before the grant: {before}"
+    );
+
+    // Exactly what `cowboy grant <path> --ro` writes.
+    cowboy_cli::sandbox::grants::add_in(
+        store.path(),
+        &p.path(),
+        &cowboy_sandbox::plan::Grant {
+            path: outside_path.clone(),
+            read_only: true,
+        },
+        cowboy_cli::sandbox::grants::Persistence::Project,
+    )
+    .unwrap();
+
+    let (code, after) = run(&s, &probe).await;
+    assert_eq!(code, 0, "{after}");
+    assert!(
+        after.contains("granted-out-of-band"),
+        "a grant recorded out of band must reach the next command of a running \
+         session: {after}"
+    );
+    s.stop().await;
+}
+
+/// A saved grant naming a credential store is refused when it is *used*, not merely
+/// when it was written — the file is host-owned but hand-editable, and a global grant
+/// outlives the project it was made in. Asserted against a real sandbox: the path
+/// must not be readable inside it.
+///
+/// The home directory is faked so this creates its own credential store on disk
+/// rather than writing into the developer's real `~/.aws`, and so it asserts the same
+/// thing on a machine that has no AWS config at all.
+#[tokio::test]
+async fn a_saved_grant_for_credentials_is_refused_by_a_real_sandbox() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let home = assert_fs::TempDir::new().unwrap();
+    let home_path = std::fs::canonicalize(home.path()).unwrap();
+    let aws = home_path.join(".aws");
+    std::fs::create_dir_all(&aws).unwrap();
+    let marker = aws.join("credentials");
+    std::fs::write(&marker, "secret-material").unwrap();
+
+    let (s, store) = sandbox_with_probe(&p.path(), Host::with_home(home_path));
+
+    cowboy_cli::sandbox::grants::add_in(
+        store.path(),
+        &p.path(),
+        &cowboy_sandbox::plan::Grant {
+            path: aws.clone(),
+            read_only: true,
+        },
+        cowboy_cli::sandbox::grants::Persistence::Global,
+    )
+    .unwrap();
+
+    // The grant is definitely on record — so a pass here is the denylist refusing it,
+    // not the grant having failed to be saved.
+    assert!(
+        !cowboy_cli::sandbox::grants::load_in(store.path(), &p.path()).is_empty(),
+        "the test must actually have recorded a grant"
+    );
+
+    let (_, out) = run(&s, &format!("cat {} 2>&1", marker.display())).await;
+    s.stop().await;
+
+    assert!(
+        !out.contains("secret-material"),
+        "a saved grant must not be able to expose a credential store: {out}"
+    );
 }

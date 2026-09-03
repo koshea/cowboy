@@ -10,6 +10,7 @@ pub mod decisions;
 pub mod doctor;
 pub mod down;
 pub mod fileop;
+pub mod grant;
 pub mod handoff;
 pub mod init;
 pub mod logs;

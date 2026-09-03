@@ -346,4 +346,112 @@ impl AgentLoop<'_> {
             }
         }
     }
+    /// Host-side `request_path` tool: ask the user to widen the sandbox's filesystem
+    /// view, and on approval add the grant so the *next* command sees the path.
+    ///
+    /// The decision is the user's, always. The agent supplies a path and a reason and
+    /// gets a yes or a no — it cannot grant itself anything, which is the same reason
+    /// grants are persisted outside the workspace. An empty answer (nobody attached,
+    /// a subagent, a piped stdin) is a denial: a boundary must not widen because no
+    /// one was watching.
+    ///
+    /// Lifetime is offered through [`AgentUi::ask_user`] rather than a new approval
+    /// modal, so this works identically in the TUI, the console, and over the socket
+    /// without a new wire message. Global scope is deliberately not offered here —
+    /// granting a path to *every* project is a decision to make deliberately at the
+    /// CLI (`cowboy grant --global`), not in the middle of a task.
+    pub(super) fn run_request_path(&mut self, args: &RequestPathArgs) -> String {
+        let read_only = args.read_only.unwrap_or(true);
+        let access = if read_only { "read-only" } else { "read-write" };
+
+        // Expand `~` and resolve the real path before asking, so the user is shown
+        // what they are actually approving rather than what the model typed. A
+        // symlink resolved after approval could otherwise point somewhere else.
+        let expanded = match cowboy_core::config::expand_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return format!("error: cannot understand the path `{}`: {e}", args.path),
+        };
+        let resolved = match std::fs::canonicalize(&expanded) {
+            Ok(p) => p,
+            Err(e) => {
+                return format!(
+                    "error: {} does not exist on the host ({e}). Check the path — a grant \
+                     cannot create it.",
+                    expanded.display()
+                )
+            }
+        };
+
+        // Already granted with at least the access being asked for: answer from what
+        // is already true rather than putting the same question to the user twice.
+        // The agent hits this when it retries after forgetting it already asked.
+        if let Some((_, ro)) = self
+            .runtime
+            .granted_paths()
+            .into_iter()
+            .find(|(p, _)| *p == resolved)
+        {
+            if !ro || read_only {
+                return format!(
+                    "{} is already granted ({}). Nothing to approve — re-run the command \
+                     that failed. If it still fails, the problem is not access.",
+                    resolved.display(),
+                    if ro { "read-only" } else { "read-write" }
+                );
+            }
+        }
+
+        let question = format!(
+            "The agent is asking for {access} access to {}\n  why: {}",
+            resolved.display(),
+            args.reason.trim()
+        );
+        let options = vec![
+            "allow for this session".to_string(),
+            "allow and remember for this project".to_string(),
+            "deny".to_string(),
+        ];
+        let answer = self.ui.ask_user(&question, &options);
+        let answer = answer.trim().to_lowercase();
+
+        // Fail closed on anything that is not an explicit approval, including the
+        // empty answer that means "no one could be asked".
+        let persistence = if answer.starts_with("allow and remember") || answer == "2" {
+            crate::sandbox::grants::Persistence::Project
+        } else if answer.starts_with("allow") || answer == "1" {
+            crate::sandbox::grants::Persistence::Session
+        } else {
+            self.ui
+                .notice(&format!("denied access to {}", resolved.display()));
+            return format!(
+                "denied: the user did not approve access to {}. Do not ask again for this \
+                 path; work without it or explain to the user what you cannot do.",
+                resolved.display()
+            );
+        };
+
+        match self.runtime.add_grant(&resolved, read_only, persistence) {
+            Ok(()) => {
+                self.ui.tool_use(&format!(
+                    "granted {access} access to {} ({})",
+                    resolved.display(),
+                    persistence.label()
+                ));
+                format!(
+                    "granted {access} access to {} for {}. It is visible to the NEXT command, \
+                     so re-run the command that failed. Already-running processes keep their \
+                     old view until restarted.",
+                    resolved.display(),
+                    persistence.label()
+                )
+            }
+            // The denylist refuses credential stores even with the user's approval:
+            // consent is not the control here, because the model wrote the path and
+            // a plausible-looking reason is exactly how this would be abused.
+            Err(e) => {
+                self.ui.notice(&format!("refused: {e}"));
+                format!("refused: {e}")
+            }
+        }
+    }
 }

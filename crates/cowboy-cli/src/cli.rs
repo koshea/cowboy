@@ -104,6 +104,13 @@ pub enum Command {
     /// Inspect the sandbox boundary for this project.
     Sandbox(SandboxArgs),
 
+    /// Let the sandbox see a host path outside this project.
+    ///
+    /// Takes effect for the next command, including in a session already running.
+    /// Credential stores (~/.aws, ~/.ssh, browser profiles, …) are always refused —
+    /// use `cowboy secrets add` for those.
+    Grant(GrantArgs),
+
     /// Open an interactive shell inside the agent container.
     Shell,
 
@@ -267,6 +274,31 @@ pub struct SessionWorkerArgs {
 pub struct SandboxArgs {
     #[command(subcommand)]
     pub command: SandboxCommand,
+}
+
+/// `cowboy grant` — record a runtime path grant.
+#[derive(Debug, Args)]
+pub struct GrantArgs {
+    /// The host path to grant. Omit with `--list`.
+    #[arg(value_name = "PATH")]
+    pub path: Option<String>,
+
+    /// Grant read-only access. The default is read-write, since a path you ask for
+    /// by hand is usually one you intend to work in.
+    #[arg(long)]
+    pub ro: bool,
+
+    /// Remember for every project on this machine, not just this one.
+    #[arg(long)]
+    pub global: bool,
+
+    /// Forget a previously granted path.
+    #[arg(long)]
+    pub remove: bool,
+
+    /// Show the saved grants for this project.
+    #[arg(long)]
+    pub list: bool,
 }
 
 #[derive(Debug, Subcommand)]

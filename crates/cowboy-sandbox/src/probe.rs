@@ -22,6 +22,12 @@ pub trait HostProbe {
     fn git_common_dir(&self, root: &Path) -> Option<PathBuf>;
 
     /// Expand a configured path (`~`, `$VAR`) to an absolute one.
+    /// Resolve a configured path, expanding a leading `~`.
+    ///
+    /// Must agree with [`Self::home`]. The denylist resolves credential sources
+    /// (`~/.aws`, `~/.ssh`, …) through this method and separately uses `home()` to
+    /// cover the home directory itself, so an implementation where the two disagree
+    /// silently shrinks the denylist rather than failing.
     fn expand(&self, raw: &str) -> Option<PathBuf>;
 
     /// The user's home directory, for denylist entries expressed relative to it.
@@ -57,6 +63,14 @@ impl FakeHost {
         P: Into<PathBuf>,
     {
         self.existing.extend(paths.into_iter().map(Into::into));
+        self
+    }
+
+    /// Point the home directory at `home`, so a test can place a real credential
+    /// store on disk and have the denylist recognise it — without depending on
+    /// whatever happens to exist in the developer's own home.
+    pub fn with_home(mut self, home: impl Into<PathBuf>) -> Self {
+        self.home = Some(home.into());
         self
     }
 

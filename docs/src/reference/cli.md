@@ -162,6 +162,19 @@ Stop and remove this project's agent + gateway containers and networks
 | `--all` | Remove ALL cowboy-managed containers and networks (every project) |
 
 
+## `cowboy grant`
+
+Let the sandbox see a host path outside this project
+
+| Arg | Description |
+|-----|-------------|
+| `<PATH>` | The host path to grant. Omit with `--list` |
+| `--ro` | Grant read-only access. The default is read-write, since a path you ask for by hand is usually one you intend to work in |
+| `--global` | Remember for every project on this machine, not just this one |
+| `--remove` | Forget a previously granted path |
+| `--list` | Show the saved grants for this project |
+
+
 ## `cowboy handoff`
 
 Print a session's handoff summary (defaults to the most recent)
