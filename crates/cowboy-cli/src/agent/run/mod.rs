@@ -257,7 +257,6 @@ pub struct AgentLoop<'a> {
 struct SubagentPlan {
     exe: std::path::PathBuf,
     root: std::path::PathBuf,
-    session_name: String,
     /// The child's session id (assigned by the parent via `COWBOY_SESSION_ID`), so
     /// the parent advertises it and the UI can watch the child's journal at
     /// `<root>/.cowboy/sessions/<id>/events.jsonl`.
@@ -286,14 +285,18 @@ fn setup_hash(cmds: &[String]) -> String {
     format!("{:016x}", h.finish())
 }
 
-/// Execute one planned subagent: a nested one-shot `cowboy` run sharing this
-/// session's container. No parent borrow, so many can run concurrently.
+/// Execute one planned subagent: a nested one-shot `cowboy` run in the same worktree.
+/// No parent borrow, so many can run concurrently.
+///
+/// The child brings up its **own** sandbox session — it re-derives the same
+/// deterministic session name from the project root, but that name only identifies the
+/// project; nothing is shared. An earlier version also passed the parent's name as
+/// `COWBOY_CONTAINER_NAME`, a leftover of the Docker runtime that nothing read.
 async fn exec_subagent(plan: SubagentPlan) -> String {
     use std::os::unix::process::ExitStatusExt;
     let mut cmd = tokio::process::Command::new(&plan.exe);
     cmd.arg(&plan.task)
         .current_dir(&plan.root)
-        .env("COWBOY_CONTAINER_NAME", &plan.session_name)
         .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
         // Assign the child its session id so its journal lands at a path the parent
         // already advertised (SubagentStarted { id }) and the UI can watch.
@@ -2658,7 +2661,6 @@ impl<'a> AgentLoop<'a> {
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
-            session_name: self.runtime.session_name().to_string(),
             id,
             child_depth: self.subagent_depth + 1,
             task,

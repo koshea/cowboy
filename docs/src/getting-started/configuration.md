@@ -72,7 +72,9 @@ sandbox. The credential *value* never lands in config.
 **Resource limits.** `cpus`/`memory` are enforced with an unprivileged cgroup v2
 (a number/size, `auto` to size from the host, or omit for unlimited). They bound the
 whole session, and they protect the machine rather than the boundary — the sandbox
-confines correctly without them.
+confines correctly without them. Each session gets its **own** cgroup, so several
+sessions in one project (a foreman and its subagents, say) each get the full ceiling
+rather than sharing one between them.
 
 `cpus` also **bounds build parallelism**. Modern `nproc` does read the CPU quota,
 as do Rust's `available_parallelism` and the JVM, but plenty of tools do not (Node's

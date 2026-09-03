@@ -63,6 +63,10 @@ pub struct NativeSandbox {
     /// one project cannot share (or delete) each other's `/tmp`. See
     /// [`crate::project::scratch_key`].
     scratch_key: String,
+    /// Name of this sandbox's cgroup, unique to this instance so concurrent sessions
+    /// in one project get independent limits and independent teardown. See
+    /// [`crate::project::cgroup_key`].
+    cgroup_key: String,
     /// The policy engine that answers the relay.
     ///
     /// Constructed up front rather than attached later: a sandbox with no engine
@@ -85,6 +89,7 @@ impl NativeSandbox {
     ) -> Result<Self> {
         let session_name = crate::project::session_name_for(&root);
         let scratch_key = crate::project::scratch_key(&session_name);
+        let cgroup_key = crate::project::cgroup_key(&session_name);
         // Persisted project/global approvals are merged in here, in one place, so the
         // policy the engine enforces is the same one `cowboy sandbox plan` describes.
         let mut policy = security.network_policy.clone();
@@ -109,6 +114,7 @@ impl NativeSandbox {
             probe,
             session_name,
             scratch_key,
+            cgroup_key,
         })
     }
 
@@ -121,6 +127,13 @@ impl NativeSandbox {
     pub fn with_grants_dir(mut self, dir: PathBuf) -> Self {
         self.grants_dir = dir;
         self
+    }
+
+    /// The name of this sandbox's cgroup, without the `cowboy-` prefix that
+    /// `Cgroup` adds. Exposed so a test can assert against the directory the kernel
+    /// actually reads — the only evidence that limits are per-instance.
+    pub fn cgroup_name(&self) -> &str {
+        &self.cgroup_key
     }
 
     /// The network policy in force, for the caller to log. The sandbox owns the
@@ -320,7 +333,7 @@ impl NativeSandbox {
             // The plan's limits, so what `cowboy sandbox plan` prints is what the
             // session is actually held to.
             let limits = self.plan()?.limits;
-            let (session, channels) = SessionSandbox::start(&self.session_name, &exe, &limits)?;
+            let (session, channels) = SessionSandbox::start(&self.cgroup_key, &exe, &limits)?;
             match session.limits_in_force() {
                 Some(s) => self.report(format!("resource limits: {s}")),
                 None if limits.memory_mib.is_some() || limits.cpus.is_some() => self.report(

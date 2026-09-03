@@ -32,12 +32,43 @@ pub fn project_hash(root: &Path) -> u32 {
 /// delete the other's scratch out from under it. `cowboy sandbox exec` run while an
 /// agent session is live is exactly that case.
 ///
-/// Scoped to the process, not to each `NativeSandbox`: nothing runs two sandboxes for
-/// one project in a single process (the worker has one, the one-off CLI has one), and
-/// a pid is what makes an abandoned directory recognisable as such — see
-/// [`ensure_scratch_dir`].
+/// Scoped to the process, not to each `NativeSandbox`: in production nothing runs two
+/// sandboxes for one project in a single process (the worker has one, the one-off CLI
+/// has one), and a pid is what makes an abandoned directory recognisable as such — see
+/// [`ensure_scratch_dir`], which parses it back out. Two sandboxes in one process (the
+/// integration tests) therefore do share this directory, which is survivable only
+/// because `ensure_scratch_dir` runs per command and recreates what a sibling removed;
+/// the cgroup could not be handled the same way, which is why [`cgroup_key`] is
+/// per-instance.
 pub fn scratch_key(session_name: &str) -> String {
     format!("{session_name}.{}", std::process::id())
+}
+
+/// The name of the cgroup belonging to *one* sandbox instance for `session_name`.
+///
+/// Instance-scoped, and deliberately more so than [`scratch_key`]. The cgroup was
+/// originally named from the project alone, so every concurrent session in one
+/// project — a foreman and its subagents, or `cowboy sandbox exec` run alongside a
+/// live agent — shared a single directory. `Cgroup::create` reuses an existing
+/// directory, so this was silent, and it broke in two ways:
+///
+/// - Whichever session tore down first ran `remove_dir` on the shared cgroup. That
+///   succeeds whenever the directory momentarily holds no processes, which is true
+///   of any sibling sitting idle between commands. Every surviving session then
+///   failed to start its next command with `spawning the sandbox: No such file or
+///   directory` — joining the cgroup is fatal on purpose — leaving an agent alive but
+///   unable to run a single command for the rest of the session.
+/// - The ceilings documented as per-session were really per-project, divided by
+///   however many sessions happened to be live.
+///
+/// A pid is not enough on its own: one process may hold two sandboxes (integration
+/// tests do), so a per-process counter distinguishes them. The `cowboy-` prefix that
+/// [`crate::sandbox::cgroup::reap_empty`] matches on is added by `Cgroup::create`.
+pub fn cgroup_key(session_name: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{session_name}.{}.{seq}", std::process::id())
 }
 
 /// The session's scratch directory, created if absent, with the subdirectories the
@@ -279,4 +310,40 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
             .with_context(|| format!("restricting {} to owner-only", dir.display()))?;
     }
     Ok(dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The same project always yields the same session name — the daemon registry
+    /// finds a session by it without asking a running worker.
+    #[test]
+    fn the_session_name_is_stable_per_project() {
+        let a = session_name_for(Path::new("/tmp/one"));
+        assert_eq!(a, session_name_for(Path::new("/tmp/one")));
+        assert_ne!(a, session_name_for(Path::new("/tmp/two")));
+        assert!(a.starts_with("cowboy-"), "{a}");
+    }
+
+    /// But the cgroup name must **not** be stable per project. It was, once, and two
+    /// sessions in one project then shared a cgroup: the first to stop removed it and
+    /// every sibling's next command died with `No such file or directory`.
+    ///
+    /// A pid alone is not enough — one process can hold two sandboxes — so the names
+    /// must differ within a process too.
+    #[test]
+    fn cgroup_names_are_unique_per_instance() {
+        let name = session_name_for(Path::new("/tmp/one"));
+        let keys: Vec<_> = (0..4).map(|_| cgroup_key(&name)).collect();
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
+        for k in &keys {
+            assert!(
+                k.starts_with("cowboy-"),
+                "the prefix cgroup::reap_empty matches on must survive: {k}"
+            );
+            assert!(k.contains(&format!(".{}.", std::process::id())), "{k}");
+        }
+    }
 }

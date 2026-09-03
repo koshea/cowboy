@@ -658,7 +658,7 @@ async fn the_session_cgroup_is_reaped_on_teardown() {
     assert_eq!(code, 0);
 
     // Find it by name, the way an operator would.
-    let name = s.session_name().to_string();
+    let name = s.cgroup_name().to_string();
     let found = |name: &str| -> Vec<std::path::PathBuf> {
         let out = std::process::Command::new("find")
             .args([
@@ -689,4 +689,95 @@ async fn the_session_cgroup_is_reaped_on_teardown() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("the session cgroup was not reaped: {:?}", found(&name));
+}
+
+/// Regression: one session tearing down must not brick a live sibling.
+///
+/// The cgroup used to be named from the project, so every session in a project shared
+/// one directory (`Cgroup::create` reuses an existing one). `stop()` then removed it
+/// out from under the survivors — `remove_dir` succeeds whenever the cgroup holds no
+/// processes, which is true of any sibling idle *between* commands. Joining the cgroup
+/// is fatal on purpose, so every later command failed with `spawning the sandbox: No
+/// such file or directory` and the session was alive but unable to run anything.
+///
+/// Observed for real: a foreman that spawned four subagents could not run a single
+/// shell command after they finished.
+#[tokio::test]
+async fn a_sibling_teardown_leaves_a_live_session_working() {
+    skip_if_unsupported!();
+    if !cowboy_cli::sandbox::cgroup::available() {
+        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+        return;
+    }
+    let p = Project::new();
+    let (a, _sa) = sandbox_with_store(&p.path());
+    let (b, _sb) = sandbox_with_store(&p.path());
+
+    let (code, out) = run(&a, "echo A-first").await;
+    assert_eq!(code, 0, "{out}");
+
+    // B runs and stops while A sits idle between commands — the foreman/subagent
+    // shape, and the state in which the shared cgroup was removable.
+    let (code, out) = run(&b, "echo B-only").await;
+    assert_eq!(code, 0, "{out}");
+    b.stop().await;
+
+    let (res, out) = a
+        .run_capture("echo A-second", None, 120)
+        .await
+        .expect("A must still be able to run a command after its sibling stopped");
+    a.stop().await;
+    assert_eq!(res.exit_code, 0, "{out}");
+    assert!(out.contains("A-second"), "{out}");
+}
+
+/// And the limits are per-session, not a project-wide ceiling shared out between
+/// however many sessions are live. Sharing one cgroup silently divided the documented
+/// per-session ceiling by the number of siblings.
+#[tokio::test]
+async fn concurrent_sessions_get_independent_cgroups() {
+    skip_if_unsupported!();
+    if !cowboy_cli::sandbox::cgroup::available() {
+        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+        return;
+    }
+    let p = Project::new();
+    let (a, _sa) = sandbox_with_store(&p.path());
+    let (b, _sb) = sandbox_with_store(&p.path());
+    assert_ne!(
+        a.cgroup_name(),
+        b.cgroup_name(),
+        "two sessions in one project must not name the same cgroup"
+    );
+
+    // Bring both up, then assert each has its own directory in the kernel.
+    for s in [&a, &b] {
+        let (code, out) = run(s, "true").await;
+        assert_eq!(code, 0, "{out}");
+    }
+    let dirs = |name: &str| -> Vec<PathBuf> {
+        let out = std::process::Command::new("find")
+            .args([
+                "/sys/fs/cgroup",
+                "-maxdepth",
+                "6",
+                "-type",
+                "d",
+                "-name",
+                &format!("cowboy-{name}"),
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        out.lines().map(PathBuf::from).collect()
+    };
+    let (da, db) = (dirs(a.cgroup_name()), dirs(b.cgroup_name()));
+    assert!(!da.is_empty(), "session A has no cgroup");
+    assert!(!db.is_empty(), "session B has no cgroup");
+    assert!(
+        da.iter().all(|x| !db.contains(x)),
+        "the two sessions share a cgroup directory: {da:?} vs {db:?}"
+    );
+    a.stop().await;
+    b.stop().await;
 }

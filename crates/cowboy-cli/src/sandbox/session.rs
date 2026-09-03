@@ -44,6 +44,11 @@ pub struct SessionSandbox {
     name: String,
     /// Resource ceilings for the session's commands, when the host can enforce them.
     ///
+    /// One cgroup per sandbox **instance**, never per project: the directory is shared
+    /// by anything given the same name, and a shared one is both removed by whichever
+    /// session stops first and divided between all of them. See
+    /// [`crate::project::cgroup_key`].
+    ///
     /// Deliberately does **not** contain the holder. The holder is the relay: if the
     /// agent exhausted `pids.max` or the memory ceiling, enforcement machinery inside
     /// the same cgroup would start failing to fork or allocate, and the failure mode
@@ -54,6 +59,10 @@ pub struct SessionSandbox {
 
 impl SessionSandbox {
     /// Create the session's namespaces.
+    ///
+    /// `name` must be unique to this sandbox instance, not merely to the project —
+    /// it names the session's cgroup, and two sessions sharing one would share (and
+    /// remove) each other's limits. Use [`crate::project::cgroup_key`].
     ///
     /// `holder_exe` must be the `cowboy` binary. It is passed in rather than taken
     /// from `current_exe()` because those differ whenever cowboy is not the running

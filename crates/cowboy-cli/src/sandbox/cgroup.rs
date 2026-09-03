@@ -67,8 +67,10 @@ impl Cgroup {
         // thing has no such window and leaves nothing behind.
         for parent in candidate_parents() {
             let path = parent.join(format!("cowboy-{name}"));
-            // Reuse an existing directory: a session restarting in the same process
-            // should not fail because its previous cgroup was not reaped.
+            // Reuse an existing directory: a session whose holder died restarts with
+            // the same name, and should not fail because its previous cgroup was not
+            // reaped. Names are per-instance (`project::cgroup_key`), so the directory
+            // being reused is always this sandbox's own.
             match std::fs::create_dir(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}

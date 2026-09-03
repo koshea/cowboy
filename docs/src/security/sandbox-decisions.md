@@ -814,6 +814,32 @@ nothing. Both are now covered by
 `cgroup::tests::concurrent_sessions_each_get_enforced_limits`, and the mechanism
 creates the real directory instead of probing.
 
+### The cgroup is per session, not per project
+
+Named per **sandbox instance**, and this is load-bearing rather than tidiness.
+`Cgroup::create` deliberately reuses an existing directory (a session whose holder
+died restarts into the same one), so anything given the same name shares one cgroup.
+When the name came from the project, every concurrent session in a project — a foreman
+and its subagents, or `cowboy sandbox exec` alongside a live agent — shared a single
+directory, with two consequences:
+
+- Whichever session stopped first ran `remove_dir` on it. That succeeds whenever the
+  cgroup momentarily holds no processes, which is true of any sibling sitting idle
+  *between* commands (only per-command bwrap children ever join it). Joining the
+  cgroup is fatal on purpose, so every surviving session's next command failed with
+  `spawning the sandbox: No such file or directory` — an agent still alive, still
+  answering, and unable to run a single shell command for the rest of the session.
+- The ceilings documented as per-session were really per-project, divided by however
+  many sessions happened to be live.
+
+Observed in the wild: a foreman that spawned four subagents ran two commands
+successfully before them and none after. A pid is not sufficient on its own — one
+process can hold two sandboxes — so the name carries a per-process counter as well
+(`project::cgroup_key`). The `cowboy-` prefix that `cgroup::reap_empty` matches on is
+preserved. Pinned by
+`sandbox_session::a_sibling_teardown_leaves_a_live_session_working`, which fails with
+the exact production error against the old naming.
+
 ## `cowboy doctor` checks by doing
 
 Docker had one prerequisite. A host-native sandbox depends on several kernel
