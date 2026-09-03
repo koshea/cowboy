@@ -630,3 +630,91 @@ every UI, so one code path serves all of them with no new wire message.
 Anything that is not an explicit approval denies, including the empty string a
 non-interactive or unattended session returns. A boundary must not widen because
 nobody was watching.
+
+
+## Resource limits use a cgroup, not `setrlimit`
+
+The container runtime bounded memory, CPU and processes for free. Rebuilding that
+was not optional: without it one runaway build takes the machine down, which is a
+worse day than any confinement bug.
+
+`setrlimit` was the obvious route and is the wrong one:
+
+- `RLIMIT_AS` bounds *address space*, not memory in use. A JVM, the Go runtime,
+  ASan, or a memory-mapped database reserves a large virtual mapping without
+  touching it and dies on a limit it never consumed.
+- `RLIMIT_NPROC` is counted per-uid rather than per-process-tree, so the sandbox's
+  process ceiling would be shared with — and consumable by — the user's own login
+  session.
+- Neither can express CPU as a share of the machine.
+
+A cgroup v2 bounds the tree, counts what is actually charged, and is torn down with
+the session. No privilege is needed: on a systemd host `user@<uid>.service` already
+has `cpu memory pids` in its `cgroup.subtree_control`, so the user may create and
+configure a child. The delegated directory is found by walking up from our own
+cgroup rather than hardcoding systemd's layout.
+
+Our own cgroup is skipped when walking up. cgroup v2 forbids a cgroup from holding
+processes *and* enabling controllers for its children, and ours holds us — so a
+child of it could never be given a controller.
+
+Measured, contradicting an earlier code comment: modern `nproc` **does** read
+`cpu.max` (a 4-core quota reports 4 while the affinity mask still shows all 32), as
+do Rust's `available_parallelism` and the JVM. The `MAKEFLAGS`/`CARGO_BUILD_JOBS`
+injection stays anyway, because plenty of tools do not — Node's `os.cpus()` reports
+every host core — and a build sized for 32 cores under a 4-core quota thrashes
+rather than failing.
+
+### The relay stays out of the cgroup
+
+Commands are bounded; the session holder is not. The holder is the relay, so if the
+agent exhausted `pids.max` or the memory ceiling, enforcement machinery inside the
+same cgroup would begin failing to fork or allocate — and the failure mode of a
+resource limit would become a policy outage. The thing being bounded and the thing
+doing the bounding are kept separate.
+
+### A failed join fails the command
+
+The cgroup is joined in `pre_exec`, so a command is bounded before its first
+instruction and there is no window in which it runs unlimited. If that join fails,
+the command fails. That looks harsh for a mechanism explicitly outside the security
+boundary, but the alternative is running unbounded exactly when the user configured
+a ceiling to prevent it.
+
+### The bug this feature nearly shipped with
+
+Deciding whether a parent cgroup was usable was originally done by creating a probe
+directory named after the pid. Two sessions in the *same process* therefore raced on
+one name: the loser saw `EEXIST`, concluded no cgroup subtree was available, and ran
+**unlimited while reporting that limits were in force** — the worst possible failure
+for this feature, and one that surfaced only as an intermittently failing
+end-to-end test.
+
+It also made a sibling test pass vacuously: the fork-bomb test was satisfied by the
+host's own `RLIMIT_NPROC` rather than by the cgroup, so it "passed" while proving
+nothing. Both are now covered by
+`cgroup::tests::concurrent_sessions_each_get_enforced_limits`, and the mechanism
+creates the real directory instead of probing.
+
+## `cowboy doctor` checks by doing
+
+Docker had one prerequisite. A host-native sandbox depends on several kernel
+features a distribution can independently omit, so each is verified by performing
+the real operation rather than by reading a config symbol:
+
+- a user namespace is **created**;
+- the kernel is **asked** its Landlock ABI (via the raw syscall — the `landlock`
+  crate keeps its equivalent private, deliberately, since exposing it invites
+  building rules against an ABI the crate does not know);
+- `seccomp` is confirmed to offer the `errno` action;
+- the **real** interception ruleset is loaded into a throwaway namespace.
+
+That last one is the check worth having. Every nftables module it needs autoloads on
+demand, so inspecting `/proc/modules` says almost nothing, while loading the actual
+ruleset says everything and costs one process.
+
+Every non-`ok` result carries a remedy — a kernel option to set or a package to
+install — because the reader is being asked to change their machine. A prerequisite
+the sandbox cannot run without is a **failure** (so `doctor` exits non-zero);
+resource limits only **warn**, because the boundary does not depend on them. That
+distinction is the reason for having both states, and it is tested.

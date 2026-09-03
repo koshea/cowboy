@@ -132,5 +132,16 @@ fn plan() -> Result<()> {
     let plan = SandboxPlan::build(&inputs, &probe)?;
     println!("project {}\n", root.display());
     print!("{}", plan.render(&denylist));
+    // The plan describes what a command *gets*; a configured ceiling this host cannot
+    // apply would otherwise be printed as though it were in force.
+    let configured = plan.limits.memory_mib.is_some()
+        || plan.limits.cpus.is_some()
+        || plan.limits.pids.is_some();
+    if configured && !crate::sandbox::cgroup::available() {
+        println!(
+            "  NOT ENFORCED: no delegated cgroup v2 subtree on this host. \
+             Run `cowboy doctor` for what to change."
+        );
+    }
     Ok(())
 }

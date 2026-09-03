@@ -41,7 +41,7 @@ use super::shim::ShimRequest;
 /// ruleset and so are unrestricted. That is deliberate — pinning the ABI keeps
 /// enforcement identical across kernel upgrades instead of silently tightening (and
 /// breaking builds) or silently loosening.
-const REQUIRED_ABI: ABI = ABI::V6;
+pub(crate) const REQUIRED_ABI: ABI = ABI::V6;
 
 /// `SOCK_RAW`, and the mask that isolates the socket type from flags like
 /// `SOCK_CLOEXEC`/`SOCK_NONBLOCK` which are OR'd into the same argument.

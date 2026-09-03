@@ -153,12 +153,20 @@ fn sandbox_with_store(root: &Path) -> (NativeSandbox, assert_fs::TempDir) {
 }
 
 fn sandbox_with_probe(root: &Path, probe: Host) -> (NativeSandbox, assert_fs::TempDir) {
+    sandbox_with(root, probe, SecurityConfig::default())
+}
+
+fn sandbox_with(
+    root: &Path,
+    probe: Host,
+    security: SecurityConfig,
+) -> (NativeSandbox, assert_fs::TempDir) {
     let store = assert_fs::TempDir::new().unwrap();
     // DenyAll: these tests exercise the sandbox lifecycle, not policy, and an
     // explicit fail-closed approver keeps them from depending on a UI.
     let s = NativeSandbox::new(
         root.to_path_buf(),
-        SecurityConfig::default(),
+        security,
         Box::new(probe),
         std::sync::Arc::new(cowboy_gateway::DenyAll),
     )
@@ -468,4 +476,145 @@ async fn a_saved_grant_for_credentials_is_refused_by_a_real_sandbox() {
         !out.contains("secret-material"),
         "a saved grant must not be able to expose a credential store: {out}"
     );
+}
+
+/// A memory ceiling is real: a command that allocates past it is killed, and the
+/// machine survives. This is the capability the container runtime provided for free
+/// and that had to be rebuilt — without it one runaway build takes the box down.
+///
+/// Uses the cgroup's own OOM killer, so only the offending process dies; nothing
+/// outside the sandbox is affected.
+#[tokio::test]
+async fn a_memory_ceiling_kills_a_runaway_command_and_not_the_machine() {
+    skip_if_unsupported!();
+    if !cowboy_cli::sandbox::cgroup::available() {
+        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+        return;
+    }
+    let p = Project::new();
+    let security = SecurityConfig {
+        container: cowboy_core::config::ContainerConfig {
+            memory: Some("128m".into()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let (s, _store) = sandbox_with(&p.path(), Host::real(), security);
+
+    // A modest allocation first: the ceiling must not break ordinary work.
+    let (code, out) = run(
+        &s,
+        "python3 -c 'b = bytearray(16 * 1024 * 1024); print(\"ALLOCATED\", len(b))'",
+    )
+    .await;
+    assert_eq!(code, 0, "a small allocation must still succeed: {out}");
+    assert!(out.contains("ALLOCATED"), "{out}");
+
+    // Then past the ceiling, touching every page so it is charged to the cgroup
+    // rather than merely reserved.
+    let (code, out) = run(
+        &s,
+        "python3 -c 'b = bytearray(1024 * 1024 * 1024); b[::4096] = b\"x\" * (len(b)//4096); \
+         print(\"LEAKED\", len(b))' 2>&1",
+    )
+    .await;
+    assert!(
+        !out.contains("LEAKED"),
+        "an allocation past the ceiling must not succeed: {out}"
+    );
+    assert_ne!(code, 0, "the runaway command must fail: {out}");
+
+    // And the session is still usable afterwards — the limit bounded one command,
+    // it did not tear the sandbox down.
+    let (code, out) = run(&s, "echo STILL-ALIVE").await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("STILL-ALIVE"), "{out}");
+    s.stop().await;
+}
+
+/// The process ceiling bounds a fork bomb. `pids.max` is charged to the session's
+/// cgroup, so the refusal lands inside the sandbox and the host's process table is
+/// never at risk.
+#[tokio::test]
+async fn a_fork_bomb_is_bounded_by_the_process_ceiling() {
+    skip_if_unsupported!();
+    if !cowboy_cli::sandbox::cgroup::available() {
+        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+        return;
+    }
+    let p = Project::new();
+    let (s, _store) = sandbox_with_store(&p.path());
+
+    // The default ceiling is 4096, so this asks for more than that and expects to be
+    // refused rather than to succeed 20000 times.
+    let (_, out) = run(
+        &s,
+        r#"python3 -c '
+import os
+n = 0
+try:
+    while n < 20000:
+        if os.fork() == 0:
+            os._exit(0)
+        n += 1
+except OSError:
+    print("FORK REFUSED after", n)
+else:
+    print("NO LIMIT", n)
+' 2>&1"#,
+    )
+    .await;
+    assert!(
+        out.contains("FORK REFUSED"),
+        "the process ceiling must stop a fork bomb: {out}"
+    );
+    s.stop().await;
+}
+
+/// The session's cgroup is reaped on teardown; a long-lived daemon must not leak a
+/// directory per session.
+#[tokio::test]
+async fn the_session_cgroup_is_reaped_on_teardown() {
+    skip_if_unsupported!();
+    if !cowboy_cli::sandbox::cgroup::available() {
+        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+        return;
+    }
+    let p = Project::new();
+    let (s, _store) = sandbox_with_store(&p.path());
+    let (code, _) = run(&s, "true").await;
+    assert_eq!(code, 0);
+
+    // Find it by name, the way an operator would.
+    let name = s.session_name().to_string();
+    let found = |name: &str| -> Vec<std::path::PathBuf> {
+        let out = std::process::Command::new("find")
+            .args([
+                "/sys/fs/cgroup",
+                "-maxdepth",
+                "6",
+                "-type",
+                "d",
+                "-name",
+                &format!("cowboy-{name}"),
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        out.lines().map(std::path::PathBuf::from).collect()
+    };
+    assert!(
+        !found(&name).is_empty(),
+        "the session's cgroup should exist while it runs"
+    );
+
+    s.stop().await;
+    // The holder's exit is what empties it; give the kernel a moment.
+    for _ in 0..20 {
+        if found(&name).is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the session cgroup was not reaped: {:?}", found(&name));
 }

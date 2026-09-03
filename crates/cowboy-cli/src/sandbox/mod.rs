@@ -10,11 +10,13 @@
 //! seam the follow-up portability work plugs into.
 
 pub mod bwrap;
+pub mod cgroup;
 pub mod exec;
 pub mod grants;
 pub mod lockdown;
 pub mod native;
 pub mod policy;
+pub mod preflight;
 pub mod session;
 pub mod shim;
 pub mod stream;

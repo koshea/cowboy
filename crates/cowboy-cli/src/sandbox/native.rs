@@ -297,7 +297,19 @@ impl NativeSandbox {
                 .probe
                 .self_exe()
                 .context("cannot locate the cowboy binary to hold the session namespaces")?;
-            let (session, channels) = SessionSandbox::start(&self.session_name, &exe)?;
+            // The plan's limits, so what `cowboy sandbox plan` prints is what the
+            // session is actually held to.
+            let limits = self.plan()?.limits;
+            let (session, channels) = SessionSandbox::start(&self.session_name, &exe, &limits)?;
+            match session.limits_in_force() {
+                Some(s) => self.report(format!("resource limits: {s}")),
+                None if limits.memory_mib.is_some() || limits.cpus.is_some() => self.report(
+                    "resource limits are configured but cannot be enforced here (no delegated \
+                     cgroup v2 subtree). Run `cowboy doctor` for details."
+                        .to_string(),
+                ),
+                None => {}
+            }
             // Serve both relay channels on dedicated threads. They must be running
             // before any command does, or the first connection blocks on a verdict
             // and the first lookup on a response.

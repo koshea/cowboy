@@ -136,8 +136,12 @@ pub struct ResourceLimits {
     pub pids: Option<u32>,
     /// Build parallelism derived from `cpus`, injected as `MAKEFLAGS` and friends.
     ///
-    /// A cgroup CPU quota does not change what `nproc` reports, so without this a
-    /// build sizes itself from the host's core count and can OOM the box.
+    /// Not redundant with the cgroup quota, though for a different reason than you
+    /// might expect. Modern coreutils `nproc` *does* read `cpu.max` (measured: a
+    /// 4-core quota reports 4 while the affinity mask still shows all 32), and so do
+    /// Rust's `available_parallelism` and the JVM. But plenty of tools do not —
+    /// Node's `os.cpus()` reports every host core — and a build that sizes itself
+    /// from 32 cores under a 4-core quota does not fail, it thrashes.
     pub jobs: Option<u32>,
 }
 
@@ -471,9 +475,15 @@ impl SandboxPlan {
         ));
 
         s.push_str("\nlimits\n");
+        // Spelled out rather than debug-printed: this command exists to be read, and
+        // `memory Some(8192) MiB` is not a sentence anyone wants to parse.
+        let show = |v: Option<String>| v.unwrap_or_else(|| "unlimited".to_string());
         s.push_str(&format!(
-            "  memory {:?} MiB, cpus {:?}, pids {:?}, build jobs {:?}\n",
-            self.limits.memory_mib, self.limits.cpus, self.limits.pids, self.limits.jobs
+            "  memory {}, cpu {}, processes {}, build jobs {}\n",
+            show(self.limits.memory_mib.map(|m| format!("{m} MiB"))),
+            show(self.limits.cpus.map(|c| format!("{c} cores"))),
+            show(self.limits.pids.map(|p| p.to_string())),
+            show(self.limits.jobs.map(|j| j.to_string())),
         ));
 
         s.push_str(&format!(

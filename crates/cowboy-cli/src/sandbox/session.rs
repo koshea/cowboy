@@ -28,8 +28,10 @@ use std::process::{Child, Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
+use super::cgroup::Cgroup;
 use super::transport::channel::{self, EngineChannels};
 use super::transport::{EgressTransport, NftTransport, TransportConfig};
+use cowboy_sandbox::ResourceLimits;
 
 /// Printed by the holder once its namespaces exist and loopback is up.
 const READY: &str = "cowboy-sandbox-ready";
@@ -40,6 +42,14 @@ pub struct SessionSandbox {
     /// The holder's pid, and so the path to its namespace files.
     pid: u32,
     name: String,
+    /// Resource ceilings for the session's commands, when the host can enforce them.
+    ///
+    /// Deliberately does **not** contain the holder. The holder is the relay: if the
+    /// agent exhausted `pids.max` or the memory ceiling, enforcement machinery inside
+    /// the same cgroup would start failing to fork or allocate, and the failure mode
+    /// of a resource limit would become a policy outage. The thing being bounded and
+    /// the thing doing the bounding stay separate.
+    cgroup: Option<Cgroup>,
 }
 
 impl SessionSandbox {
@@ -55,7 +65,11 @@ impl SessionSandbox {
     /// The caller must serve them; until it does, every connection and every lookup
     /// the sandbox attempts blocks waiting for a verdict — the right failure
     /// direction.
-    pub fn start(name: &str, holder_exe: &Path) -> Result<(Self, EngineChannels)> {
+    pub fn start(
+        name: &str,
+        holder_exe: &Path,
+        limits: &ResourceLimits,
+    ) -> Result<(Self, EngineChannels)> {
         let (engine_connect, relay_connect) =
             channel::pair().context("creating the relay connect channel")?;
         let (engine_resolve, relay_resolve) =
@@ -150,11 +164,23 @@ impl SessionSandbox {
             );
         }
 
+        // After readiness, so a failure to bring the session up does not leave a
+        // stray cgroup behind. Not fatal: limits are resource hygiene, not part of
+        // the boundary, so a host that cannot enforce them still runs.
+        let cgroup = match Cgroup::create(name, limits) {
+            Ok(cg) => cg,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not create the session cgroup");
+                None
+            }
+        };
+
         Ok((
             Self {
                 holder,
                 pid,
                 name: name.to_string(),
+                cgroup,
             },
             EngineChannels {
                 connect: engine_connect,
@@ -193,11 +219,27 @@ impl SessionSandbox {
         let net = cstring(self.ns_path("net"))?;
         let ipc = cstring(self.ns_path("ipc"))?;
         let uts = cstring(self.ns_path("uts"))?;
+        // Joining the cgroup here rather than after spawning means the command is
+        // bounded before its first instruction, so there is no window in which it
+        // runs unlimited.
+        let procs = self
+            .cgroup
+            .as_ref()
+            .map(|c| cstring(c.procs_path()))
+            .transpose()?;
 
         // SAFETY: `pre_exec` requires async-signal-safe work only. open/setns/close
         // are raw syscalls with no locking and no allocation.
         unsafe {
             cmd.pre_exec(move || {
+                // Fatal on purpose. `procs` is only set when limits were configured
+                // *and* the cgroup was created, so a failure here means the ceiling
+                // the user asked for is not in force — and running unbounded is the
+                // outcome they configured a limit to prevent. Better a clear failure
+                // than a machine taken down by a build that was supposed to be capped.
+                if let Some(procs) = &procs {
+                    join_cgroup(procs)?;
+                }
                 join(&user, libc::CLONE_NEWUSER)?;
                 join(&net, libc::CLONE_NEWNET)?;
                 join(&ipc, libc::CLONE_NEWIPC)?;
@@ -206,6 +248,12 @@ impl SessionSandbox {
             });
         }
         Ok(())
+    }
+
+    /// What resource ceilings are in force, for the caller to report at bring-up.
+    /// `None` when the host cannot enforce any.
+    pub fn limits_in_force(&self) -> Option<String> {
+        self.cgroup.as_ref().and_then(Cgroup::summary)
     }
 
     /// Tear the session down, releasing its namespaces.
@@ -217,6 +265,10 @@ impl SessionSandbox {
         drop(self.holder.stdin.take());
         let _ = self.holder.kill();
         let _ = self.holder.wait();
+        // Only after the processes are gone: a cgroup with members cannot be removed.
+        if let Some(cg) = &self.cgroup {
+            cg.remove();
+        }
     }
 }
 
@@ -230,6 +282,27 @@ fn cstring(p: PathBuf) -> Result<CString> {
     use std::os::unix::ffi::OsStrExt;
     CString::new(p.as_os_str().as_bytes())
         .with_context(|| format!("namespace path {} contains a NUL", p.display()))
+}
+
+/// Write our own pid into a `cgroup.procs` file. Runs in the pre-exec child, so it
+/// uses raw syscalls and formats the pid without allocating.
+fn join_cgroup(path: &CString) -> std::io::Result<()> {
+    // SAFETY: `path` is a valid NUL-terminated string; the fd is closed below.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // "0" means "the writing process", which avoids formatting a number between
+    // fork and exec — and is exactly what we want, since we are that process.
+    let buf = b"0";
+    // SAFETY: writing a 1-byte buffer we own to a descriptor we just opened.
+    let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+    // SAFETY: closing our own fd.
+    unsafe { libc::close(fd) };
+    if n < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `setns` on a namespace file. Runs in the pre-exec child, so it returns
@@ -384,6 +457,7 @@ mod tests {
             holder: Command::new("true").spawn().unwrap(),
             pid: 4242,
             name: "t".into(),
+            cgroup: None,
         };
         assert_eq!(s.ns_path("net"), PathBuf::from("/proc/4242/ns/net"));
         assert_eq!(s.ns_path("user"), PathBuf::from("/proc/4242/ns/user"));

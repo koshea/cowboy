@@ -63,6 +63,15 @@ pub async fn run() -> Result<()> {
     // Platform.
     r.check("platform", check_platform());
 
+    // The sandbox's host prerequisites. First, because everything else is
+    // configuration: if these fail, nothing runs regardless of how the project is
+    // set up, and a reader should see the cause before the consequences.
+    println!("\n{}", style::bold("sandbox"));
+    for req in crate::sandbox::preflight::check_all() {
+        r.check(req.name, sandbox_status(req));
+    }
+
+    println!("\n{}", style::bold("containers (legacy path)"));
     // Docker.
     r.check("docker", check_command(&["docker", "--version"]));
     r.check(
@@ -73,6 +82,7 @@ pub async fn run() -> Result<()> {
     // Network gateway.
     r.check("network enforcement", check_enforcement());
 
+    println!("\n{}", style::bold("configuration"));
     // Config files.
     r.check("security.yaml", check_security(&paths.security));
     r.check("agent.yaml", check_agent(&paths.agent));
@@ -87,7 +97,7 @@ pub async fn run() -> Result<()> {
         check_credentials(&paths.security, &root),
     );
 
-    // Container images.
+    println!("\n{}", style::bold("container images (legacy path)"));
     r.check("agent image", check_image(&paths.security));
     r.check(
         "gateway image",
@@ -97,10 +107,9 @@ pub async fn run() -> Result<()> {
         ),
     );
 
-    // Compose detection.
     r.check("compose", check_compose(&root));
 
-    // Coordination daemon.
+    println!("\n{}", style::bold("daemon"));
     r.check("cowboyd", check_daemon().await);
 
     println!();
@@ -129,6 +138,21 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Render a sandbox prerequisite as a report line, folding its remedy into the
+/// message — the remedy is the useful half when something is wrong.
+fn sandbox_status(req: crate::sandbox::preflight::Requirement) -> Status {
+    use crate::sandbox::preflight::State;
+    let msg = match &req.remedy {
+        Some(r) => format!("{} → {r}", req.detail),
+        None => req.detail.clone(),
+    };
+    match req.state {
+        State::Ok => Status::Ok(msg),
+        State::Warn => Status::Warn(msg),
+        State::Missing => Status::Fail(msg),
+    }
+}
+
 /// Ping the coordination daemon. Not running is informational (it auto-starts
 /// on the next `cowboy` session), so this only ever warns.
 async fn check_daemon() -> Status {
@@ -144,13 +168,12 @@ async fn check_daemon() -> Status {
 fn check_platform() -> Status {
     match std::env::consts::OS {
         "linux" => Status::Ok("linux".to_string()),
-        // The gateway runs as a sidecar in the agent's netns inside Docker
-        // Desktop's Linux VM, so macOS is fully supported (no host nft needed).
-        "macos" => {
-            Status::Ok("macos (via Docker Desktop; gateway runs as an in-VM sidecar)".to_string())
-        }
-        other => Status::Warn(format!(
-            "{other} is untested; supported hosts are Linux and macOS (Docker Desktop)"
+        // The sandbox is namespaces, Landlock, seccomp and nftables — all Linux
+        // kernel features with no equivalent elsewhere. macOS support went with the
+        // container, deliberately; there is no VM to run this in.
+        other => Status::Fail(format!(
+            "{other} is not supported: the sandbox is built on Linux namespaces, \
+             Landlock and nftables"
         )),
     }
 }
@@ -365,5 +388,75 @@ fn check_compose(root: &Path) -> Status {
         )),
         Ok(None) => Status::Ok("no compose file detected".to_string()),
         Err(e) => Status::Warn(format!("found but unparsable: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sandbox::preflight::{Requirement, State};
+
+    fn req(state: State, remedy: Option<&str>) -> Requirement {
+        Requirement {
+            name: "landlock",
+            state,
+            detail: "ABI 2, but 6 is required".into(),
+            remedy: remedy.map(str::to_string),
+        }
+    }
+
+    /// A prerequisite the sandbox cannot run without must be a **failure**, so
+    /// `doctor` exits non-zero. Downgrading it to a warning would let the command
+    /// report success on a host where every session then fails to start.
+    #[test]
+    fn a_missing_prerequisite_fails_the_run() {
+        let mut r = Report::new();
+        r.check(
+            "landlock",
+            sandbox_status(req(State::Missing, Some("newer kernel"))),
+        );
+        assert_eq!(r.failures, 1);
+        assert_eq!(r.warnings, 0);
+    }
+
+    /// Limits are not part of the boundary, so their absence warns and `doctor` still
+    /// succeeds — the distinction between the two is the point of having both.
+    #[test]
+    fn a_degraded_capability_only_warns() {
+        let mut r = Report::new();
+        r.check(
+            "resource limits",
+            sandbox_status(req(State::Warn, Some("delegate a subtree"))),
+        );
+        assert_eq!(r.failures, 0);
+        assert_eq!(r.warnings, 1);
+    }
+
+    #[test]
+    fn the_remedy_is_shown_with_the_problem() {
+        match sandbox_status(req(State::Missing, Some("enable CONFIG_SECURITY_LANDLOCK"))) {
+            Status::Fail(msg) => {
+                assert!(msg.contains("ABI 2"), "the finding: {msg}");
+                assert!(
+                    msg.contains("enable CONFIG_SECURITY_LANDLOCK"),
+                    "and what to do about it: {msg}"
+                );
+            }
+            _ => panic!("a missing prerequisite must fail"),
+        }
+    }
+
+    /// This host runs the sandbox, so `doctor` must not report a sandbox failure on
+    /// it — otherwise the command is not usable as the preflight it is meant to be.
+    #[test]
+    fn this_host_reports_no_sandbox_failures() {
+        let mut r = Report::new();
+        for c in crate::sandbox::preflight::check_all() {
+            r.check(c.name, sandbox_status(c));
+        }
+        assert_eq!(
+            r.failures, 0,
+            "doctor reports a sandbox failure on a host that runs it"
+        );
     }
 }

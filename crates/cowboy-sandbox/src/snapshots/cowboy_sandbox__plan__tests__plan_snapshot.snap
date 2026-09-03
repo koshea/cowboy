@@ -24,7 +24,7 @@ seccomp
   24 syscalls denied (incl. io_uring_setup), raw sockets denied: true
 
 limits
-  memory Some(4096) MiB, cpus Some(2.0), pids Some(4096), build jobs Some(2)
+  memory 4096 MiB, cpu 2 cores, processes 4096, build jobs 2
 
 never grantable at any approval scope (21 paths)
   /home/dev/.aws
