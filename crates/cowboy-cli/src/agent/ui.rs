@@ -3,6 +3,20 @@
 
 use std::io::Write;
 
+/// A snapshot of what the live prompt costs, for display.
+///
+/// `used + reserve` is what the next request will occupy; `budget` is what the
+/// conversation alone is allowed. `top` names the biggest consumers so the answer to
+/// "why is my context full?" is visible rather than inferred.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContextUsage {
+    pub used: u64,
+    pub budget: u64,
+    pub window: u64,
+    pub reserve: u64,
+    pub top: Vec<(String, u64)>,
+}
+
 /// Events the agent loop reports to a front-end. Methods take `&mut self` and
 /// run on the loop's task (no `Send` requirement on the UI).
 pub trait AgentUi {
@@ -27,6 +41,10 @@ pub trait AgentUi {
     fn file_diff(&mut self, _path: &str, _diff: &str) {}
     /// Running session token estimate (input/output). Default: ignored.
     fn tokens(&mut self, _input: u64, _output: u64) {}
+
+    /// Context-window utilisation for the request just sent. Default no-op: only the
+    /// clients that can display it care.
+    fn context_usage(&mut self, _usage: &ContextUsage) {}
     /// Running estimated session spend in USD. Default: ignored.
     fn cost(&mut self, _usd: f64) {}
     /// The agent's working plan changed: ordered (step, status) pairs where

@@ -259,6 +259,27 @@ pub struct CrewMember {
     pub elapsed_secs: u64,
 }
 
+/// What the live prompt costs, as last reported by the agent loop.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContextSnapshot {
+    pub used: u64,
+    pub budget: u64,
+    pub window: u64,
+    pub reserve: u64,
+    pub top: Vec<(String, u64)>,
+}
+
+impl ContextSnapshot {
+    /// Percentage of the conversation budget in use, saturating at the budget being
+    /// zero (a window too small for the reserve — reported as full, which it is).
+    pub fn percent(&self) -> u64 {
+        if self.budget == 0 {
+            return 100;
+        }
+        (self.used * 100 / self.budget).min(999)
+    }
+}
+
 pub struct App {
     pub title: String,
     pub status: String,
@@ -267,6 +288,9 @@ pub struct App {
     /// Running session token estimate (input/prompt, output/completion).
     pub tokens_in: u64,
     pub tokens_out: u64,
+    /// Latest context-window snapshot: (used, budget, window, reserve) plus the
+    /// biggest consumers. `None` until the first request of the session goes out.
+    pub context: Option<ContextSnapshot>,
     /// Running estimated session spend in USD (0.0 when pricing is unknown).
     pub cost_usd: f64,
     pub transcript: Vec<TranscriptLine>,
@@ -411,6 +435,7 @@ impl App {
             diff: String::new(),
             tokens_in: 0,
             tokens_out: 0,
+            context: None,
             cost_usd: 0.0,
             transcript: Vec::new(),
             streaming: String::new(),
@@ -1339,6 +1364,60 @@ mod tests {
         app.tokens_out = 9_120;
         app.diff = "Δ 2f +30 -4".into();
         insta::assert_snapshot!(render(&app));
+    }
+
+    /// The `/context` report is the answer to "why is my window full?", so what it
+    /// prints is worth pinning: the ratio, the reserve, and the consumers ranked.
+    #[test]
+    fn snapshot_context_report() {
+        let mut app = App::new("~/dev/cowboy  ⎇ main");
+        app.mode = Mode::Idle;
+        app.status = "ready".into();
+        app.context = Some(ContextSnapshot {
+            used: 84_500,
+            budget: 160_000,
+            window: 200_000,
+            reserve: 40_000,
+            top: vec![
+                ("tool results".into(), 41_000),
+                ("model reasoning".into(), 22_000),
+                ("assistant messages".into(), 12_500),
+                ("tool schemas".into(), 3_650),
+                ("your messages".into(), 2_400),
+                ("system + summaries".into(), 1_300),
+            ],
+        });
+        // Rendered by the CLI's `/context` handler; mirrored here so the layout is
+        // reviewable. Percentages and bars are computed from the snapshot.
+        let c = app.context.clone().unwrap();
+        assert_eq!(c.percent(), 52);
+        app.push(LineKind::Notice, "context  84,500/160,000 tokens (52%)");
+        for (label, n) in &c.top {
+            let share = (*n * 20 / c.used).min(20);
+            app.push(
+                LineKind::Notice,
+                format!("  {:<20} {:>9}  {}", label, n, "█".repeat(share as usize)),
+            );
+        }
+        insta::assert_snapshot!(render(&app));
+    }
+
+    /// A budget of zero means the window cannot even hold the reserve. Reporting it as
+    /// 100% is honest; dividing by it is not.
+    #[test]
+    fn context_percent_handles_a_zero_budget() {
+        let c = ContextSnapshot {
+            used: 10,
+            budget: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.percent(), 100);
+        let empty = ContextSnapshot {
+            used: 0,
+            budget: 1000,
+            ..Default::default()
+        };
+        assert_eq!(empty.percent(), 0);
     }
 
     #[test]

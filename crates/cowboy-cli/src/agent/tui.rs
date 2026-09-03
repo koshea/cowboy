@@ -120,6 +120,15 @@ impl AgentUi for TuiUi {
     fn tokens(&mut self, input: u64, output: u64) {
         self.wire(UiEventMsg::Tokens { input, output });
     }
+    fn context_usage(&mut self, u: &crate::agent::ui::ContextUsage) {
+        self.wire(UiEventMsg::ContextUsage {
+            used: u.used,
+            budget: u.budget,
+            window: u.window,
+            reserve: u.reserve,
+            top: u.top.clone(),
+        });
+    }
     fn cost(&mut self, usd: f64) {
         self.wire(UiEventMsg::Cost(usd));
     }
@@ -199,6 +208,21 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
         UiEventMsg::Tokens { input, output } => {
             app.tokens_in = input;
             app.tokens_out = output;
+        }
+        UiEventMsg::ContextUsage {
+            used,
+            budget,
+            window,
+            reserve,
+            top,
+        } => {
+            app.context = Some(cowboy_tui::ContextSnapshot {
+                used,
+                budget,
+                window,
+                reserve,
+                top,
+            });
         }
         UiEventMsg::Cost(usd) => app.cost_usd = usd,
         UiEventMsg::Plan(steps) => app.plan = steps,
@@ -657,6 +681,7 @@ const COMMAND_COMPLETIONS: &[(&str, &str)] = &[
     ),
     ("crew", "[usage] show the crew roster"),
     ("mcp", "list connected MCP servers"),
+    ("context", "context-window usage and what is filling it"),
     ("diff", "working-tree diff"),
     ("copy", "copy the last answer"),
     ("clear", "clear the view"),
@@ -1122,6 +1147,7 @@ const HELP_LINES: &[&str] = &[
     "  /crew [usage]  show the crew roster (model routing) or its usage",
     "  /mcp           list connected MCP servers (manage with `cowboy mcp`)",
     "  /diff          show the working-tree diff",
+    "  /context       context-window usage and what is filling it",
     "  /copy          copy the last answer to the system clipboard",
     "  /clear         clear the view (conversation memory is kept)",
     "  /detach        leave the session running and exit (re-attach later)",
@@ -1135,6 +1161,76 @@ const HELP_LINES: &[&str] = &[
 
 /// `/mcp`: list the configured MCP servers (host + this repo's trust-gated
 /// `.mcp.json`) as notices. Read-only — manage servers with the `cowboy mcp` CLI.
+/// Render the latest context-window snapshot.
+///
+/// Reads state the agent loop already reports every turn rather than asking the worker
+/// for it, so this works while a turn is running and needs no round trip. Before the
+/// first request there is nothing to show, and saying so is better than showing zeroes
+/// that look like an empty context.
+fn context_command(app: &mut App) {
+    let Some(c) = app.context.clone() else {
+        app.push(
+            LineKind::Notice,
+            "no context snapshot yet — send a message first",
+        );
+        return;
+    };
+    let pct = c.percent();
+    app.push(
+        LineKind::Notice,
+        format!(
+            "context  {}/{} tokens of the conversation budget ({pct}%)",
+            fmt_thousands(c.used),
+            fmt_thousands(c.budget)
+        ),
+    );
+    app.push(
+        LineKind::Notice,
+        format!(
+            "         window {} · reserved {} for the reply, tool schemas and headroom",
+            fmt_thousands(c.window),
+            fmt_thousands(c.reserve)
+        ),
+    );
+    if pct >= 80 {
+        app.push(
+            LineKind::Notice,
+            "         near the budget — older turns will be compacted into a summary",
+        );
+    }
+    if c.top.is_empty() {
+        return;
+    }
+    app.push(LineKind::Notice, "         largest first:");
+    for (label, n) in &c.top {
+        // A bar makes the ratio readable at a glance; the number is there for when it
+        // matters.
+        let share = if c.used > 0 {
+            (*n * 20 / c.used.max(1)).min(20)
+        } else {
+            0
+        };
+        let bar: String = "█".repeat(share as usize);
+        app.push(
+            LineKind::Notice,
+            format!("           {:<20} {:>9}  {bar}", label, fmt_thousands(*n)),
+        );
+    }
+}
+
+/// `123456` -> `123,456`, so a five-digit token count is readable.
+fn fmt_thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn mcp_command(app: &mut App, root: &std::path::Path) {
     let cfg = match cowboy_core::mcp::load_or_default() {
         Ok(cfg) => cfg,
@@ -1428,6 +1524,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         }
         "crew" => crew_command(arg, app),
         "mcp" => mcp_command(app, &ctx.session.root),
+        "context" => context_command(app),
         "quit" | "exit" | "q" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {

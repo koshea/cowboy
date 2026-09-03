@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ ~/dev/cowboy  ⎇ main ─────────────────────────╮╭ network ────────────╮
+│context  84,500/160,000 tokens (52%)           ││no network activity  │
+│  tool results             41000  █████████    ││yet                  │
+│  model reasoning          22000  █████        ││                     │
+│  assistant messages       12500  ██           ││                     │
+│  tool schemas              3650               ││                     │
+│  your messages             2400               ││                     │
+│  system + summaries        1300               │╰─────────────────────╯
+│                                               │╭ background ─────────╮
+│                                               ││no background activit│
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+╰───────────────────────────────────────────────╯╰─────────────────────╯
+   ready — ready
+╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯

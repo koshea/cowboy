@@ -415,6 +415,26 @@ pub enum UiEventMsg {
         input: u64,
         output: u64,
     },
+    /// How much of the context window the conversation occupies, as of the request
+    /// just sent.
+    ///
+    /// Distinct from [`UiEventMsg::Tokens`], which is cumulative *spend*. This is a
+    /// snapshot of the live prompt: what it costs now, what it is allowed to cost, and
+    /// where the weight sits. Without it, context pressure is invisible until the model
+    /// truncates — which surfaces as a stall and reads like a mystery.
+    ContextUsage {
+        /// Conversation tokens (messages only).
+        used: u64,
+        /// What the conversation may occupy: window minus the reserve.
+        budget: u64,
+        /// The model's full context window.
+        window: u64,
+        /// Reserved for the response, the tool schemas, and a floor.
+        reserve: u64,
+        /// Biggest consumers as (label, tokens), largest first. Bounded by the
+        /// producer so one journal line stays small.
+        top: Vec<(String, u64)>,
+    },
     /// Running estimated session spend in USD.
     Cost(f64),
     /// The session is blocked (`Some(reason)`) or unblocked (`None`).

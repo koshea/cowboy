@@ -84,6 +84,15 @@ impl AgentUi for JournalUi {
     fn tokens(&mut self, input: u64, output: u64) {
         self.emit(UiEventMsg::Tokens { input, output });
     }
+    fn context_usage(&mut self, u: &crate::agent::ui::ContextUsage) {
+        self.emit(UiEventMsg::ContextUsage {
+            used: u.used,
+            budget: u.budget,
+            window: u.window,
+            reserve: u.reserve,
+            top: u.top.clone(),
+        });
+    }
     fn cost(&mut self, usd: f64) {
         self.emit(UiEventMsg::Cost(usd));
     }

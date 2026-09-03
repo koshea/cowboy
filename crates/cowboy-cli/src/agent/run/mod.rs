@@ -12,7 +12,7 @@ use super::tools::{
     McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, RequestPathArgs, ShellArgs,
     SubagentArgs, WriteArgs,
 };
-use super::ui::AgentUi;
+use super::ui::{AgentUi, ContextUsage};
 use crate::sandbox::{ExecResult, Sandbox};
 use crate::session::SessionLogger;
 
@@ -846,6 +846,55 @@ impl<'a> AgentLoop<'a> {
         self.context_window.saturating_sub(reserve)
     }
 
+    /// A snapshot of what the live prompt costs and where the weight sits.
+    ///
+    /// `top` groups messages by what produced them rather than listing them, because
+    /// the actionable question is "which *kind* of thing is filling my window" — tool
+    /// output, the model's own reasoning, the task and system prompt, or the
+    /// conversation itself. The tool schemas are included because they are sent on
+    /// every request and were the least visible term of all.
+    fn context_usage(&self) -> ContextUsage {
+        let mut reasoning = 0u64;
+        let mut tool_results = 0u64;
+        let mut assistant = 0u64;
+        let mut user = 0u64;
+        let mut system = 0u64;
+        for m in &self.messages {
+            let total = Self::message_tokens(m) as u64;
+            let r = m
+                .reasoning
+                .as_deref()
+                .map(cowboy_core::tokens::count)
+                .unwrap_or(0) as u64;
+            reasoning += r;
+            let rest = total.saturating_sub(r);
+            match m.role {
+                Role::Tool => tool_results += rest,
+                Role::Assistant => assistant += rest,
+                Role::User => user += rest,
+                Role::System => system += rest,
+            }
+        }
+        let mut top: Vec<(String, u64)> = vec![
+            ("tool results".to_string(), tool_results),
+            ("assistant messages".to_string(), assistant),
+            ("model reasoning".to_string(), reasoning),
+            ("your messages".to_string(), user),
+            ("system + summaries".to_string(), system),
+            ("tool schemas".to_string(), self.tools_tokens() as u64),
+        ];
+        top.retain(|(_, n)| *n > 0);
+        top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        top.truncate(6);
+        ContextUsage {
+            used: self.total_tokens() as u64,
+            budget: self.context_budget() as u64,
+            window: self.context_window as u64,
+            reserve: (self.context_window - self.context_budget()) as u64,
+            top,
+        }
+    }
+
     /// Keep the conversation within the context window. When it overflows, fold
     /// the oldest whole turns into a single model-generated summary message
     /// rather than dropping them, so earlier decisions, edits, and facts survive.
@@ -1433,6 +1482,11 @@ impl<'a> AgentLoop<'a> {
                 .iter()
                 .map(Self::message_tokens)
                 .sum::<usize>() as u64;
+            // Report what the request costs before making it, so the pressure is
+            // visible in the UI and the journal rather than only when it overflows.
+            let usage = self.context_usage();
+            self.ui.context_usage(&usage);
+
             let response = match self.call_model().await {
                 Ok(r) => r,
                 Err(_) if self.cancel.is_cancelled() => {
