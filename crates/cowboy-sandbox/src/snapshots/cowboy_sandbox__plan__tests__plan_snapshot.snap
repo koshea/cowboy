@@ -7,12 +7,14 @@ filesystem
   ro  /usr -> /usr   (host toolchain)
   ro  /etc/ssl -> /etc/ssl   (toolchain configuration)
   ro  /etc/resolv.conf -> /etc/resolv.conf   (toolchain configuration)
+  rw  /scratch/tmp -> /tmp   (session scratch (survives between commands, not between sessions))
+  rw  /scratch/run -> /run   (session scratch (survives between commands, not between sessions))
+  rw  /scratch/var-tmp -> /var/tmp   (session scratch (survives between commands, not between sessions))
   rw  /srv/proj -> /workspace   (the project)
   rw  /srv/main/.git/worktrees/wt -> /srv/main/.git/worktrees/wt   (shared git dir (linked worktree))
   ro  /srv/other-repo -> /srv/other-repo   (runtime grant (approved by the user))
   ro  /run/cowboy/mask -> /workspace/.cowboy/security.yaml   (mask host-owned config)
   ro  /run/cowboy/mask -> /workspace/.cowboy/models.yaml   (mask host-owned config)
-  tmpfs /tmp, /run, /var/tmp
   proc /proc   dev /dev
 
 landlock

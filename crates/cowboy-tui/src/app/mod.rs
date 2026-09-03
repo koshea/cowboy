@@ -1199,7 +1199,7 @@ mod tests {
     fn snapshot_welcome_screen() {
         let mut app = App::new("cowboy · 20260614-abcd");
         for l in [
-            "Welcome to cowboy — the agent runs sandboxed in Docker.",
+            "Welcome to cowboy — the agent runs in a sandbox built from your machine.",
             "workspace  /home/dev/myproject",
             "model      anthropic/claude-sonnet-4-6  (gw.local)",
             "branch     main",

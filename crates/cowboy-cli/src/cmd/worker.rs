@@ -690,10 +690,19 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // after `End`. Finalizing the journal and notifying clients/daemon are
     // disk/socket-only and complete promptly.
     agent.finalize_session();
+    // Stops serving and unlinks the socket, so the session is un-attachable from this
+    // moment — before the teardown below, which is bounded but not instant.
     emitter.end("session ended");
     if args.register {
         let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
     }
+    // Guarantee the process exits. Every step below is individually bounded, but
+    // "bounded" is not the same as "guaranteed": a wedged step, a blocking task the
+    // runtime waits on at drop, or a non-daemon thread that never returns all leave a
+    // worker alive after its session has ended — which is how an ended session comes
+    // back to life in `ps` and in the registry. This watchdog makes ending
+    // unconditional.
+    force_exit_after(std::time::Duration::from_secs(20));
     // Now the (bounded) teardown. `shutdown` stops managed processes inside the
     // sandbox; the session's namespaces, interception ruleset and cgroup then go with
     // its holder process. We held the exclusive worktree lease, so we're the sole
@@ -704,6 +713,28 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
     tracing::debug!(session = %session_name, "session torn down");
     Ok(())
+}
+
+/// Arrange for this process to exit within `grace`, whatever else happens.
+///
+/// A detached thread rather than a task, so it cannot be starved by the runtime it is
+/// there to backstop, and `process::exit` rather than a panic, so it cannot be caught
+/// or unwound. Everything that must be durable (the journal, the artifacts, the
+/// daemon notification) has already been written by the time this is armed; what it
+/// interrupts is teardown, whose failure mode is a leftover namespace that the
+/// kernel releases anyway when the process dies.
+fn force_exit_after(grace: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("cowboy-exit-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            tracing::error!(
+                "teardown did not finish within {grace:?}; exiting anyway so the session \
+                 cannot outlive its end"
+            );
+            std::process::exit(0);
+        })
+        .ok();
 }
 
 /// Sign off on this session's ranch workstream: ask the daemon to complete the

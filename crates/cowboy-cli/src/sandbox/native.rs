@@ -60,6 +60,10 @@ pub struct NativeSandbox {
     status: Mutex<Option<StatusTx>>,
     probe: Box<dyn HostProbe + Send + Sync>,
     session_name: String,
+    /// Directory name of this sandbox's scratch, owner-scoped so two sandboxes on
+    /// one project cannot share (or delete) each other's `/tmp`. See
+    /// [`crate::project::scratch_key`].
+    scratch_key: String,
     /// The policy engine that answers the relay.
     ///
     /// Constructed up front rather than attached later: a sandbox with no engine
@@ -82,15 +86,17 @@ impl NativeSandbox {
     ) -> Result<Self> {
         let mask_file = crate::project::ensure_mask_file()?;
         let session_name = crate::project::session_name_for(&root);
+        let scratch_key = crate::project::scratch_key(&session_name);
         // Persisted project/global approvals are merged in here, in one place, so the
         // policy the engine enforces is the same one `cowboy sandbox plan` describes.
         let mut policy = security.network_policy.clone();
         crate::net::approvals::merge_into(&mut policy, &crate::net::approvals::load(&root));
-        let policy_engine = Arc::new(GatewayState::new(
-            policy,
-            cowboy_gateway::dns::DnsMap::new(),
-            approver,
-        ));
+        let policy_engine = Arc::new(
+            GatewayState::new(policy, cowboy_gateway::dns::DnsMap::new(), approver)
+                // The host's search domains, so a name the resolver qualified for us
+                // isn't mistaken for an exfiltration payload.
+                .with_search_domains(cowboy_gateway::dns::host_search_domains()),
+        );
         Ok(Self {
             policy_engine,
             root,
@@ -105,6 +111,7 @@ impl NativeSandbox {
             status: Mutex::new(None),
             probe,
             session_name,
+            scratch_key,
         })
     }
 
@@ -141,12 +148,27 @@ impl NativeSandbox {
     /// session — but it is reported *once* per path, because this runs per command.
     pub fn plan(&self) -> Result<SandboxPlan> {
         let grants = self.effective_grants();
+        // Created here rather than at session start because `plan()` is also what
+        // `cowboy sandbox plan` renders, and bwrap refuses to bind a missing source.
+        let scratch = crate::project::ensure_scratch_dir(&self.scratch_key)?;
+        // Re-check the mask, for the same reason. It lives in the user's cache
+        // directory, and a session outlives many things that sweep one (a cache
+        // cleaner, a stray `rm -rf ~/.cache/*`). If it went missing, bwrap dies with
+        // an opaque "Unable to mount source on destination" and the sandbox does not
+        // start at all — recreating it is idempotent, and a stat is cheaper than the
+        // support question.
+        let mask_file = if self.mask_file.exists() {
+            self.mask_file.clone()
+        } else {
+            crate::project::ensure_mask_file()?
+        };
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
             grants: &grants,
-            mask_file: &self.mask_file,
+            mask_file: &mask_file,
             relay_port: super::RELAY_PORT,
+            scratch: &scratch,
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }
@@ -507,6 +529,11 @@ impl Sandbox for NativeSandbox {
         if let Some(mut s) = self.session.lock().await.take() {
             s.stop();
         }
+        // Scratch is session-scoped, so it goes with the session — but only once
+        // everything using it has stopped. Done here rather than in
+        // `SessionSandbox::stop` because the sandbox owns the session name, and a
+        // sandbox that never started a session still has scratch to clean up.
+        crate::project::remove_scratch_dir(&self.scratch_key);
     }
 
     async fn exec_stream(

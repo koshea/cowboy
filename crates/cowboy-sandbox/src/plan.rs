@@ -154,7 +154,6 @@ pub struct SandboxPlan {
     pub proc_at: String,
     /// Minimal device set (`null`, `zero`, `urandom`, tty…), never the host `/dev`.
     pub dev_at: String,
-    pub tmpfs: Vec<String>,
     pub symlinks: Vec<(String, String)>,
     pub env: Vec<(String, String)>,
     pub workdir: String,
@@ -166,10 +165,11 @@ pub struct SandboxPlan {
 /// Where the `cowboy` binary is bound inside the sandbox, for bwrap to exec as
 /// the lockdown shim.
 ///
-/// A fixed top-level path because it must not be shadowed: `/run` and `/tmp` are
-/// tmpfs mounted *after* the binds (so nothing can shadow them), and `/usr` is a
-/// read-only bind of the host's, so a mount point cannot be created inside it. The
-/// leading dot keeps it out of the way of anything a project might use.
+/// A fixed top-level path because it must not be shadowed: `/proc` and `/dev` are
+/// mounted before the binds and the plan refuses any bind that would cover them,
+/// and `/usr` is a read-only bind of the host's, so a mount point cannot be created
+/// inside it. The leading dot keeps it out of the way of anything a project might
+/// use.
 pub const SHIM_PATH: &str = "/.cowboy-shim";
 
 /// Host directories exposed read-only so the agent can use the machine's own
@@ -231,7 +231,28 @@ pub struct PlanInputs<'a> {
     pub mask_file: &'a Path,
     /// Loopback port of the egress relay, the only TCP destination permitted.
     pub relay_port: u16,
+    /// Session-scoped scratch directory, bound at `/tmp`, `/run` and `/var/tmp`.
+    ///
+    /// These were a per-command `tmpfs`, which was a real bug rather than a design:
+    /// every command gets its own mount namespace, so each one got a *fresh, empty*
+    /// tmpfs and anything the previous command wrote to `/tmp` had vanished. A
+    /// container's `/tmp` lived as long as the container, and agents rely on that
+    /// constantly — download in one command, process it in the next.
+    ///
+    /// A host directory rather than a shared tmpfs because the session holder does
+    /// not have a mount namespace of its own to put one in (it shares the host's, and
+    /// cannot mount there). The tradeoff is that scratch is now disk-backed, so a
+    /// runaway write fills the disk instead of being stopped by the memory ceiling.
+    pub scratch: &'a Path,
 }
+
+/// Where the sandbox's scratch filesystems are rooted inside `scratch`, and the
+/// targets they are bound at.
+///
+/// `/run` and `/var/tmp` get the same treatment as `/tmp` for the same reason: a
+/// socket or a build's intermediate output must still be there for the next command.
+pub const SCRATCH_DIRS: &[(&str, &str)] =
+    &[("tmp", "/tmp"), ("run", "/run"), ("var-tmp", "/var/tmp")];
 
 impl SandboxPlan {
     /// Build the plan, or fail if configuration or a grant would breach the
@@ -268,7 +289,19 @@ impl SandboxPlan {
             }
         }
 
-        // 2. The project and any other configured mounts. The default config
+        // 2. Session-scoped scratch, EARLY so anything later can be mounted on top of
+        //    it. Putting it after the grants was a bug: binding `/tmp` shadows a grant
+        //    for a path *under* `/tmp`, which is exactly the hazard the ordering rules
+        //    exist to prevent, and the grant tests caught it immediately.
+        for (sub, target) in SCRATCH_DIRS {
+            binds.push(Bind::rw(
+                inputs.scratch.join(sub),
+                *target,
+                "session scratch (survives between commands, not between sessions)",
+            ));
+        }
+
+        // 3. The project and any other configured mounts. The default config
         //    mounts `.` at the workdir, so the project arrives through here rather
         //    than being hardcoded — one source of truth, and no second bind that
         //    could silently downgrade the project to read-only by landing later.
@@ -314,7 +347,7 @@ impl SandboxPlan {
             )));
         }
 
-        // 3. A linked worktree's shared git dir, at its own host path so the
+        // 4. A linked worktree's shared git dir, at its own host path so the
         //    absolute gitdir reference in `.git` resolves. Writable so the
         //    worktree's branch can write objects and refs.
         if let Some(common) = probe.git_common_dir(inputs.root) {
@@ -322,7 +355,7 @@ impl SandboxPlan {
             binds.push(Bind::rw(common, t, "shared git dir (linked worktree)"));
         }
 
-        // 4. Credential grants from host-owned config. Deliberate and out-of-band:
+        // 5. Credential grants from host-owned config. Deliberate and out-of-band:
         //    these come from a file the user edited, which is exactly the gate the
         //    runtime-grant denylist preserves.
         for grant in &sec.secrets.files {
@@ -350,7 +383,7 @@ impl SandboxPlan {
             });
         }
 
-        // 5. Runtime grants. Re-checked against the denylist here as well as at
+        // 6. Runtime grants. Re-checked against the denylist here as well as at
         //    approval time: this is the load-bearing check, since it is the one a
         //    persisted or hand-edited grant must also pass.
         for g in inputs.grants {
@@ -374,7 +407,7 @@ impl SandboxPlan {
             });
         }
 
-        // 6. Mask host-owned config LAST. It lives under the project directory, so
+        // 7. Mask host-owned config LAST. It lives under the project directory, so
         //    it is inside a bind the agent can otherwise read; an empty read-only
         //    file over it means the agent cannot learn its own boundary.
         for file in [config::SECURITY_FILE, config::MODELS_FILE] {
@@ -392,18 +425,13 @@ impl SandboxPlan {
         let env = build_env(sec, &workdir, &limits);
         let proc_at = "/proc".to_string();
         let dev_at = "/dev".to_string();
-        let tmpfs = vec![
-            "/tmp".to_string(),
-            "/run".to_string(),
-            "/var/tmp".to_string(),
-        ];
 
-        // The special filesystems are mounted *before* the binds, so that a grant
-        // for a path under /tmp is not silently shadowed by the tmpfs. That means
-        // order no longer prevents a bind from shadowing them, so refuse it here
-        // instead: a bind over /proc would let the agent present a fabricated /proc
-        // to its own tooling, and one over /dev could hand it a device node of its
-        // choosing.
+        // The special filesystems are mounted *before* the binds, so that a bind for a
+        // path under one of them lands inside it rather than being shadowed by it.
+        // That means order no longer prevents a bind from shadowing them, so refuse it
+        // here instead: a bind over /proc would let the agent present a fabricated
+        // /proc to its own tooling, and one over /dev could hand it a device node of
+        // its choosing.
         for b in &binds {
             for special in [&proc_at, &dev_at] {
                 if &b.target == special || Path::new(special).starts_with(&b.target) {
@@ -416,13 +444,12 @@ impl SandboxPlan {
             }
         }
 
-        let landlock = landlock_for(&binds, &proc_at, &dev_at, &tmpfs);
+        let landlock = landlock_for(&binds, &proc_at, &dev_at);
 
         Ok(Self {
             binds,
             proc_at,
             dev_at,
-            tmpfs,
             symlinks: USR_SYMLINKS
                 .iter()
                 .map(|(t, l)| (t.to_string(), l.to_string()))
@@ -455,7 +482,6 @@ impl SandboxPlan {
                 b.why
             ));
         }
-        s.push_str(&format!("  tmpfs {}\n", self.tmpfs.join(", ")));
         s.push_str(&format!("  proc {}   dev {}\n", self.proc_at, self.dev_at));
 
         s.push_str("\nlandlock\n");
@@ -508,9 +534,9 @@ impl SandboxPlan {
 /// write is denied.
 ///
 /// The special filesystems must be included too. They are not binds, so deriving
-/// rules only from the bind list leaves `/proc`, `/dev` and the tmpfs mounts
-/// unreadable — which breaks anything that reads `/proc/self/*`.
-fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str, tmpfs: &[String]) -> LandlockRules {
+/// rules only from the bind list leaves `/proc` and `/dev` unreadable — which breaks
+/// anything that reads `/proc/self/*`.
+fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str) -> LandlockRules {
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
     for b in binds {
@@ -519,12 +545,11 @@ fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str, tmpfs: &[String]) -
             BindMode::ReadWrite => read_write.push(PathBuf::from(&b.target)),
         }
     }
-    // Virtual and scratch filesystems, writable. Each is created fresh for every
-    // command, and `/proc/sys` needs privileges we do not have regardless, so
-    // finer-grained rules here would cost compatibility for no gain.
+    // The virtual filesystems, writable. Each is created fresh for every command, and
+    // `/proc/sys` needs privileges we do not have regardless, so finer-grained rules
+    // here would cost compatibility for no gain.
     read_write.push(PathBuf::from(proc_at));
     read_write.push(PathBuf::from(dev_at));
-    read_write.extend(tmpfs.iter().map(PathBuf::from));
     LandlockRules {
         read_only,
         read_write,
@@ -662,6 +687,7 @@ mod tests {
             grants,
             mask_file: mask,
             relay_port: 8443,
+            scratch: Path::new("/scratch"),
         }
     }
 

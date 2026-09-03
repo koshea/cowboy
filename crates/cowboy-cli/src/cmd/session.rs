@@ -531,7 +531,7 @@ fn welcome_lines(
         .next()
         .unwrap_or("");
     let mut lines = vec![
-        "Welcome to cowboy — the agent runs sandboxed in Docker.".to_string(),
+        "Welcome to cowboy — the agent runs in a sandbox built from your machine.".to_string(),
         format!("workspace  {}", root.display()),
         format!("model      {}  ({host})", model.model),
     ];

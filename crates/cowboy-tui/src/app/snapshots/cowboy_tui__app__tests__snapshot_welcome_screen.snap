@@ -3,8 +3,8 @@ source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
-│Welcome to cowboy — the agent runs sandboxed in││no network activity  │
-│Docker.                                        ││yet                  │
+│Welcome to cowboy — the agent runs in a sandbox││no network activity  │
+│built from your machine.                       ││yet                  │
 │workspace  /home/dev/myproject                 ││                     │
 │model      anthropic/claude-sonnet-4-6         ││                     │
 │(gw.local)                                     ││                     │

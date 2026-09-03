@@ -117,7 +117,13 @@ Every gate is host-side:
 - **Tunnel shapes are refused** (`network_policy.dns.tunnel_detection`, default
   on): very long or high-entropy names, deeply chunked subdomains, or a high query
   rate to one parent. This catches `<payload>.allowed.com`, which a name allow-list
-  alone cannot.
+  alone cannot. The shape checks first remove any of the host's own **search
+  domains** (`/etc/resolv.conf`) from the end of the name: the resolver appends
+  those itself, and with `search corp.example` a plain `duckduckgo.com` arrives as
+  `duckduckgo.com.corp.example`, whose subdomain region is long and
+  high-entropy enough to look like exfiltration. Removing a suffix cannot hide a
+  payload — the payload's own labels stay in place and stay scored — and the query
+  forwarded upstream is the original bytes either way.
 - **Answers are bound to the question that was approved**: the upstream socket is
   `connect()`ed, so the kernel drops datagrams from anyone but the resolver, and a
   reply is accepted only if its transaction id **and** question match what was

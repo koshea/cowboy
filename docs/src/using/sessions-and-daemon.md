@@ -39,6 +39,22 @@ x-session-worker`). The daemon:
 It listens on a per-user Unix socket under `$XDG_RUNTIME_DIR/cowboy` and persists
 state to `$XDG_STATE_HOME/cowboy/daemon/state.json`.
 
+### It exits on its own
+
+The daemon starts automatically and stops automatically. Once no session is live
+and it is not serving the web UI, it lingers briefly and then exits, so closing
+the last TUI leaves nothing running. A *detached* session counts as live — that is
+the point of detaching — so this only fires when there is genuinely nothing left.
+
+The linger exists so that starting a session does not race the daemon shutting
+down. `COWBOY_DAEMON_LINGER` sets it in seconds (default `20`); `0` disables
+idle exit entirely and the daemon stays up until asked to stop.
+
+Ending a session is unconditional rather than merely bounded. The worker unlinks
+its socket and stops accepting *before* it tears anything down, so an ended session
+cannot be attached to while it winds up, and both worker and daemon arm a watchdog
+that hard-exits if teardown itself wedges.
+
 ## Upgrades
 
 `cowboy` and `cowboyd` are version-locked. After you upgrade the binary, cowboy

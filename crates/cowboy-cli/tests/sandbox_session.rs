@@ -200,17 +200,29 @@ while True:
         auto_start: false,
     };
     s.start_process("web", &def).await.unwrap();
-    // Give the listener a moment to bind.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    assert!(s.process_is_running("web"), "the process should be running");
+    assert!(
+        s.process_is_running("web"),
+        "the process should have been started"
+    );
 
-    let (code, out) = run(
-        &s,
-        "python3 -c 'import socket
+    // Poll rather than sleep-then-connect. A fixed wait was flaky: on a loaded
+    // machine python3's startup inside a fresh sandbox can outlast any constant
+    // small enough to keep the suite quick.
+    let mut out = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let (code, text) = run(
+            &s,
+            "python3 -c 'import socket
 c=socket.socket(); c.settimeout(5); c.connect((\"127.0.0.1\",18080)); print(c.recv(64).decode())'",
-    )
-    .await;
-    assert_eq!(code, 0, "{out}");
+        )
+        .await;
+        out = text;
+        if code == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert!(
         out.contains("hello-from-process"),
         "a later command must reach the background process over loopback: {out}"
@@ -289,6 +301,66 @@ async fn a_grant_applies_to_the_next_command_but_not_the_current_one() {
     );
 
     s.stop().await;
+}
+
+/// Scratch space survives from one command to the next. Each command gets a fresh
+/// mount namespace, so `/tmp` was private per command: an agent that wrote a file
+/// in one shell found it gone in the next, which broke the ordinary
+/// `curl -o /tmp/x` then `read /tmp/x` pattern with a bare "No such file".
+///
+/// The three writable scratch paths are checked together because a shell that can
+/// only keep `/tmp` still surprises anything using `TMPDIR=/var/tmp` or a pid file
+/// under `/run`.
+#[tokio::test]
+async fn scratch_space_survives_between_commands_and_is_gone_after_the_session() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let s = sandbox(&p.path());
+
+    for dir in ["/tmp", "/run", "/var/tmp"] {
+        let (code, out) = run(&s, &format!("echo kept > {dir}/marker 2>&1")).await;
+        assert_eq!(code, 0, "{dir} must be writable: {out}");
+    }
+    for dir in ["/tmp", "/run", "/var/tmp"] {
+        let (code, out) = run(&s, &format!("cat {dir}/marker 2>&1")).await;
+        assert_eq!(code, 0, "{dir}/marker must still exist: {out}");
+        assert!(out.contains("kept"), "{dir}/marker lost its content: {out}");
+    }
+
+    // …and it is genuinely scratch: ending the session discards it, so the next
+    // session does not inherit whatever the last one left lying around.
+    s.stop().await;
+    let s2 = sandbox(&p.path());
+    let (_, out) = run(&s2, "cat /tmp/marker 2>&1").await;
+    assert!(
+        !out.contains("kept"),
+        "a new session must start with empty scratch: {out}"
+    );
+    s2.stop().await;
+}
+
+/// Two sandboxes on the *same project* are two independent sessions — each starts its
+/// own holder and so its own namespaces — so they must not share scratch. Before this
+/// was keyed to the owning process they did, which meant `cowboy sandbox exec` run
+/// alongside a live agent session both saw its `/tmp` and deleted it on the way out.
+#[test]
+fn scratch_is_scoped_to_the_owning_process_not_the_project() {
+    let key = cowboy_cli::project::scratch_key("cowboy-deadbeef");
+    assert_eq!(key, format!("cowboy-deadbeef.{}", std::process::id()));
+
+    // Abandoned scratch is reaped rather than accumulating: a process killed with
+    // SIGKILL never runs its own cleanup, and scratch is disk-backed.
+    let mine = cowboy_cli::project::ensure_scratch_dir(&key).unwrap();
+    let base = mine.parent().unwrap().to_path_buf();
+    // pid 0 is never a live process, so this stands in for a crashed owner.
+    let abandoned = base.join("cowboy-deadbeef.0");
+    std::fs::create_dir_all(abandoned.join("tmp")).unwrap();
+    cowboy_cli::project::ensure_scratch_dir(&key).unwrap();
+    assert!(!abandoned.exists(), "a dead owner's scratch must be reaped");
+    assert!(mine.exists(), "the live owner's scratch must be kept");
+
+    cowboy_cli::project::remove_scratch_dir(&key);
+    assert!(!mine.exists());
 }
 
 /// A running process cannot see a later grant, and the user is told so rather than

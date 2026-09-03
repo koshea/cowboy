@@ -63,6 +63,10 @@ struct Inner {
     /// Live progress, mirrored from the event stream so the daemon registry
     /// (`cowboy sessions`) can show real numbers without parsing the journal.
     stats: std::sync::Mutex<SessionStats>,
+    /// Where this session's socket lives, so ending can remove it.
+    socket_path: std::path::PathBuf,
+    /// Fired by [`SocketUi::end`] to stop the accept loop.
+    closed: tokio_util::sync::CancellationToken,
 }
 
 /// Snapshot of a session's live progress for the daemon registry.
@@ -121,6 +125,8 @@ impl SocketUi {
             pending_approvals: std::sync::Mutex::new(HashMap::new()),
             pending_asks: std::sync::Mutex::new(HashMap::new()),
             stats: std::sync::Mutex::new(SessionStats::default()),
+            socket_path: socket_path.to_path_buf(),
+            closed: tokio_util::sync::CancellationToken::new(),
         });
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -196,11 +202,25 @@ impl SocketUi {
             .clone()
     }
 
-    /// Broadcast a terminal `Ended` to attached clients (worker shutting down).
+    /// Tell attached clients the session is over, then **stop being attachable**.
+    ///
+    /// The second half is the part that was missing, and it is the whole reason an
+    /// ended session could be attached to again: notifying current clients left the
+    /// accept loop running and the socket file on disk, so a client that connected
+    /// afterwards was accepted by a worker that had already finished — appearing to
+    /// join a live session, then hanging when the worker exited. The daemon's registry
+    /// said `Completed`, but a socket path is enough to attach with.
+    ///
+    /// Removing the socket first means a late attach fails immediately with "no such
+    /// file", which is both true and actionable, instead of connecting to nothing.
     pub fn end(&self, reason: &str) {
         let _ = self.inner.live.send(ServerMsg::Ended {
             reason: reason.to_string(),
         });
+        // Order matters: unlink before cancelling, so there is no window in which the
+        // loop has stopped accepting while the path still looks connectable.
+        let _ = std::fs::remove_file(&self.inner.socket_path);
+        self.inner.closed.cancel();
     }
 
     /// Wait (up to `timeout`) for at least one client to attach. Returns whether
@@ -367,7 +387,17 @@ async fn accept_loop(
     cmd_tx: mpsc::UnboundedSender<ClientMsg>,
 ) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else {
+        let accepted = tokio::select! {
+            biased;
+            // Stop accepting the moment the session ends, so nothing can attach to a
+            // worker that is on its way out.
+            _ = inner.closed.cancelled() => {
+                tracing::debug!("session ended; no longer accepting clients");
+                return;
+            }
+            a = listener.accept() => a,
+        };
+        let Ok((stream, _)) = accepted else {
             continue;
         };
         let inner = inner.clone();

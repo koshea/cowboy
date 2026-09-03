@@ -125,12 +125,18 @@ fn mask_file() -> PathBuf {
 fn plan_for(root: &Path) -> SandboxPlan {
     let sec = SecurityConfig::default();
     let mask = mask_file();
+    // Real directories: bwrap refuses to bind a source that does not exist.
+    let scratch = cowboy_cli::project::ensure_scratch_dir(&cowboy_cli::project::scratch_key(
+        "sandbox-exec-test",
+    ))
+    .unwrap();
     let inputs = PlanInputs {
         root,
         security: &sec,
         grants: &[],
         mask_file: &mask,
         relay_port: 8443,
+        scratch: &scratch,
     };
     SandboxPlan::build(&inputs, &Host).unwrap()
 }

@@ -52,6 +52,14 @@ struct Fixture {
 }
 
 fn setup() -> Fixture {
+    setup_with_setup_command(false)
+}
+
+/// As [`setup`], but with an `agent.setup` command when `eager` — which makes the
+/// worker bring the **sandbox** up before the first message. That distinction matters
+/// for teardown: a worker that never started a sandbox has no holder process, no
+/// namespaces and no broker threads to release, so it cannot exhibit a teardown leak.
+fn setup_with_setup_command(eager: bool) -> Fixture {
     let port = blackhole();
     let runtime = assert_fs::TempDir::new().unwrap();
     let state = assert_fs::TempDir::new().unwrap();
@@ -70,7 +78,11 @@ fn setup() -> Fixture {
         .write_str("version: 1\n")
         .unwrap();
     proj.child(".cowboy/agent.yaml")
-        .write_str("version: 1\n")
+        .write_str(if eager {
+            "version: 1\nagent:\n  setup:\n    - true\n"
+        } else {
+            "version: 1\n"
+        })
         .unwrap();
     let _ = Command::new("git")
         .arg("-C")
@@ -84,6 +96,9 @@ fn setup() -> Fixture {
         .env("XDG_RUNTIME_DIR", runtime.path())
         .env("XDG_STATE_HOME", state.path())
         .env("XDG_CONFIG_HOME", cfg.path())
+        // A short idle window so the auto-exit tests do not have to wait out the
+        // production default.
+        .env("COWBOY_DAEMON_LINGER", "1")
         .spawn()
         .expect("spawn cowboyd");
     let fx = Fixture {
@@ -238,6 +253,10 @@ fn end_terminates_the_worker() {
         .trim_end_matches(".sock")
         .to_string();
     let mut c = Client::connect(&ws, Duration::from_secs(8));
+    let worker_pid = match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+        Some(DaemonResp::Session { info }) => info.pid,
+        other => panic!("expected a session record, got {other:?}"),
+    };
 
     c.send(&ClientMsg::End);
 
@@ -261,6 +280,39 @@ fn end_terminates_the_worker() {
         ended,
         "ClientMsg::End must terminate the worker; still Running after 8s"
     );
+
+    // And the *process* must actually be gone. The daemon learns the session is over
+    // BEFORE the worker tears its sandbox down, so a status check alone cannot tell a
+    // clean exit from a worker that reported completion and then hung — which is
+    // exactly the shape of leak this is guarding against.
+    let pid = worker_pid.expect("the daemon should have recorded the worker pid");
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    panic!("the worker process ({pid}) is still alive 10s after End");
+}
+
+/// Is a process still *running*?
+///
+/// Deliberately not `kill(pid, 0)`, which also succeeds for a **zombie** — a process
+/// that has exited but whose parent has not reaped it. These tests spawn the daemon
+/// and hold its `Child`, so an exited daemon stays a zombie for the rest of the test
+/// and `kill(pid, 0)` would report it alive forever. That cost me a false failure
+/// here, and the same trap would hide a genuine shutdown bug.
+fn pid_alive(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Field 3 is the state, after the (possibly space-containing) comm in parens.
+        Ok(stat) => stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .map(|state| state != "Z")
+            .unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// End-to-end through the REAL client bridge (not raw protocol): connect the
@@ -390,4 +442,227 @@ fn wait_for_notice(c: &mut Client, needle: &str) -> bool {
         }
     }
     false
+}
+
+/// The leak this is really about: a worker that **started a sandbox** must still exit
+/// on `End`, and must take its holder process with it.
+///
+/// The holder owns the session's namespaces, its interception ruleset and its cgroup,
+/// so a surviving holder is not merely an untidy process — it is a live sandbox with
+/// nobody driving it. `agent.setup` forces the eager bring-up that creates one.
+#[test]
+fn end_terminates_a_worker_that_started_a_sandbox_and_its_holder() {
+    if !sandbox_available() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
+        return;
+    }
+    let fx = setup_with_setup_command(true);
+    let ws = start(&fx, None);
+    let id = ws
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("s-")
+        .trim_end_matches(".sock")
+        .to_string();
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+    let worker_pid = match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+        Some(DaemonResp::Session { info }) => info.pid.expect("a worker pid"),
+        other => panic!("expected a session record, got {other:?}"),
+    };
+
+    // Wait for a holder to exist, so this cannot pass by the sandbox never coming up.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) && holders_of(worker_pid).is_empty() {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let holders = holders_of(worker_pid);
+    assert!(
+        !holders.is_empty(),
+        "the sandbox never came up, so this test would prove nothing"
+    );
+
+    c.send(&ClientMsg::End);
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(20) {
+        let worker_gone = !pid_alive(worker_pid);
+        let holders_gone = holders.iter().all(|h| !pid_alive(*h));
+        if worker_gone && holders_gone {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!(
+        "after End: worker {worker_pid} alive={}, holders {holders:?} alive={:?}",
+        pid_alive(worker_pid),
+        holders.iter().map(|h| pid_alive(*h)).collect::<Vec<_>>()
+    );
+}
+
+/// Whether a sandbox can run here at all.
+fn sandbox_available() -> bool {
+    Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--",
+            "/usr/bin/true",
+        ])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// PIDs of `x-sandbox-holder` processes descended from `worker`.
+///
+/// Read from `/proc` rather than with `pgrep -f`, whose pattern would also match the
+/// process running the search.
+fn holders_of(worker: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for e in entries.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if !cmdline.contains("x-sandbox-holder") {
+            continue;
+        }
+        // `unshare` sits between the worker and the holder, so match the whole
+        // ancestor chain rather than only the direct parent.
+        let mut cur = pid;
+        for _ in 0..6 {
+            let Some(parent) = ppid_of(cur) else { break };
+            if parent == worker {
+                out.push(pid);
+                break;
+            }
+            if parent <= 1 {
+                break;
+            }
+            cur = parent;
+        }
+    }
+    out
+}
+
+fn ppid_of(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    status
+        .lines()
+        .find_map(|l| l.strip_prefix("PPid:"))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// With no sessions left, `cowboyd` exits on its own — so quitting the last TUI
+/// leaves nothing behind. It restarts on the next `cowboy` command, so lingering
+/// bought nothing but a surprising process in `ps`.
+///
+/// `COWBOY_DAEMON_LINGER` shortens the grace period; the point of the grace period
+/// is that a just-started daemon sees zero sessions for the moment before its client
+/// registers one, so exiting instantly would race.
+#[test]
+fn the_daemon_exits_once_no_sessions_remain() {
+    let fx = setup();
+    let pid = daemon_pid(&fx.sock).expect("the daemon should be reachable");
+
+    // Run a session to completion, so this covers "the last TUI quit" rather than
+    // only "a daemon nobody ever used".
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+    c.send(&ClientMsg::End);
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("cowboyd ({pid}) is still alive 60s after the last session ended");
+}
+
+/// A **detached** session must keep the daemon alive: the worker is still serving and
+/// the user can reattach, so exiting would orphan it from its control plane.
+#[test]
+fn the_daemon_stays_up_while_a_session_is_detached() {
+    let fx = setup();
+    let pid = daemon_pid(&fx.sock).expect("the daemon should be reachable");
+
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+    c.send(&ClientMsg::Detach);
+    drop(c);
+
+    // Well past the linger window this fixture sets.
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        pid_alive(pid),
+        "cowboyd must not exit while a detached session is live"
+    );
+}
+
+/// The daemon's pid, via its own `Ping`.
+fn daemon_pid(sock: &Path) -> Option<u32> {
+    match dreq(sock, DaemonReq::Ping) {
+        Some(DaemonResp::Pong { pid, .. }) => Some(pid),
+        _ => None,
+    }
+}
+
+/// An ended session must not be attachable — the symptom that kept coming back.
+///
+/// The old failure was subtle: `End` told *currently attached* clients the session was
+/// over, but left the accept loop running and the socket file on disk. A client that
+/// connected afterwards was accepted by a worker already tearing down, so it looked
+/// like it had joined a live session and then hung. The daemon's registry said
+/// `Completed` the whole time, which is why this was easy to blame on something else.
+///
+/// Asserted at the socket, not through the registry, because the socket is what a
+/// stale client actually connects to.
+#[test]
+fn an_ended_session_is_not_attachable() {
+    let fx = setup();
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+
+    c.send(&ClientMsg::End);
+    drop(c);
+
+    // PROMPTLY is the assertion. The daemon's periodic vacuum also prunes dead
+    // sockets, so a generous deadline here would pass on the old behaviour too — it
+    // just took ten seconds, and those ten seconds were the bug: long enough to
+    // reattach to a session you had just ended. This deadline is far below the
+    // vacuum's interval and far above what the worker needs.
+    let deadline = Duration::from_secs(3);
+    let started = Instant::now();
+    while started.elapsed() < deadline && ws.exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ws.exists(),
+        "the worker socket still existed {:?} after End — long enough for a client to \
+         attach to an ended session",
+        started.elapsed()
+    );
+
+    // And connecting is refused rather than accepted-then-hung.
+    match UnixStream::connect(&ws) {
+        Err(_) => {}
+        Ok(_) => panic!("connecting to an ended session succeeded; it must be refused"),
+    }
 }

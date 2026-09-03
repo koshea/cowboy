@@ -132,9 +132,9 @@ pub fn build_argv(
 
     // Special filesystems FIRST, so a bind can be made *inside* one of them.
     //
-    // This ordering is load-bearing and was originally the other way round. With
-    // the tmpfs mounted after the binds, a grant for a path under /tmp (a temporary
-    // directory, say) was silently shadowed by the tmpfs: it appeared in
+    // This ordering is load-bearing and was originally the other way round. With the
+    // special filesystems mounted after the binds, a grant for a path under /tmp (a
+    // temporary directory, say) was silently shadowed: it appeared in
     // `cowboy sandbox plan` and then did not exist inside the sandbox. The plan
     // separately refuses any bind that would shadow /proc or /dev, so nothing is
     // lost by no longer relying on order for that.
@@ -142,10 +142,6 @@ pub fn build_argv(
     a.push(plan.proc_at.clone().into());
     push!("--dev");
     a.push(plan.dev_at.clone().into());
-    for t in &plan.tmpfs {
-        push!("--tmpfs");
-        a.push(t.clone().into());
-    }
 
     for b in &plan.binds {
         // `try` variants: an optional path that vanished between planning and now
@@ -203,6 +199,7 @@ mod tests {
             grants: &[],
             mask_file: Path::new("/run/mask"),
             relay_port: 8443,
+            scratch: Path::new("/scratch"),
         };
         SandboxPlan::build(&inputs, &probe).unwrap()
     }
@@ -270,11 +267,11 @@ mod tests {
         assert!(proj < mask, "the mask must come after the project bind");
     }
 
-    /// The special filesystems come BEFORE the binds, so a grant for a path under
-    /// /tmp can be mounted inside the tmpfs. With the old order the tmpfs shadowed
-    /// it: the grant showed up in `cowboy sandbox plan` and then did not exist
-    /// inside the sandbox. The plan refuses binds that would shadow /proc or /dev,
-    /// so nothing relies on order for that.
+    /// The special filesystems come BEFORE the binds, so a bind under one of them
+    /// is mounted inside it rather than shadowed by it. With the old order the
+    /// order shadowed a grant under /tmp: it showed up in `cowboy sandbox plan`
+    /// and then did not exist inside the sandbox. The plan refuses binds that
+    /// would shadow /proc or /dev, so nothing relies on order for that.
     #[test]
     fn special_filesystems_are_mounted_before_binds() {
         let a = argv_strings(NetMode::Isolated);
@@ -282,7 +279,7 @@ mod tests {
             .iter()
             .position(|s| s == "--ro-bind-try" || s == "--bind-try")
             .unwrap();
-        for flag in ["--proc", "--dev", "--tmpfs"] {
+        for flag in ["--proc", "--dev"] {
             let i = a.iter().position(|s| s == flag).unwrap();
             assert!(i < first_bind, "{flag} must precede the binds");
         }
@@ -301,7 +298,7 @@ mod tests {
         let last_mount = a
             .iter()
             .rposition(|s| {
-                s == "--ro-bind-try" || s == "--bind-try" || s == "--tmpfs" || s == "--proc"
+                s == "--ro-bind-try" || s == "--bind-try" || s == "--dev" || s == "--proc"
             })
             .unwrap();
         assert!(i > last_mount, "--remount-ro / must come after every mount");

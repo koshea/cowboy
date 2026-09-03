@@ -2008,13 +2008,20 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
-    /// Stop managed processes in the container (called on session end).
+    /// End-of-session teardown: stop managed processes, then the sandbox itself.
+    ///
+    /// The sandbox stop is explicit rather than left to `Drop`. `SessionSandbox` does
+    /// release its namespaces on drop, but the thing being released here is the
+    /// security boundary — an interception ruleset, a network namespace, a cgroup —
+    /// and that should be relinquished at a point the caller chose and can bound with
+    /// a timeout, not wherever the value happens to fall out of scope.
     pub async fn shutdown(&self) {
         let _ = self.runtime.stop_all_processes().await;
+        self.runtime.stop().await;
     }
 
-    /// Idle teardown: stop the agent container to free its RAM. The next command
-    /// restarts it (via the runtime's `ensure_running`). Used by the worker when a
+    /// Idle teardown: tear the sandbox down to free its resources. The next command
+    /// brings it back (via the runtime's `ensure_running`). Used by the worker when a
     /// detached session sits idle past the configured timeout.
     pub async fn stop_container(&self) {
         self.runtime.stop().await;

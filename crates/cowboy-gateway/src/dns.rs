@@ -299,6 +299,42 @@ pub fn upstream_from_resolv_conf(text: &str) -> Option<SocketAddr> {
     None
 }
 
+/// The search domains this machine appends to unqualified names, read from
+/// `/etc/resolv.conf`.
+///
+/// The sandbox's resolver library qualifies a name with each of these in turn, so
+/// the gateway sees `duckduckgo.com.corp.example` before it ever sees
+/// `duckduckgo.com`. Knowing the list lets the tunnel heuristics judge the name the
+/// user actually asked for instead of the resolver's scratch work — see
+/// `GatewayState::decide_dns`.
+pub fn host_search_domains() -> Vec<String> {
+    std::fs::read_to_string("/etc/resolv.conf")
+        .map(|t| search_from_resolv_conf(&t))
+        .unwrap_or_default()
+}
+
+/// Parse `search`/`domain` lines. Later lines win (that is what libc does), and
+/// `search` and `domain` are mutually exclusive in the same way.
+pub fn search_from_resolv_conf(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut parts = line.split_whitespace();
+        match parts.next() {
+            Some("search") | Some("domain") => {}
+            _ => continue,
+        }
+        let domains: Vec<String> = parts
+            .map(|d| d.trim_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+        if !domains.is_empty() {
+            out = domains;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,6 +497,30 @@ mod tests {
             Some("127.0.0.53:53".parse().unwrap()),
             "a loopback stub is correct here: this is dialled from the host namespace"
         );
+    }
+
+    #[test]
+    fn search_domains_are_read_from_resolv_conf() {
+        assert_eq!(
+            search_from_resolv_conf(
+                "nameserver 1.1.1.1\nsearch internal follow-chinstrap.ts.net\n"
+            ),
+            vec!["internal", "follow-chinstrap.ts.net"]
+        );
+        // `domain` is the single-entry spelling of the same thing.
+        assert_eq!(
+            search_from_resolv_conf("domain Corp.Example.\n"),
+            vec!["corp.example"]
+        );
+        // The last directive wins, as libc does.
+        assert_eq!(
+            search_from_resolv_conf("search a.test\nsearch b.test\n"),
+            vec!["b.test"]
+        );
+        // Nothing configured, commented out, or empty → no suffixes to strip.
+        assert!(search_from_resolv_conf("nameserver 1.1.1.1\n").is_empty());
+        assert!(search_from_resolv_conf("#search a.test\n").is_empty());
+        assert!(search_from_resolv_conf("search\n").is_empty());
     }
 
     #[test]

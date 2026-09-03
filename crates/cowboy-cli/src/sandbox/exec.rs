@@ -12,7 +12,6 @@
 //! `docs/src/security/sandbox-decisions.md`.
 
 use std::ffi::OsString;
-use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -335,30 +334,13 @@ fn to_strings(paths: &[std::path::PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// Build a plan for a one-off command in `root`, for `cowboy sandbox exec`.
-pub fn plan_for(
-    root: &Path,
-    security: &cowboy_core::config::SecurityConfig,
-    mask_file: &Path,
-    probe: &dyn cowboy_sandbox::HostProbe,
-) -> Result<SandboxPlan> {
-    use cowboy_sandbox::plan::PlanInputs;
-    let inputs = PlanInputs {
-        root,
-        security,
-        grants: &[],
-        mask_file,
-        relay_port: super::RELAY_PORT,
-    };
-    SandboxPlan::build(&inputs, probe).map_err(anyhow::Error::new)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cowboy_core::config::SecurityConfig;
     use cowboy_sandbox::plan::PlanInputs;
     use cowboy_sandbox::probe::FakeHost;
+    use std::path::Path;
 
     fn dummy_plan() -> SandboxPlan {
         let probe = FakeHost::new().with_existing(["/usr", "/srv/proj"]);
@@ -370,6 +352,7 @@ mod tests {
                 grants: &[],
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
+                scratch: Path::new("/scratch"),
             },
             &probe,
         )

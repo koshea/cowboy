@@ -145,10 +145,10 @@ reachable *inside* the sandbox, and its host path generally is not: the project 
 bound at `/workspace`, so a development build at `<project>/target/debug/cowboy`
 does not exist at that path inside.
 
-It is bound read-only at `/.cowboy-shim`. A fixed top-level path because `/run`
-and `/tmp` are tmpfs mounted after the binds (deliberately, so nothing can shadow
-them), and `/usr` is a read-only bind of the host's, so no mount point can be
-created inside it.
+It is bound read-only at `/.cowboy-shim`. A fixed top-level path because it must
+not be shadowed: the plan's ordering rules keep `/proc` and `/dev` unshadowable and
+`/usr` is a read-only bind of the host's, so no mount point can be created inside
+it. A leading dot keeps the name out of the way of anything a project might use.
 
 The shim receives its instructions as JSON on **stdin**, not argv, because argv is
 visible in `/proc/<pid>/cmdline` to anything that can see the process.
@@ -165,8 +165,8 @@ every write is denied. The rules must come from the bind **targets**.
 Two things made it worse and are now fixed:
 
 - The special filesystems are not binds. Rules derived from the bind list alone
-  leave `/proc`, `/dev` and the tmpfs mounts outside the domain, so anything
-  reading `/proc/self/*` fails.
+  leave `/proc` and `/dev` outside the domain, so anything reading `/proc/self/*`
+  fails.
 - The rule-adding code originally dropped failed rules with
   `filter_map(|r| r.ok())`. Since every rule failed to resolve, the domain ended up
   with no allow rules — denying everything, which looks exactly like working
@@ -294,6 +294,40 @@ prevents shadowing, the plan refuses any bind whose target is, or contains, `/pr
 or `/dev`: a bind over `/proc` would let the agent present a fabricated `/proc` to
 its own tooling, and one over `/dev` could hand it a device node of its choosing.
 `--remount-ro /` still comes last of all.
+
+The same ordering rule applies to the scratch binds described below, and for the
+same reason — they go in early, ahead of the configured mounts and the grants, so a
+grant for a path under `/tmp` lands *inside* scratch instead of being hidden by it.
+
+## Scratch space is a session directory, not a per-command tmpfs
+
+`/tmp`, `/run` and `/var/tmp` started as `--tmpfs` mounts. Every command gets its
+own mount namespace, so every command got a *fresh, empty* one — and an agent that
+wrote a file in one shell found it gone in the next:
+
+```
+$ curl -sL "…" -o /tmp/search.html   # exit 0
+$ head -c 2000 /tmp/search.html
+head: cannot open '/tmp/search.html' for reading: No such file or directory
+```
+
+Download-then-process is not an unusual thing for an agent to do, it is the normal
+thing, and a container's `/tmp` lives as long as the container. The three paths are
+now read-write binds of subdirectories of a **session** scratch directory under
+`~/.cache/cowboy/run/scratch/<session>/`, created on the first plan and removed when
+the session stops. `/run` and `/var/tmp` get the same treatment as `/tmp` because a
+pid file, a socket, or a build's intermediate output has to survive to the next
+command too.
+
+A host directory rather than one shared tmpfs because the session holder shares the
+host's mount namespace and so has nowhere to put one — it unshares user, net, ipc
+and uts, deliberately not mount. The tradeoff is real and worth stating: scratch is
+disk-backed, so a runaway write fills the disk instead of hitting the memory
+ceiling.
+
+`cowboy-cli/tests/sandbox_session.rs` asserts both halves: a marker written in one
+command is readable by the next in all three paths, and a new session on the same
+project starts with none of it.
 
 ## Every running process is stale for a new grant
 

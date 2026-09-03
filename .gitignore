@@ -7,6 +7,9 @@
 # cowboy session logs (per-project, not source)
 .cowboy/sessions/
 
+# the sandboxed agent's HOME (tool caches, not project source)
+.cowboy/home/
+
 # insta pending snapshots
 **/*.snap.new
 

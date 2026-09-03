@@ -180,6 +180,22 @@ impl Daemon {
         tracing::info!(bind = %addr, "serving web UI");
     }
 
+    /// Whether any session is still live. A *detached* session counts as live — the
+    /// worker is still serving and the user can reattach — so the daemon must not
+    /// exit under one.
+    fn has_live_sessions(&self) -> bool {
+        self.state
+            .sessions
+            .values()
+            .any(|s| !s.status.is_terminal())
+    }
+
+    /// Whether the daemon is serving the web UI, in which case it is useful with no
+    /// sessions at all and must not exit on idleness.
+    fn serving_web(&self) -> bool {
+        self.web.is_some()
+    }
+
     /// Canonical lease key for a worktree root (matches the container/network
     /// path hashing). Falls back to the given path if it can't be canonicalized.
     fn lease_key(root: &Path) -> String {
@@ -461,6 +477,43 @@ impl Daemon {
 // Server
 // ---------------------------------------------------------------------------
 
+/// Arrange for this process to exit within `grace`, whatever else happens.
+///
+/// A detached thread rather than a task, so the runtime it backstops cannot starve it.
+/// State is saved on every mutation, so there is nothing here that must be flushed
+/// first.
+fn force_exit_after(grace: std::time::Duration) {
+    std::thread::Builder::new()
+        .name("cowboyd-exit-watchdog".into())
+        .spawn(move || {
+            std::thread::sleep(grace);
+            tracing::error!("shutdown did not complete within {grace:?}; exiting anyway");
+            std::process::exit(0);
+        })
+        .ok();
+}
+
+/// How long the daemon stays up with nothing to supervise before exiting.
+///
+/// `COWBOY_DAEMON_LINGER` overrides it, in seconds; `0` keeps the daemon running
+/// forever, which is what someone supervising it with systemd wants. A value that is
+/// not a number is a typo, not a request to change the behaviour, so it warns and
+/// uses the default rather than silently picking either extreme.
+fn idle_linger() -> Option<std::time::Duration> {
+    const DEFAULT_SECS: u64 = 20;
+    let secs = match std::env::var("COWBOY_DAEMON_LINGER") {
+        Ok(v) => v.trim().parse::<u64>().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = %v,
+                "COWBOY_DAEMON_LINGER is not a number of seconds; using {DEFAULT_SECS}"
+            );
+            DEFAULT_SECS
+        }),
+        Err(_) => DEFAULT_SECS,
+    };
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
 /// Run the daemon until terminated. Refuses to start if another instance holds
 /// the lock.
 pub async fn serve() -> Result<()> {
@@ -507,7 +560,11 @@ pub async fn serve() -> Result<()> {
     // Periodic staleness sweep so crashed/abandoned workers are noticed even
     // without a client poking the daemon.
     let sweeper = daemon.clone();
+    let idle_shutdown = shutdown.clone();
     tokio::spawn(async move {
+        // Tracks how long the daemon has had nothing to supervise.
+        let mut idle_since: Option<std::time::Instant> = None;
+        let linger = idle_linger();
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(10));
         // `interval` fires the first tick immediately; consume it so the first
         // sweep+reap runs a full period after startup, giving workers that
@@ -548,6 +605,32 @@ pub async fn serve() -> Result<()> {
             // cgroup were owned by a holder process tied to the worker's lifetime, so
             // they went when the worker did. Only the empty cgroup *directory* can
             // linger, and `cowboy down` reaps those.
+
+            // Exit once there is nothing left to supervise. The daemon auto-starts on
+            // the next `cowboy` command, so lingering buys nothing but a process in
+            // everyone's `ps` — and the surprise of finding one there after quitting
+            // the last TUI. A short grace period rather than an immediate exit,
+            // because a daemon that has just been auto-started sees zero sessions for
+            // the moment before its client registers one.
+            if let Some(window) = linger {
+                let (live, web) = {
+                    let d = sweeper.lock().await;
+                    (d.has_live_sessions(), d.serving_web())
+                };
+                if live || web {
+                    idle_since = None;
+                } else {
+                    let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= window {
+                        tracing::info!(
+                            idle_for = ?since.elapsed(),
+                            "no sessions left; cowboyd exiting (it restarts on the next command)"
+                        );
+                        idle_shutdown.cancel();
+                        return;
+                    }
+                }
+            }
         }
     });
 
@@ -561,7 +644,11 @@ pub async fn serve() -> Result<()> {
                 }
             },
             _ = shutdown.cancelled() => {
-                tracing::info!("cowboyd shutting down on request (workers left running)");
+                tracing::info!("cowboyd shutting down (any remaining workers are left running)");
+                // Same reasoning as the worker's watchdog: a shutdown that is logged
+                // but does not happen is worse than no shutdown at all, because
+                // everything downstream now believes the daemon is gone.
+                force_exit_after(std::time::Duration::from_secs(10));
                 break;
             }
         };

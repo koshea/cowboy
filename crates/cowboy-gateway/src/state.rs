@@ -23,6 +23,9 @@ pub struct GatewayState {
     cache: Mutex<HashMap<String, Verdict>>,
     /// Per-parent DNS query-rate tracker (tunnel signal).
     dns_rate: RateTracker,
+    /// The host's resolver search domains, lowercased and without trailing dots.
+    /// Used only to un-qualify a name before the tunnel heuristics look at it.
+    search_domains: Vec<String>,
 }
 
 impl GatewayState {
@@ -38,7 +41,16 @@ impl GatewayState {
             approver,
             cache: Mutex::new(HashMap::new()),
             dns_rate,
+            search_domains: Vec::new(),
         }
+    }
+
+    /// Teach the engine which suffixes the host resolver appends to unqualified
+    /// names. Separate from `new` because it is host configuration, not policy: the
+    /// engine is correct without it, just noisier.
+    pub fn with_search_domains(mut self, domains: Vec<String>) -> Self {
+        self.search_domains = domains;
+        self
     }
 
     /// Access the DNS map (used by the resolver task and tests).
@@ -175,7 +187,32 @@ impl GatewayState {
         }
     }
 
-    /// Record a DNS resolution (used by the resolver task).
+    /// Drop a trailing host search domain from `qname`, if one applies.
+    ///
+    /// Returns a borrow of `qname` so the *original* bytes are what gets forwarded
+    /// upstream — this only changes what the heuristics score, never what is asked.
+    /// The longest matching suffix wins, and a name that is *exactly* a search
+    /// domain is left alone (there would be nothing left to judge).
+    fn strip_search_domain<'a>(&self, qname: &'a str) -> &'a str {
+        let name = qname.trim_end_matches('.');
+        let lower = name.to_ascii_lowercase();
+        let mut best = name;
+        for d in &self.search_domains {
+            // `+ 1` for the dot: require a label boundary so `evilexample.com`
+            // isn't treated as being under `example.com`.
+            let Some(head_len) = lower.len().checked_sub(d.len() + 1) else {
+                continue;
+            };
+            if head_len == 0 || !lower.ends_with(d) || lower.as_bytes()[head_len] != b'.' {
+                continue;
+            }
+            if head_len < best.len() {
+                best = &name[..head_len];
+            }
+        }
+        best
+    }
+
     #[allow(dead_code)]
     pub fn record_dns(&self, ip: IpAddr, host: String) {
         self.dns.record(ip, host);
@@ -234,13 +271,23 @@ impl GatewayState {
         //      of lookups to an explicitly ALLOWED domain (e.g. `bundle install`
         //      hammering `index.rubygems.org`, or npm/cargo) is legitimate, not a
         //      tunnel — rate-limiting it silently breaks the allow-list.
+        //
+        //    The shape checks see the name with any host search-domain suffix
+        //    removed. The resolver appends those itself, and the extra labels push
+        //    the name the user actually asked for down into the "subdomain region"
+        //    the heuristics score: with `search corp.example`, a plain
+        //    `duckduckgo.com` arrives as `duckduckgo.com.corp.example`, whose
+        //    subdomain region is `duckduckgocom` — long and high-entropy enough to
+        //    look like exfiltration. Stripping a *suffix* cannot hide a payload,
+        //    since the payload labels stay in place and stay scored.
         let mut verdict = verdict;
         if dns.tunnel_detection && verdict != Verdict::Deny {
-            let why = dns_policy::tunnel_reason(qname, dns).or_else(|| {
+            let unqualified = self.strip_search_domain(qname);
+            let why = dns_policy::tunnel_reason(unqualified, dns).or_else(|| {
                 if verdict != Verdict::Ask {
                     return None;
                 }
-                let parent = dns_policy::registrable_parent(qname);
+                let parent = dns_policy::registrable_parent(unqualified);
                 self.dns_rate
                     .over_limit(&parent)
                     .then(|| format!("high query rate for {parent}"))
@@ -500,6 +547,65 @@ mod tests {
             denied,
             "a high query rate to an unknown parent should be denied"
         );
+    }
+
+    /// The host resolver qualifies unqualified names with each of its search
+    /// domains, so the gateway sees those attempts before it sees the real name.
+    /// Without accounting for that, `duckduckgo.com` + `search follow-chinstrap.ts.net`
+    /// scores as a high-entropy subdomain and gets refused with a scary tunnel
+    /// notice — which is exactly what happened in practice.
+    #[tokio::test]
+    async fn a_search_domain_qualified_name_is_not_mistaken_for_a_tunnel() {
+        let s = state(NetworkPolicy::default())
+            .with_search_domains(vec!["internal".into(), "follow-chinstrap.ts.net".into()]);
+        for name in [
+            "duckduckgo.com.follow-chinstrap.ts.net",
+            "html.duckduckgo.com.follow-chinstrap.ts.net",
+            "registry.npmjs.org.internal",
+        ] {
+            assert_eq!(
+                s.decide_dns(name, "A").await,
+                Verdict::Allow,
+                "{name} is the resolver's own search-list attempt, not a tunnel"
+            );
+        }
+    }
+
+    /// Stripping a suffix must not become a way to smuggle one: the payload labels
+    /// are still there after the search domain comes off.
+    #[tokio::test]
+    async fn appending_a_search_domain_does_not_hide_a_tunnel() {
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.push("evil.com".into());
+        let s = state(p).with_search_domains(vec!["follow-chinstrap.ts.net".into()]);
+        let payload = "mfrggzdfmztwq2lknnwg23tpobyxe43uov3ho6dzpiztgmzr";
+        assert_eq!(
+            s.decide_dns(&format!("{payload}.evil.com.follow-chinstrap.ts.net"), "A")
+                .await,
+            Verdict::Deny
+        );
+    }
+
+    /// A name that *is* a search domain has nothing to strip, and a name that
+    /// merely ends with the same characters isn't under it.
+    #[test]
+    fn stripping_a_search_domain_respects_label_boundaries() {
+        let s = state(NetworkPolicy::default()).with_search_domains(vec!["example.com".into()]);
+        assert_eq!(s.strip_search_domain("a.b.example.com"), "a.b");
+        assert_eq!(s.strip_search_domain("A.B.EXAMPLE.COM"), "A.B");
+        assert_eq!(s.strip_search_domain("a.b.example.com."), "a.b");
+        assert_eq!(s.strip_search_domain("example.com"), "example.com");
+        assert_eq!(s.strip_search_domain("notexample.com"), "notexample.com");
+        assert_eq!(s.strip_search_domain("other.net"), "other.net");
+    }
+
+    /// The longest match wins, so a nested search domain doesn't leave a stub of
+    /// itself behind to be scored.
+    #[test]
+    fn the_longest_search_domain_wins() {
+        let s = state(NetworkPolicy::default())
+            .with_search_domains(vec!["ts.net".into(), "tail.ts.net".into()]);
+        assert_eq!(s.strip_search_domain("host.tail.ts.net"), "host");
     }
 
     #[tokio::test]

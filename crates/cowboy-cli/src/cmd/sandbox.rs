@@ -147,12 +147,17 @@ fn plan() -> Result<()> {
         .collect();
     // A representative mask path; the executor creates the real one per session.
     let mask = PathBuf::from("<mask: empty read-only file>");
+    // Likewise representative. Printing the boundary must not create anything: the
+    // real directory belongs to a running session, keyed to the process that owns it,
+    // and inventing one here would leave litter behind for the reaper.
+    let scratch = PathBuf::from("<session scratch>");
     let inputs = PlanInputs {
         root: &root,
         security: &security,
         grants: &grants,
         mask_file: &mask,
         relay_port: crate::sandbox::RELAY_PORT,
+        scratch: &scratch,
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
     println!("project {}\n", root.display());
