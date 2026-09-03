@@ -467,3 +467,106 @@ async fn assembles_streamed_tool_call() {
     assert_eq!(resp.tool_calls[0].id, "call_1");
     assert_eq!(resp.tool_calls[0].arguments, "{\"command\":\"ls -la\"}");
 }
+
+/// A stream that ends without a trailing newline must not lose its last frame.
+///
+/// The SSE reader consumes complete `\n`-terminated lines and leaves any partial one
+/// buffered for the next chunk. When the stream simply ends, that buffer used to be
+/// discarded — so a provider that omits the final newline (or never sends `[DONE]`)
+/// silently lost its last delta. Here that delta carries both the tail of the answer
+/// and `finish_reason: length`, which is what tells the loop the response was truncated
+/// and to run recovery. Losing it produces a quietly wrong response rather than a
+/// failed one, which is the worse of the two.
+#[tokio::test]
+async fn a_stream_that_ends_without_a_newline_keeps_its_last_frame() {
+    let server = MockServer::start().await;
+    let truncated_tail = serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "test-model",
+        "choices": [{"index": 0, "delta": {"content": "world"}, "finish_reason": "length"}]
+    });
+    // No `[DONE]`, and no newline after the final frame.
+    let body = format!(
+        "data: {}\n\ndata: {truncated_tail}",
+        content_chunk("Hello, ")
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.content.as_deref(), Some("Hello, world"));
+    assert!(
+        resp.truncated,
+        "the final frame's finish_reason must survive, or recovery never runs"
+    );
+}
+
+/// A tool call whose id never arrived is still answerable.
+///
+/// Some providers send the id only in the first delta of a call. If that delta is lost,
+/// the accumulator ends up with a named call and an empty id — and an empty id means
+/// the tool result carries `""`, which the provider rejects on the *next* request. Since
+/// the whole conversation is replayed, that failure is permanent. Synthesising an id
+/// from the slot index keeps the pair addressable; it is only ever sent back alongside
+/// the call it belongs to.
+#[tokio::test]
+async fn a_tool_call_with_no_id_is_still_addressable() {
+    let server = MockServer::start().await;
+    let chunk = serde_json::json!({
+        "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "test-model",
+        "choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "type": "function",
+             "function": {"name": "shell", "arguments": "{}"}}
+        ]}, "finish_reason": "tool_calls"}]
+    });
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse(&[chunk]), "text/event-stream"))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("go")], &[], None)
+        .await
+        .unwrap();
+
+    assert_eq!(resp.tool_calls.len(), 1);
+    assert_eq!(resp.tool_calls[0].name, "shell");
+    assert!(
+        !resp.tool_calls[0].id.is_empty(),
+        "an unnamed id makes the call unanswerable for the rest of the session"
+    );
+}
+
+/// And a tool result with no id at all is refused locally, rather than sent as `""` for
+/// the provider to reject with no indication of which message was wrong.
+#[tokio::test]
+async fn a_tool_result_with_no_id_is_refused_before_sending() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("hi")]), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let mut orphan = Message::new(cowboy_core::model::Role::Tool, "some output");
+    orphan.tool_call_id = None;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let err = client
+        .chat(&[Message::user("go"), orphan], &[], None)
+        .await
+        .expect_err("an unanswerable conversation must not be sent");
+    assert!(err.to_string().contains("tool_call_id"), "{err}");
+}

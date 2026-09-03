@@ -489,12 +489,28 @@ fn to_openai_messages(messages: &[Message]) -> Result<Vec<ChatCompletionRequestM
                 }
                 args.build().map_err(oa_err)?.into()
             }
-            Role::Tool => ChatCompletionRequestToolMessageArgs::default()
-                .content(m.content.clone())
-                .tool_call_id(m.tool_call_id.clone().unwrap_or_default())
-                .build()
-                .map_err(oa_err)?
-                .into(),
+            Role::Tool => {
+                // A tool result with no id cannot be matched to its call. Sending `""`
+                // (what `unwrap_or_default` did) gets a rejection from the provider
+                // with no hint as to which message was wrong; saying so here names it.
+                let id = m
+                    .tool_call_id
+                    .clone()
+                    .filter(|id| !id.is_empty())
+                    .ok_or_else(|| {
+                        Error::Model(
+                            "a tool result has no tool_call_id, so it cannot be matched to \
+                         its call; refusing to send an unanswerable conversation"
+                                .to_string(),
+                        )
+                    })?;
+                ChatCompletionRequestToolMessageArgs::default()
+                    .content(m.content.clone())
+                    .tool_call_id(id)
+                    .build()
+                    .map_err(oa_err)?
+                    .into()
+            }
         };
         out.push(msg);
     }
@@ -574,12 +590,27 @@ impl ToolCallAccumulator {
         }
     }
 
+    /// Materialise the accumulated slots as tool calls.
+    ///
+    /// A slot with no name never became a call (some providers open an index before
+    /// naming it), so it is dropped. A slot with a name but **no id** is a different
+    /// problem: the id is how the result is addressed back to the call, and a provider
+    /// that only sends the id in the first delta will leave it empty if that delta was
+    /// lost. An empty id makes the call unanswerable — the tool result would carry `""`
+    /// and the next request would be rejected — so one is synthesised from the index.
+    /// A made-up id is only ever sent back to the provider paired with the call it
+    /// belongs to, so it costs nothing and keeps the turn runnable.
     fn finish(self) -> Vec<ToolCall> {
         self.slots
             .into_iter()
-            .filter(|(_, name, _)| !name.is_empty())
-            .map(|(id, name, arguments)| ToolCall {
-                id,
+            .enumerate()
+            .filter(|(_, (_, name, _))| !name.is_empty())
+            .map(|(index, (id, name, arguments))| ToolCall {
+                id: if id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    id
+                },
                 name,
                 arguments,
             })
@@ -798,7 +829,10 @@ impl ModelClient for OpenAiClient {
         let mut truncated = false;
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
-        loop {
+        // Set once the stream has ended, so the final (unterminated) frame still gets
+        // one pass through the line loop before we stop.
+        let mut ended = false;
+        while !ended {
             // Bound the wait for the next frame: a provider whose stream stalls
             // silently mid-response (observed with wafer/MiniMax-M3: reasoning
             // deltas, then nothing, forever) must error out, not hang the turn.
@@ -818,8 +852,24 @@ impl ModelClient for OpenAiClient {
                     }
                 }
             };
-            let Some(chunk) = item else { break };
-            buf.push_str(&String::from_utf8_lossy(&chunk.map_err(oa_err)?));
+            match item {
+                Some(chunk) => buf.push_str(&String::from_utf8_lossy(&chunk.map_err(oa_err)?)),
+                None => {
+                    // End of stream. Anything left in the buffer is a frame with no
+                    // trailing newline, which the line loop below would never see — so
+                    // a provider that ends without a final `\n` (or without `[DONE]`)
+                    // silently lost its last delta. That delta is often the one
+                    // carrying `finish_reason` or the tail of a tool call's arguments,
+                    // which turns a complete response into a subtly wrong one rather
+                    // than a failed one. Terminate the partial line and make one final
+                    // pass.
+                    if buf.trim().is_empty() {
+                        break;
+                    }
+                    buf.push('\n');
+                    ended = true;
+                }
+            }
             // SSE: process complete `\n`-terminated lines, leaving any partial
             // line in the buffer for the next chunk.
             while let Some(nl) = buf.find('\n') {
