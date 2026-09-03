@@ -121,6 +121,7 @@ pub const DEFAULT_MODEL: &str = "<default>";
 /// Delegation limits + the crew on/off switch. These are *throughput / safety*
 /// knobs, not quota or budget controls (the gateway owns those).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Delegation {
     /// Crew mode: when true the foreman delegates per the roster; when false the
     /// foreman (the selected model) does everything itself (solo). Toggled from
@@ -158,7 +159,13 @@ impl Default for Delegation {
 }
 
 /// The crew roster.
+///
+/// `deny_unknown_fields` because the failure it prevents is silent: a mistyped
+/// `delegatoin:` block leaves delegation at its defaults, and the user's only clue is
+/// that the crew behaves as if they had never configured it. The one legacy key is
+/// named explicitly below rather than tolerated as "unknown".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CrewConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -171,6 +178,13 @@ pub struct CrewConfig {
     pub temperature: BTreeMap<String, f32>,
     #[serde(default)]
     pub delegation: Delegation,
+    /// Accepted and ignored: old `crew.yaml` files carried a `planner:` block, from
+    /// before the foreman became the selected model. Declared rather than swept up by
+    /// serde's "ignore unknown" so that strictness applies to everything *except* the
+    /// one key we knowingly retired — dropping a stale block is the right outcome,
+    /// failing on a typo is too, and only an explicit field gives both.
+    #[serde(default, skip_serializing, rename = "planner")]
+    pub legacy_planner: Option<serde_yaml_ng::Value>,
 }
 
 /// Which roster layer produced the resolved model (for logging / display).
@@ -381,6 +395,7 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
         crew,
         temperature: BTreeMap::new(),
         delegation: Delegation::default(),
+        legacy_planner: None,
     }
 }
 
@@ -594,6 +609,7 @@ mod tests {
             crew,
             temperature: BTreeMap::new(),
             delegation: Delegation::default(),
+            legacy_planner: None,
         }
     }
 
@@ -713,8 +729,9 @@ crew:
 
     #[test]
     fn legacy_planner_field_is_ignored() {
-        // Old crew.yaml files carried a `planner:` block; it must still parse
-        // (serde ignores it) now that the foreman is the selected model.
+        // Old crew.yaml files carried a `planner:` block; it must still parse now
+        // that the foreman is the selected model. It is declared and skipped rather
+        // than swept up by "ignore unknown fields", so that a *typo* still fails.
         let yaml = "\
 version: 1
 planner:
@@ -725,6 +742,25 @@ crew:
 ";
         let c: CrewConfig = serde_yaml_ng::from_str(yaml).unwrap();
         assert_eq!(c.resolve("anything", Effort::Deep, "f").model, "cheap");
+        // Dropped on the way out: a re-saved roster does not carry it forward.
+        assert!(!serde_yaml_ng::to_string(&c).unwrap().contains("planner"));
+    }
+
+    /// A mistyped key must fail rather than leave that section at its defaults. The
+    /// old behaviour meant a `delegatoin:` block was silently ignored, and the only
+    /// symptom was a crew behaving as though it had never been configured.
+    #[test]
+    fn a_mistyped_key_is_refused_not_ignored() {
+        let yaml = "\
+version: 1
+crew:
+  general: cheap
+delegatoin:
+  max_parallel: 8
+";
+        let err = serde_yaml_ng::from_str::<CrewConfig>(yaml)
+            .expect_err("a typo must not be silently dropped");
+        assert!(err.to_string().contains("delegatoin"), "{err}");
     }
 
     #[test]

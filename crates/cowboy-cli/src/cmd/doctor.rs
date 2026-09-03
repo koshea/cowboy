@@ -177,7 +177,13 @@ fn check_credentials(path: &Path, root: &Path) -> Status {
     use cowboy_core::config::expand_path;
     let mut cfg = match SecurityConfig::load(path) {
         Ok(c) => c,
-        Err(_) => return Status::Ok("none".into()),
+        // A missing file is a fair "nothing configured"; anything else is a config we
+        // could not read, and reporting that as "none" would tell the user their
+        // grants are fine when we never saw them. `check_security` names the reason.
+        Err(cowboy_core::Error::ConfigNotFound(_)) => return Status::Ok("none".into()),
+        Err(_) => {
+            return Status::Warn("not checked: security.yaml did not parse".into());
+        }
     };
     // Include the user's personal overlay (global + per-repo, all worktrees).
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());

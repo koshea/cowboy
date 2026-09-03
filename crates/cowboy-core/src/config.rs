@@ -40,6 +40,7 @@ pub const PROVIDERS_FILE: &str = "providers.yaml";
 /// Host-owned security configuration. This file is read only by the host
 /// `cowboy` process and is **never** mounted into the agent container.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -67,6 +68,7 @@ pub struct SecurityConfig {
 /// sandbox does, and `privileged`/`docker_socket` in particular were only ever
 /// honoured as warnings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// Where the project appears inside the sandbox.
     #[serde(default = "default_workdir")]
@@ -144,6 +146,7 @@ pub fn auto_mem_mib(host_total_mib: u64) -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Mount {
     pub source: String,
     pub target: String,
@@ -162,6 +165,7 @@ pub enum DefaultVerdict {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     #[serde(default = "default_ask")]
     pub default_external: DefaultVerdict,
@@ -183,6 +187,7 @@ pub struct NetworkPolicy {
 /// allowlist-gated resolution (only Allowed/approved names leave the gateway),
 /// risky record types refused, and tunnel detection on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DnsPolicy {
     /// Apply the full allow/deny/default policy to each query name (resolve only
     /// Allowed/approved; REFUSE the rest locally). When false, the resolver only
@@ -240,6 +245,7 @@ fn default_max_subdomains_per_min() -> u32 {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleSet {
     #[serde(default)]
     pub domains: Vec<String>,
@@ -250,6 +256,7 @@ pub struct RuleSet {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretsConfig {
     #[serde(default)]
     pub env: Vec<SecretEnv>,
@@ -262,6 +269,7 @@ pub struct SecretsConfig {
 /// A host credential path granted into the container. The agent cannot edit this
 /// grant (security.yaml is host-owned and masked); only the user elects it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretMount {
     /// Host path (a leading `~` and `${VAR}` are expanded), e.g. `~/.config/gh`.
     pub source: String,
@@ -300,6 +308,7 @@ pub fn approval_required(approval: &Option<String>) -> bool {
 /// of a host command (`source_command`, e.g. `gh auth token`). The agent cannot
 /// edit this; values are never logged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecretEnv {
     /// Name of the env var as seen inside the container.
     pub name: String,
@@ -333,6 +342,7 @@ impl SecretEnv {
 /// Agent-visible configuration, mounted into the container and editable by the
 /// agent. Contains no security controls.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -347,6 +357,7 @@ pub struct AgentConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentBehavior {
     #[serde(default = "default_command_timeout")]
     pub command_timeout_seconds: u64,
@@ -389,12 +400,14 @@ pub struct AgentBehavior {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionConfig {
     #[serde(default = "default_scratchpad")]
     pub scratchpad: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessDef {
     pub command: String,
     #[serde(default = "default_workdir")]
@@ -1018,6 +1031,7 @@ impl ProvidersConfig {
 /// serves the web UI whenever `enabled`; toggled with `cowboy web on|off`. Lives
 /// at `~/.config/cowboy/web.yaml` and holds the access token, so it's `0600`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct WebConfig {
     /// Whether `cowboyd` serves the web UI.

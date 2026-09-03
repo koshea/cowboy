@@ -51,5 +51,21 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 
 | Path | Purpose |
 |------|---------|
-| `$XDG_RUNTIME_DIR/cowboy/` | Daemon + worker sockets, lock. |
+| `$XDG_RUNTIME_DIR/cowboy/` | Daemon + worker sockets, lock (`0700`; the sockets are `0600` and peer-uid checked — see [the boundary](../security/model.md)). |
 | `$XDG_STATE_HOME/cowboy/daemon/state.json` | Session registry + leases. |
+
+## Unknown keys are an error
+
+Every config file above is parsed strictly: a key Cowboy does not recognise fails the
+load and names itself in the error. This is not pedantry — the alternative is that a
+typo *silently* leaves that section at its defaults. A misspelt `netwrok_policy:` used
+to mean the deny rules under it did not exist, and the only symptom was a sandbox
+behaving as though it had never been configured.
+
+Two keys are retired rather than unknown, and are declared so that they can be
+handled deliberately:
+
+- `container:` in `security.yaml` → **refused by name**, pointing at `sandbox:`.
+  Dropping it would take every mount under it with it.
+- `planner:` in `crew.yaml` → **accepted and ignored**, since the foreman is now the
+  selected model. Dropping it costs nothing, and it is not written back out.

@@ -67,6 +67,7 @@ impl WorkstreamStatus {
 
 /// One workstream within a ranch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Workstream {
     pub id: String,
     pub title: String,
@@ -105,6 +106,7 @@ impl Workstream {
 
 /// A ranch plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ranch {
     #[serde(default = "default_version")]
     pub version: u32,

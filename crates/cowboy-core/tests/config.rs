@@ -75,6 +75,47 @@ fn the_old_container_section_is_refused_with_a_clear_message() {
     assert!(msg.contains("sandbox:"), "and the new one: {msg}");
 }
 
+/// A mistyped key in `security.yaml` must fail the load, not fall back to defaults.
+///
+/// This is the failure mode the `container:` check above handles by name, generalised:
+/// serde's default is to ignore what it does not recognise, so `netwrok_policy:` used
+/// to leave the policy at its defaults and `deny:` rules the user wrote would simply
+/// not exist. The defaults are fail-closed (`ask`), so this was never an open door —
+/// but a security file that half-applies without saying so is exactly what host-owned
+/// config is supposed to rule out.
+#[test]
+fn a_mistyped_security_key_fails_the_load() {
+    let dir = tempdir();
+    for (yaml, typo) in [
+        (
+            "version: 1\nnetwrok_policy:\n  default_external: deny\n",
+            "netwrok_policy",
+        ),
+        (
+            "version: 1\nnetwork_policy:\n  deny:\n    domians:\n      - evil.example\n",
+            "domians",
+        ),
+        (
+            "version: 1\nsandbox:\n  mounts:\n    - source: /data\n      target: /data\n      \
+             readonly: true\n",
+            "readonly",
+        ),
+        (
+            "version: 1\nsecrets:\n  env:\n    - name: TOKEN\n      source: HOST_TOKEN\n",
+            "source",
+        ),
+    ] {
+        let p = dir.0.join("security.yaml");
+        std::fs::write(&p, yaml).unwrap();
+        let err = SecurityConfig::load(&p)
+            .expect_err("a key cowboy does not understand must not be silently dropped");
+        assert!(
+            err.to_string().contains(typo),
+            "the error must name the offending key {typo}: {err}"
+        );
+    }
+}
+
 /// The new key loads, and its mounts survive — the other half of the check above.
 #[test]
 fn the_sandbox_section_loads_its_mounts() {
@@ -407,16 +448,19 @@ fn partial_agent_yaml_uses_defaults() {
 #[test]
 fn cpus_accepts_number_or_auto() {
     // A bare number.
-    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\ncpus: 2\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("cpus: 2\n").unwrap();
     assert_eq!(c.cpus, Some(CpuLimit::Cores(2.0)));
     // The `auto` keyword (case-insensitive).
-    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\ncpus: auto\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("cpus: auto\n").unwrap();
     assert_eq!(c.cpus, Some(CpuLimit::Auto));
     // Absent → None (unlimited).
-    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("{}\n").unwrap();
     assert_eq!(c.cpus, None);
     // Garbage is rejected.
-    assert!(serde_yaml_ng::from_str::<SandboxConfig>("image: x\ncpus: lots\n").is_err());
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: lots\n").is_err());
+    // So is a key from the Docker era. This test itself used to carry `image: x`,
+    // ignored by serde and meaningless since the container went.
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("image: x\ncpus: 2\n").is_err());
     // Round-trips.
     let yaml = serde_yaml_ng::to_string(&CpuLimit::Auto).unwrap();
     assert_eq!(yaml.trim(), "auto");
