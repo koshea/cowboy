@@ -389,11 +389,23 @@ impl AgentUi for SocketUi {
             question: question.to_string(),
             options: options.to_vec(),
         });
-        // The agent loop blocks here for the answer; the reply arrives on a
-        // socket-server task (separate runtime thread), so this does not deadlock.
-        // First reply wins. Bail to "" early if every client detaches mid-ask (no
-        // one left to answer — e.g. a detached ranch workstream), and cap the total
-        // wait at ASK_TIMEOUT.
+        // The agent loop blocks here for the answer. That is safe, and deliberately so
+        // rather than by luck: `AgentUi` is a sync trait called from the middle of the
+        // loop, and the loop is driven by the worker's top-level `block_on` future —
+        // the process main thread — not by a task on the runtime's worker pool. The
+        // reply arrives on the socket accept loop, which *is* a spawned task, so it
+        // still gets scheduled even on a single-vCPU host where the pool has one
+        // thread. Verified by
+        // `tests::an_ask_is_answerable_on_a_single_worker_runtime`.
+        //
+        // The one real consequence is that the `select!` in `cmd::worker` cannot poll
+        // its other arms while an ask is outstanding, so an orphan-cancellation lands
+        // when the ask resolves rather than during it. Acceptable: a session should not
+        // be torn down halfway through asking the user a question.
+        //
+        // First reply wins. Bail to "" early if every client detaches mid-ask (no one
+        // left to answer — e.g. a detached ranch workstream), and cap the total wait at
+        // ASK_TIMEOUT.
         let deadline = std::time::Instant::now() + ASK_TIMEOUT;
         let answer = loop {
             match rx.recv_timeout(Duration::from_millis(500)) {
@@ -1025,6 +1037,63 @@ mod tests {
         )
         .await;
         assert_eq!(answer.await.unwrap(), "yes");
+    }
+
+    /// The same property on a runtime with a **single** worker thread, with `ask_user`
+    /// called inline rather than handed to `spawn_blocking`.
+    ///
+    /// This is how the agent loop calls it: `AgentUi` is a sync trait invoked from the
+    /// middle of the loop. A review flagged the blocking `recv_timeout` as able to
+    /// starve the runtime — it cannot, because the loop runs on the worker's top-level
+    /// `block_on` future while the reply arrives on a *spawned* accept-loop task, and
+    /// tokio sizes the worker pool from the host's core count. This pins that, since
+    /// the property is not obvious from reading either side alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn an_ask_is_answerable_on_a_single_worker_runtime() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+
+        // The only client lives on a plain OS thread with its own runtime, so nothing
+        // about the reply path can borrow the server runtime's single worker.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let sock2 = sock.clone();
+        let replier = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let (mut r, mut w) = attach_client(&sock2).await;
+                // Attached *and* subscribed (attach_client waits for the Snapshot), so
+                // the Ask cannot be broadcast before anyone is listening.
+                ready_tx.send(()).unwrap();
+                loop {
+                    if let ServerMsg::Ask { id, .. } = read_msg(&mut r).await {
+                        send_client(
+                            &mut w,
+                            &ClientMsg::AskReply {
+                                id,
+                                answer: "yes".into(),
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            });
+        });
+        ready_rx.recv().unwrap();
+
+        let mut ask_ui = ui.clone();
+        assert_eq!(
+            ask_ui.ask_user("continue?", &[]),
+            "yes",
+            "the reply task must still be schedulable while the loop blocks"
+        );
+        replier.join().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

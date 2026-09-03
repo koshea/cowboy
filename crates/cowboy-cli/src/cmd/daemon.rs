@@ -132,14 +132,50 @@ struct VacuumOutcome {
     reaped: Vec<SessionId>,
 }
 
+/// Read the persisted registry, keeping a corrupt file rather than dropping it.
+///
+/// The old version was `read_to_string().ok().and_then(parse).ok().unwrap_or_default()`,
+/// which treated "no such file" (a fresh daemon — normal) and "this file did not
+/// parse" (something is wrong) identically. The second case is not cosmetic: `leases`
+/// lives in here, and it is what stops two sessions running in one worktree. Losing it
+/// silently means the next `cowboy` command happily starts a second session on top of
+/// a live one.
+///
+/// Starting empty is still the only workable outcome — a daemon that refuses to start
+/// leaves the user with no way to run anything — so the recovery is to say so loudly
+/// and move the file aside so it can be inspected or restored by hand.
+fn load_state(path: &Path) -> State {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(), error = %e,
+                "could not read the daemon registry; starting empty (worktree leases are lost, \
+                 so a busy worktree may not be detected until its session re-registers)"
+            );
+            return State::default();
+        }
+    };
+    match serde_json::from_str(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            let kept = path.with_extension(format!("json.corrupt-{}", now_ms()));
+            let saved = std::fs::rename(path, &kept).is_ok();
+            tracing::error!(
+                path = %path.display(), error = %e, kept = %kept.display(), saved,
+                "the daemon registry did not parse; starting empty. Worktree leases are lost, \
+                 so a busy worktree may not be detected until its session re-registers"
+            );
+            State::default()
+        }
+    }
+}
+
 impl Daemon {
     fn load(state_path: PathBuf) -> Self {
-        let state = std::fs::read_to_string(&state_path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
         Self {
-            state,
+            state: load_state(&state_path),
             state_path,
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
@@ -459,6 +495,13 @@ impl Daemon {
     }
 
     /// Persist the registry atomically (temp file + rename).
+    /// Persist the registry, atomically and durably.
+    ///
+    /// The temp-file-then-rename gets atomicity; the two fsyncs get durability, and
+    /// without them the rename can reach the disk before the bytes do. The window is
+    /// small but the payload is not: a truncated `state.json` is a *parse* failure,
+    /// which used to reset the registry — leases included — without a word. So the
+    /// two halves of this fix belong together.
     fn save(&self) {
         if let Some(parent) = self.state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -467,10 +510,31 @@ impl Daemon {
             return;
         };
         let tmp = self.state_path.with_extension("json.tmp");
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(&tmp, &self.state_path);
+        if let Err(e) = write_durable(&tmp, json.as_bytes()) {
+            tracing::warn!(path = %tmp.display(), error = %e, "could not stage the daemon registry");
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp, &self.state_path) {
+            tracing::warn!(path = %self.state_path.display(), error = %e, "could not save the daemon registry");
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        // The rename itself is a directory operation, so the directory needs its own
+        // flush or the entry can be lost even though the file's contents are safe.
+        if let Some(parent) = self.state_path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
         }
     }
+}
+
+/// Write `bytes` to `path` and flush them to the device before returning.
+fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 // ---------------------------------------------------------------------------
@@ -1537,6 +1601,60 @@ mod tests {
             coordinating: std::collections::HashMap::new(),
             web: None,
         }
+    }
+
+    /// A registry that survives a round trip, and one that does not.
+    ///
+    /// The corrupt case has to start empty — a daemon that refuses to start leaves the
+    /// user unable to run anything — but it must not do so *quietly*: `leases` is in
+    /// here, and losing it means the next command may start a second session on top of
+    /// a live one. So the file is kept for inspection rather than overwritten.
+    #[test]
+    fn a_corrupt_registry_is_preserved_rather_than_overwritten() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+
+        // A good file round-trips, leases included.
+        let mut d = Daemon {
+            state: State::default(),
+            state_path: path.clone(),
+            next_seq: 0,
+            coordinating: std::collections::HashMap::new(),
+            web: None,
+        };
+        put_session(&mut d, "s1", SessionStatus::Running);
+        d.save();
+        assert!(load_state(&path).sessions.contains_key("s1"));
+
+        // Truncated, as an un-fsynced write followed by a crash leaves it.
+        std::fs::write(&path, "{\"sessions\": {\"s1\": ").unwrap();
+        let recovered = load_state(&path);
+        assert!(recovered.sessions.is_empty(), "it cannot be parsed");
+        let kept: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt"))
+            .collect();
+        assert_eq!(
+            kept.len(),
+            1,
+            "the unparseable registry must be kept for inspection, not dropped: {kept:?}"
+        );
+        assert!(!path.exists(), "and moved aside, not left to fail again");
+    }
+
+    /// A missing file is a fresh daemon, not a problem — it must not be confused with
+    /// the case above, which is the confusion the old one-liner made.
+    #[test]
+    fn a_missing_registry_is_just_an_empty_one() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        assert!(load_state(&path).sessions.is_empty());
+        assert!(
+            std::fs::read_dir(tmp.path()).unwrap().flatten().count() == 0,
+            "nothing is written for a daemon that has never saved"
+        );
     }
 
     /// Register a session with a given status so its lease holder has known
