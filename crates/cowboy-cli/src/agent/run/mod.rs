@@ -1351,6 +1351,78 @@ impl<'a> AgentLoop<'a> {
         kept.into()
     }
 
+    /// Repair tool-call/tool-result pairing anywhere in the history.
+    ///
+    /// Providers reject a conversation in which an assistant turn carries a tool call
+    /// with no matching result, or a tool result whose call id it has never seen. Both
+    /// shapes are fatal for the *whole session*, not just the turn that produced them:
+    /// the history is replayed on every subsequent call, so one bad splice 400s until
+    /// the session is abandoned.
+    ///
+    /// Several things reshape the history — `fit_context`, `compact_within_turn`,
+    /// `drop_oldest`, `tail_within` on resume, and an interrupted turn — and each was
+    /// separately responsible for not breaking the pairing. `seal_dangling_tool_calls`
+    /// only repairs the *last* dangling assistant turn, which is the right amount for
+    /// the cancel path it was written for and not enough as a general guarantee.
+    ///
+    /// So the invariant is enforced in one place instead: this runs immediately before
+    /// every model call, which is the only point that matters. A path that trims badly
+    /// still loses information, but it can no longer produce a conversation the
+    /// provider refuses.
+    ///
+    /// Static rather than a method so it is testable directly on a message list.
+    /// Returns how many repairs it made (0 in the normal case).
+    fn enforce_tool_call_pairing(messages: &mut Vec<Message>, why: &str) -> usize {
+        use std::collections::HashSet;
+        let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+        let mut repairs = 0usize;
+        let mut i = 0usize;
+        while i < messages.len() {
+            let m = &messages[i];
+            if m.role == Role::Assistant && !m.tool_calls.is_empty() {
+                let calls = m.tool_calls.clone();
+                out.push(m.clone());
+                i += 1;
+                // The run of tool results that belongs to this assistant turn.
+                let mut answered: HashSet<String> = HashSet::new();
+                while i < messages.len() && messages[i].role == Role::Tool {
+                    let keep = match &messages[i].tool_call_id {
+                        // A duplicate result for one call is as invalid as none.
+                        Some(id) => {
+                            calls.iter().any(|c| &c.id == id) && answered.insert(id.clone())
+                        }
+                        None => false,
+                    };
+                    if keep {
+                        out.push(messages[i].clone());
+                    } else {
+                        repairs += 1;
+                    }
+                    i += 1;
+                }
+                // Anything still unanswered gets a result, so the turn is complete.
+                for c in &calls {
+                    if !answered.contains(&c.id) {
+                        out.push(Message::tool_result(&c.id, why));
+                        repairs += 1;
+                    }
+                }
+            } else if m.role == Role::Tool {
+                // A result with no assistant turn before it claiming its id — what a
+                // trim that cut mid-turn leaves behind.
+                repairs += 1;
+                i += 1;
+            } else {
+                out.push(m.clone());
+                i += 1;
+            }
+        }
+        if repairs > 0 {
+            *messages = out;
+        }
+        repairs
+    }
+
     /// Set the active model's per-1M-token USD pricing (used for the running
     /// cost estimate; `None` disables cost tracking for this model).
     pub fn with_pricing(
@@ -2698,6 +2770,21 @@ impl<'a> AgentLoop<'a> {
 
     /// Call the model, streaming deltas to the UI, racing cancellation.
     async fn call_model(&mut self) -> Result<ChatResponse> {
+        // The one place every request passes through, and so the only place the
+        // tool-call pairing invariant can be guaranteed rather than hoped for. A
+        // repair here means something upstream trimmed across a turn boundary; that
+        // has lost information either way, but it must not produce a conversation the
+        // provider refuses — which would fail every later turn too, not just this one.
+        let repaired = Self::enforce_tool_call_pairing(
+            &mut self.messages,
+            "not run: this turn was trimmed out of the conversation to fit the context window",
+        );
+        if repaired > 0 {
+            tracing::warn!(
+                repaired,
+                "repaired {repaired} orphaned tool call(s)/result(s) before calling the model"
+            );
+        }
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Delta>();
         // A truncation recovery asks for minimal reasoning for exactly this call.
         // Taken (not merely read) so it cannot leak into later turns, and resolved
@@ -4622,6 +4709,139 @@ mod tests {
         let before = agent.messages.len();
         agent.fit_context().await;
         assert_eq!(agent.messages.len(), before);
+    }
+
+    /// Every shape a provider rejects, repaired in one pass — and normal history left
+    /// untouched.
+    ///
+    /// The failure this guards is not turn-local: the history is replayed on every
+    /// later call, so a single orphaned tool call 400s the session from then on. Rather
+    /// than making each of `fit_context`, `compact_within_turn`, `drop_oldest` and
+    /// `tail_within` individually responsible for not producing one, the invariant is
+    /// enforced immediately before the model call.
+    #[test]
+    fn orphaned_tool_calls_and_results_are_repaired_before_the_model_sees_them() {
+        let why = "not run";
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        };
+        let asst_with = |ids: &[&str]| {
+            let mut m = Message::new(Role::Assistant, "");
+            m.tool_calls = ids.iter().map(|i| call(i)).collect();
+            m
+        };
+
+        // A well-formed conversation is not touched at all.
+        let mut good = vec![
+            Message::user("do it"),
+            asst_with(&["a", "b"]),
+            Message::tool_result("a", "ok"),
+            Message::tool_result("b", "ok"),
+            Message::new(Role::Assistant, "done"),
+        ];
+        let untouched = good.clone();
+        assert_eq!(AgentLoop::enforce_tool_call_pairing(&mut good, why), 0);
+        assert_eq!(good, untouched, "valid history must pass through unchanged");
+
+        // An unanswered call gets a result, in place — not appended at the end, which
+        // would put it after a later user turn.
+        let mut dangling = vec![
+            asst_with(&["a", "b"]),
+            Message::tool_result("a", "ok"),
+            Message::user("actually, do this instead"),
+        ];
+        assert_eq!(AgentLoop::enforce_tool_call_pairing(&mut dangling, why), 1);
+        assert_eq!(dangling.len(), 4);
+        assert_eq!(dangling[2].tool_call_id.as_deref(), Some("b"));
+        assert_eq!(dangling[3].role, Role::User);
+
+        // A result whose assistant turn was trimmed away has nothing to attach to.
+        let mut orphan_result = vec![
+            Message::tool_result("gone", "ok"),
+            Message::user("carry on"),
+        ];
+        assert_eq!(
+            AgentLoop::enforce_tool_call_pairing(&mut orphan_result, why),
+            1
+        );
+        assert_eq!(orphan_result.len(), 1);
+        assert_eq!(orphan_result[0].role, Role::User);
+
+        // A result for an id this turn never asked for, and a duplicate answer to one
+        // it did: both invalid, both dropped.
+        let mut mismatched = vec![
+            asst_with(&["a"]),
+            Message::tool_result("a", "ok"),
+            Message::tool_result("a", "ok again"),
+            Message::tool_result("z", "from somewhere else"),
+        ];
+        assert_eq!(
+            AgentLoop::enforce_tool_call_pairing(&mut mismatched, why),
+            2
+        );
+        assert_eq!(mismatched.len(), 2);
+
+        // Two dangling turns, not just the newest — the gap
+        // `seal_dangling_tool_calls` leaves by design.
+        let mut two = vec![asst_with(&["a"]), Message::user("hmm"), asst_with(&["b"])];
+        assert_eq!(AgentLoop::enforce_tool_call_pairing(&mut two, why), 2);
+        assert_eq!(two.len(), 5);
+        assert_eq!(two[1].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(two[4].tool_call_id.as_deref(), Some("b"));
+
+        // Idempotent: repairing a repaired history changes nothing.
+        assert_eq!(AgentLoop::enforce_tool_call_pairing(&mut two, why), 0);
+    }
+
+    /// The invariant is wired into `call_model`, not merely available.
+    ///
+    /// Asserted by handing the loop a history no provider would accept and confirming
+    /// that making a call repairs it. This is the wiring test; the shapes themselves
+    /// are covered above.
+    #[tokio::test]
+    async fn calling_the_model_repairs_the_history_first() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![ChatResponse::default()])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let mut asst = Message::new(Role::Assistant, "");
+        asst.tool_calls = vec![ToolCall {
+            id: "a".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        agent.messages = vec![
+            Message::tool_result("trimmed-away", "orphan"),
+            Message::user("go"),
+            asst,
+        ];
+
+        let _ = agent.call_model().await;
+
+        assert_eq!(
+            AgentLoop::enforce_tool_call_pairing(&mut agent.messages, "x"),
+            0,
+            "the history must be valid after a call, not just before the next one"
+        );
+        assert!(
+            !agent
+                .messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("trimmed-away")),
+            "the orphaned result must be gone"
+        );
+        assert_eq!(
+            agent.messages.last().unwrap().tool_call_id.as_deref(),
+            Some("a"),
+            "and the dangling call must have been answered"
+        );
     }
 
     /// Shrink `agent`'s window so the conversation budget is exactly `budget` tokens.

@@ -104,6 +104,15 @@ after `--resume`, where the previous session's transcript sits in front of it. A
 loads at most half the budget, newest first, so continuing an old session cannot blow
 the window on the first request.
 
+**Tool calls always keep their results.** Every trim, fold and prune above can in
+principle cut across a turn boundary, and the shape that results — an assistant turn
+whose tool call has no result, or a result whose call is gone — is one providers reject
+outright. Because the whole conversation is replayed on every request, that would not
+fail one turn but every turn after it. So the pairing is repaired in the one place that
+matters, immediately before each model call, rather than each trimming path being
+separately trusted not to break it. A repair still means information was lost, so it
+logs; it just cannot brick the session.
+
 If a reasoning model burns its whole output budget thinking and returns no answer
 or tool call, Cowboy warns that its `max_tokens` may be too low and then recovers
 rather than ending the turn. It retries with a directive to answer now, and asks the
