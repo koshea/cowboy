@@ -32,7 +32,6 @@ use cowboy_core::daemonproto::{
 use cowboy_core::netproto::encode_line;
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio_util::sync::CancellationToken;
 
 /// Resolves a session id to its attach target. Injected so the WS bridge is
@@ -517,7 +516,7 @@ fn status_word(s: &SessionStatus) -> &'static str {
 /// worker line becomes a WS text frame; every (well-formed) WS frame becomes a
 /// `ClientMsg` line to the worker.
 async fn bridge(ws: WebSocket, worker_sock: PathBuf, since_seq: Option<u64>) {
-    let stream = match UnixStream::connect(&worker_sock).await {
+    let stream = match crate::localsock::connect(&worker_sock).await {
         Ok(s) => s,
         Err(e) => {
             ended(ws, &format!("worker unreachable: {e}")).await;

@@ -103,11 +103,11 @@ impl SocketUi {
         journal_path: &Path,
         info: SessionInfo,
     ) -> Result<(Self, mpsc::UnboundedReceiver<ClientMsg>)> {
-        if let Some(parent) = socket_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::remove_file(socket_path);
-        let listener = UnixListener::bind(socket_path)
+        // Owner-only, in an owner-only directory. A peer on this socket can inject
+        // messages into the agent's conversation and answer outstanding
+        // network-approval prompts — answering those *is* the `ask` policy gate — so
+        // it is as privileged as the daemon socket.
+        let listener = crate::localsock::bind(socket_path)
             .with_context(|| format!("binding session socket {}", socket_path.display()))?;
 
         let file = std::fs::OpenOptions::new()
@@ -434,6 +434,12 @@ async fn accept_loop(
         let Ok((stream, _)) = accepted else {
             continue;
         };
+        // From the kernel, not from anything the client sends: a peer here can answer
+        // network-approval prompts, so admitting the wrong uid would hand the `ask`
+        // gate to another local user.
+        if !crate::localsock::peer_is_ours(&stream) {
+            continue;
+        }
         let inner = inner.clone();
         let cmd_tx = cmd_tx.clone();
         tokio::spawn(async move {
@@ -722,6 +728,26 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].contains("command_start"));
+    }
+
+    /// The session socket is at least as privileged as the daemon's: a peer on it can
+    /// inject messages into the conversation and **answer outstanding
+    /// network-approval prompts**, which is the `ask` policy gate. So no other local
+    /// user may reach it. It used to be bound at the process umask in a directory
+    /// created with `create_dir_all`'s default.
+    #[tokio::test]
+    async fn the_session_socket_is_not_reachable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let dir = tmp.path().join("run");
+        let sock = dir.join("s.sock");
+        let (_ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&sock), 0o600, "answering an `ask` must stay ours");
+        assert_eq!(mode(&dir), 0o700);
     }
 
     /// A client that attached read-only may watch, but must not drive the session.

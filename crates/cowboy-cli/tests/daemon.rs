@@ -85,6 +85,30 @@ fn daemon_pings_lists_and_is_single_instance() {
     );
 }
 
+/// The control socket is a full privileged interface: a peer can start and end
+/// sessions, create worktrees and drive workers. So it must not be reachable by other
+/// local users. Asserted on the real thing the daemon binds, because this was
+/// previously left to whatever the process umask happened to be — `0755` on a typical
+/// host — inside a directory created with `create_dir_all`'s default. Without
+/// `XDG_RUNTIME_DIR` that directory is a predictable path in world-writable `/tmp`.
+#[test]
+fn the_control_socket_is_not_reachable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = assert_fs::TempDir::new().unwrap();
+    let state = assert_fs::TempDir::new().unwrap();
+    let sock = runtime.path().join("cowboy/cowboyd.sock");
+    let _d = spawn_daemon(runtime.path(), state.path());
+    assert!(wait_for_pong(&sock), "daemon should answer Ping");
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&sock), 0o600, "the daemon socket must be owner-only");
+    assert_eq!(
+        mode(&runtime.path().join("cowboy")),
+        0o700,
+        "and no other user may create or replace entries beside it"
+    );
+}
+
 #[test]
 fn registry_carries_ranch_and_workstream_tags() {
     let runtime = assert_fs::TempDir::new().unwrap();

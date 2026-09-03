@@ -67,7 +67,7 @@ pub async fn run(target: String) -> Result<()> {
             // A worker can exit between GetSession and our connect. Probe the
             // socket first; if it's dead, fall back to a read-only journal
             // replay rather than dropping the user into a broken live view.
-            if std::os::unix::net::UnixStream::connect(&worker_sock).is_ok() {
+            if crate::localsock::connect_blocking(&worker_sock).is_ok() {
                 attach_socket(
                     &worker_sock,
                     &title,
@@ -179,7 +179,7 @@ pub fn attach_socket_ro(
             return;
         };
         rt.block_on(async move {
-            match UnixStream::connect(&sock).await {
+            match crate::localsock::connect(&sock).await {
                 Ok(stream) => {
                     let _ = bridge(stream, ui_tx.clone(), task_rx, bridge_cancel, read_only).await;
                 }

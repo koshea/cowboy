@@ -146,11 +146,37 @@ build, and the sandbox confines correctly without them. `cowboy doctor` warns
 rather than fails when they are unavailable, and `cowboy sandbox plan` marks a
 configured ceiling this host cannot apply.
 
+## The local control sockets
+
+The daemon and each live session listen on unix sockets under
+`$XDG_RUNTIME_DIR/cowboy` (or `/tmp/cowboy-$UID` when that is unset). Both are
+**fully privileged interfaces**, and the session one is the more sensitive of the two:
+over it a peer injects messages into the agent's conversation and answers outstanding
+network-approval prompts. Whoever can answer those *is* the `ask` gate.
+
+They are protected three ways, because each covers a different failure:
+
+- the directory is **`0700`, verified to be owned by you and not a symlink** — this is
+  what stops a hostile pre-created path, which no permission on the socket could fix;
+- each socket is **`0600`**, so the mode still says what is intended if the directory
+  is later loosened by hand;
+- every accepted connection's **peer uid is checked with `SO_PEERCRED`** and dropped
+  unless it is yours. Permissions can be undone by anything that touches the file; the
+  kernel's answer to who is on the other end cannot. Clients check the other
+  direction too, refusing a socket they do not own rather than handing their project
+  paths and approvals to whatever is listening.
+
+`root` is deliberately not admitted as a special case: it can already do anything, so
+allowing uid 0 buys nothing and would make a root-run client work where the same
+client run as you would not.
+
 ## Fail-closed by default
 
 Every gate denies when it cannot get an answer:
 
 - `ask` with no approver attached → **deny**;
+- a control-socket peer whose uid cannot be read → **refused**, since an
+  unidentifiable caller is what the check exists to stop;
 - a DNS query whose name is denied → **REFUSED**, without a byte leaving the host;
 - a connection whose original destination cannot be recovered → refused, rather
   than forwarded somewhere guessed;

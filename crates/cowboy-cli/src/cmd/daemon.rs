@@ -19,7 +19,7 @@ use cowboy_core::daemonproto::{
 use cowboy_core::netproto::encode_line;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
 // ---------------------------------------------------------------------------
@@ -518,15 +518,16 @@ fn idle_linger() -> Option<std::time::Duration> {
 /// the lock.
 pub async fn serve() -> Result<()> {
     let dir = runtime_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    // 0700 and verified ours: the sockets in here are a full control surface, and
+    // without `XDG_RUNTIME_DIR` this is a predictable path in world-writable /tmp.
+    crate::localsock::ensure_private_dir(&dir)?;
 
     // Single-instance lock (held for the process lifetime).
     let _lock = acquire_lock(&dir.join("cowboyd.lock"))?;
 
     let sock = socket_path();
-    let _ = std::fs::remove_file(&sock); // we hold the lock, so any socket is stale
-    let listener =
-        UnixListener::bind(&sock).with_context(|| format!("binding {}", sock.display()))?;
+    // Owner-only, and any socket here is stale because we hold the lock.
+    let listener = crate::localsock::bind(&sock)?;
     tracing::info!(sock = %sock.display(), "cowboyd listening");
 
     let daemon = Arc::new(Mutex::new(Daemon::load(state_path())));
@@ -654,6 +655,13 @@ pub async fn serve() -> Result<()> {
         };
         let daemon = daemon.clone();
         let shutdown = shutdown.clone();
+        // Who is on the other end, from the kernel. The socket is 0600 in a 0700
+        // directory, but permissions can be widened by anything that touches the
+        // file and this cannot: a peer that is not us never reaches `handle_conn`,
+        // which would otherwise let them start sessions and drive workers.
+        if !crate::localsock::peer_is_ours(&stream) {
+            continue;
+        }
         tokio::spawn(async move {
             if let Err(e) = handle_conn(stream, daemon, shutdown).await {
                 tracing::debug!(error = %e, "connection ended");
@@ -1427,7 +1435,7 @@ async fn start_session(
 /// Connect and issue a single request, returning the response. Errors if the
 /// daemon is not reachable.
 pub async fn request(req: DaemonReq) -> Result<DaemonResp> {
-    let stream = UnixStream::connect(socket_path())
+    let stream = crate::localsock::connect(&socket_path())
         .await
         .context("connecting to cowboyd (is it running?)")?;
     let (r, mut w) = stream.into_split();

@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod cli;
 pub mod cmd;
+pub mod localsock;
 pub mod mcp;
 pub mod net;
 pub mod project;
