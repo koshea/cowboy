@@ -139,6 +139,36 @@ fn default_true() -> bool {
 }
 
 impl Ranch {
+    /// A hash of everything that counts as the plan's **scope**, as opposed to its
+    /// progress.
+    ///
+    /// In: the ranch's identity and goal, and for each workstream its id, title, goal,
+    /// dependencies, expected artifacts and acceptance criteria. Out: status,
+    /// `session_id`, `branch`, `worktree_path`, `auto_advance`, timestamps — the things
+    /// the coordinator maintains as work happens.
+    ///
+    /// Order-sensitive on purpose: reordering the workstreams is a change to the plan
+    /// as a person reads it, so it should not slip through a progress write.
+    ///
+    /// Used by [`save_progress`] to make the "scope changes are user-gated" rule an
+    /// actual check rather than a convention.
+    pub fn scope_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.id.hash(&mut h);
+        self.title.hash(&mut h);
+        self.goal.hash(&mut h);
+        for w in &self.workstreams {
+            w.id.hash(&mut h);
+            w.title.hash(&mut h);
+            w.goal.hash(&mut h);
+            w.depends_on.hash(&mut h);
+            w.expected_artifacts.hash(&mut h);
+            w.acceptance.hash(&mut h);
+        }
+        h.finish()
+    }
+
     /// Ids of workstreams whose outputs are done.
     pub fn done_ids(&self) -> HashSet<String> {
         self.workstreams
@@ -280,6 +310,8 @@ pub fn load(root: &Path, id: &str) -> Result<Ranch> {
 }
 
 /// Write a ranch plan (creates its dir; atomic temp+rename).
+///
+/// Use [`save_progress`] for any write that is *not* meant to change the plan's scope.
 pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
     let path = ranch_path(root, &ranch.id);
     if let Some(parent) = path.parent() {
@@ -290,6 +322,31 @@ pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
     std::fs::write(&tmp, yaml).map_err(|e| Error::Invalid(e.to_string()))?;
     std::fs::rename(&tmp, &path).map_err(|e| Error::Invalid(e.to_string()))?;
     Ok(())
+}
+
+/// Write a plan whose **scope has not changed**, refusing the write if it has.
+///
+/// `ranch.yaml` is the committed source of truth, and the rule is that its *scope* —
+/// which workstreams exist, what they depend on, what they are for, what they must
+/// deliver — changes only when the user says so, via a scope proposal and
+/// `cowboy ranch approve`. Progress is different: which workstream is running, its
+/// session id, branch and worktree, and the derived overall status. The daemon
+/// coordinator writes those on its own, all day.
+///
+/// That distinction was documented and then enforced by nothing, which is the kind of
+/// invariant that quietly stops being true. `before` is the plan as loaded; passing it
+/// here makes the write assert what it claims. The check is on the scope fields only,
+/// so ordinary bookkeeping passes and an accidental (or agent-driven) scope edit on a
+/// progress path fails loudly instead of landing in a committed file.
+pub fn save_progress(root: &Path, before: &Ranch, after: &Ranch) -> Result<()> {
+    if before.scope_fingerprint() != after.scope_fingerprint() {
+        return Err(Error::Invalid(format!(
+            "refusing to write ranch `{}`: this is a progress update, but the plan's scope \
+             changed. Scope changes go through a proposal and `cowboy ranch approve`",
+            after.id
+        )));
+    }
+    save(root, after)
 }
 
 /// List all ranch plans for a project (newest activity is not implied; sorted by id).
@@ -414,6 +471,68 @@ mod tests {
         ])
         .validate()
         .is_err());
+    }
+
+    /// Progress writes go through; scope writes on a progress path do not.
+    ///
+    /// This is the AGENTS.md rule made mechanical: the daemon coordinator and
+    /// `ranch complete/accept/retry` maintain status, session ids, branches and
+    /// worktrees on their own, but which workstreams exist and what they must deliver
+    /// only changes when the user approves a proposal. Previously nothing checked it.
+    #[test]
+    fn a_progress_write_may_not_change_the_plans_scope() {
+        let dir = std::env::temp_dir().join(format!("cowboy-ranch-scope-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut before = ranch(vec![ws("schema", &[], WorkstreamStatus::Planned)]);
+        before.workstreams[0].acceptance = vec!["migrations apply cleanly".into()];
+        before.workstreams[0].expected_artifacts = vec!["schema.sql".into()];
+        save(&dir, &before).unwrap();
+
+        // Bookkeeping: status, session, branch, worktree, timestamps, auto_advance.
+        let mut progress = before.clone();
+        progress.status = RanchStatus::Running;
+        progress.auto_advance = !before.auto_advance;
+        progress.updated_ms = 12_345;
+        {
+            let w = progress.workstream_mut("schema").unwrap();
+            w.status = WorkstreamStatus::Running;
+            w.session_id = Some("s1".into());
+            w.branch = Some("cowboy/schema".into());
+            w.worktree_path = Some(PathBuf::from("/w/schema"));
+        }
+        save_progress(&dir, &before, &progress).expect("progress must be writable");
+        assert_eq!(load(&dir, "r").unwrap().status, RanchStatus::Running);
+
+        // Scope: a new workstream, a changed dependency, a reworded goal, a dropped
+        // acceptance criterion. Each must be refused on this path.
+        let mut added = progress.clone();
+        added
+            .workstreams
+            .push(ws("api", &["schema"], WorkstreamStatus::Planned));
+        let mut redirected = progress.clone();
+        redirected.workstreams[0].depends_on = vec!["nonexistent".into()];
+        let mut regoaled = progress.clone();
+        regoaled.workstreams[0].goal = "something else entirely".into();
+        let mut deaccepted = progress.clone();
+        deaccepted.workstreams[0].acceptance.clear();
+        let mut retitled = progress.clone();
+        retitled.title = "a different plan".into();
+
+        for (label, candidate) in [
+            ("a new workstream", added),
+            ("a changed dependency", redirected),
+            ("a reworded goal", regoaled),
+            ("a dropped acceptance criterion", deaccepted),
+            ("a retitled plan", retitled),
+        ] {
+            let err = match save_progress(&dir, &progress, &candidate) {
+                Err(e) => e.to_string(),
+                Ok(()) => panic!("{label} is a scope change and must be refused"),
+            };
+            assert!(err.contains("scope changed"), "{label}: {err}");
+        }
+        // And nothing leaked to disk: the committed plan still has one workstream.
+        assert_eq!(load(&dir, "r").unwrap().workstreams.len(), 1);
     }
 
     #[test]

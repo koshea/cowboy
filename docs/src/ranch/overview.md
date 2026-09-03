@@ -22,8 +22,13 @@ promotes outputs, advances the plan, and pauses for your sign-off where it matte
 
 ## Invariants
 
-- **The agent never edits `ranch.yaml`.** Scope changes go through a
-  [proposal you approve](scope-proposals.md).
+- **The plan's *scope* only changes when you say so.** Which workstreams exist,
+  their goals, `depends_on`, expected artifacts and acceptance criteria are changed
+  by a [proposal you approve](scope-proposals.md) — never by a worker agent, and
+  never by the coordinator on its own. Its *progress* (statuses, session ids,
+  branches, worktrees) is the coordinator's job and it writes that continuously.
+  The split is enforced in code, not just stated here: progress writes are refused
+  if the scope fingerprint changed.
 - **Artifacts are promoted, not shared ad hoc.** A finished workstream's published
   artifacts (+ handoff) are copied into the committed ranch store at
   `.cowboy/ranches/<id>/artifacts/<workstream>/`, and injected into the prompts of

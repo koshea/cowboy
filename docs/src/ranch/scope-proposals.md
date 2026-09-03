@@ -1,9 +1,15 @@
 # Scope-change proposals
 
-The ranch plan (`ranch.yaml`) is the committed source of truth and is **never**
-edited by a worker agent — nor autonomously by the coordinator. When the plan
-looks wrong, the change is filed as a **proposal** that you review and approve or
-reject. Only on approval does the plan change.
+The ranch plan (`ranch.yaml`) is the committed source of truth, and its **scope** —
+which workstreams exist, their goals, dependencies, expected artifacts and acceptance
+criteria — is never changed by a worker agent, nor autonomously by the coordinator.
+When the plan looks wrong, the change is filed as a **proposal** that you review and
+approve or reject. Only on approval does the plan change.
+
+(The coordinator *does* write to `ranch.yaml`, continuously — statuses, session ids,
+branches, worktree paths. That is progress, not scope, and the two are kept apart by a
+check rather than by convention: a progress write that would alter any scope field is
+refused before it reaches disk.)
 
 ## Filing a proposal
 

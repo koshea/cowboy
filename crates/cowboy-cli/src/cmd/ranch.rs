@@ -127,6 +127,7 @@ fn accept(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
 async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
     let _lock = lock_ranch(root, id)?;
     let mut ranch = ranch::load(root, id)?;
+    let before = ranch.clone();
     let Some(w) = ranch.workstream_mut(workstream) else {
         bail!("no workstream `{workstream}` in ranch `{id}`");
     };
@@ -157,7 +158,7 @@ async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()>
     w.worktree_path = None;
     w.branch = None;
     ranch.recompute_readiness();
-    ranch::save(root, &ranch)?;
+    ranch::save_progress(root, &before, &ranch)?;
     if let Some((path, branch)) = old {
         crate::net::worktree::remove(root, &path, &branch);
     }
@@ -217,6 +218,7 @@ fn lock_ranch(root: &Path, id: &str) -> Result<RanchLock> {
 fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> Result<()> {
     let _lock = lock_ranch(root, id)?;
     let mut ranch = ranch::load(root, id)?;
+    let before = ranch.clone();
     {
         let ws = ranch
             .workstream_mut(workstream)
@@ -230,7 +232,7 @@ fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> 
         ranch.status = RanchStatus::Complete;
     }
     ranch.updated_ms = now_ms();
-    ranch::save(root, &ranch)?;
+    ranch::save_progress(root, &before, &ranch)?;
     println!("✓ {workstream} {verb} — promoted {n} artifact(s)");
     if !newly.is_empty() {
         println!("newly ready: {}", newly.join(", "));
@@ -803,6 +805,11 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
     let _lock = lock_ranch(root, id)?;
     let mut log: Vec<String> = Vec::new();
     let mut ranch = ranch::load(root, id)?;
+    // The scope as committed. Everything below is progress bookkeeping — statuses,
+    // session ids, branches, worktrees — so the write at the end asserts that rather
+    // than trusting it. The coordinator runs unattended inside the daemon; it is the
+    // one writer that must never be able to redefine the plan.
+    let scope_as_committed = ranch.clone();
     // Reject a broken dependency graph up front: a cycle or a typo'd `depends_on`
     // would otherwise silently leave workstreams blocked forever with no error.
     ranch
@@ -911,7 +918,7 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
         ranch.status = RanchStatus::WaitingForUser;
     }
     ranch.updated_ms = now_ms();
-    ranch::save(root, &ranch)?;
+    ranch::save_progress(root, &scope_as_committed, &ranch)?;
 
     if started.is_empty() {
         log.push("nothing ready to start.".into());

@@ -170,9 +170,16 @@ in its own worktree/branch. `cowboy-core/src/ranch.rs` (data model + readiness) 
 the **coordinator** in `cmd/daemon.rs` auto-advances on workstream completion.
 
 Invariants to preserve here:
-- `.cowboy/ranches/<id>/ranch.yaml` is the **committed source of truth** and is
-  **never edited by an agent** (nor autonomously by the coordinator). Scope changes
-  go through `propose_scope_change` → `cowboy ranch approve` (user-gated).
+- `.cowboy/ranches/<id>/ranch.yaml` is the **committed source of truth**. Its
+  **scope** — which workstreams exist, their goals, `depends_on`, expected artifacts
+  and acceptance criteria — is **never** changed by an agent, and never autonomously
+  by the coordinator: scope changes go through `propose_scope_change` →
+  `cowboy ranch approve` (user-gated). Its **progress** — statuses, `session_id`,
+  `branch`, `worktree_path`, timestamps — is written all day by the coordinator and by
+  `ranch start/complete/accept/retry`. That split is enforced, not just documented:
+  progress paths call `ranch::save_progress(root, before, after)`, which refuses the
+  write if `Ranch::scope_fingerprint()` changed. Use plain `ranch::save` only on a
+  user-gated scope path.
 - Coordination is **artifact-driven**, not chat: workstreams publish artifacts /
   handoffs that get promoted into the ranch store for downstream consumers.
 - **Acceptance gates** pause a finished workstream for human sign-off
