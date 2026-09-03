@@ -606,6 +606,46 @@ mod tests {
     use super::*;
     use std::net::Ipv6Addr;
 
+    /// The bundle really did get embedded — not merely "the build compiled".
+    ///
+    /// The embed happens in a derive macro reading `../cowboy-web-ui/dist` at compile
+    /// time, and an absent or stale bundle degrades *silently* to a placeholder page:
+    /// the binary builds, `cowboy web` starts, and the browser gets an apology. CI
+    /// built the bundle before the binary and called that end-to-end coverage, but
+    /// nothing checked the result.
+    ///
+    /// Self-skips on an ordinary dev checkout, where an empty `dist/` is the expected
+    /// state. `COWBOY_WEB_UI_TESTS=required` turns the skip into a failure, which is
+    /// what CI and the release build set — otherwise this test would pass by doing
+    /// nothing precisely when it matters.
+    #[test]
+    fn the_web_ui_bundle_is_embedded_when_it_was_built() {
+        let files: Vec<String> = WebAssets::iter().map(|f| f.to_string()).collect();
+        let required = std::env::var("COWBOY_WEB_UI_TESTS").as_deref() == Ok("required");
+        if files.is_empty() {
+            assert!(
+                !required,
+                "COWBOY_WEB_UI_TESTS=required but no web UI bundle is embedded — run \
+                 `trunk build --release` in crates/cowboy-web-ui before building"
+            );
+            eprintln!("skipping: no bundle embedded (empty dist/ — run `trunk build`)");
+            return;
+        }
+        assert!(
+            files.iter().any(|f| f == "index.html"),
+            "a bundle is embedded but has no index.html, so the SPA shell would still \
+             fall back to the placeholder: {files:?}"
+        );
+        assert!(
+            files.iter().any(|f| f.ends_with("_bg.wasm")),
+            "no wasm in the bundle — the page would load and do nothing: {files:?}"
+        );
+        assert!(
+            serve_asset("index.html").is_some(),
+            "index.html is embedded but not servable"
+        );
+    }
+
     #[test]
     fn bind_guard_allows_loopback_and_tailscale_refuses_lan() {
         // loopback

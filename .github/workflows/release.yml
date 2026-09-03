@@ -1,0 +1,190 @@
+name: Release binaries
+
+# Builds `cowboy` + `cowboyd` and attaches them to a GitHub release.
+#
+# This replaced an image-publishing pipeline. There are no images any more: the
+# sandbox is built from kernel features on the user's own machine and the agent uses
+# the toolchain already installed there, so there is nothing to ship but the binaries.
+#
+# The web UI bundle is built first and embedded, so a released binary serves
+# `cowboy web` without needing trunk or a wasm toolchain on the user's machine.
+#
+# Tag push (`v0.2.0`) → build, then publish a release with notes and checksums.
+# Manual run → build and keep the artifacts, publishing nothing. That makes
+# `workflow_dispatch` a safe rehearsal of the whole thing.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Publish whatever did build rather than losing a good architecture to a
+      # broken one; the release job checks that what it needs actually arrived.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned to the runner image rather than cross-compiled: several
+      # dependencies build C (aws-lc-rs among them), and a native runner avoids a
+      # cross toolchain that would have to be kept working. arm64 runners are free
+      # for public repos.
+      - name: Install Rust (+ wasm32 for the web UI)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      # Must come before the binary build: `cowboy-cli/build.rs` embeds an existing
+      # `dist/`, and silently falls back to a placeholder page when there is none.
+      - name: Build the web UI bundle
+        run: trunk build --release
+        working-directory: crates/cowboy-web-ui
+
+      - name: Build the binaries
+        run: cargo build --release --locked -p cowboy-cli
+
+      # The embed happens in a derive macro reading `dist/` at compile time, and an
+      # absent bundle degrades silently to a placeholder page — the binary builds and
+      # `cowboy web` starts, it just apologises to the browser. Assert the bundle
+      # actually landed in what is about to be published.
+      - name: Check the web UI bundle really got embedded
+        env:
+          COWBOY_WEB_UI_TESTS: required
+        run: cargo test --locked -p cowboy-cli --lib the_web_ui_bundle_is_embedded
+
+      # The tag is the source of truth for the version, and it must agree with the
+      # manifest. Disagreeing is a mistake that is invisible until someone reports
+      # that `cowboy --version` does not match what they downloaded.
+      - name: Resolve and check the version
+        id: version
+        run: |
+          manifest=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            if [ "$version" != "$manifest" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $manifest" >&2
+              exit 1
+            fi
+          else
+            version="$manifest"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Package
+        id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="cowboy-${VERSION}-${TARGET}"
+          staging="dist/${name}"
+          mkdir -p "$staging"
+          # `cowboy` and `cowboyd` are version-locked to each other, so they ship
+          # together — a mismatched pair is a startup error for the user.
+          cp target/release/cowboy target/release/cowboyd "$staging/"
+          cp README.md LICENSE "$staging/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+      # A released binary that cannot start is worse than no release. This is not a
+      # test suite — the runner has no Landlock/bwrap guarantees — but it does prove
+      # the thing that was just packaged executes and is the version it claims.
+      - name: Smoke-test the packaged binaries
+        env:
+          NAME: ${{ steps.package.outputs.name }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -C dist -xzf "dist/${NAME}.tar.gz"
+          for bin in cowboy cowboyd; do
+            got=$("dist/${NAME}/${bin}" --version)
+            echo "$bin: $got"
+            case "$got" in
+              *"$VERSION"*) ;;
+              *) echo "::error::${bin} --version reported '$got', expected $VERSION" >&2; exit 1 ;;
+            esac
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      # The only job that needs to write, and it writes exactly one thing.
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      # `fail-fast: false` above means a partial matrix still reaches this job.
+      # Publishing a release that silently lacks an architecture is worse than
+      # failing here, so require both.
+      - name: Check both architectures arrived
+        run: |
+          set -euo pipefail
+          ls -l dist
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            if ! ls dist/*"${target}".tar.gz >/dev/null 2>&1; then
+              echo "::error::no archive for ${target}; refusing to publish a partial release" >&2
+              exit 1
+            fi
+          done
+
+      - name: Combine checksums
+        run: cat dist/*.sha256 | sort -k2 > dist/SHA256SUMS
+
+      # Uses the GitHub CLI, already on the runner, rather than a third-party
+      # release action — one less pinned dependency to keep current.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag \
+            dist/*.tar.gz dist/SHA256SUMS

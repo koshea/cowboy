@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Release staging (built by .github/workflows/release.yml; also handy locally)
+/dist
+
 # Secrets and local env
 .env
 

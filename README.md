@@ -19,8 +19,23 @@ command sees it — no restart.
 
 ## Quick start
 
+Grab the binaries from the [latest release](https://github.com/koshea/cowboy/releases/latest)
+— `x86_64` or `aarch64` Linux, with the `cowboy web` UI already embedded:
+
 ```sh
-cargo install --git https://github.com/koshea/cowboy cowboy-cli   # installs `cowboy` + `cowboyd`
+tar xzf cowboy-<version>-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/
+```
+
+Or build from source (needs a Rust toolchain):
+
+```sh
+cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli   # installs `cowboy` + `cowboyd`
+```
+
+Then, either way:
+
+```sh
 cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
 cd your-project
 cowboy init                              # writes .cowboy/{security,agent}.yaml
@@ -28,14 +43,14 @@ cowboy doctor                            # kernel prerequisites, model config, d
 cowboy "run the tests and fix one simple failure"
 ```
 
-The default install ships the CLI and daemon. To also embed the **`cowboy web`**
+A source install ships the CLI and daemon only. To also embed the **`cowboy web`**
 UI, set `COWBOY_WEB_UI=1` for the build — it then ensures `trunk` and the wasm
 target are present and bundles the frontend into the binary (one-time, slower).
-The `env …` prefix works in every shell (including fish/zsh, which reject the
-bare `VAR=value cmd` form):
+Release downloads already include it. The `env …` prefix works in every shell
+(including fish/zsh, which reject the bare `VAR=value cmd` form):
 
 ```sh
-env COWBOY_WEB_UI=1 cargo install --git https://github.com/koshea/cowboy cowboy-cli
+env COWBOY_WEB_UI=1 cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli
 ```
 
 **Install a prebuilt `trunk` first.** If `trunk` isn't found the build will try
@@ -102,7 +117,7 @@ or package to change for anything missing.
 
 ## Development
 
-Install from a checkout with `cargo install --path crates/cowboy-cli`.
+Install from a checkout with `cargo install --locked --path crates/cowboy-cli`.
 
 ```sh
 cargo nextest run                   # unit + integration

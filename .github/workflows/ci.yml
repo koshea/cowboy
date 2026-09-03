@@ -73,6 +73,15 @@ jobs:
       - name: Build cowboy with the bundle embedded
         run: cargo build -p cowboy-cli
 
+      # "It compiled" is not the same as "the bundle is in there": the embed is a
+      # derive macro reading `dist/`, and a missing bundle falls back to a
+      # placeholder page without failing the build. `required` makes that a failure
+      # instead of a skip.
+      - name: Check the bundle was embedded
+        env:
+          COWBOY_WEB_UI_TESTS: required
+        run: cargo test -p cowboy-cli --lib the_web_ui_bundle_is_embedded
+
   docs:
     name: build docs (mdbook)
     runs-on: ubuntu-latest

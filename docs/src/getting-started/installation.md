@@ -49,13 +49,30 @@ you want multiple models, budgets, or failover.
 
 ## Install the binaries
 
-Install straight from GitHub (needs a Rust toolchain — [rustup](https://rustup.rs)):
+Every tagged release ships prebuilt `cowboy` + `cowboyd` for `x86_64` and `aarch64`
+Linux, with the web UI already embedded and a `SHA256SUMS` file beside them:
 
 ```sh
-cargo install --git https://github.com/koshea/cowboy cowboy-cli
+tar xzf cowboy-<version>-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/
+```
+
+There is nothing else to fetch — no image, no runtime. Built against the glibc on
+GitHub's `ubuntu-24.04` runners, so build from source below if yours is older.
+
+Or build it yourself (needs a Rust toolchain — [rustup](https://rustup.rs)):
+
+```sh
+cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli
 ```
 
 This builds and installs `cowboy` (and the `cowboyd` daemon) to `~/.cargo/bin`.
+
+`--locked` is worth keeping: it builds the dependency versions this project actually
+tests, rather than re-resolving to whatever is newest today. Without it, cargo also
+reports a couple of transitive crates as behind their latest release — `matchit` and
+`generic-array`, both pinned to an exact version by `axum`, so there is nothing to
+update and nothing wrong.
 
 ## The toolchain the agent gets
 
@@ -71,7 +88,7 @@ writable).
 
 ```sh
 git clone https://github.com/koshea/cowboy && cd cowboy
-cargo install --path crates/cowboy-cli
+cargo install --locked --path crates/cowboy-cli
 ```
 
 See [Contributing](../contributing.md) for the test suite, including the sandbox
