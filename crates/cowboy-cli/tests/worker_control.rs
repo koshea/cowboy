@@ -156,6 +156,19 @@ fn start(fx: &Fixture, task: Option<&str>) -> std::path::PathBuf {
 }
 
 /// A client on a worker's per-session socket.
+/// One read from a worker socket.
+enum Recv {
+    // Boxed: this variant is far larger than the others, and the enum is returned
+    // from a hot read loop.
+    Msg(Box<ServerMsg>),
+    /// A line that did not parse as a `ServerMsg`.
+    Garbage,
+    /// The read timed out; the session is still there.
+    Timeout,
+    /// EOF or a real error: nothing more is coming.
+    Closed,
+}
+
 struct Client {
     r: BufReader<UnixStream>,
     w: UnixStream,
@@ -184,10 +197,34 @@ impl Client {
         self.w.flush().unwrap();
     }
     fn recv(&mut self) -> Option<ServerMsg> {
+        match self.recv_outcome() {
+            Recv::Msg(m) => Some(*m),
+            Recv::Garbage => None,
+            Recv::Timeout | Recv::Closed => None,
+        }
+    }
+    /// As [`Self::recv`], but distinguishing a read timeout from a closed socket.
+    ///
+    /// The difference matters for anything that waits for a specific message: a
+    /// timeout means "not yet", a close means "never", and collapsing them into
+    /// `None` turns a slow machine into a test failure.
+    fn recv_outcome(&mut self) -> Recv {
         let mut line = String::new();
         match self.r.read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => serde_json::from_str(line.trim()).ok(),
+            Ok(0) => Recv::Closed,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Recv::Timeout
+            }
+            Err(_) => Recv::Closed,
+            Ok(_) => match serde_json::from_str(line.trim()) {
+                Ok(m) => Recv::Msg(Box::new(m)),
+                Err(_) => Recv::Garbage,
+            },
         }
     }
 }
@@ -431,17 +468,103 @@ fn switch_model_reports_success_and_failure() {
 
 /// Read events until a `Notice` containing `needle` (or we run out / time out).
 fn wait_for_notice(c: &mut Client, needle: &str) -> bool {
-    for _ in 0..50 {
-        match c.recv() {
-            Some(ServerMsg::Event {
-                event: UiEventMsg::Notice(m),
-                ..
-            }) if m.contains(needle) => return true,
-            Some(_) => continue,
-            None => return false,
+    // Bounded by time, not by a message count: a busy machine can interleave far more
+    // than fifty events before the one being waited for, and a read timeout is not the
+    // same as the session hanging up.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match c.recv_outcome() {
+            Recv::Msg(m)
+                if matches!(
+                    &*m,
+                    ServerMsg::Event { event: UiEventMsg::Notice(n), .. } if n.contains(needle)
+                ) =>
+            {
+                return true
+            }
+            Recv::Msg(_) | Recv::Garbage | Recv::Timeout => continue,
+            Recv::Closed => return false,
         }
     }
     false
+}
+
+/// A client that **vanishes** — no `End`, no `Detach`, just a closed socket — must not
+/// strand the session. This is the failure that kept coming back: `End` travels over
+/// the socket, so a client killed outright, a closed terminal, or a client that lost
+/// the race in its own shutdown all left the worker parked in its idle loop forever,
+/// holding a sandbox holder and keeping the daemon alive with it.
+///
+/// The worker cannot see *why* the socket closed, so the distinction is drawn at the
+/// protocol: leaving on purpose says `Detach` (asserted by the test below), and
+/// anything else is a client that is not coming back.
+#[test]
+fn a_client_that_vanishes_without_detaching_ends_the_session() {
+    let fx = setup();
+    let ws = start(&fx, None);
+    let id = ws
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("s-")
+        .trim_end_matches(".sock")
+        .to_string();
+    let worker_pid = match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+        Some(DaemonResp::Session { info }) => info.pid.expect("a worker pid"),
+        other => panic!("expected a session record, got {other:?}"),
+    };
+
+    // Attach, then drop the connection on the floor — the moral equivalent of the
+    // client being SIGKILLed.
+    let c = Client::connect(&ws, Duration::from_secs(8));
+    drop(c);
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(40) {
+        if !pid_alive(worker_pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    panic!("the worker ({worker_pid}) outlived a client that vanished without detaching");
+}
+
+/// …and the converse, which is what makes the rule above safe: a client that
+/// *detaches* is saying "keep going", so the session must stay up and reattachable.
+/// Without this the fix above would quietly delete the detach feature.
+#[test]
+fn a_client_that_detaches_leaves_the_session_running() {
+    let fx = setup();
+    let ws = start(&fx, None);
+    let id = ws
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .trim_start_matches("s-")
+        .trim_end_matches(".sock")
+        .to_string();
+    let worker_pid = match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+        Some(DaemonResp::Session { info }) => info.pid.expect("a worker pid"),
+        other => panic!("expected a session record, got {other:?}"),
+    };
+
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+    c.send(&ClientMsg::Detach);
+    drop(c);
+
+    // Well past the abandonment grace period.
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        pid_alive(worker_pid),
+        "a detached session must stay running and reattachable"
+    );
+    assert!(ws.exists(), "its socket must stay connectable");
+
+    // And it really is reattachable, not merely alive.
+    let mut c2 = Client::connect(&ws, Duration::from_secs(8));
+    c2.send(&ClientMsg::End);
 }
 
 /// The leak this is really about: a worker that **started a sandbox** must still exit

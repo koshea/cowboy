@@ -300,7 +300,6 @@ same reason — they go in early, ahead of the configured mounts and the grants,
 grant for a path under `/tmp` lands *inside* scratch instead of being hidden by it.
 
 ## Scratch space is a session directory, not a per-command tmpfs
-
 `/tmp`, `/run` and `/var/tmp` started as `--tmpfs` mounts. Every command gets its
 own mount namespace, so every command got a *fresh, empty* one — and an agent that
 wrote a file in one shell found it gone in the next:
@@ -328,6 +327,35 @@ ceiling.
 `cowboy-cli/tests/sandbox_session.rs` asserts both halves: a marker written in one
 command is readable by the next in all three paths, and a new session on the same
 project starts with none of it.
+
+The directory is keyed to the **owning process**, not the project, because a
+`NativeSandbox` always starts its own holder and so its own namespaces: two sandboxes
+on one project are two independent sessions. Sharing one directory meant
+`cowboy sandbox exec` run alongside a live agent session both saw its `/tmp` and
+deleted it on the way out. A directory whose owner is gone is reaped on the next
+start, since `SIGKILL` leaves nothing a chance to clean up after itself.
+
+## The config mask must not be a shared path
+
+The empty file bound over `security.yaml` and `models.yaml` started life as one path
+under the cache directory, rewritten (fresh temp file, `rename` into place) by every
+cowboy process that opened a sandbox. On a machine running several at once, many
+`bwrap` invocations were binding a name that other processes kept replacing, and
+sandbox startup failed intermittently with an opaque
+
+```
+bwrap: Can't bind mount …/mask-empty on /workspace/.cowboy/security.yaml:
+Unable to mount source on destination: No such file or directory
+```
+
+— roughly half of full test-suite runs. The mask now lives inside the session's
+scratch directory: per-session by construction, created with it, removed with it, and
+never touched by another process. That took the failure rate to zero across six
+consecutive suite runs.
+
+Worth stating plainly, because the symptom looked alarming: this always failed
+**closed**. A mask that cannot be bound aborts the sandbox rather than starting one
+where the agent can read its own boundary. It was a startup failure, never a hole.
 
 ## Every running process is stale for a new grant
 

@@ -430,49 +430,76 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // unendable: End/Detach/orphan abort it and end/detach cleanly; an Interrupt
     // abandons it and returns to idle; a Message typed during setup is queued.
     let mut setup_pending = true;
+    // Control messages that arrived while setup held `&mut agent`, applied as soon as
+    // it lets go.
+    let mut deferred: Vec<ClientMsg> = Vec::new();
     'serve: loop {
         if std::mem::take(&mut setup_pending) {
-            let tc = CancellationToken::new();
-            agent.set_cancel(tc.clone());
-            let setup = agent.run_session_setup();
-            tokio::pin!(setup);
-            loop {
-                tokio::select! {
-                    _ = &mut setup => break,
-                    _ = orphan.cancelled() => {
-                        tc.cancel();
-                        let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
-                        break 'serve;
-                    }
-                    ctl = cmd_rx.recv() => match ctl {
-                        None
-                        | Some(ClientMsg::End)
-                        | Some(ClientMsg::Interrupt { kind: InterruptKind::End }) => {
+            // Scoped so the setup future — and with it its `&mut agent` borrow — is
+            // dropped before the deferred settings below are applied.
+            {
+                let tc = CancellationToken::new();
+                agent.set_cancel(tc.clone());
+                let setup = agent.run_session_setup();
+                tokio::pin!(setup);
+                loop {
+                    tokio::select! {
+                        _ = &mut setup => break,
+                        _ = orphan.cancelled() => {
                             tc.cancel();
                             let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
                             break 'serve;
                         }
-                        Some(ClientMsg::Accept { note }) => {
-                            tc.cancel();
-                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
-                            sign_off(&id, note, &emitter).await;
-                            break 'serve;
+                        ctl = cmd_rx.recv() => match ctl {
+                            None
+                            | Some(ClientMsg::End)
+                            | Some(ClientMsg::Interrupt { kind: InterruptKind::End }) => {
+                                tc.cancel();
+                                let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                                break 'serve;
+                            }
+                            Some(ClientMsg::Accept { note }) => {
+                                tc.cancel();
+                                let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                                sign_off(&id, note, &emitter).await;
+                                break 'serve;
+                            }
+                            // Abandon setup and drop to idle (don't end the session).
+                            Some(ClientMsg::Interrupt { .. }) => {
+                                tc.cancel();
+                                let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                                emitter.emit(UiEventMsg::Notice("setup interrupted".into()));
+                                break;
+                            }
+                            // A message typed during setup runs after it finishes.
+                            Some(ClientMsg::Message(m)) => {
+                                emitter.emit(UiEventMsg::UserMessage(m.clone()));
+                                queue.push_back(m);
+                            }
+                            // Settings changed during setup apply once it finishes. They
+                            // need `&mut agent`, which the setup future is holding, so they
+                            // cannot be applied here — but dropping them meant a client
+                            // that spoke a moment too early got silence instead of an
+                            // answer, which is indistinguishable from the session being
+                            // wedged. (Caught by `switch_model_reports_success_and_failure`,
+                            // which raced setup roughly one run in six.)
+                            Some(m @ (ClientMsg::SwitchModel(_) | ClientMsg::PlanMode(_))) => {
+                                deferred.push(m);
+                            }
+                            // Detach leaves the session running; setup keeps going.
+                            _ => {}
                         }
-                        // Abandon setup and drop to idle (don't end the session).
-                        Some(ClientMsg::Interrupt { .. }) => {
-                            tc.cancel();
-                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
-                            emitter.emit(UiEventMsg::Notice("setup interrupted".into()));
-                            break;
-                        }
-                        // A message typed during setup runs after it finishes.
-                        Some(ClientMsg::Message(m)) => {
-                            emitter.emit(UiEventMsg::UserMessage(m.clone()));
-                            queue.push_back(m);
-                        }
-                        // Detach leaves the session running; setup keeps going.
-                        _ => {}
                     }
+                }
+            }
+            // Apply anything that arrived during setup, now that `agent` is free.
+            for m in std::mem::take(&mut deferred) {
+                match m {
+                    ClientMsg::SwitchModel(name) => {
+                        apply_switch(&mut agent, &resolve, &emitter, &name)
+                    }
+                    ClientMsg::PlanMode(on) => agent.set_planning(on),
+                    _ => {}
                 }
             }
             continue; // setup done/aborted → pop any queued message, else idle
@@ -496,6 +523,23 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     tokio::select! {
                         _ = orphan.cancelled() => break 'serve,
                         m = cmd_rx.recv() => break m,
+                        // Nobody is driving and nobody said they'd be back: end,
+                        // rather than waiting for an `End` that is not coming.
+                        //
+                        // `End` reaches us over the socket, so it can be lost in every
+                        // way a message can: a SIGKILLed client, a closed terminal, a
+                        // client that raced its own shutdown. Every one of those used
+                        // to leave this worker parked here forever, holding a sandbox
+                        // holder and keeping the daemon alive with it — the "I ended
+                        // the session and it's still running" report. A deliberate
+                        // `Detach` is excluded, so leaving a session running on
+                        // purpose still works.
+                        _ = abandoned(&emitter) => {
+                            tracing::info!(
+                                "the last client vanished without detaching; ending the session"
+                            );
+                            break 'serve;
+                        }
                         _ = idle_tick => {
                             if emitter.attached() == 0 {
                                 agent.stop_container().await;
@@ -713,6 +757,27 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
     tracing::debug!(session = %session_name, "session torn down");
     Ok(())
+}
+
+/// Resolve when the session has been left with nobody driving it.
+///
+/// Polled rather than signalled because the condition is a *steady state*, not an
+/// edge: a client can drop and another attach a moment later, and only the state
+/// that survives the grace window should end the session. The window also covers
+/// startup, where there is briefly no client because the first one is still
+/// connecting.
+async fn abandoned(emitter: &crate::agent::socket_ui::SocketUi) {
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+    loop {
+        if emitter.abandoned() {
+            tokio::time::sleep(GRACE).await;
+            if emitter.abandoned() {
+                return;
+            }
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Arrange for this process to exit within `grace`, whatever else happens.

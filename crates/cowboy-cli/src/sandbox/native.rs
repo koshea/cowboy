@@ -41,7 +41,6 @@ struct Background {
 pub struct NativeSandbox {
     root: PathBuf,
     security: SecurityConfig,
-    mask_file: PathBuf,
     /// Started lazily: constructing a sandbox must not create namespaces, so that
     /// `cowboy sandbox plan` and the unit tests stay side-effect free.
     session: tokio::sync::Mutex<Option<SessionSandbox>>,
@@ -84,7 +83,6 @@ impl NativeSandbox {
         probe: Box<dyn HostProbe + Send + Sync>,
         approver: Arc<dyn cowboy_gateway::Approver>,
     ) -> Result<Self> {
-        let mask_file = crate::project::ensure_mask_file()?;
         let session_name = crate::project::session_name_for(&root);
         let scratch_key = crate::project::scratch_key(&session_name);
         // Persisted project/global approvals are merged in here, in one place, so the
@@ -101,7 +99,6 @@ impl NativeSandbox {
             policy_engine,
             root,
             security,
-            mask_file,
             session: tokio::sync::Mutex::new(None),
             grants: Mutex::new(Vec::new()),
             grant_generation: AtomicU64::new(0),
@@ -151,17 +148,11 @@ impl NativeSandbox {
         // Created here rather than at session start because `plan()` is also what
         // `cowboy sandbox plan` renders, and bwrap refuses to bind a missing source.
         let scratch = crate::project::ensure_scratch_dir(&self.scratch_key)?;
-        // Re-check the mask, for the same reason. It lives in the user's cache
-        // directory, and a session outlives many things that sweep one (a cache
-        // cleaner, a stray `rm -rf ~/.cache/*`). If it went missing, bwrap dies with
-        // an opaque "Unable to mount source on destination" and the sandbox does not
-        // start at all — recreating it is idempotent, and a stat is cheaper than the
-        // support question.
-        let mask_file = if self.mask_file.exists() {
-            self.mask_file.clone()
-        } else {
-            crate::project::ensure_mask_file()?
-        };
+        // The config mask lives inside the scratch directory, so `ensure_scratch_dir`
+        // has just created it too. Per-session by construction: nothing outside this
+        // process ever writes that path, which is what a machine-global mask could not
+        // promise.
+        let mask_file = crate::project::mask_file_in(&scratch);
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,

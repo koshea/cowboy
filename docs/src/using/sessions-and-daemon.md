@@ -55,6 +55,21 @@ its socket and stops accepting *before* it tears anything down, so an ended sess
 cannot be attached to while it winds up, and both worker and daemon arm a watchdog
 that hard-exits if teardown itself wedges.
 
+### A vanished client ends the session
+
+`End` reaches the worker over its socket, so it can be lost the way any message can:
+a client killed outright, a terminal that closed, a client that raced its own
+shutdown. The worker therefore does not wait for it. If the last client's connection
+drops **without** a `Detach` first, the session ends after a few seconds' grace.
+
+The distinction is the whole rule: `Detach` means "keep going, I'll be back" and
+leaves the session running and reattachable, while a socket that simply closed means
+nobody is driving. Nothing is lost either way — a turn already in flight runs to
+completion first, and the transcript is on disk regardless.
+
+Sessions the daemon drives itself (ranch workstreams) never have a client attach, so
+this never applies to them.
+
 ## Upgrades
 
 `cowboy` and `cowboyd` are version-locked. After you upgrade the binary, cowboy

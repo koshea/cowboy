@@ -38,6 +38,14 @@ pub enum AgentCmd {
     Accept { note: Option<String> },
     /// Detach this client, leaving the session running for later re-attach.
     Detach,
+    /// End the session.
+    ///
+    /// Explicit rather than inferred from dropping the sender. The channel-hangup
+    /// route still exists as a backstop for a client that dies without asking, but
+    /// "the user pressed end" deserves a message of its own: a side effect of a drop
+    /// is invisible in a log, untestable in isolation, and was the prime suspect when
+    /// ending a session left the worker running.
+    End,
 }
 
 /// Events the agent loop / control server send to the TUI event loop.
@@ -974,13 +982,18 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 return true; // exit the event loop; the worker keeps running
             }
             KeyCode::Char('e') => {
-                // End the session: drop the task sender so the agent finalizes.
-                // Dropping it hangs up the bridge's command channel, which sends
-                // `End` to the worker; the worker finalizes and broadcasts
-                // `Ended`, which arrives as `UiEvent::Done`. Close the overlay so
-                // the user sees the transcript + "ending session…" while that
-                // round-trip happens (otherwise the menu lingers and it looks like
-                // the key did nothing).
+                // End the session. Send `End` explicitly, THEN drop the sender:
+                // the message is the request, and the hangup is only a backstop for
+                // the case where it never got through. Order matters — dropping
+                // first would leave nothing to send it on.
+                //
+                // The worker finalizes and broadcasts `Ended`, which arrives as
+                // `UiEvent::Done`. Close the overlay so the user sees the transcript
+                // and "ending session…" while that round-trip happens (otherwise the
+                // menu lingers and it looks like the key did nothing).
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::End);
+                }
                 ctx.task_tx.take();
                 if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
                     tok.cancel();

@@ -53,6 +53,14 @@ struct Inner {
     info: std::sync::Mutex<SessionInfo>,
     /// Count of currently attached clients.
     attached: AtomicU32,
+    /// Set when a client's connection dropped **without** a `Detach` first.
+    ///
+    /// The distinction is the whole point: a client that detaches on purpose is
+    /// saying "keep going, I'll be back", while one whose socket just closed has
+    /// gone away — its terminal died, it was killed, or its goodbye was lost. The
+    /// second case used to leave the worker waiting for a client that would never
+    /// speak again. Cleared when someone attaches, so a reconnect cancels it.
+    abandoned: std::sync::atomic::AtomicBool,
     /// Monotonic id for outstanding `Ask`/`Approval` prompts (disjoint spaces
     /// are unnecessary — the maps are keyed separately).
     next_req_id: AtomicU64,
@@ -121,6 +129,7 @@ impl SocketUi {
             live,
             info: std::sync::Mutex::new(info),
             attached: AtomicU32::new(0),
+            abandoned: std::sync::atomic::AtomicBool::new(false),
             next_req_id: AtomicU64::new(0),
             pending_approvals: std::sync::Mutex::new(HashMap::new()),
             pending_asks: std::sync::Mutex::new(HashMap::new()),
@@ -143,6 +152,22 @@ impl SocketUi {
         self.inner
             .attached
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Has the session been left with nobody driving it?
+    ///
+    /// True once a client's connection dropped without detaching and no client has
+    /// attached since. This is what lets the worker stop waiting on a goodbye it may
+    /// never receive: `End` travels over the socket, so *every* way the client can
+    /// die without sending it — SIGKILL, a closed terminal, a lost race in the
+    /// client's own shutdown — used to strand the worker (and with it the sandbox
+    /// holder and the daemon) until someone noticed it in `ps`.
+    pub fn abandoned(&self) -> bool {
+        self.attached() == 0
+            && self
+                .inner
+                .abandoned
+                .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Update the snapshot metadata new clients receive.
@@ -406,19 +431,31 @@ async fn accept_loop(
             inner
                 .attached
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let _ = serve_client(stream, &inner, cmd_tx).await;
+            // A fresh client cancels any earlier abandonment: someone is driving again.
+            inner
+                .abandoned
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            let graceful = serve_client(stream, &inner, cmd_tx).await.unwrap_or(false);
+            if !graceful {
+                inner
+                    .abandoned
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             inner
                 .attached
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(graceful, "client connection closed");
         });
     }
 }
 
+/// Serve one client until it goes away. Returns whether it left **gracefully** —
+/// that is, said `Detach` rather than simply vanishing.
 async fn serve_client(
     stream: UnixStream,
     inner: &Inner,
     cmd_tx: mpsc::UnboundedSender<ClientMsg>,
-) -> Result<()> {
+) -> Result<bool> {
     let (r, w) = stream.into_split();
     let writer = Arc::new(AsyncMutex::new(w));
     let mut reader = BufReader::new(r);
@@ -432,7 +469,8 @@ async fn serve_client(
     // the boundary that actually owns the session instead of trusting the peer.
     let mut first = String::new();
     let (since, read_only) = if reader.read_line(&mut first).await? == 0 {
-        return Ok(());
+        // Connected and said nothing: a probe, not a driver. Not an abandonment.
+        return Ok(true);
     } else {
         match serde_json::from_str::<ClientMsg>(first.trim()) {
             Ok(ClientMsg::Hello {
@@ -488,7 +526,10 @@ async fn serve_client(
         }
     });
 
-    // Read client input until disconnect.
+    // Read client input until disconnect. `graceful` distinguishes "the client said
+    // goodbye" from "the socket closed", which is what decides whether the session
+    // should keep waiting for it to come back.
+    let mut graceful = false;
     let mut line = String::new();
     loop {
         line.clear();
@@ -497,7 +538,10 @@ async fn serve_client(
             Ok(_) => {
                 if let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) {
                     match msg {
-                        ClientMsg::Detach => break,
+                        ClientMsg::Detach => {
+                            graceful = true;
+                            break;
+                        }
                         // Approval/ask replies resolve a pending prompt here
                         // (first reply wins); they never reach the agent loop.
                         ClientMsg::ApprovalReply { id, verdict, scope } => {
@@ -539,7 +583,7 @@ async fn serve_client(
         }
     }
     live.abort();
-    Ok(())
+    Ok(graceful)
 }
 
 /// Read journaled events `[since..len)` (0-based seq = line number).

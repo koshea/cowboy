@@ -57,8 +57,45 @@ pub fn ensure_scratch_dir(key: &str) -> Result<PathBuf> {
         std::fs::create_dir_all(&path)
             .with_context(|| format!("creating the sandbox scratch dir {}", path.display()))?;
     }
+    ensure_mask_file(&dir)?;
     reap_abandoned_scratch(&base, key);
     Ok(dir)
+}
+
+/// The empty file bound over host-owned config to mask it, inside `dir`.
+///
+/// Deliberately per-session rather than one shared path under the cache directory.
+/// The shared version was rewritten (fresh temp file, `rename` into place) by every
+/// cowboy process that opened a sandbox, so a machine running several at once had many
+/// readers of a name that others kept replacing — and sandbox startup failed
+/// intermittently with an opaque `bwrap: Can't bind mount … mask-empty …: No such file
+/// or directory`. Per-session, nothing else ever touches it.
+///
+/// It fails closed either way: a mask that cannot be bound stops the sandbox rather
+/// than exposing `security.yaml` to the agent. That is why this was a startup failure
+/// and never a boundary hole.
+fn ensure_mask_file(dir: &Path) -> Result<PathBuf> {
+    let path = dir.join("mask-empty");
+    // Create only when absent: a bind of this file may be live in another command of
+    // the same session, and replacing it under them is the very thing being fixed.
+    if !path.exists() {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o400);
+        }
+        opts.open(&path)
+            .with_context(|| format!("creating the config mask {}", path.display()))?;
+    }
+    Ok(path)
+}
+
+/// Where the mask file lives inside a scratch directory. One definition, so the
+/// plan and the thing that creates it cannot disagree.
+pub fn mask_file_in(scratch: &Path) -> PathBuf {
+    scratch.join("mask-empty")
 }
 
 /// Remove scratch directories whose owning process is gone. Best-effort throughout:
@@ -242,57 +279,4 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
             .with_context(|| format!("restricting {} to owner-only", dir.display()))?;
     }
     Ok(dir)
-}
-
-/// Create a file inside [`private_dir`] with `contents`, replacing any existing
-/// one. Fails rather than following a symlink or reusing a file we don't own.
-pub(crate) fn write_private_file(name: &str, contents: &[u8]) -> Result<PathBuf> {
-    let dir = private_dir()?;
-    let path = dir.join(name);
-    // Write to a unique temporary name and rename into place.
-    //
-    // Never open the destination directly: a pre-existing symlink there would make
-    // us write *through* it to a file of someone else's choosing. Creating a fresh
-    // name exclusively and renaming avoids that, and unlike `remove` + `create_new`
-    // it is atomic and safe when two callers race — that pattern fails the loser
-    // with `AlreadyExists`, which showed up as a flaky test once a second caller
-    // existed.
-    let tmp = dir.join(format!("{name}.{}.{}", std::process::id(), now_nanos()));
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts
-        .open(&tmp)
-        .with_context(|| format!("creating {}", tmp.display()))?;
-    use std::io::Write;
-    let write = f
-        .write_all(contents)
-        .with_context(|| format!("writing {}", tmp.display()));
-    if write.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-        write?;
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("installing {}", path.display()));
-    }
-    Ok(path)
-}
-
-/// Nanoseconds since the epoch, for a unique temporary filename.
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
-/// The empty file used to mask host-owned config inside the container.
-pub(crate) fn ensure_mask_file() -> Result<PathBuf> {
-    write_private_file("mask-empty", b"")
 }

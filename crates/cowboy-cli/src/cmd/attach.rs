@@ -9,6 +9,7 @@
 //! becomes a `ClientMsg` on the socket.
 
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_core::daemonproto::{
@@ -228,7 +229,7 @@ pub async fn bridge(
         .ok();
 
     // Single writer: drain ClientMsgs to the socket.
-    let writer = tokio::spawn(async move {
+    let mut writer = tokio::spawn(async move {
         while let Some(msg) = out_rx.recv().await {
             if w.write_all(encode_line(&msg).as_bytes()).await.is_err() {
                 break;
@@ -242,7 +243,7 @@ pub async fn bridge(
     // forever waiting for the worker to close the socket, hanging the client's
     // `handle.join()`. cmd_pump signals this channel so the bridge tears itself
     // down immediately instead.
-    let (detach_tx, detach_rx) = tokio::sync::oneshot::channel::<()>();
+    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
 
     // UI commands (blocking std recv) -> ClientMsg. On hangup, end the session.
     // A read-only client drops input but still drains the channel and ends on
@@ -261,12 +262,19 @@ pub async fn bridge(
             if read_only {
                 continue;
             }
+            // An explicit end: forward it and stop pumping. Returning here rather
+            // than falling through to the hangup path means exactly one `End` is
+            // sent, whether the client asked for it or simply hung up.
+            if let AgentCmd::End = cmd {
+                let _ = cmd_out.send(ClientMsg::End);
+                return;
+            }
             let msg = match cmd {
                 AgentCmd::Message(m) => ClientMsg::Message(m),
                 AgentCmd::SwitchModel(n) => ClientMsg::SwitchModel(n),
                 AgentCmd::PlanMode(b) => ClientMsg::PlanMode(b),
                 AgentCmd::Accept { note } => ClientMsg::Accept { note },
-                AgentCmd::Detach => unreachable!("handled above"),
+                AgentCmd::Detach | AgentCmd::End => unreachable!("handled above"),
             };
             if cmd_out.send(msg).is_err() {
                 return;
@@ -326,18 +334,33 @@ pub async fn bridge(
     });
 
     // Exit when the worker ends/closes the socket, or when the user detaches.
+    //
+    // `Ok(())` matters: `detach_tx` lives in `cmd_pump`, so it is *dropped* whenever
+    // that task returns — including right after it queues an `End`. A bare `_ =`
+    // arm therefore fired on the drop, and the teardown below aborted the writer
+    // before the `End` had been written to the socket. The user saw "session ended"
+    // and a worker that kept running, because the request never left the client.
+    // Only an explicit send is a detach; a drop means nothing.
     tokio::select! {
         _ = &mut reader_task => {}
-        _ = detach_rx => {}
+        Ok(()) = &mut detach_rx => {}
     }
 
-    // Aborting the reader/writer drops both socket halves, closing the connection
-    // so the worker's client handler sees EOF and tears down its side too (the
-    // session keeps running; only the now-detached client goes away).
+    // Stop the producers, then let the writer drain what they queued. Aborting it
+    // outright was the other half of the bug above: the last message a client sends
+    // is precisely the one that says why it is leaving, so dropping it strands the
+    // session. Bounded, because a wedged socket must not hold the client open.
     reader_task.abort();
     interrupts.abort();
     cmd_pump.abort();
-    writer.abort();
+    drop(out_tx);
+    if tokio::time::timeout(Duration::from_secs(2), &mut writer)
+        .await
+        .is_err()
+    {
+        tracing::debug!("outbound queue did not drain before teardown");
+        writer.abort();
+    }
     Ok(())
 }
 
@@ -404,7 +427,6 @@ fn title_for(info: &SessionInfo) -> String {
 mod tests {
     use super::*;
     use cowboy_core::daemonproto::SessionStatus;
-    use std::time::Duration;
     use tokio::net::UnixListener;
 
     /// The TUI's "end" drops `task_tx`; the bridge must then send `ClientMsg::End`
@@ -450,6 +472,181 @@ mod tests {
             "dropping task_tx must make the bridge send ClientMsg::End"
         );
         bridge_h.abort();
+    }
+
+    /// The reported sequence, which the test above misses: interrupt a turn (`k`),
+    /// *then* end (`e`). This is the shape of the "ended the session and the worker
+    /// is still running" bug — a plain end works, an end after an interrupt did not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropping_task_tx_after_an_interrupt_still_sends_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = assert_fs::TempDir::new().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Counters rather than a return value: a fake worker that *returns* closes its
+        // socket, which makes the bridge tear itself down — a feedback loop that races
+        // whatever is still being written. Observing from the outside keeps the
+        // connection open for as long as the test needs it.
+        let interrupts = std::sync::Arc::new(AtomicUsize::new(0));
+        let ends = std::sync::Arc::new(AtomicUsize::new(0));
+        let (si, se) = (interrupts.clone(), ends.clone());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match serde_json::from_str::<ClientMsg>(line.trim()) {
+                    Ok(ClientMsg::Interrupt { .. }) => {
+                        si.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(ClientMsg::End) => {
+                        se.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
+        let turn_cancel: TurnCancel =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let bridge_h = tokio::spawn(bridge(stream, ui_tx, task_rx, turn_cancel.clone(), false));
+
+        // "k": cancel the in-flight turn. The bridge's watcher turns this into an
+        // Interrupt and re-arms a fresh token for the next turn.
+        turn_cancel.lock().unwrap().clone().unwrap().cancel();
+        await_count(&interrupts, 1, "the interrupt was never forwarded").await;
+
+        // "e": exactly what the pause menu does — send End, drop the sender, then
+        // cancel whatever token is current.
+        task_tx.send(AgentCmd::End).unwrap();
+        drop(task_tx);
+        if let Some(tok) = turn_cancel.lock().unwrap().as_ref() {
+            tok.cancel();
+        }
+        await_count(&ends, 1, "ending after an interrupt must still send End").await;
+
+        bridge_h.abort();
+        server.abort();
+    }
+
+    /// Wait for `counter` to reach `want`, or fail with `why`.
+    async fn await_count(counter: &std::sync::atomic::AtomicUsize, want: usize, why: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while counter.load(std::sync::atomic::Ordering::SeqCst) < want {
+            assert!(tokio::time::Instant::now() < deadline, "{why}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The explicit end: `e` sends `AgentCmd::End`, and the bridge must forward it as
+    /// `ClientMsg::End` exactly once — not twice (the sender is dropped straight
+    /// after, which is the backstop path).
+    /// On a **current_thread** runtime, deliberately: that is what `attach_socket_ro`
+    /// builds, so the writer task and the bridge's own teardown share one thread and
+    /// their ordering is decided by the runtime's queue rather than by two CPUs racing.
+    /// This is the shape the product actually uses, so it is the shape to assert on.
+    #[tokio::test]
+    async fn an_explicit_end_is_forwarded_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = assert_fs::TempDir::new().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        // Counted from outside rather than returned: a fake worker that returns closes
+        // its socket, and the bridge deliberately no longer tears down until the worker
+        // says `Ended` — so waiting for EOF here would wait forever.
+        let ends = std::sync::Arc::new(AtomicUsize::new(0));
+        let se = ends.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if matches!(
+                    serde_json::from_str::<ClientMsg>(line.trim()),
+                    Ok(ClientMsg::End)
+                ) {
+                    se.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        });
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
+        let turn_cancel: TurnCancel =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let bridge_h = tokio::spawn(bridge(stream, ui_tx, task_rx, turn_cancel, false));
+
+        // Exactly what the pause menu's "e" does now.
+        task_tx.send(AgentCmd::End).unwrap();
+        drop(task_tx);
+
+        await_count(&ends, 1, "the explicit end was never forwarded").await;
+        // Then settle, so a second End from the hangup path would be caught.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            ends.load(Ordering::SeqCst),
+            1,
+            "End must be sent once, not duplicated by the hangup"
+        );
+        bridge_h.abort();
+        server.abort();
+    }
+
+    /// A read-only client must not be able to end the session it is watching, however
+    /// the end was requested.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_read_only_client_never_sends_end() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = assert_fs::TempDir::new().unwrap();
+        let sock = dir.path().join("w.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let hellos = std::sync::Arc::new(AtomicUsize::new(0));
+        let ends = std::sync::Arc::new(AtomicUsize::new(0));
+        let (sh, se) = (hellos.clone(), ends.clone());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                match serde_json::from_str::<ClientMsg>(line.trim()) {
+                    Ok(ClientMsg::Hello { .. }) => {
+                        sh.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(ClientMsg::End) => {
+                        se.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (ui_tx, _ui_rx) = std::sync::mpsc::channel::<UiEvent>();
+        let (task_tx, task_rx) = std::sync::mpsc::channel::<AgentCmd>();
+        let turn_cancel: TurnCancel =
+            std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let bridge_h = tokio::spawn(bridge(stream, ui_tx, task_rx, turn_cancel, true));
+
+        // The Hello proves the bridge is really talking, so "no End" is a decision and
+        // not just a connection that never got going.
+        await_count(&hellos, 1, "the read-only client never announced itself").await;
+        task_tx.send(AgentCmd::End).unwrap();
+        drop(task_tx);
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            ends.load(Ordering::SeqCst),
+            0,
+            "a watcher must not end the session it is only watching"
+        );
+        bridge_h.abort();
+        server.abort();
     }
 
     fn info() -> SessionInfo {
