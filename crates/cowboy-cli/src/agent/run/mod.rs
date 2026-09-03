@@ -160,8 +160,22 @@ pub struct AgentLoop<'a> {
     /// One-shot notice that older reasoning is being shed, so a long session does not
     /// repeat it every turn.
     reasoning_shed_notified: bool,
+    /// One-shot notice that the window cannot fit the reserve — a config problem, so
+    /// repeating it every iteration would just bury the turn.
+    zero_budget_warned: bool,
     /// Cached token cost of `tools`, which is fixed once MCP tools are merged in.
     tools_tokens_cache: std::sync::OnceLock<usize>,
+    /// Memoized per-message token counts, keyed by a hash of the fields that affect
+    /// the count.
+    ///
+    /// tiktoken is slow enough to matter here: measured at ~570ms for one pass over a
+    /// realistic 300-message / 110k-token conversation, and the loop makes several
+    /// passes per iteration (budget check, usage report, prompt estimate) for up to
+    /// `max_iterations` iterations per turn. Keying on a content hash rather than
+    /// tracking mutations means there is no invalidation to get wrong: if a message
+    /// changes — `shed_reasoning` drops a `reasoning` field, say — the key changes with
+    /// it. Hashing is orders of magnitude cheaper than BPE encoding.
+    token_memo: std::cell::RefCell<std::collections::HashMap<u64, usize>>,
     /// The current task statement, remembered so pruning and compaction can protect
     /// it wherever it sits.
     ///
@@ -548,7 +562,9 @@ impl<'a> AgentLoop<'a> {
             reprime_attempts: 0,
             minimize_reasoning_next_turn: false,
             reasoning_shed_notified: false,
+            zero_budget_warned: false,
             tools_tokens_cache: std::sync::OnceLock::new(),
+            token_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
             task: None,
             output_limit_warned: false,
             subagent_depth,
@@ -771,9 +787,35 @@ impl<'a> AgentLoop<'a> {
         n
     }
 
+    /// Approximate token count of a message, memoized. See [`Self::token_memo`].
+    fn tokens_of(&self, m: &Message) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Exactly the fields `message_tokens` reads.
+        m.content.hash(&mut h);
+        m.reasoning.hash(&mut h);
+        for tc in &m.tool_calls {
+            tc.name.hash(&mut h);
+            tc.arguments.hash(&mut h);
+        }
+        let key = h.finish();
+        if let Some(n) = self.token_memo.borrow().get(&key) {
+            return *n;
+        }
+        let n = Self::message_tokens(m);
+        let mut memo = self.token_memo.borrow_mut();
+        // Folds and prunes drop messages without dropping their keys. Clearing wholesale
+        // beats tracking liveness for a cache this cheap to refill.
+        if memo.len() > 4096 {
+            memo.clear();
+        }
+        memo.insert(key, n);
+        n
+    }
+
     /// Total estimated tokens of the current conversation.
     fn total_tokens(&self) -> usize {
-        self.messages.iter().map(Self::message_tokens).sum()
+        self.messages.iter().map(|m| self.tokens_of(m)).sum()
     }
 
     /// Drop `reasoning` from all but the most recent assistant turns.
@@ -866,7 +908,7 @@ impl<'a> AgentLoop<'a> {
         let mut user = 0u64;
         let mut system = 0u64;
         for m in &self.messages {
-            let total = Self::message_tokens(m) as u64;
+            let total = self.tokens_of(m) as u64;
             let r = m
                 .reasoning
                 .as_deref()
@@ -908,7 +950,25 @@ impl<'a> AgentLoop<'a> {
     /// is never orphaned. Falls back to dropping if a summary can't be made.
     async fn fit_context(&mut self) {
         let budget = self.context_budget();
-        if budget == 0 || self.total_tokens() <= budget {
+        if budget == 0 {
+            // The window cannot hold the reserve, so there is no room for a
+            // conversation at all and nothing to trim. Silence here meant the request
+            // went out anyway and failed at the provider with a context-length error
+            // that names none of this. Say it once, with the numbers.
+            if !self.zero_budget_warned {
+                self.zero_budget_warned = true;
+                self.ui.notice(&format!(
+                    "context_window ({}) is too small for this model's max_tokens ({}) \
+                     plus {} tokens of tool schemas — raise context_window or lower \
+                     max_tokens in models.yaml",
+                    self.context_window,
+                    self.model.max_output_tokens(),
+                    self.tools_tokens()
+                ));
+            }
+            return;
+        }
+        if self.total_tokens() <= budget {
             return;
         }
 
@@ -925,9 +985,14 @@ impl<'a> AgentLoop<'a> {
                 return;
             }
         };
+        // Suffix sums, so walking back over the turn boundaries is one pass rather than
+        // a fresh sum per boundary (which was quadratic in the message count).
+        let mut suffix = vec![0usize; self.messages.len() + 1];
+        for i in (0..self.messages.len()).rev() {
+            suffix[i] = suffix[i + 1] + self.tokens_of(&self.messages[i]);
+        }
         for &idx in user_idxs.iter().rev() {
-            let tail: usize = self.messages[idx..].iter().map(Self::message_tokens).sum();
-            if tail <= tail_budget {
+            if suffix[idx] <= tail_budget {
                 keep_from = idx;
             } else {
                 break;
@@ -1017,15 +1082,13 @@ impl<'a> AgentLoop<'a> {
         let pin = self.pinned();
         // The earliest safe cut whose tail fits — keeps as much recent context as
         // the budget allows.
+        let mut suffix = vec![0usize; self.messages.len() + 1];
+        for i in (0..self.messages.len()).rev() {
+            suffix[i] = suffix[i + 1] + self.tokens_of(&self.messages[i]);
+        }
         let cut = (pin..self.messages.len())
             .filter(|&i| self.messages[i].role != Role::Tool)
-            .find(|&i| {
-                self.messages[i..]
-                    .iter()
-                    .map(Self::message_tokens)
-                    .sum::<usize>()
-                    <= tail_budget
-            });
+            .find(|&i| suffix[i] <= tail_budget);
         let Some(cut) = cut.filter(|&c| c > pin) else {
             // Nothing foldable (or no safe boundary): fall back to dropping, which
             // still preserves the pinned head.
@@ -1071,7 +1134,24 @@ impl<'a> AgentLoop<'a> {
         let low = client.with_minimal_reasoning();
         let client = low.as_deref().unwrap_or(client);
         let resp = client.chat(&msgs, &[], None).await?;
-        Ok(resp.content.unwrap_or_default())
+        let summary = resp.content.unwrap_or_default();
+        // Cap it. The whole point of a fold is that the result is smaller than what it
+        // replaced, and nothing enforced that: `fit_context` leaves 40% of the budget
+        // for the system prompt, the task and this summary, but a model is free to
+        // return an essay. A summary that overflows its own allowance turns one
+        // compaction into a loop of them.
+        Ok(cowboy_core::tokens::truncate_to_tokens(
+            &summary,
+            self.summary_token_cap(),
+        ))
+    }
+
+    /// How many tokens a compaction summary may occupy.
+    ///
+    /// A fraction of the tail allowance rather than a constant, so it scales with the
+    /// window instead of being generous on a small model and stingy on a large one.
+    fn summary_token_cap(&self) -> usize {
+        (self.context_budget() / 10).clamp(256, 8192)
     }
 
     /// One-shot warning that the model's configured output-token limit may be
@@ -1155,8 +1235,8 @@ impl<'a> AgentLoop<'a> {
         let pin = self.pinned();
         let head: Vec<Message> = self.messages[..pin].to_vec();
         let task = self.task_in(pin..self.messages.len());
-        let mut used: usize = head.iter().map(Self::message_tokens).sum();
-        used += task.as_ref().map(Self::message_tokens).unwrap_or(0);
+        let mut used: usize = head.iter().map(|m| self.tokens_of(m)).sum();
+        used += task.as_ref().map(|m| self.tokens_of(m)).unwrap_or(0);
 
         // Newest-first, stopping at the budget.
         let mut tail: Vec<Message> = Vec::new();
@@ -1164,7 +1244,7 @@ impl<'a> AgentLoop<'a> {
             if Some(&m.content) == self.task.as_ref() && m.role == Role::User {
                 continue; // already accounted for above
             }
-            let cost = Self::message_tokens(m);
+            let cost = self.tokens_of(m);
             if used + cost > budget {
                 break;
             }
@@ -1597,7 +1677,7 @@ impl<'a> AgentLoop<'a> {
             let prompt_est: u64 = self
                 .messages
                 .iter()
-                .map(Self::message_tokens)
+                .map(|m| self.tokens_of(m))
                 .sum::<usize>() as u64;
             // Report what the request costs before making it, so the pressure is
             // visible in the UI and the journal rather than only when it overflows.
@@ -4298,6 +4378,136 @@ mod tests {
         ];
         let kept = AgentLoop::tail_within(history.clone(), 100_000);
         assert_eq!(kept.len(), history.len());
+    }
+
+    /// tiktoken is slow enough that repeated full passes dominate the loop's own cost:
+    /// measured ~570ms for one pass over a 300-message / 110k-token conversation, and
+    /// the loop makes several passes per iteration. This asserts the memo actually
+    /// bites, rather than trusting that it does.
+    #[tokio::test]
+    async fn repeated_token_counts_are_memoized() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let body = "the quick brown fox jumps over the lazy dog ".repeat(40);
+        for _ in 0..120 {
+            agent.messages.push(Message::user(body.clone()));
+        }
+        let t = std::time::Instant::now();
+        let cold_total = agent.total_tokens();
+        let cold = t.elapsed();
+        let t = std::time::Instant::now();
+        let warm_total = agent.total_tokens();
+        let warm = t.elapsed();
+
+        assert_eq!(
+            cold_total, warm_total,
+            "the memo must not change the answer"
+        );
+        assert!(cold_total > 1000, "the fixture should be substantial");
+        assert!(
+            warm * 5 < cold,
+            "the second pass should be far cheaper: cold {cold:?} vs warm {warm:?}"
+        );
+
+        // Changing a message changes its key, so the count follows the content rather
+        // than going stale — which is the whole reason for hashing instead of tracking
+        // mutations.
+        let mut m = Message::new(Role::Assistant, "short");
+        let before = agent.tokens_of(&m);
+        m.reasoning = Some(body.clone());
+        let after = agent.tokens_of(&m);
+        assert!(
+            after > before,
+            "adding reasoning must raise the count ({before} -> {after})"
+        );
+    }
+
+    /// A fold has to shrink things. Nothing enforced that the summary was smaller than
+    /// what it replaced: `fit_context` leaves 40% of the budget for the system prompt,
+    /// the task and the summary, but the model is free to return an essay — and a
+    /// summary that overflows its own allowance turns one compaction into a loop of
+    /// them.
+    #[tokio::test]
+    async fn a_runaway_compaction_summary_is_capped() {
+        let mut ui = RecordingUi::default();
+        // The "summary" is longer than the conversation it is meant to condense.
+        let essay = "and then a great many further details followed. ".repeat(4_000);
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some(essay.clone()),
+            tool_calls: vec![],
+        }]);
+        let agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let cap = agent.summary_token_cap();
+        let got = agent
+            .run_summary(SUMMARY_SYSTEM, "condense this".into())
+            .await
+            .unwrap();
+        let n = cowboy_core::tokens::count(&got);
+        assert!(
+            n <= cap,
+            "a summary must fit its allowance: {n} tokens against a cap of {cap}"
+        );
+        assert!(n > 0, "and it must not be emptied entirely");
+        assert!(
+            cowboy_core::tokens::count(&essay) > cap,
+            "the fixture should exceed the cap, or this proves nothing"
+        );
+    }
+
+    /// A window too small to hold the reserve leaves no room for a conversation, and
+    /// there is nothing `fit_context` can trim to fix it. It used to return silently, so
+    /// the request went out anyway and failed at the provider with a context-length
+    /// error that names none of the numbers involved.
+    #[tokio::test]
+    async fn an_impossible_window_says_so_instead_of_failing_at_the_provider() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.context_window = 500;
+        assert_eq!(agent.context_budget(), 0);
+        agent.messages.push(Message::user("do something"));
+        agent.fit_context().await;
+        agent.fit_context().await; // twice: the notice must not repeat
+
+        let hits: Vec<&String> = ui
+            .notices
+            .iter()
+            .filter(|n| n.contains("too small for this model's max_tokens"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "said once, with the numbers: {:?}",
+            ui.notices
+        );
+        assert!(hits[0].contains("500"), "names the window: {}", hits[0]);
+        assert!(
+            hits[0].contains("models.yaml"),
+            "points at the fix: {}",
+            hits[0]
+        );
     }
 
     #[tokio::test]

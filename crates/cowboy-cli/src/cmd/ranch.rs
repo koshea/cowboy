@@ -1313,9 +1313,18 @@ fn compose_task(
         }
     }
 
-    // Inline the dependencies' promoted artifacts (capped) so the worker has the
-    // upstream contracts/handoffs in context.
+    // Inline the dependencies' promoted artifacts so the worker has the upstream
+    // contracts/handoffs in context.
+    //
+    // Bounded twice: per file, and in aggregate. Per-file alone was not enough — this
+    // lands in the workstream's *first user message*, which pruning pins, so an
+    // oversized one cannot be trimmed later. Five dependencies with ten artifacts each
+    // would have inlined ~400 KB (~100k tokens) of unprunable prompt before the
+    // workstream had done anything.
+    const PER_FILE: usize = 8_000;
+    const TOTAL: usize = 48_000;
     let mut deps_block = String::new();
+    let mut omitted = 0usize;
     for dep in &ws.depends_on {
         let dir = ranch::ranch_artifact_dir(root, &ranch.id, dep);
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -1327,7 +1336,11 @@ fn compose_task(
             let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
             let Some(name) = name else { continue };
             if let Ok(body) = std::fs::read_to_string(&f) {
-                let body = truncate(&body, 8000);
+                if deps_block.len() >= TOTAL {
+                    omitted += 1;
+                    continue;
+                }
+                let body = truncate(&body, PER_FILE);
                 deps_block.push_str(&format!("\n### {dep}/{name}\n{body}\n"));
             }
         }
@@ -1335,6 +1348,16 @@ fn compose_task(
     if !deps_block.is_empty() {
         s.push_str("\nArtifacts from your dependencies (consume these):\n");
         s.push_str(&deps_block);
+        if omitted > 0 {
+            // Naming the count matters: the agent needs to know the list it can see is
+            // partial, and where to read the rest, or it will reason from a subset
+            // believing it has everything.
+            s.push_str(&format!(
+                "\n({omitted} further artifact(s) omitted to bound this prompt — read them \
+                 from .cowboy/ranches/{}/artifacts/ with the `read` tool.)\n",
+                ranch.id
+            ));
+        }
     }
 
     s.push_str(
@@ -1933,5 +1956,38 @@ mod tests {
         assert!(task.contains("Artifacts from your dependencies"));
         assert!(task.contains("schema/a0001-contract.md"));
         assert!(task.contains("TABLE users"));
+    }
+
+    /// The composed task becomes the workstream's *first user message*, which pruning
+    /// pins — so an oversized one cannot be trimmed later. Per-file truncation alone
+    /// left the total unbounded: enough dependencies with enough artifacts would inline
+    /// hundreds of KB of unprunable prompt.
+    #[test]
+    fn compose_task_bounds_the_total_inlined_artifacts() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let r = ranch(vec![]);
+        let dep_dir = cowboy_core::ranch::ranch_artifact_dir(tmp.path(), &r.id, "schema");
+        std::fs::create_dir_all(&dep_dir).unwrap();
+        // 40 artifacts of 8 KB each: 320 KB if nothing bounds the aggregate.
+        for i in 0..40 {
+            std::fs::write(dep_dir.join(format!("a{i:04}-big.md")), "x".repeat(8_000)).unwrap();
+        }
+
+        let w = ws("api", &["schema"], WorkstreamStatus::Ready, None);
+        let task = compose_task(tmp.path(), &r, &w);
+
+        assert!(
+            task.len() < 120_000,
+            "the composed task should be bounded, got {} bytes",
+            task.len()
+        );
+        // And the agent is told the list is partial, with somewhere to read the rest —
+        // otherwise it reasons from a subset believing it has everything.
+        assert!(
+            task.contains("omitted to bound this prompt"),
+            "the omission should be stated: {}",
+            &task[task.len().saturating_sub(400)..]
+        );
+        assert!(task.contains("`read` tool"));
     }
 }
