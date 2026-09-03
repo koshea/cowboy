@@ -221,6 +221,42 @@ pub fn available() -> bool {
     !candidate_parents().is_empty()
 }
 
+/// Remove leftover cowboy cgroup directories that no longer hold any process.
+///
+/// A clean shutdown reaps its own, but a crashed worker cannot: the holder dies with
+/// it, which empties the cgroup, and an empty cgroup then persists until someone
+/// removes the directory. Returns how many were reaped.
+///
+/// Only ever removes a directory that is **empty of processes**, so this cannot
+/// disturb a live session — including one belonging to another project.
+pub fn reap_empty() -> usize {
+    let mut reaped = 0;
+    for parent in candidate_parents() {
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_ours = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("cowboy-"));
+            if !is_ours || !path.is_dir() {
+                continue;
+            }
+            // `cgroup.procs` empty means no member processes. `remove_dir` would fail
+            // anyway if it were occupied, but checking first keeps the count honest.
+            let occupied = std::fs::read_to_string(path.join("cgroup.procs"))
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(true);
+            if !occupied && std::fs::remove_dir(&path).is_ok() {
+                reaped += 1;
+            }
+        }
+    }
+    reaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

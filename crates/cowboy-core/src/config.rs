@@ -3,16 +3,17 @@
 //! Three files live under `.cowboy/`:
 //!
 //! * [`SecurityConfig`] (`security.yaml`) — **host-owned**, never mounted into
-//!   the agent container. Controls the container, mounts, networks, network
+//!   the sandbox. Controls what the sandbox can see, its resource ceilings, network
 //!   policy, and secret injection.
-//! * [`AgentConfig`] (`agent.yaml`) — mounted into the container, agent-editable.
+//! * [`AgentConfig`] (`agent.yaml`) — visible in the sandbox, agent-editable.
 //!   Non-security behavior only (timeouts, processes, command shortcuts).
 //! * [`ModelsConfig`] (`models.yaml`) — host-owned model profiles for the
 //!   OpenAI-compatible client.
 //!
-//! Loaders enforce security invariants (see [`SecurityConfig::validate`]): the
-//! agent must never be able to mount `security.yaml`, and dangerous options are
-//! surfaced rather than silently honored.
+//! Loaders enforce security invariants (see [`SecurityConfig::validate`]): the agent
+//! must never be able to mount `security.yaml`, a config still using the
+//! pre-sandbox `container:` key is refused by name rather than silently ignored, and
+//! an unknown mount mode fails closed instead of defaulting to writable.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -53,8 +54,6 @@ pub struct SecurityConfig {
     #[serde(default, skip_serializing, rename = "container")]
     pub legacy_container: Option<serde_yaml_ng::Value>,
     #[serde(default)]
-    pub networks: NetworksConfig,
-    #[serde(default)]
     pub network_policy: NetworkPolicy,
     #[serde(default)]
     pub secrets: SecretsConfig,
@@ -63,26 +62,19 @@ pub struct SecurityConfig {
 /// How the agent's sandbox is shaped: what it can see, and how much of the machine
 /// it may use.
 ///
-/// Named `sandbox` since the boundary stopped being a container. The `image`,
-/// `dockerfile` and `build` fields are vestiges of that era and no longer describe
-/// anything the sandbox does — the agent uses the host's own toolchain, which is the
-/// point.
+/// Deliberately small. `image`, `dockerfile`, `build`, `privileged` and
+/// `docker_socket` are gone with the container — none of them described anything a
+/// sandbox does, and `privileged`/`docker_socket` in particular were only ever
+/// honoured as warnings.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    #[serde(default = "default_image")]
-    pub image: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dockerfile: Option<String>,
-    #[serde(default)]
-    pub build: bool,
+    /// Where the project appears inside the sandbox.
     #[serde(default = "default_workdir")]
     pub workdir: String,
+    /// Host paths exposed inside it. For one-off access prefer `cowboy grant`, which
+    /// takes effect on the next command without editing this file.
     #[serde(default = "default_mounts")]
     pub mounts: Vec<Mount>,
-    #[serde(default)]
-    pub privileged: bool,
-    #[serde(default)]
-    pub docker_socket: bool,
     /// Memory ceiling (e.g. `8g`), or `auto` to size from the host. None = unlimited.
     /// Enforced with a cgroup v2 `memory.max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -147,27 +139,6 @@ pub struct Mount {
     pub target: String,
     #[serde(default = "default_mount_mode")]
     pub mode: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct NetworksConfig {
-    #[serde(default)]
-    pub isolated: IsolatedNetwork,
-    #[serde(default)]
-    pub compose: ComposeNetworks,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct IsolatedNetwork {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct ComposeNetworks {
-    /// Docker network names the user has approved the agent to join.
-    #[serde(default)]
-    pub approved: Vec<String>,
 }
 
 /// Default verdict applied to a class of destination when no explicit
@@ -604,12 +575,7 @@ fn default_version() -> u32 {
 fn default_true() -> bool {
     true
 }
-fn default_image() -> String {
-    // Version-pinned to this binary; published to GHCR by the release workflow and
-    // pulled on first run (or built from source when developing). Keep the
-    // registry path in sync with `cowboy-cli`'s `DEFAULT_IMAGE`.
-    concat!("ghcr.io/koshea/cowboy/agent:", env!("CARGO_PKG_VERSION")).to_string()
-}
+
 fn default_workdir() -> String {
     "/workspace".to_string()
 }
@@ -693,22 +659,11 @@ fn default_allow_rules() -> RuleSet {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            image: default_image(),
-            dockerfile: None,
-            build: false,
             workdir: default_workdir(),
             mounts: default_mounts(),
-            privileged: false,
-            docker_socket: false,
             memory: None,
             cpus: None,
         }
-    }
-}
-
-impl Default for IsolatedNetwork {
-    fn default() -> Self {
-        Self { enabled: true }
     }
 }
 
@@ -731,7 +686,6 @@ impl Default for SecurityConfig {
             version: 1,
             sandbox: SandboxConfig::default(),
             legacy_container: None,
-            networks: NetworksConfig::default(),
             network_policy: NetworkPolicy::default(),
             secrets: SecretsConfig::default(),
         }
@@ -825,8 +779,10 @@ impl SecurityConfig {
         if self.legacy_container.is_some() {
             return Err(Error::SecurityInvariant(
                 "security.yaml uses `container:`, which is now `sandbox:`. The agent no \
-                 longer runs in a container — rename the section. `image`, `dockerfile` \
-                 and `build` under it no longer do anything and can be deleted."
+                 longer runs in a container — rename the section, and delete `image`, \
+                 `dockerfile`, `build`, `privileged` and `docker_socket`, which no \
+                 longer do anything. `workdir`, `mounts`, `memory` and `cpus` carry \
+                 over unchanged."
                     .to_string(),
             ));
         }
@@ -889,21 +845,31 @@ impl SecurityConfig {
 
     /// Returns warnings for dangerous-but-permitted options. The host process
     /// should surface these to the user; they do not block startup.
+    ///
+    /// This used to flag `privileged` and `docker_socket`, which are gone with the
+    /// container. The equivalent risk now is a **broad mount**: the denylist refuses
+    /// credential stores and host-owned config outright, but a read-write mount of a
+    /// whole home directory or of `/` is permitted and hands the agent most of the
+    /// machine. Permitted because someone may genuinely mean it; surfaced because
+    /// almost nobody does.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.sandbox.privileged {
-            out.push(
-                "container.privileged is set but NOT honored by cowboy (a privileged agent would \
-                 not be sandboxed); remove it"
-                    .to_string(),
-            );
-        }
-        if self.sandbox.docker_socket {
-            out.push(
-                "container.docker_socket is set but NOT honored by cowboy (Docker-daemon access \
-                 is a container escape); remove it"
-                    .to_string(),
-            );
+        let home = expand_path("~").ok();
+        for m in &self.sandbox.mounts {
+            let Ok(source) = expand_path(&m.source) else {
+                continue;
+            };
+            let broad = source.parent().is_none() // "/"
+                || home.as_ref().is_some_and(|h| source == *h);
+            if broad {
+                out.push(format!(
+                    "sandbox.mounts exposes {} ({}) — that is most of the machine. \
+                     Prefer mounting the paths you need, or `cowboy grant <path>` as \
+                     you go",
+                    source.display(),
+                    m.mode
+                ));
+            }
         }
         out
     }
@@ -1322,12 +1288,6 @@ sandbox:
   # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
   memory: 8g
   cpus: 2
-
-networks:
-  isolated:
-    enabled: true
-  compose:
-    approved: []
 
 network_policy:
   default_external: ask

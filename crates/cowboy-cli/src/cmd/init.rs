@@ -28,7 +28,6 @@ pub fn run(args: InitArgs) -> Result<()> {
     }
 
     // Offer to approve Compose networks for the agent (interactive only).
-    crate::net::compose::prompt_and_persist(&root)?;
 
     println!(
         "\n{} {}",

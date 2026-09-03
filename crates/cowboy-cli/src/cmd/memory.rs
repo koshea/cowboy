@@ -8,7 +8,7 @@ use anyhow::Result;
 use cowboy_core::memory;
 
 use crate::cli::{MemoryCmdArgs, MemoryCommand};
-use crate::net::runtime::project_hash;
+use crate::project::project_hash;
 
 /// The memory key for the current worktree (matches the agent's).
 fn project_key() -> Result<String> {

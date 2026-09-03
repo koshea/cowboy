@@ -13,10 +13,7 @@ impl AgentLoop<'_> {
     /// the observation text.
     pub(super) fn run_memory(&self, args: &MemoryArgs) -> String {
         use cowboy_core::memory::{self, Scope};
-        let key = format!(
-            "{:08x}",
-            crate::net::runtime::project_hash(self.runtime.root())
-        );
+        let key = format!("{:08x}", crate::project::project_hash(self.runtime.root()));
         match args.action.as_str() {
             "save" => {
                 let (Some(title), Some(content)) = (&args.title, &args.content) else {

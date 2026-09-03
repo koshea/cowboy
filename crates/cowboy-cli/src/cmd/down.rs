@@ -1,4 +1,18 @@
-//! `cowboy down` — stop and remove cowboy-managed containers and networks.
+//! `cowboy down` — end this project's sessions (or every session) and reap residue.
+//!
+//! Much smaller than it was. Tearing down a container meant removing named objects
+//! that outlived the process which created them: an agent container, a gateway
+//! sidecar, and a bridge network, all reconstructed from a hash of the worktree path
+//! so that three different callers could agree on what to delete.
+//!
+//! A sandbox has no such objects. Its namespaces, interception ruleset and resource
+//! cgroup are all owned by a holder process whose lifetime is tied to the worker's,
+//! so ending the worker *is* the teardown — including after a crash, which is why
+//! the daemon no longer needs a reaper for it either.
+//!
+//! What can outlive a worker is an empty cgroup **directory**: the kernel keeps it
+//! until someone removes it, and only a clean shutdown does. So this reaps those too
+//! — harmless, but they accumulate one per crashed session.
 
 use std::path::Path;
 
@@ -6,14 +20,13 @@ use anyhow::Result;
 use cowboy_core::daemonproto::{DaemonReq, DaemonResp, SessionInfo};
 
 use crate::cli::DownArgs;
-use crate::net::docker::{CliDocker, DockerCli};
-use crate::net::{gateway, runtime};
 use crate::style;
 
-/// Stop the worker processes of the given live sessions (SIGTERM). A worker whose
-/// container we're about to remove must be killed too — otherwise it lingers as a
-/// "Running" session and recreates the container on its next command. The daemon's
-/// vacuum then reaps the now-dead session records + leases. Returns the count.
+/// Stop the worker processes of the given live sessions (SIGTERM).
+///
+/// This is the whole teardown: the worker's exit closes the holder's stdin, the
+/// holder exits, and the kernel releases the namespaces — taking any process still
+/// running inside them with it. Returns the count.
 fn kill_session_workers(sessions: &[SessionInfo]) -> usize {
     let mut killed = 0;
     for s in sessions {
@@ -42,109 +55,30 @@ async fn live_sessions(root: Option<&Path>) -> Vec<SessionInfo> {
     }
 }
 
-/// Remove a single project's cowboy objects: its agent container, its gateway
-/// sidecar, and its network (all named deterministically from the worktree
-/// `root`). Best-effort — missing objects are ignored. Shared by `cowboy down`,
-/// the worker's clean-shutdown reap, and the daemon's crash reap, so they all
-/// tear down exactly the same set. The gateway shares the agent's netns, so
-/// remove it first; the network removal then succeeds.
-pub async fn teardown_project(docker: &dyn DockerCli, root: &Path, container_name: &str) {
-    let hash = runtime::project_hash(root);
-    let (agent_net, gw) = gateway::network_names(hash);
-    for c in [&gw, container_name] {
-        let _ = docker.remove(c, true).await;
-    }
-    let _ = docker.remove_network(&agent_net).await;
-}
-
 pub async fn run(args: DownArgs) -> Result<()> {
-    let docker = CliDocker::new();
+    let (scope, killed) = if args.all {
+        (
+            "every project",
+            kill_session_workers(&live_sessions(None).await),
+        )
+    } else {
+        let root = crate::cmd::project_root()?;
+        (
+            "this project",
+            kill_session_workers(&live_sessions(Some(&root)).await),
+        )
+    };
 
-    if args.all {
-        // Kill every live session's worker first, so none recreates its container.
-        let killed = kill_session_workers(&live_sessions(None).await);
-        let (containers, networks) = docker.list_labeled().await?;
-        for c in &containers {
-            let _ = docker.remove(c, true).await;
-        }
-        for n in &networks {
-            let _ = docker.remove_network(n).await;
-        }
-        println!(
-            "{}",
-            style::success(&format!(
-                "stopped {killed} session(s); removed {} container(s) and {} network(s)",
-                containers.len(),
-                networks.len()
-            ))
-        );
-        return Ok(());
+    // Give the workers a moment to exit so their cgroups are empty and removable.
+    if killed > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    let reaped = crate::sandbox::cgroup::reap_empty();
 
-    // This project's deterministic names.
-    let root = crate::cmd::project_root()?;
-    let agent = std::env::var("COWBOY_CONTAINER_NAME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| runtime::container_name_for(&root));
-
-    // End this worktree's session(s) first (kill their workers), then remove the
-    // containers/networks. Without this, a still-running worker would just
-    // recreate the container and the session would keep showing as Running.
-    let killed = kill_session_workers(&live_sessions(Some(&root)).await);
-    teardown_project(&docker, &root, &agent).await;
-    println!(
-        "{}",
-        style::success(&format!(
-            "cowboy down: stopped {killed} session(s) and removed this project's containers and networks"
-        ))
-    );
+    let mut msg = format!("cowboy down: stopped {killed} session(s) in {scope}");
+    if reaped > 0 {
+        msg.push_str(&format!(", reaped {reaped} leftover cgroup(s)"));
+    }
+    println!("{}", style::success(&msg));
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::net::docker::MockDockerCli;
-
-    #[tokio::test]
-    async fn teardown_removes_agent_gateway_and_network() {
-        let root = std::path::Path::new("/tmp/cowboy-teardown-test");
-        let (agent_net, gw) = gateway::network_names(runtime::project_hash(root));
-        let agent = "cowboy-agent-test".to_string();
-
-        let mut docker = MockDockerCli::new();
-        let (a, g) = (agent.clone(), gw.clone());
-        docker
-            .expect_remove()
-            .times(2)
-            .withf(move |name, force| *force && (name == a || name == g))
-            .returning(|_, _| Ok(()));
-        let n = agent_net.clone();
-        docker
-            .expect_remove_network()
-            .times(1)
-            .withf(move |x| x == n)
-            .returning(|_| Ok(()));
-
-        teardown_project(&docker, root, &agent).await;
-    }
-
-    #[test]
-    fn kill_session_workers_skips_terminal_and_pidless() {
-        // A terminal session (has a pid but already done) and a live session with
-        // no pid: neither should be signalled — so nothing is killed and no real
-        // process is touched.
-        let mk = |status: &str, pid: serde_json::Value| -> SessionInfo {
-            serde_json::from_value(serde_json::json!({
-                "id": "s", "root": "/w", "status": status, "pid": pid,
-            }))
-            .unwrap()
-        };
-        let sessions = vec![
-            mk("completed", serde_json::json!(999999999u32)),
-            mk("running", serde_json::Value::Null),
-        ];
-        assert_eq!(kill_session_workers(&sessions), 0);
-    }
 }

@@ -72,10 +72,7 @@ pub fn dir() -> PathBuf {
 
 /// Grants file for one project, keyed by the root's hash.
 fn project_file_in(dir: &Path, root: &Path) -> PathBuf {
-    dir.join(format!(
-        "{:08x}.json",
-        crate::net::runtime::project_hash(root)
-    ))
+    dir.join(format!("{:08x}.json", crate::project::project_hash(root)))
 }
 
 /// Grants that apply to every project on this machine.

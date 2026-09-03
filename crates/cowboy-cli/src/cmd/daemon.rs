@@ -11,7 +11,6 @@ use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::net::docker::DockerCli as _;
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
     AttachTarget, BusMessage, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode,
@@ -123,51 +122,14 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-/// Result of a [`Daemon::vacuum`] pass: the session ids removed from the
-/// registry, plus the `(root, container_name)` of crashed sessions whose
-/// container no live session still uses — for the async caller to tear down.
+/// Result of a [`Daemon::vacuum`] pass: the session ids removed from the registry.
+///
+/// It used to also carry the containers of crashed sessions for the caller to tear
+/// down. Nothing to carry any more: a session's namespaces belong to a holder
+/// process whose lifetime is tied to its worker's, so losing the worker *is* the
+/// teardown and a crash needs no reaper.
 struct VacuumOutcome {
     reaped: Vec<SessionId>,
-    containers: Vec<(PathBuf, String)>,
-}
-
-/// Tear down the agent container + gateway + networks for each crashed session
-/// the vacuum surfaced. Best-effort; runs outside the daemon lock (it shells out
-/// to Docker). This is what finally cleans up containers a crashed worker left
-/// behind — the clean-exit path reaps its own in the worker.
-async fn reap_containers(containers: Vec<(PathBuf, String)>) {
-    if containers.is_empty() {
-        return;
-    }
-    let docker = crate::net::docker::CliDocker::new();
-    for (root, name) in containers {
-        tracing::info!(container = %name, "reaping crashed session's container");
-        crate::cmd::down::teardown_project(&docker, &root, &name).await;
-    }
-}
-
-/// Reap the listed `cowboy-net-*` networks that no live session owns. The
-/// clean-shutdown and crash-reap paths both tear down a session's network, but a
-/// `kill -9`'d worker (or a Docker create that lost a race and was abandoned) can
-/// leave one behind; the next session then hits a subnet/name clash.
-///
-/// `names` is a snapshot taken *before* `keep` (the deterministic network names
-/// of every session in the registry). Because the daemon records a session
-/// *before* its worker creates the network, any name in this earlier snapshot
-/// that is absent from `keep` has no owning session and is a genuine leftover —
-/// a session created after the snapshot can't appear in it. Best-effort; an
-/// in-use network refuses removal harmlessly.
-async fn reap_orphan_networks(names: Vec<String>, keep: std::collections::HashSet<String>) {
-    let docker = crate::net::docker::CliDocker::new();
-    for n in orphan_networks(names, &keep) {
-        tracing::info!(network = %n, "reaping orphaned cowboy network (no owning session)");
-        let _ = docker.remove_network(&n).await;
-    }
-}
-
-/// The listed networks with no owning session — the ones to remove.
-fn orphan_networks(names: Vec<String>, keep: &std::collections::HashSet<String>) -> Vec<String> {
-    names.into_iter().filter(|n| !keep.contains(n)).collect()
 }
 
 impl Daemon {
@@ -360,21 +322,6 @@ impl Daemon {
         (reap, released)
     }
 
-    /// Deterministic agent-network names of every session currently in the
-    /// registry — the set the orphan-network sweep must keep. (A session is
-    /// recorded before its worker creates the network, so this never omits a
-    /// network whose session still exists.)
-    fn owned_network_names(&self) -> std::collections::HashSet<String> {
-        self.state
-            .sessions
-            .values()
-            .map(|s| {
-                let hash = crate::net::runtime::project_hash(&s.root);
-                crate::net::gateway::network_names(hash).0
-            })
-            .collect()
-    }
-
     /// Reap already-marked `Stale` sessions and release their leases, then drop
     /// orphan leases (holder gone), bound terminal-session history, and remove
     /// dead per-session socket files. Idempotent maintenance run on startup and
@@ -383,22 +330,15 @@ impl Daemon {
     /// ranch coordination can see the just-stale records before they're reaped).
     /// Returns the reaped session ids.
     fn vacuum(&mut self) -> VacuumOutcome {
-        // 1. Reap crashed sessions (already marked Stale by a prior sweep),
-        //    capturing each one's container coordinates before it's removed.
-        let stale: Vec<(SessionId, PathBuf, String)> = self
+        // 1. Reap crashed sessions (already marked Stale by a prior sweep).
+        let stale: Vec<SessionId> = self
             .state
             .sessions
             .iter()
             .filter(|(_, s)| s.status == SessionStatus::Stale)
-            .map(|(id, s)| {
-                let name = s
-                    .container_name
-                    .clone()
-                    .unwrap_or_else(|| crate::net::runtime::container_name_for(&s.root));
-                (id.clone(), s.root.clone(), name)
-            })
+            .map(|(id, _)| id.clone())
             .collect();
-        let reaped: Vec<SessionId> = stale.iter().map(|(id, _, _)| id.clone()).collect();
+        let reaped: Vec<SessionId> = stale.clone();
         self.state.sessions.retain(|id, _| !reaped.contains(id));
 
         // 2. Drop leases whose holder no longer exists (reaped now, or orphaned by
@@ -428,29 +368,7 @@ impl Daemon {
 
         self.save();
 
-        // 4. Of the reaped sessions' containers, return those NO live session still
-        //    uses, so the (async) caller can tear them down. A live session's
-        //    container name is its registered name, or the one it would derive — so
-        //    a just-started session that hasn't registered yet is still protected.
-        let live_names: std::collections::HashSet<String> = self
-            .state
-            .sessions
-            .values()
-            .filter(|s| !s.status.is_terminal())
-            .map(|s| {
-                s.container_name
-                    .clone()
-                    .unwrap_or_else(|| crate::net::runtime::container_name_for(&s.root))
-            })
-            .collect();
-        let mut seen = std::collections::HashSet::new();
-        let containers: Vec<(PathBuf, String)> = stale
-            .into_iter()
-            .filter(|(_, _, name)| !live_names.contains(name) && seen.insert(name.clone()))
-            .map(|(_, root, name)| (root, name))
-            .collect();
-
-        VacuumOutcome { reaped, containers }
+        VacuumOutcome { reaped }
     }
 
     /// Remove per-session socket files (`s-<id>.sock`) that don't belong to a
@@ -613,7 +531,7 @@ pub async fn serve() -> Result<()> {
             }
             // Reap stale records + release dangling leases, prune sockets, bound
             // history. Idempotent; runs every tick so crashes self-heal.
-            let containers = {
+            {
                 let mut d = sweeper.lock().await;
                 let outcome = d.vacuum();
                 // Survivors have had their re-heartbeat window by now, so it's
@@ -625,21 +543,11 @@ pub async fn serve() -> Result<()> {
                         "reaped stale sessions (+released leases)"
                     );
                 }
-                outcome.containers
-            };
-            // Tear down the crashed sessions' containers (Docker; lock released).
-            reap_containers(containers).await;
-
-            // Reap networks left by `kill -9`'d workers (no clean teardown ran).
-            // List BEFORE snapshotting owners so a session created mid-sweep — its
-            // network can't be in this list yet — is never mistaken for an orphan.
-            if let Ok(net_names) = crate::net::docker::CliDocker::new()
-                .cowboy_network_names()
-                .await
-            {
-                let keep = sweeper.lock().await.owned_network_names();
-                reap_orphan_networks(net_names, keep).await;
             }
+            // Nothing to tear down for a crashed session: its namespaces, ruleset and
+            // cgroup were owned by a holder process tied to the worker's lifetime, so
+            // they went when the worker did. Only the empty cgroup *directory* can
+            // linger, and `cowboy down` reaps those.
         }
     });
 
@@ -1271,7 +1179,7 @@ async fn start_session(
                 status: SessionStatus::Starting,
                 pid: None, // set once the child is spawned, below
                 branch: None,
-                container_name: None,
+                session_name: None,
                 worker_sock: Some(sock.clone()),
                 journal_path: Some(journal.clone()),
                 lease_mode: Some(mode),
@@ -1548,7 +1456,7 @@ mod tests {
                 status,
                 pid: None,
                 branch: None,
-                container_name: None,
+                session_name: None,
                 worker_sock: None,
                 journal_path: None,
                 lease_mode: Some(LeaseMode::Exclusive),
@@ -1564,33 +1472,6 @@ mod tests {
                 workstream_id: None,
             },
         );
-    }
-
-    #[test]
-    fn owned_network_names_cover_live_sessions_and_orphans_are_reaped() {
-        let mut d = daemon();
-        put_session(&mut d, "s1", SessionStatus::Running);
-        d.state.sessions.get_mut("s1").unwrap().root = PathBuf::from("/w/alpha");
-        put_session(&mut d, "s2", SessionStatus::Stale);
-        d.state.sessions.get_mut("s2").unwrap().root = PathBuf::from("/w/beta");
-
-        let keep = d.owned_network_names();
-        let net_alpha = crate::net::gateway::network_names(crate::net::runtime::project_hash(
-            Path::new("/w/alpha"),
-        ))
-        .0;
-        let net_beta = crate::net::gateway::network_names(crate::net::runtime::project_hash(
-            Path::new("/w/beta"),
-        ))
-        .0;
-        assert!(keep.contains(&net_alpha) && keep.contains(&net_beta));
-
-        // A leftover network from a `kill -9`'d session no record owns is reaped;
-        // both live sessions' networks (even the stale-but-still-recorded one,
-        // whose container teardown runs separately) are kept.
-        let leftover = "cowboy-net-deadbeef".to_string();
-        let listed = vec![net_alpha.clone(), net_beta.clone(), leftover.clone()];
-        assert_eq!(orphan_networks(listed, &keep), vec![leftover]);
     }
 
     #[test]
@@ -1670,7 +1551,7 @@ mod tests {
                 updated_ms: 0,
             },
         );
-        // A live session on the SAME root (→ same container) is left untouched.
+        // A live session on the same root is left untouched.
         put_session(&mut d, "live", SessionStatus::Running);
 
         let outcome = d.vacuum();
@@ -1681,35 +1562,6 @@ mod tests {
         assert!(
             !d.state.leases.contains_key("/w"),
             "dangling lease freed so a new session can start"
-        );
-        // Refcount: the container is NOT torn down because a live session shares it.
-        assert!(
-            outcome.containers.is_empty(),
-            "shared container must not be reaped while a live session uses it"
-        );
-    }
-
-    #[test]
-    fn vacuum_reaps_lone_crashed_container() {
-        let mut d = daemon();
-        put_session(&mut d, "crashed", SessionStatus::Stale);
-        // Distinct root + explicit container name, no other session sharing it.
-        {
-            let s = d.state.sessions.get_mut("crashed").unwrap();
-            s.root = PathBuf::from("/repo-a");
-            s.container_name = Some("cowboy-agent-a".into());
-        }
-        // An unrelated live session on a different container — must not be touched.
-        put_session(&mut d, "other", SessionStatus::Running);
-        d.state.sessions.get_mut("other").unwrap().root = PathBuf::from("/repo-b");
-
-        let outcome = d.vacuum();
-
-        assert_eq!(outcome.reaped, vec!["crashed".to_string()]);
-        assert_eq!(
-            outcome.containers,
-            vec![(PathBuf::from("/repo-a"), "cowboy-agent-a".to_string())],
-            "the lone crashed container is surfaced for teardown"
         );
     }
 

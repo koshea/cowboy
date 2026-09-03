@@ -555,7 +555,7 @@ mod tests {
             status: SessionStatus::Running,
             pid: None,
             branch: None,
-            container_name: None,
+            session_name: None,
             worker_sock: None,
             journal_path: None,
             lease_mode: None,

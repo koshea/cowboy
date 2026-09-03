@@ -1,19 +1,22 @@
 //! End-to-end tests for the `cowboyd` daemon + worker + client stack, exercised
 //! through the real `cowboy`/`cowboyd` binaries and unix sockets.
 //!
-//! All `#[ignore]`: they spawn real worker processes (and, for the turn test,
-//! real Docker containers against a configured model). Run them explicitly:
+//! All `#[ignore]`: they spawn real worker processes (and, for the turn test, run
+//! real commands in a real sandbox against a configured model). Run them explicitly:
 //!
 //! ```text
 //! cargo test -p cowboy-cli --test daemon_e2e -- --ignored
 //! ```
 //!
-//! Each test self-skips (prints why, returns Ok) when its prerequisites are
-//! absent, so `--ignored` is safe to run anywhere. The "turn" test needs Docker,
-//! the default agent image (built from source on first run, or pulled), and a
-//! model provider in `~/.config/cowboy`;
-//! the rest only need a model *provider* to exist (the worker resolves one at
-//! startup but, with no task, never calls it), so they supply a fake one.
+//! Each test self-skips (prints why, returns Ok) when its prerequisites are absent,
+//! so `--ignored` is safe to run anywhere. The tests that execute a turn need a
+//! working sandbox (kernel prerequisites — see `cowboy doctor`) and a model provider
+//! in `~/.config/cowboy`; the rest only need a model *provider* to exist (the worker
+//! resolves one at startup but, with no task, never calls it), so they supply a fake.
+//!
+//! Cleanup is much smaller than it was. A session's namespaces, interception ruleset
+//! and cgroup all belong to a holder process whose lifetime is tied to its worker's,
+//! so ending the worker releases them; only an empty cgroup *directory* can linger.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -32,43 +35,42 @@ use cowboy_core::netproto::encode_line;
 // Prerequisites / skip helpers
 // ---------------------------------------------------------------------------
 
-fn docker_ok() -> bool {
-    Command::new("docker")
-        .args(["info"])
+/// Whether this host can actually run a sandbox, so a test that needs a command to
+/// execute skips cleanly rather than failing for the wrong reason.
+///
+/// Checked by creating a user namespace, which is the prerequisite everything else
+/// rests on. `cowboy doctor` reports the full list.
+fn sandbox_ok() -> bool {
+    Command::new("bwrap")
+        .args([
+            "--unshare-user",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--symlink",
+            "usr/lib",
+            "/lib",
+            "--symlink",
+            "usr/lib64",
+            "/lib64",
+            "--",
+            "/usr/bin/true",
+        ])
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-/// IDs of cowboy-labelled docker containers + networks (for snapshot-diff
-/// cleanup so a test never leaks the worker's agent/gateway objects).
-fn cowboy_docker_objects() -> (Vec<String>, Vec<String>) {
-    let ids = |args: &[&str]| -> Vec<String> {
-        Command::new("docker")
-            .args(args)
-            .output()
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    (
-        ids(&["ps", "-aq", "--filter", "label=cowboy=1"]),
-        ids(&["network", "ls", "-q", "--filter", "label=cowboy=1"]),
-    )
-}
-
-/// Remove any cowboy container/network created since `before`.
-fn reap_new_docker(before: &(Vec<String>, Vec<String>)) {
-    let (after_c, after_n) = cowboy_docker_objects();
-    for id in after_c.iter().filter(|id| !before.0.contains(id)) {
-        let _ = Command::new("docker").args(["rm", "-f", id]).output();
-    }
-    for id in after_n.iter().filter(|id| !before.1.contains(id)) {
-        let _ = Command::new("docker").args(["network", "rm", id]).output();
+/// Reap anything a finished session could have left behind.
+///
+/// Only empty cgroup directories can outlive a worker, and only because the kernel
+/// keeps a cgroup until someone removes the directory. There are no containers,
+/// networks, or ruleset remnants to chase: they lived in namespaces the worker's exit
+/// released.
+fn reap_session_residue() {
+    let reaped = cowboy_cli::sandbox::cgroup::reap_empty();
+    if reaped > 0 {
+        eprintln!("reaped {reaped} leftover cgroup(s)");
     }
 }
 
@@ -276,7 +278,7 @@ fn fake_parent(id: &str, root: &Path) -> cowboy_core::daemonproto::SessionInfo {
         status: SessionStatus::Running,
         pid: Some(std::process::id()),
         branch: None,
-        container_name: None,
+        session_name: None,
         worker_sock: None,
         journal_path: None,
         lease_mode: Some(LeaseMode::Exclusive),
@@ -507,7 +509,7 @@ fn e2e_shutdown_request_exits_daemon_and_keeps_workers() {
 /// tools (artifact, blocked/unblock, handoff) and leave the right on-disk
 /// effects — the regression check for prompt/model compatibility. Asserts the
 /// file effects (robust to wording), not the transcript. Needs a model provider
-/// but not Docker (these tools run host-side; the task does no shell/network).
+/// but not the sandbox (these tools run host-side; the task does no shell/network).
 #[test]
 #[ignore = "real model: needs a provider in ~/.config/cowboy"]
 fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
@@ -516,7 +518,6 @@ fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
         return;
     };
 
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -564,7 +565,7 @@ fn e2e_foundation_tools_record_artifacts_lifecycle_handoff() {
         .output();
     // The worker may eagerly bring up its agent/gateway even for a tool-only
     // task; reap anything new so the suite never leaks containers/networks.
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 
     // Each coordination tool left its mark.
     for needle in [
@@ -603,7 +604,6 @@ fn e2e_ranch_start_launches_ready_workstream() {
         eprintln!("skipping: no model provider in ~/.config/cowboy");
         return;
     };
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -691,28 +691,27 @@ fn e2e_ranch_start_launches_ready_workstream() {
             .arg(&p)
             .output();
     }
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
 /// Ranch workstream lifecycle (interactive model): start a ranch's first
-/// workstream, let it run its initial attempt in Docker, and assert it IDLES
+/// workstream, let it run its initial attempt, and assert it IDLES
 /// (stays `Running`, never auto-completes) and the dependent does NOT auto-launch.
 /// Then sign off the way the TUI's `/accept` does — send `ClientMsg::Accept` to
 /// the worker — and assert the full loop: worker → `AcceptWorkstream` → daemon
 /// completes schema + advances → api auto-launches, and the schema session ends.
-/// Needs Docker + a real model.
+/// Needs a working sandbox + a real model.
 #[test]
-#[ignore = "real Docker + model: exercises idle workstream + in-session /accept"]
+#[ignore = "real sandbox + model: exercises idle workstream + in-session /accept"]
 fn e2e_ranch_workstream_idles_then_signoff_advances() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(_) = real_provider() else {
         eprintln!("skipping: no model provider in ~/.config/cowboy");
         return;
     };
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -838,25 +837,24 @@ fn e2e_ranch_workstream_idles_then_signoff_advances() {
                 .output();
         }
     }
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
 /// Ranch sign-off via the CLI fallback (`cowboy ranch accept`): the same as the
 /// in-session path, but signing off from the shell while the idle worker is not
 /// attached. After `ranch accept`, the dependent launches on the next advance.
-/// Needs Docker + a real model.
+/// Needs a working sandbox + a real model.
 #[test]
-#[ignore = "real Docker + model: exercises `cowboy ranch accept` sign-off"]
+#[ignore = "real sandbox + model: exercises `cowboy ranch accept` sign-off"]
 fn e2e_ranch_cli_accept_signoff_advances() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(_) = real_provider() else {
         eprintln!("skipping: no model provider in ~/.config/cowboy");
         return;
     };
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -961,7 +959,7 @@ fn e2e_ranch_cli_accept_signoff_advances() {
                 .output();
         }
     }
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
 /// Ranch scope proposals (agent path): a workstream worker, told to, uses the
@@ -970,17 +968,16 @@ fn e2e_ranch_cli_accept_signoff_advances() {
 /// Model-dependent (the agent must choose to call the tool) — exactly the kind of
 /// behavior this manual suite is meant to check across models.
 #[test]
-#[ignore = "real Docker + model: exercises the propose_scope_change agent tool"]
+#[ignore = "real sandbox + model: exercises the propose_scope_change agent tool"]
 fn e2e_ranch_agent_proposes_scope_change_then_user_approves() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(_) = real_provider() else {
         eprintln!("skipping: no model provider in ~/.config/cowboy");
         return;
     };
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -1068,19 +1065,19 @@ fn e2e_ranch_agent_proposes_scope_change_then_user_approves() {
                 .output();
         }
     }
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
 /// Crew routing (agent path): with a crew roster configured, a planner that
 /// delegates subagents has them routed through the roster — each launch logs a
 /// `SubagentRouted` lifecycle event with the resolved model. Uses an isolated
 /// config home (copies the real provider/models, writes its own crew.yaml) so it
-/// never touches `~/.config/cowboy`. Model-dependent + needs Docker.
+/// never touches `~/.config/cowboy`. Model-dependent; needs a working sandbox.
 #[test]
-#[ignore = "real Docker + model: exercises crew routing of subagents"]
+#[ignore = "real sandbox + model: exercises crew routing of subagents"]
 fn e2e_crew_routes_delegated_subagents() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(real_providers) = real_provider() else {
@@ -1088,7 +1085,6 @@ fn e2e_crew_routes_delegated_subagents() {
         return;
     };
     let real_dir = real_providers.parent().unwrap().to_path_buf();
-    let docker_before = cowboy_docker_objects();
 
     // Isolated config home: copy the real provider + models, add our own crew.yaml.
     let cfg = assert_fs::TempDir::new().unwrap();
@@ -1163,26 +1159,25 @@ fn e2e_crew_routes_delegated_subagents() {
         "subagents should route to the rostered model {default_model}, got {routed:?}"
     );
 
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
 /// Subagents share their parent's worktree by design — a subagent (run with a
 /// held worktree lease) must NOT try to acquire the lease, or it's denied and
 /// returns nothing ("no final answer"). This reproduces a parent holding the
 /// exclusive lease and asserts a subagent-style child still produces a final
-/// answer. Needs Docker + a real model.
+/// answer. Needs a working sandbox + a real model.
 #[test]
-#[ignore = "real Docker + model: subagent runs in a parent-held worktree"]
+#[ignore = "real sandbox + model: subagent runs in a parent-held worktree"]
 fn e2e_subagent_runs_in_held_worktree() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(_) = real_provider() else {
         eprintln!("skipping: no model provider in ~/.config/cowboy");
         return;
     };
-    let docker_before = cowboy_docker_objects();
     let env = Env::real();
     let _d = env.spawn_daemon();
     let sock = env.sock();
@@ -1230,17 +1225,17 @@ fn e2e_subagent_runs_in_held_worktree() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    reap_new_docker(&docker_before);
+    reap_session_residue();
 }
 
-/// The flagship real-Docker turn: the daemon starts a session that runs an
+/// The flagship end-to-end turn: the daemon starts a session that runs an
 /// actual agent turn against the configured model, a client streams it, detach
 /// leaves it running, and re-attach replays the journal.
 #[test]
-#[ignore = "real Docker + model: needs docker, the agent image, and ~/.config/cowboy"]
+#[ignore = "real sandbox + model: needs the kernel prerequisites and ~/.config/cowboy"]
 fn e2e_turn_streams_detach_keeps_running_then_reattach_replays() {
-    if !docker_ok() {
-        eprintln!("skipping: docker not available");
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
         return;
     }
     let Some(_) = real_provider() else {

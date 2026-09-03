@@ -1,26 +1,27 @@
-//! `cowboy run <command>` and `cowboy shell` — execute inside the agent
-//! container.
+//! `cowboy run <command>` and `cowboy shell` — execute inside the sandbox.
 
 use std::process::exit;
+use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use cowboy_core::config::{ConfigPaths, SecurityConfig};
+use anyhow::Result;
 
-use crate::net::docker::CliDocker;
-use crate::net::runtime::AgentRuntime;
+use crate::sandbox::Sandbox;
 
-/// Build an [`AgentRuntime`] backed by the real `docker` CLI for this project.
-fn runtime() -> Result<AgentRuntime> {
+/// This project's sandbox, with no approver.
+///
+/// `DenyAll` is deliberate rather than incidental: these are one-off CLI paths with
+/// no UI attached, so a prompt would have nobody to answer it. Saying so explicitly
+/// keeps an unanswerable question from becoming an allow.
+fn sandbox() -> Result<impl Sandbox> {
     let root = crate::cmd::project_root()?;
-    let paths = ConfigPaths::for_root(&root);
-    let security = SecurityConfig::load(&paths.security)
-        .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-    AgentRuntime::new(Box::new(CliDocker::new()), root, security)
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    crate::cmd::sandbox::open(root, Arc::new(cowboy_gateway::DenyAll))
 }
 
 pub async fn run(command: Vec<String>) -> Result<()> {
-    let rt = runtime()?;
-    let result = rt.run(&command).await?;
+    let sb = sandbox()?;
+    let result = sb.run(&command).await?;
+    sb.stop().await;
     // Propagate the command's exit code to our caller.
     if result.exit_code != 0 {
         exit(result.exit_code);
@@ -29,8 +30,9 @@ pub async fn run(command: Vec<String>) -> Result<()> {
 }
 
 pub async fn shell() -> Result<()> {
-    let rt = runtime()?;
-    let result = rt.shell().await?;
+    let sb = sandbox()?;
+    let result = sb.shell().await?;
+    sb.stop().await;
     if result.exit_code != 0 {
         exit(result.exit_code);
     }

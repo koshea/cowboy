@@ -25,8 +25,7 @@ use crate::cmd::session::{
     context_title, git_branch, log_approval, log_network, post_turn_indicators, verdict_str,
 };
 use crate::net::approvals;
-use crate::net::docker::CliDocker;
-use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
+use crate::project::{project_hash, session_name_for};
 use crate::sandbox::policy::ChannelApprover;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 
@@ -71,7 +70,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
     // Merge the user's personal credential overlay (global + per-repo, shared by
     // all of a repo's worktrees) and re-validate the combined config.
-    cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(&root));
+    cowboy_core::usersecrets::merge_into(&mut security, &crate::project::repo_key(&root));
     security
         .validate()
         .context("validating merged credential grants")?;
@@ -136,7 +135,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         status: SessionStatus::Running,
         pid: Some(std::process::id()),
         branch: git_branch(&root),
-        container_name: Some(container_name_for(&root)),
+        session_name: Some(session_name_for(&root)),
         worker_sock: Some(sock.clone()),
         journal_path: Some(journal.clone()),
         lease_mode: Some(LeaseMode::Exclusive),
@@ -235,37 +234,25 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     }
 
     // Gate credential grants flagged `approval: required` behind a per-session
-    // prompt to the attached client; a denied grant is dropped before the
-    // container is ever built. With no client attached, this fails closed.
+    // prompt to the attached client; a denied grant is dropped before the sandbox is
+    // ever built. With no client attached, this fails closed.
     gate_credential_grants(&mut security, &emitter).await;
 
-    // The network policy the engine enforces, with previously persisted
-    // project/global approvals merged in — the same merge the Docker path performed
-    // when writing the gateway's policy file, minus the file.
-    let mut network_policy = security.network_policy.clone();
-    approvals::merge_into(&mut network_policy, &approvals::load(&root));
-
-    let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
-    // Captured before the runtime moves into the agent loop, so we can reap this
-    // session's container + gateway on clean shutdown below.
-    let container_name = runtime.container_name().to_string();
-
-    // The policy engine runs in this process. `ask` verdicts go to attached
-    // clients and fail closed when none are; decisions are logged and surfaced.
+    // The policy engine lives inside the sandbox value, which owns the merge of
+    // configured policy and persisted approvals — one authority, so nothing can
+    // enforce a different policy than the one reported here. `ask` verdicts go to
+    // attached clients and fail closed when none are.
     //
-    // Nothing has to be bound or awaited to make this reachable: it used to be a TCP
+    // Nothing has to be bound or awaited to make this reachable. It used to be a TCP
     // listener on the gateway's bridge IP, which meant a retry loop (the IP did not
     // exist until the network came up) and an eager, detached Docker call to create
     // that network early so the loop would settle. Both are gone.
     let approver = control_approver(emitter.clone(), Some(session_dir.clone()), root.clone());
-    let policy_engine = std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
-        network_policy.clone(),
-        cowboy_gateway::dns::DnsMap::new(),
-        approver,
-    ));
-    crate::cmd::session::log_policy_in_force(&network_policy);
-    // The relay attaches to this engine once the sandbox transport is up.
-    let _ = &policy_engine;
+    let runtime = crate::cmd::sandbox::open_with(root.clone(), security, approver)?;
+    crate::cmd::session::log_policy_in_force(runtime.policy());
+    // Captured before the runtime moves into the agent loop, so the session can be
+    // torn down on clean shutdown below.
+    let session_name = crate::sandbox::Sandbox::session_name(&runtime).to_string();
 
     let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
     // Continue a prior session if asked (load its transcript as history).
@@ -707,19 +694,15 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if args.register {
         let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
     }
-    // Now do the (bounded) container cleanup. `shutdown` execs into the container
-    // to stop managed processes; the reap removes this session's container +
-    // gateway + networks. We held the exclusive worktree lease, so we're the sole
-    // user; a *crashed* worker's containers are instead reaped by the daemon's
-    // vacuum. (A detach never reaches here — the worker keeps serving — so detached
-    // sessions live.) Both are bounded so a wedged Docker can't keep the worker
-    // process alive forever.
+    // Now the (bounded) teardown. `shutdown` stops managed processes inside the
+    // sandbox; the session's namespaces, interception ruleset and cgroup then go with
+    // its holder process. We held the exclusive worktree lease, so we're the sole
+    // user; a *crashed* worker needs no cleanup here at all, because the holder's
+    // lifetime is tied to the worker's — losing the worker reaps the session. (A
+    // detach never reaches here — the worker keeps serving — so detached sessions
+    // live.) Bounded so a wedged command cannot keep the worker process alive.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), agent.shutdown()).await;
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        crate::cmd::down::teardown_project(&CliDocker::new(), &root, &container_name),
-    )
-    .await;
+    tracing::debug!(session = %session_name, "session torn down");
     Ok(())
 }
 
@@ -965,7 +948,7 @@ mod tests {
             status: SessionStatus::Running,
             pid: None,
             branch: None,
-            container_name: None,
+            session_name: None,
             worker_sock: None,
             journal_path: None,
             lease_mode: None,

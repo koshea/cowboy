@@ -123,7 +123,6 @@ insta = { version = "1", features = ["yaml", "json"] }
 rstest = "0.26"
 proptest = "1"
 wiremock = "0.6"
-mockall = "0.14"
 assert_cmd = "2"
 assert_fs = "1"
 predicates = "3"

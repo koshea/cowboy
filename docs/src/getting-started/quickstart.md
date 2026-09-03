@@ -37,7 +37,7 @@ cowboy skill list|show <name>
 cowboy sessions              # list live/registered sessions
 cowboy logs                  # list past sessions
 cowboy replay <id>           # replay a past session
-cowboy down [--all]          # tear down this project's (or every) sandbox
+cowboy down [--all]          # end this project's (or every) session
 ```
 
 See the [CLI reference](../reference/cli.md) for the full, auto-generated command

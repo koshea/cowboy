@@ -1,13 +1,17 @@
-//! `cowboy proc ...` — supervise long-running processes defined in
-//! `agent.yaml`. Processes run inside the agent container as detached process
-//! groups; state (pid + logs) lives under `/workspace/.cowboy/proc/`.
+//! `cowboy proc ...` — supervise long-running processes defined in `agent.yaml`.
+//!
+//! Processes run inside the sandbox as detached process groups; state (pid + logs)
+//! lives under `/workspace/.cowboy/proc/`.
+//!
+//! A process keeps the filesystem view it started with: a Landlock domain is fixed
+//! at `exec` and can only narrow, so a path granted afterwards is invisible to it
+//! until it is restarted. `cowboy proc list` reports that rather than leaving it to
+//! be debugged.
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{AgentConfig, ConfigPaths, ProcessDef, SecurityConfig};
 
 use crate::cli::{ProcArgs, ProcCommand};
-use crate::net::docker::CliDocker;
-use crate::net::runtime::AgentRuntime;
 use crate::sandbox::Sandbox;
 
 const CONTROL_TIMEOUT: u64 = 30;
@@ -42,7 +46,12 @@ pub async fn run(args: ProcArgs) -> Result<()> {
     let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
     let workdir = security.sandbox.workdir.clone();
     let proc_dir = format!("{workdir}/.cowboy/proc");
-    let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
+    // No UI here, so an `ask` has nobody to answer it: fail closed explicitly.
+    let runtime = crate::cmd::sandbox::open_with(
+        root.clone(),
+        security,
+        std::sync::Arc::new(cowboy_gateway::DenyAll),
+    )?;
 
     let ctx = Proc {
         runtime: Box::new(runtime),

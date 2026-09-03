@@ -68,7 +68,7 @@ fn doctor_runs_after_init() {
         .arg("init")
         .assert()
         .success();
-    // Doctor should succeed on this host (Linux + docker + nft present), though
+    // Doctor should succeed on this host (Linux with the kernel prerequisites present), though
     // it may warn about a missing provider.
     let home = assert_fs::TempDir::new().unwrap();
     cowboy()

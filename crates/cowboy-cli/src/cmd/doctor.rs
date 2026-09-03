@@ -1,14 +1,12 @@
 //! `cowboy doctor` — environment and configuration checks.
 
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::Result;
 use cowboy_core::config::{
     resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
 };
 
-use crate::net::compose;
 use crate::style;
 
 /// Outcome of a single check.
@@ -71,17 +69,6 @@ pub async fn run() -> Result<()> {
         r.check(req.name, sandbox_status(req));
     }
 
-    println!("\n{}", style::bold("containers (legacy path)"));
-    // Docker.
-    r.check("docker", check_command(&["docker", "--version"]));
-    r.check(
-        "docker compose",
-        check_command(&["docker", "compose", "version"]),
-    );
-
-    // Network gateway.
-    r.check("network enforcement", check_enforcement());
-
     println!("\n{}", style::bold("configuration"));
     // Config files.
     r.check("security.yaml", check_security(&paths.security));
@@ -96,18 +83,6 @@ pub async fn run() -> Result<()> {
         "credential grants",
         check_credentials(&paths.security, &root),
     );
-
-    println!("\n{}", style::bold("container images (legacy path)"));
-    r.check("agent image", check_image(&paths.security));
-    r.check(
-        "gateway image",
-        image_present(
-            crate::net::gateway::GATEWAY_IMAGE,
-            "missing; pulled from GHCR on first run (or `docker/build.sh gateway`)",
-        ),
-    );
-
-    r.check("compose", check_compose(&root));
 
     println!("\n{}", style::bold("daemon"));
     r.check("cowboyd", check_daemon().await);
@@ -133,8 +108,6 @@ pub async fn run() -> Result<()> {
         }
     );
 
-    // Offer Compose network approval (interactive only; no-op otherwise).
-    compose::prompt_and_persist(&root)?;
     Ok(())
 }
 
@@ -178,25 +151,6 @@ fn check_platform() -> Status {
     }
 }
 
-fn check_command(argv: &[&str]) -> Status {
-    match Command::new(argv[0]).args(&argv[1..]).output() {
-        Ok(out) if out.status.success() => {
-            let v = String::from_utf8_lossy(&out.stdout);
-            Status::Ok(v.lines().next().unwrap_or("").trim().to_string())
-        }
-        Ok(out) => Status::Fail(format!("`{}` exited with {}", argv.join(" "), out.status)),
-        Err(_) => Status::Fail(format!("`{}` not found", argv[0])),
-    }
-}
-
-/// The nft REDIRECT that forces agent egress through the proxy runs *inside* the
-/// gateway sidecar (sharing the agent's netns), using the Docker VM kernel's
-/// netfilter — not the host. So there's no host `nft`/`ip_forward` requirement on
-/// either platform; the gateway image (checked separately) carries the tooling.
-fn check_enforcement() -> Status {
-    Status::Ok("in-netns gateway sidecar (no host nft/ip-forwarding needed)".to_string())
-}
-
 fn check_security(path: &Path) -> Status {
     match SecurityConfig::load(path) {
         Ok(cfg) => {
@@ -227,7 +181,7 @@ fn check_credentials(path: &Path, root: &Path) -> Status {
     };
     // Include the user's personal overlay (global + per-repo, all worktrees).
     let canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    cowboy_core::usersecrets::merge_into(&mut cfg, &crate::net::runtime::repo_key(&canon));
+    cowboy_core::usersecrets::merge_into(&mut cfg, &crate::project::repo_key(&canon));
     let (mut count, mut warns, mut fails) = (0usize, Vec::new(), Vec::new());
     for e in &cfg.secrets.env {
         count += 1;
@@ -353,41 +307,6 @@ fn check_config_separation(path: &Path) -> Status {
         }
         Err(cowboy_core::Error::SecurityInvariant(m)) => Status::Fail(m),
         Err(e) => Status::Fail(e.to_string()),
-    }
-}
-
-/// Report whether a docker image exists locally (clean message, no JSON).
-fn image_present(image: &str, warn: &str) -> Status {
-    match std::process::Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-    {
-        Ok(out) if out.status.success() => Status::Ok(format!("{image} present")),
-        Ok(_) => Status::Warn(warn.to_string()),
-        Err(_) => Status::Fail("`docker` not found".to_string()),
-    }
-}
-
-fn check_image(security: &Path) -> Status {
-    let image = SecurityConfig::load(security)
-        .map(|c| c.sandbox.image)
-        .unwrap_or_else(|_| cowboy_core::config::SandboxConfig::default().image);
-    image_present(
-        &image,
-        &format!("{image} missing; pulled from GHCR on first run (or `docker/build.sh agent`)"),
-    )
-}
-
-fn check_compose(root: &Path) -> Status {
-    match compose::detect(root) {
-        Ok(Some(p)) => Status::Ok(format!(
-            "{} ({} service(s); default net `{}`)",
-            p.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
-            p.services.len(),
-            p.default_network
-        )),
-        Ok(None) => Status::Ok("no compose file detected".to_string()),
-        Err(e) => Status::Warn(format!("found but unparsable: {e}")),
     }
 }
 

@@ -5,7 +5,7 @@
 //! two, so the loop never knows which confinement mechanism is in use.
 //!
 //! Two implementations exist during the migration to host-native isolation:
-//! `net::runtime::AgentRuntime` (Docker) and the namespace/Landlock sandbox that
+//! `project::AgentRuntime` (Docker) and the namespace/Landlock sandbox that
 //! replaces it. The trait is kept after Docker is removed because it is also the
 //! seam the follow-up portability work plugs into.
 

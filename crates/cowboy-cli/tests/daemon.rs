@@ -171,7 +171,7 @@ fn sample_info(id: &str) -> SessionInfo {
         status: SessionStatus::Running,
         pid: Some(1234),
         branch: Some("main".into()),
-        container_name: Some("cowboy-agent-app-deadbeef".into()),
+        session_name: Some("cowboy-agent-app-deadbeef".into()),
         worker_sock: Some("/tmp/cowboy-x/s-abc.sock".into()),
         journal_path: Some("/home/me/app/.cowboy/sessions/abc/events.jsonl".into()),
         lease_mode: Some(LeaseMode::Exclusive),
@@ -477,7 +477,7 @@ fn lease_acquire_denies_live_holder_then_release_frees_it() {
 }
 
 /// A piped, non-interactive `cowboy "task"` refuses to run in a worktree that a
-/// live session already holds (it fails before any model call). No Docker/model
+/// live session already holds (it fails before any model call). No sandbox/model
 /// needed — coordination bails at lease acquisition.
 #[test]
 fn piped_run_is_denied_in_a_busy_worktree() {
@@ -585,7 +585,7 @@ fn start_session_spawns_and_registers_a_worker() {
     assert!(wait_for_pong(&sock));
 
     // Start a session with no task (so the worker registers but runs no turn —
-    // no Docker/model needed).
+    // no sandbox/model needed).
     let (id, worker_sock) = match request(
         &sock,
         DaemonReq::StartSession {

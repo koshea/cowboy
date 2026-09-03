@@ -39,11 +39,17 @@ fn templates_parse_and_validate() {
 fn security_config_save_roundtrips() {
     let tmp = tempdir();
     let mut cfg = SecurityConfig::default();
-    cfg.networks.compose.approved.push("myapp_default".into());
+    cfg.sandbox.mounts.push(Mount {
+        source: "/data".into(),
+        target: "/data".into(),
+        mode: "ro".into(),
+    });
+    cfg.sandbox.memory = Some("4g".into());
     let p = tmp.path().join("security.yaml");
     cfg.save(&p).unwrap();
     let reloaded = SecurityConfig::load(&p).unwrap();
-    assert_eq!(reloaded.networks.compose.approved, vec!["myapp_default"]);
+    assert_eq!(reloaded.sandbox.mounts, cfg.sandbox.mounts);
+    assert_eq!(reloaded.sandbox.memory.as_deref(), Some("4g"));
 }
 
 /// A config still using the pre-sandbox `container:` key is refused by name.
@@ -238,13 +244,31 @@ fn expand_path_resolves_tilde_and_vars() {
     );
 }
 
+/// A broad read-write mount is permitted — someone may mean it — but must be
+/// surfaced, because it hands the agent most of the machine and almost nobody means
+/// it. This is the successor to the old `privileged`/`docker_socket` warnings.
 #[test]
-fn warnings_flag_dangerous_options() {
-    let mut cfg = SecurityConfig::default();
-    assert!(cfg.warnings().is_empty());
-    cfg.sandbox.privileged = true;
-    cfg.sandbox.docker_socket = true;
-    assert_eq!(cfg.warnings().len(), 2);
+fn warnings_flag_a_mount_that_exposes_most_of_the_machine() {
+    let cfg = SecurityConfig::default();
+    assert!(
+        cfg.warnings().is_empty(),
+        "the default project-only mount is not worth warning about"
+    );
+
+    for broad in ["~", "/"] {
+        let mut cfg = SecurityConfig::default();
+        cfg.sandbox.mounts.push(Mount {
+            source: broad.into(),
+            target: "/host".into(),
+            mode: "rw".into(),
+        });
+        let warnings = cfg.warnings();
+        assert_eq!(warnings.len(), 1, "{broad} should warn: {warnings:?}");
+        assert!(
+            warnings[0].contains("cowboy grant"),
+            "and point at the narrower alternative: {warnings:?}"
+        );
+    }
 }
 
 fn provider(base_url: &str) -> Provider {

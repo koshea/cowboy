@@ -80,8 +80,8 @@ impl NativeSandbox {
         probe: Box<dyn HostProbe + Send + Sync>,
         approver: Arc<dyn cowboy_gateway::Approver>,
     ) -> Result<Self> {
-        let mask_file = crate::net::runtime::ensure_mask_file()?;
-        let session_name = format!("cowboy-{:08x}", crate::net::runtime::project_hash(&root));
+        let mask_file = crate::project::ensure_mask_file()?;
+        let session_name = crate::project::session_name_for(&root);
         // Persisted project/global approvals are merged in here, in one place, so the
         // policy the engine enforces is the same one `cowboy sandbox plan` describes.
         let mut policy = security.network_policy.clone();
@@ -117,6 +117,13 @@ impl NativeSandbox {
     pub fn with_grants_dir(mut self, dir: PathBuf) -> Self {
         self.grants_dir = dir;
         self
+    }
+
+    /// The network policy in force, for the caller to log. The sandbox owns the
+    /// merge of configured policy and persisted approvals, so this is the one
+    /// authority on what is being enforced.
+    pub fn policy(&self) -> &cowboy_core::config::NetworkPolicy {
+        self.policy_engine.policy()
     }
 
     /// Build the plan for the *next* command, from the current grant set.

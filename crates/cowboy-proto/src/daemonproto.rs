@@ -76,7 +76,7 @@ pub struct SessionInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub container_name: Option<String>,
+    pub session_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_sock: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -672,7 +672,7 @@ mod tests {
             status: SessionStatus::Running,
             pid: Some(456),
             branch: Some("main".into()),
-            container_name: Some("cowboy-agent-app-deadbeef".into()),
+            session_name: Some("cowboy-1a2b3c4d".into()),
             worker_sock: Some("/run/cowboy/s-123.sock".into()),
             journal_path: Some("/home/me/app/.cowboy/sessions/123-456/events.jsonl".into()),
             lease_mode: Some(LeaseMode::Exclusive),

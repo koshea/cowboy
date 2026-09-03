@@ -21,8 +21,7 @@ use crate::agent::tui::SessionCtx;
 use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi};
 use crate::cli::StartFlags;
 use crate::cmd::daemon;
-use crate::net::docker::CliDocker;
-use crate::net::runtime::{container_name_for, project_hash, AgentRuntime};
+use crate::project::{project_hash, session_name_for};
 use crate::sandbox::policy::ChannelApprover;
 use crate::style;
 
@@ -159,7 +158,7 @@ pub async fn run(
         // Key the personal overlay by the repo (matches the worker + `doctor`), so
         // a per-repo credential grant applies on this piped path too — `project_hash`
         // is per-worktree and would silently miss it.
-        cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(&root));
+        cowboy_core::usersecrets::merge_into(&mut security, &crate::project::repo_key(&root));
         security
             .validate()
             .context("validating merged credential grants")?;
@@ -200,12 +199,6 @@ pub async fn run(
             }),
             None => Vec::new(),
         };
-        // The network policy the engine will enforce, with previously persisted
-        // project/global approvals merged in — the same merge the Docker path did
-        // when writing the gateway's policy file, minus the file.
-        let mut network_policy = security.network_policy.clone();
-        crate::net::approvals::merge_into(&mut network_policy, &crate::net::approvals::load(&root));
-        let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root, security)?;
         let cancel = CancellationToken::new();
         let signal_cancel = cancel.clone();
         tokio::spawn(async move {
@@ -214,18 +207,13 @@ pub async fn run(
             }
         });
         let session_dir = logger.as_ref().map(|l| l.dir().to_path_buf());
-        // The policy engine runs here, in-process. Non-interactive runs have no one
-        // to ask, so every `ask` denies — stated explicitly rather than left to a
-        // missing listener. Task: the relay attaches to this engine once the sandbox
-        // transport is up; until then it decides nothing because nothing asks it.
+        // The policy engine lives inside the sandbox, which owns the merge of
+        // configured policy and persisted approvals. A one-shot run has no one to
+        // ask, so every `ask` denies — stated explicitly rather than left to a
+        // missing listener.
         let approver = autodeny_approver(session_dir.clone());
-        let policy_engine = std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
-            network_policy.clone(),
-            cowboy_gateway::dns::DnsMap::new(),
-            approver,
-        ));
-        log_policy_in_force(&network_policy);
-        let _ = &policy_engine;
+        let runtime = crate::cmd::sandbox::open_with(root, security, approver)?;
+        log_policy_in_force(runtime.policy());
         // A subagent journals to its session's `events.jsonl` (so the parent/UI can
         // watch it live) and still prints its final answer to stdout for capture; a
         // top-level one-shot run uses the console UI.
@@ -306,7 +294,7 @@ async fn coordinate_oneshot(root: &std::path::Path, id: &str, task: &str) -> Res
         status: SessionStatus::Running,
         pid: Some(std::process::id()),
         branch: git_branch(root),
-        container_name: Some(container_name_for(root)),
+        session_name: Some(session_name_for(root)),
         worker_sock: None, // in-process: no socket to attach to
         journal_path: None,
         lease_mode: Some(LeaseMode::Exclusive),

@@ -38,7 +38,10 @@ fn approvals_dir() -> PathBuf {
 
 /// Approvals file for a project root within `dir` (keyed by the root's hash).
 fn file_in(dir: &Path, root: &Path) -> PathBuf {
-    dir.join(format!("{:08x}.json", super::runtime::project_hash(root)))
+    dir.join(format!(
+        "{:08x}.json",
+        super::super::project::project_hash(root)
+    ))
 }
 
 /// Load persisted approvals (empty if none).

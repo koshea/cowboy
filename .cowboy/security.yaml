@@ -14,12 +14,6 @@ sandbox:
   memory: 8g
   cpus: 2
 
-networks:
-  isolated:
-    enabled: true
-  compose:
-    approved: []
-
 network_policy:
   default_external: ask
   default_private_lan: ask

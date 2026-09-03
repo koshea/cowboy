@@ -51,7 +51,6 @@ qrcode.workspace = true   # terminal QR of the `cowboy web` access URL
 # Typed Docker API. Default features = `http` + `pipe` (unix socket via hyperlocal
 # / Windows named pipe); `ssl` (rustls) is deliberately left off — cowboy talks to
 # the local daemon, not a TLS-remote one.
-bollard = "0.21.0"
 
 [dev-dependencies]
 async-trait.workspace = true
@@ -59,7 +58,6 @@ assert_cmd.workspace = true
 assert_fs.workspace = true
 predicates.workspace = true
 insta.workspace = true
-mockall.workspace = true
 tokio.workspace = true
 libc.workspace = true
 tokio-tungstenite.workspace = true  # WS client for `cowboy web` bridge tests

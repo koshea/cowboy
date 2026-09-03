@@ -228,7 +228,7 @@ pub struct AgentLoop<'a> {
 struct SubagentPlan {
     exe: std::path::PathBuf,
     root: std::path::PathBuf,
-    container_name: String,
+    session_name: String,
     /// The child's session id (assigned by the parent via `COWBOY_SESSION_ID`), so
     /// the parent advertises it and the UI can watch the child's journal at
     /// `<root>/.cowboy/sessions/<id>/events.jsonl`.
@@ -264,7 +264,7 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
     let mut cmd = tokio::process::Command::new(&plan.exe);
     cmd.arg(&plan.task)
         .current_dir(&plan.root)
-        .env("COWBOY_CONTAINER_NAME", &plan.container_name)
+        .env("COWBOY_CONTAINER_NAME", &plan.session_name)
         .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
         // Assign the child its session id so its journal lands at a path the parent
         // already advertised (SubagentStarted { id }) and the UI can watch.
@@ -2312,7 +2312,7 @@ impl<'a> AgentLoop<'a> {
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
-            container_name: self.runtime.session_name().to_string(),
+            session_name: self.runtime.session_name().to_string(),
             id,
             child_depth: self.subagent_depth + 1,
             task,
@@ -2383,10 +2383,12 @@ use cowboy_core::time::now_ms;
 mod tests {
     use super::*;
     use crate::agent::ui::AgentUi;
-    use crate::net::docker::{ContainerState, ExecResult, MockDockerCli};
-    use crate::net::runtime::AgentRuntime;
-    use cowboy_core::config::{Mount, SecurityConfig};
+    use crate::sandbox::ExecResult;
+    use crate::sandbox::{Sandbox, StatusRx, StatusTx};
+    use cowboy_core::config::SecurityConfig;
     use cowboy_core::model::{ChatResponse, ToolCall};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::sync::Mutex;
 
     /// A model that returns a scripted sequence of responses.
@@ -2466,6 +2468,174 @@ mod tests {
         }
     }
 
+    /// A [`Sandbox`] for the loop's own tests: records what it was asked to run and
+    /// returns a scripted result.
+    ///
+    /// The loop is tested against neither a real sandbox nor a container mock, which
+    /// is the whole reason the seam exists. A real sandbox would make every one of
+    /// these tests depend on kernel features and cost a namespace each; a container
+    /// mock made them depend on a runtime that no longer exists. What the loop needs
+    /// from a sandbox is "run this, here is the output", and that is all this
+    /// provides.
+    struct FakeSandbox {
+        root: PathBuf,
+        session: String,
+        /// What every command "prints", and the code it exits with.
+        output: String,
+        exit_code: i32,
+        /// Commands in the order the loop asked for them, so a test can assert on
+        /// what was run rather than only on what the UI showed.
+        ran: Arc<Mutex<Vec<String>>>,
+        status: Mutex<Option<StatusTx>>,
+        /// When set, the output changes per call instead of being fixed.
+        counting: bool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeSandbox {
+        fn new() -> Self {
+            let tmp = assert_fs::TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+            // Leaked so the directory outlives the sandbox for the whole test.
+            std::mem::forget(tmp);
+            Self {
+                root,
+                session: "cowboy-test".into(),
+                output: String::new(),
+                exit_code: 0,
+                ran: Arc::new(Mutex::new(Vec::new())),
+                status: Mutex::new(None),
+                counting: false,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// Every command prints `output`.
+        fn printing(output: &str) -> Self {
+            Self {
+                output: output.to_string(),
+                ..Self::new()
+            }
+        }
+
+        /// Every command fails with `code`.
+        #[allow(dead_code)]
+        fn failing(code: i32, output: &str) -> Self {
+            Self {
+                exit_code: code,
+                output: output.to_string(),
+                ..Self::new()
+            }
+        }
+
+        /// Use `root` as the project root, for tests that inspect what the loop
+        /// writes there (the per-worktree setup marker, for instance).
+        fn at(root: PathBuf) -> Self {
+            Self {
+                root,
+                ..Self::new()
+            }
+        }
+
+        /// Each command prints something *different* (`attempt 0`, `attempt 1`, …),
+        /// which is what distinguishes legitimate polling from a stuck loop.
+        fn counting() -> Self {
+            Self {
+                counting: true,
+                ..Self::new()
+            }
+        }
+
+        /// A handle to the command log, cloneable so a test can read it after the
+        /// sandbox has moved into the loop.
+        fn log(&self) -> Arc<Mutex<Vec<String>>> {
+            self.ran.clone()
+        }
+
+        fn record(&self, command: &str) -> (ExecResult, String) {
+            self.ran.lock().unwrap().push(command.to_string());
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let out = if self.counting {
+                format!("attempt {n}")
+            } else {
+                self.output.clone()
+            };
+            (
+                ExecResult {
+                    exit_code: self.exit_code,
+                },
+                out,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for FakeSandbox {
+        fn root(&self) -> &Path {
+            &self.root
+        }
+        fn session_name(&self) -> &str {
+            &self.session
+        }
+        fn status_channel(&mut self) -> StatusRx {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            *self.status.lock().unwrap() = Some(tx);
+            rx
+        }
+        fn has_mise_config(&self) -> bool {
+            false
+        }
+        async fn ensure_running(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn stop(&self) {}
+        async fn exec_stream(
+            &self,
+            command: &str,
+            _cwd: Option<&str>,
+            _timeout_secs: u64,
+            _cancel: tokio_util::sync::CancellationToken,
+            chunks: StatusTx,
+        ) -> Result<(ExecResult, String)> {
+            let (result, out) = self.record(command);
+            if !out.is_empty() {
+                let _ = chunks.send(out.clone());
+            }
+            Ok((result, out))
+        }
+        async fn run_capture(
+            &self,
+            command: &str,
+            _cwd: Option<&str>,
+            _timeout_secs: u64,
+        ) -> Result<(ExecResult, String)> {
+            Ok(self.record(command))
+        }
+        async fn run(&self, argv: &[String]) -> Result<ExecResult> {
+            Ok(self.record(&argv.join(" ")).0)
+        }
+        async fn shell(&self) -> Result<ExecResult> {
+            Ok(ExecResult { exit_code: 0 })
+        }
+        async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)> {
+            Ok(self.record(payload))
+        }
+        async fn stop_all_processes(&self) -> Result<()> {
+            Ok(())
+        }
+        fn add_grant(
+            &self,
+            _path: &Path,
+            _read_only: bool,
+            _persistence: crate::sandbox::grants::Persistence,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn granted_paths(&self) -> Vec<(PathBuf, bool)> {
+            Vec::new()
+        }
+    }
+
     fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -2474,45 +2644,10 @@ mod tests {
         }
     }
 
-    fn runtime_with(docker: MockDockerCli) -> AgentRuntime {
-        let tmp = assert_fs::TempDir::new().unwrap();
-        let mut security = SecurityConfig {
-            sandbox: cowboy_core::config::SandboxConfig {
-                image: "img".into(),
-                mounts: vec![Mount {
-                    source: ".".into(),
-                    target: "/workspace".into(),
-                    mode: "rw".into(),
-                }],
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        security.networks.isolated.enabled = false; // no gateway in unit tests
-                                                    // Leak the tempdir so it outlives the runtime for the test.
-        let root = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
-        AgentRuntime::new(Box::new(docker), root, security)
-            .expect("runtime (isolation off in tests)")
-    }
-
     #[tokio::test]
     async fn runs_shell_then_final() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        docker
-            .expect_exec_stream()
-            .withf(|_n, _w, _u, command, _t, _c, _ch| command.contains("ls"))
-            .times(1)
-            .returning(|_, _, _, _, _, _, chunks| {
-                let _ = chunks.send("file1\nfile2\n".into());
-                Ok((ExecResult { exit_code: 0 }, "file1\nfile2\n".into()))
-            });
+        let sandbox = FakeSandbox::printing("file1\nfile2\n");
+        let ran = sandbox.log();
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -2532,19 +2667,16 @@ mod tests {
         let behavior = cowboy_core::config::AgentBehavior::default();
         let cancel = CancellationToken::new();
         let mut ui = RecordingUi::default();
-        let mut agent = AgentLoop::new(
-            Box::new(model),
-            runtime_with(docker),
-            behavior,
-            200_000,
-            cancel,
-            &mut ui,
-        );
+        let mut agent =
+            AgentLoop::new(Box::new(model), sandbox, behavior, 200_000, cancel, &mut ui);
         let final_msg = agent.run("list the files then finish").await.unwrap();
 
         assert_eq!(final_msg.as_deref(), Some("done; tests pass"));
         assert_eq!(ui.commands, vec!["ls"]);
         assert_eq!(ui.finals, vec!["done; tests pass"]);
+        // And the sandbox really was asked to run it — the UI showing a command is
+        // not the same as the command reaching the sandbox.
+        assert_eq!(*ran.lock().unwrap(), vec!["ls".to_string()]);
     }
 
     #[test]
@@ -2565,39 +2697,11 @@ mod tests {
         let root = tmp.path().to_path_buf();
 
         let build = |root: &std::path::Path| {
-            let mut security = SecurityConfig {
-                sandbox: cowboy_core::config::SandboxConfig {
-                    image: "img".into(),
-                    mounts: vec![Mount {
-                        source: ".".into(),
-                        target: "/workspace".into(),
-                        mode: "rw".into(),
-                    }],
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            security.networks.isolated.enabled = false;
-            let mut docker = MockDockerCli::new();
-            docker
-                .expect_container_state()
-                .returning(|_| Ok(ContainerState::Running));
-            docker
-                .expect_container_label()
-                .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-            docker
-                .expect_exec_stream()
-                .returning(|_, _, _, _, _, _, chunks| {
-                    let _ = chunks.send("ok\n".into());
-                    Ok((ExecResult { exit_code: 0 }, "ok\n".into()))
-                });
             let behavior = cowboy_core::config::AgentBehavior {
                 setup: vec!["pnpm install".into()],
                 ..Default::default()
             };
-            let runtime =
-                AgentRuntime::new(Box::new(docker), root.to_path_buf(), security).unwrap();
-            (runtime, behavior)
+            (FakeSandbox::at(root.to_path_buf()), behavior)
         };
 
         let marker = root
@@ -2645,20 +2749,6 @@ mod tests {
 
     #[tokio::test]
     async fn stops_when_token_budget_reached_and_reports_cost() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        docker
-            .expect_exec_stream()
-            .returning(|_, _, _, _, _, _, chunks| {
-                let _ = chunks.send("out\n".into());
-                Ok((ExecResult { exit_code: 0 }, "out\n".into()))
-            });
-
         // The model keeps asking for shell (never finals); only the budget stops it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -2684,7 +2774,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             behavior,
             200_000,
             CancellationToken::new(),
@@ -2779,14 +2869,6 @@ mod tests {
 
     #[tokio::test]
     async fn plan_tool_records_steps_and_normalizes_status() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -2811,7 +2893,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -2836,7 +2918,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -2850,7 +2932,7 @@ mod tests {
         let mut ui2 = RecordingUi::default();
         let agent2 = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -2862,14 +2944,6 @@ mod tests {
 
     #[tokio::test]
     async fn artifact_tool_publishes_to_the_session_store() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -2890,7 +2964,7 @@ mod tests {
             },
         ]);
 
-        let runtime = runtime_with(docker);
+        let runtime = FakeSandbox::new();
         let root = runtime.root().to_path_buf();
         let logger = crate::session::SessionLogger::create(&root).unwrap();
         let session_dir = logger.dir().to_path_buf();
@@ -2917,14 +2991,6 @@ mod tests {
 
     #[tokio::test]
     async fn decision_tool_records_the_answer() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -2944,7 +3010,7 @@ mod tests {
             },
         ]);
 
-        let runtime = runtime_with(docker);
+        let runtime = FakeSandbox::new();
         let root = runtime.root().to_path_buf();
         let logger = crate::session::SessionLogger::create(&root).unwrap();
         let session_dir = logger.dir().to_path_buf();
@@ -2980,13 +3046,6 @@ mod tests {
     #[tokio::test]
     async fn blocked_then_unblock_reports_and_logs() {
         use cowboy_core::lifecycle::{read_in, LifecycleEvent};
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -3013,7 +3072,7 @@ mod tests {
             },
         ]);
 
-        let runtime = runtime_with(docker);
+        let runtime = FakeSandbox::new();
         let root = runtime.root().to_path_buf();
         let logger = crate::session::SessionLogger::create(&root).unwrap();
         let session_dir = logger.dir().to_path_buf();
@@ -3046,13 +3105,6 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_events_recorded_in_order() {
         use cowboy_core::lifecycle::{read_in, LifecycleEvent};
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -3083,7 +3135,7 @@ mod tests {
             },
         ]);
 
-        let runtime = runtime_with(docker);
+        let runtime = FakeSandbox::new();
         let root = runtime.root().to_path_buf();
         let logger = crate::session::SessionLogger::create(&root).unwrap();
         let session_dir = logger.dir().to_path_buf();
@@ -3116,14 +3168,6 @@ mod tests {
 
     #[tokio::test]
     async fn handoff_tool_writes_handoff_md_and_artifact() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -3144,7 +3188,7 @@ mod tests {
             },
         ]);
 
-        let runtime = runtime_with(docker);
+        let runtime = FakeSandbox::new();
         let root = runtime.root().to_path_buf();
         let logger = crate::session::SessionLogger::create(&root).unwrap();
         let session_dir = logger.dir().to_path_buf();
@@ -3173,16 +3217,6 @@ mod tests {
 
     #[tokio::test]
     async fn loop_guard_aborts_repeated_identical_action() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        docker
-            .expect_exec_stream()
-            .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "same".into())));
         // Model keeps issuing the SAME shell call (same name+args; ids differ).
         let m = ScriptedModel::new(vec![]);
         {
@@ -3204,7 +3238,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(m),
-            runtime_with(docker),
+            FakeSandbox::new(),
             behavior,
             200_000,
             CancellationToken::new(),
@@ -3230,22 +3264,8 @@ mod tests {
     /// loop. The old guard keyed on the call alone and aborted these runs.
     #[tokio::test]
     async fn loop_guard_allows_polling_with_changing_output() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         // Each identical poll returns a DIFFERENT observation (a health check going
         // from refused → starting → ok).
-        let n = std::sync::atomic::AtomicUsize::new(0);
-        docker
-            .expect_exec_stream()
-            .returning(move |_, _, _, _, _, _, _| {
-                let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok((ExecResult { exit_code: 0 }, format!("attempt {i}")))
-            });
         let m = ScriptedModel::new(vec![]);
         {
             let mut q = m.responses.lock().unwrap();
@@ -3272,7 +3292,10 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(m),
-            runtime_with(docker),
+            // Each identical poll must return a DIFFERENT observation (a health check
+            // going refused → starting → ok); that difference is exactly what tells
+            // polling apart from a stuck loop.
+            FakeSandbox::counting(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3294,7 +3317,6 @@ mod tests {
     /// an unanswered tool call is rejected by strict providers on the NEXT turn.
     #[tokio::test]
     async fn final_answers_its_own_call_and_any_batched_after_it() {
-        let docker = MockDockerCli::new();
         let m = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
             reasoning: None,
@@ -3307,7 +3329,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(m),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3334,12 +3356,7 @@ mod tests {
     /// subagent (which is not itself in plan mode).
     #[tokio::test]
     async fn plan_mode_blocks_shell_and_subagent_not_just_edits() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
         // The gate must stop the command before it ever reaches the container.
-        docker.expect_exec_stream().never();
         let m = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
             reasoning: None,
@@ -3352,7 +3369,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(m),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3383,7 +3400,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3436,7 +3453,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(GoneModel),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3495,7 +3512,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3512,28 +3529,8 @@ mod tests {
 
     #[tokio::test]
     async fn runs_edit_via_fileop_then_final() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        docker
-            .expect_exec_stdin()
-            .withf(|_n, _w, _u, argv, stdin| {
-                argv == ["cowboy", "x-fileop"]
-                    && stdin.contains("\"op\":\"edit\"")
-                    && stdin.contains("main.rs")
-            })
-            .times(1)
-            .returning(|_, _, _, _, _| {
-                Ok((
-                    ExecResult { exit_code: 0 },
-                    "edited main.rs: 1 replacement\n".into(),
-                ))
-            });
-
+        let sandbox = FakeSandbox::printing("edited main.rs: 1 replacement\n");
+        let fileops = sandbox.log();
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -3555,7 +3552,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            sandbox,
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3565,20 +3562,20 @@ mod tests {
         assert_eq!(final_msg.as_deref(), Some("done"));
         // The UI showed the helper's status line for the edit.
         assert_eq!(ui.tool_uses, vec!["edited main.rs: 1 replacement"]);
+        // And the edit really went through the structured file-op path, carrying the
+        // op and the path — not through a shell command.
+        let sent = fileops.lock().unwrap().join("\n");
+        assert!(
+            sent.contains("\"op\":\"edit\"") && sent.contains("main.rs"),
+            "the edit should reach the file-op helper: {sent}"
+        );
     }
 
     #[tokio::test]
     async fn plan_mode_blocks_edits_until_approved() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        // Deliberately set NO `expect_exec_stdin`: if the edit reached the file
-        // op, mockall would panic on the unexpected call — so this asserts the
-        // gate actually prevents the mutation, not just discourages it.
+        // The sandbox records everything it was asked to run, and the assertion at
+        // the end is that it was asked for *nothing* — so this checks the gate
+        // actually prevents the mutation rather than merely discouraging it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -3600,7 +3597,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3621,16 +3618,6 @@ mod tests {
 
     #[tokio::test]
     async fn stops_at_max_iterations() {
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
-        docker
-            .expect_exec_stream()
-            .returning(|_, _, _, _, _, _, _| Ok((ExecResult { exit_code: 0 }, "ok".into())));
         // Model always asks for another shell command -> never finishes.
         let looping = ScriptedModel::new(vec![]);
         // Empty queue returns default (no tool calls) -> would stop early; instead
@@ -3657,7 +3644,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(looping),
-            runtime_with(docker),
+            FakeSandbox::new(),
             behavior,
             200_000,
             CancellationToken::new(),
@@ -3672,13 +3659,6 @@ mod tests {
     #[tokio::test]
     async fn multi_turn_retains_conversation_context() {
         // Two turns on the same loop; the conversation must accumulate.
-        let mut docker = MockDockerCli::new();
-        docker
-            .expect_container_state()
-            .returning(|_| Ok(ContainerState::Running));
-        docker
-            .expect_container_label()
-            .returning(|_, _| Ok(Some(env!("CARGO_PKG_VERSION").to_string())));
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -3696,7 +3676,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3719,11 +3699,10 @@ mod tests {
 
     #[tokio::test]
     async fn subagent_respects_max_depth() {
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3753,11 +3732,10 @@ mod tests {
         // Three delegations in one turn. At max depth they all short-circuit in
         // planning (no subprocess), but we still get one result per call id —
         // proving the batch maps every subagent call.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3792,13 +3770,12 @@ mod tests {
         // stream is first polled, so no child process ever spawns). Without this,
         // the transcript ends the turn with dangling subagent calls and the
         // foreman re-runs everything from scratch next turn.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let cancel = CancellationToken::new();
         cancel.cancel();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             cancel,
@@ -3828,11 +3805,10 @@ mod tests {
 
     #[tokio::test]
     async fn fit_context_prunes_old_history_keeping_system() {
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             RESPONSE_HEADROOM + 20, // tiny effective budget (~20 tokens)
             CancellationToken::new(),
@@ -3853,7 +3829,6 @@ mod tests {
 
     #[tokio::test]
     async fn fit_context_compacts_old_turns_into_a_summary() {
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         // The model serves the compaction summary.
         let model = ScriptedModel::new(vec![ChatResponse {
@@ -3864,7 +3839,7 @@ mod tests {
         }]);
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             RESPONSE_HEADROOM + 60,
             CancellationToken::new(),
@@ -3900,7 +3875,6 @@ mod tests {
         // no content and no tool call with finish_reason=length. The loop must
         // surface that explicitly (so a foreman reading a subagent's stdout sees
         // the cause) rather than returning an empty/None result.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![ChatResponse {
             truncated: true,
@@ -3910,7 +3884,7 @@ mod tests {
         }]);
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3928,7 +3902,6 @@ mod tests {
         // the reasoning into a directive and retries, and the second turn wraps
         // up. Without a dedicated summarizer, the summary call falls back to the
         // main model — so the queue is: truncated, summary, final answer.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -3952,7 +3925,7 @@ mod tests {
         ]);
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -3978,7 +3951,6 @@ mod tests {
         // Every turn truncates. After MAX_REPRIME_ATTEMPTS recoveries the loop
         // stops with [incomplete] instead of spinning. Each attempt consumes a
         // truncated turn plus its (main-model) summary call.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let trunc = || ChatResponse {
             truncated: true,
@@ -4001,7 +3973,7 @@ mod tests {
         ]);
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -4024,7 +3996,6 @@ mod tests {
         // With a summarizer configured, the distilled directive comes from IT, not
         // the main model — so the main model's queue only holds the truncated turn
         // and the final answer.
-        let docker = MockDockerCli::new();
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
@@ -4048,7 +4019,7 @@ mod tests {
         }]);
         let mut agent = AgentLoop::new(
             Box::new(model),
-            runtime_with(docker),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),
@@ -4163,7 +4134,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
-            runtime_with(MockDockerCli::new()),
+            FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
             200_000,
             CancellationToken::new(),

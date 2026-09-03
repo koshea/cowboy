@@ -42,6 +42,13 @@ impl GatewayState {
     }
 
     /// Access the DNS map (used by the resolver task and tests).
+    /// The policy this engine enforces, including any approvals merged in when it
+    /// was built. Exposed so a caller can *report* what is in force without
+    /// re-deriving it — two places computing the same merge is how they drift.
+    pub fn policy(&self) -> &cowboy_core::config::NetworkPolicy {
+        &self.policy
+    }
+
     pub fn dns(&self) -> &DnsMap {
         &self.dns
     }

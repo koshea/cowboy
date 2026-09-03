@@ -14,7 +14,7 @@ use cowboy_core::presets::{preset, NAMES as PRESETS};
 use cowboy_core::usersecrets;
 
 use crate::cli::{SecretsAddArgs, SecretsCommand};
-use crate::net::runtime::repo_key;
+use crate::project::repo_key;
 use crate::style;
 
 pub fn run(command: SecretsCommand) -> Result<()> {
@@ -227,7 +227,7 @@ fn list() -> Result<()> {
         for e in envs {
             any = true;
             if let Some(cmd) = &e.source_command {
-                let mark = if crate::net::runtime::source_command_ok(cmd) {
+                let mark = if crate::project::source_command_ok(cmd) {
                     "ok"
                 } else {
                     "FAILED on host"

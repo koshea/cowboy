@@ -195,6 +195,7 @@ async fn decide(request: &ConnectRequest, state: &GatewayState) -> Decision {
         return Decision::Refuse("unparseable destination".into());
     };
     let protocol = classify(&request.peek);
+    note_name_mismatch(&request.peek, ip, state);
 
     // Authorization by what the resolver recorded for this IP, never by the
     // client-presented name in `peek`.
@@ -229,6 +230,56 @@ async fn dial(dest: SocketAddr) -> Result<OwnedFd> {
         .into_std()
         .context("converting the connection for descriptor passing")?;
     Ok(OwnedFd::from(std_stream))
+}
+
+/// Log when the name the client presents disagrees with every name the resolver
+/// recorded for the destination.
+///
+/// Detection only — it deliberately changes no verdict. The presented name is
+/// attacker-chosen, so treating a mismatch as grounds to *refuse* would let a client
+/// suppress a connection by lying, and treating a match as grounds to *allow* is the
+/// hole this design exists to avoid. What it is good for is saying so out loud: a
+/// TLS ClientHello for `evil.example` aimed at an IP the resolver only ever returned
+/// for `allowed.example` is a spoof attempt worth a line in the log, whether or not
+/// the connection was going to be allowed on its IP anyway.
+fn note_name_mismatch(peek: &[u8], ip: IpAddr, state: &GatewayState) {
+    let presented = match classify(peek) {
+        Protocol::Tls => match cowboy_gateway::sni::extract_sni(peek) {
+            cowboy_gateway::sni::SniResult::Found(name) => Some(name),
+            _ => None,
+        },
+        Protocol::Http => cowboy_gateway::http::parse_host_header(peek)
+            .ok()
+            .flatten()
+            // Strip any port from `Host: example.com:8443`.
+            .map(|h| h.split(':').next().unwrap_or_default().to_string()),
+        // `classify` never returns Dns — DNS has its own channel — but an opaque
+        // stream presents no name either way.
+        Protocol::Tcp | Protocol::Dns => None,
+    };
+    let Some(presented) = presented.filter(|p| !p.is_empty()) else {
+        return;
+    };
+    let resolved = state.dns().lookup_all(ip);
+    if resolved.is_empty() {
+        return; // a raw-IP connection presents a name we never resolved; not a lie
+    }
+    let matches = resolved.iter().any(|r| host_eq(r, &presented));
+    if !matches {
+        tracing::warn!(
+            %ip,
+            presented = %presented,
+            resolved = ?resolved,
+            "the client presented a name this address was never resolved for; \
+             authorization used the resolved name, not this one"
+        );
+    }
+}
+
+/// Hostname comparison ignoring case and a trailing dot.
+fn host_eq(a: &str, b: &str) -> bool {
+    a.trim_end_matches('.')
+        .eq_ignore_ascii_case(b.trim_end_matches('.'))
 }
 
 /// Classify by first bytes: TLS handshake, HTTP request, or opaque.
@@ -283,5 +334,32 @@ mod tests {
         // if this ever gained a `&GatewayState` parameter, that would be the smell.
         let as_tls = classify(&[0x16, 0x03, 0x01]);
         assert_eq!(as_tls, Protocol::Tls);
+    }
+
+    #[test]
+    fn host_comparison_ignores_case_and_a_trailing_dot() {
+        assert!(host_eq("GitHub.com.", "github.com"));
+        assert!(!host_eq("evil.example", "github.com"));
+    }
+
+    /// The mismatch notice must not be able to change a verdict — it only logs. This
+    /// pins that by construction: it returns nothing, so there is no verdict for it
+    /// to influence, and a caller cannot start branching on it without changing the
+    /// signature.
+    #[test]
+    fn the_mismatch_notice_yields_no_verdict() {
+        let state = std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
+            cowboy_core::config::NetworkPolicy::default(),
+            cowboy_gateway::dns::DnsMap::new(),
+            std::sync::Arc::new(cowboy_gateway::DenyAll),
+        ));
+        let ip: IpAddr = "93.184.216.34".parse().unwrap();
+        state.record_dns(ip, "allowed.example".into());
+
+        // A ClientHello-shaped buffer claiming a different name, and an opaque one.
+        // Neither returns anything the caller could act on.
+        let () = note_name_mismatch(&[0x16, 0x03, 0x01, 0x00], ip, &state);
+        let () = note_name_mismatch(b"GET / HTTP/1.1\r\nHost: evil.example\r\n\r\n", ip, &state);
+        let () = note_name_mismatch(&[], ip, &state);
     }
 }

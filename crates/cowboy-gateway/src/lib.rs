@@ -17,11 +17,9 @@
 //! receives either a refusal or an already-connected file descriptor. See
 //! `docs/src/security/model.md` for why that channel is the enforcement boundary.
 
-pub mod config;
 pub mod dns;
 pub mod dns_policy;
 pub mod http;
-pub mod proxy;
 pub mod sni;
 pub mod state;
 

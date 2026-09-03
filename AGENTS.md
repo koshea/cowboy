@@ -76,7 +76,8 @@ crates/
                      bwrap.rs, exec.rs, shim.rs, lockdown.rs (Landlock+seccomp+caps), cgroup.rs,
                      grants.rs, preflight.rs, policy.rs, transport/ (nft.rs, relay.rs, broker.rs,
                      channel.rs = the enforcement boundary)
-    src/net/         legacy docker path (deleted once the seams are unwired), worktree, approvals
+    src/net/         persisted network approvals, git worktrees
+    src/project.rs   project identity + host-side helpers (hash, repo key, private files)
     src/session/     session logging / replay
   cowboy-core/     shared types, pure logic, + the model transport
     config.rs model.rs policy.rs ranch.rs scope.rs artifact.rs
@@ -84,12 +85,12 @@ crates/
   cowboy-proto/    wire types (daemonproto, netproto) — serde-only, also compiles to wasm
   cowboy-tui/      ratatui rendering (snapshot-tested)
   cowboy-sandbox/  the sandbox plan as PURE LOGIC (binds, Landlock rules, seccomp, denylist)
-  cowboy-gateway/  the policy engine as a LIBRARY (proxy, DNS, ip->domain attribution)
+  cowboy-gateway/  the policy engine as a LIBRARY (policy, DNS, ip->domain attribution)
   cowboy-web-ui/   Yew/WASM remote-control frontend (NOT a workspace member —
                    wasm32-only; `trunk build` in this dir, embedded by cowboy-cli.
                    cowboy-cli/build.rs embeds an existing dist/, or builds one
                    when COWBOY_WEB_UI=1; plain dev builds skip it → placeholder)
-docker/ (legacy, removed with the Docker path)  docs/
+docs/
 ```
 
 Rough split: **`cowboy-core`** = data types + pure logic (serde structs, policy,

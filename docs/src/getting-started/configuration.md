@@ -17,8 +17,6 @@ sandbox:
     - { source: ".", target: /workspace, mode: rw }
   memory: 8g                     # or `auto` (¼ host RAM, 4g–16g); omit = unlimited
   cpus: 2                        # number or `auto` (½ host cores, 2–8); omit = unlimited
-networks:
-  isolated: { enabled: true }
 network_policy:
   default_external: ask          # allow | deny | ask
   allow: { domains: [github.com], cidrs: [], ports: [80, 443] }
@@ -33,8 +31,14 @@ secrets:
 
 > **Renamed.** This section used to be `container:`. If yours still says that,
 > cowboy refuses to load it and tells you to rename it — rather than silently
-> ignoring the section and dropping every mount under it. `image`, `dockerfile` and
-> `build` no longer do anything and can be deleted.
+> ignoring the section and dropping every mount under it. Delete `image`,
+> `dockerfile`, `build`, `privileged` and `docker_socket`, which no longer do
+> anything; `workdir`, `mounts`, `memory` and `cpus` carry over unchanged.
+>
+> The `networks:` section is gone too. `isolated.enabled` toggled the gateway
+> container; isolation is now unconditional — the sandbox's network namespace is
+> connected to nothing — so a key claiming to turn it off would be a lie.
+> `compose.approved` let the agent join a Docker network, which no longer exists.
 
 **Mounts.** `sandbox.mounts` sources expand a leading `~` and `${VAR}` (like
 `secrets.files`). Use this for paths a project *always* needs. For one-off access,

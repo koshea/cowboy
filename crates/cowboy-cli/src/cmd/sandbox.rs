@@ -22,14 +22,45 @@ pub async fn run(args: SandboxArgs) -> Result<()> {
     }
 }
 
+/// Open this project's sandbox.
+///
+/// One constructor for every entry point — the CLI, the worker, and a one-shot run —
+/// so they cannot drift on which config is loaded or which host probe is used.
+/// `approver` decides `ask` verdicts; pass `cowboy_gateway::DenyAll` where there is
+/// no UI to ask, explicitly, so failing closed is a choice made at the call site.
+pub(crate) fn open(
+    root: std::path::PathBuf,
+    approver: std::sync::Arc<dyn cowboy_gateway::Approver>,
+) -> Result<crate::sandbox::native::NativeSandbox> {
+    let security = load(&root)?;
+    crate::sandbox::native::NativeSandbox::new(root, security, Box::new(RealHost), approver)
+}
+
+/// As [`open`], but with a security config the caller has already adjusted (the
+/// worker gates credential grants interactively before the sandbox is built).
+pub(crate) fn open_with(
+    root: std::path::PathBuf,
+    security: cowboy_core::config::SecurityConfig,
+    approver: std::sync::Arc<dyn cowboy_gateway::Approver>,
+) -> Result<crate::sandbox::native::NativeSandbox> {
+    crate::sandbox::native::NativeSandbox::new(root, security, Box::new(RealHost), approver)
+}
+
 /// Load the effective security config for this project, personal overlay merged.
-fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
+pub(crate) fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
     let paths = ConfigPaths::for_root(root);
-    let mut security = SecurityConfig::load(&paths.security)
-        .with_context(|| format!("loading {}", paths.security.display()))?;
+    // The `cowboy init` hint matters: a missing file is overwhelmingly a project that
+    // has not been set up, and "config file not found" alone leaves the reader to
+    // guess what creates it.
+    let mut security = SecurityConfig::load(&paths.security).with_context(|| {
+        format!(
+            "loading {} (run `cowboy init` first)",
+            paths.security.display()
+        )
+    })?;
     // Merge the personal overlay so this matches what a session would actually
     // get; without it the boundary shown here would be narrower than the real one.
-    cowboy_core::usersecrets::merge_into(&mut security, &crate::net::runtime::repo_key(root));
+    cowboy_core::usersecrets::merge_into(&mut security, &crate::project::repo_key(root));
     Ok(security)
 }
 
@@ -42,13 +73,7 @@ fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
 async fn exec(command: Vec<String>) -> Result<()> {
     let root = crate::cmd::project_root()?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let security = load(&root)?;
-    let sandbox = crate::sandbox::native::NativeSandbox::new(
-        root,
-        security,
-        Box::new(RealHost),
-        std::sync::Arc::new(cowboy_gateway::DenyAll),
-    )?;
+    let sandbox = open(root, std::sync::Arc::new(cowboy_gateway::DenyAll))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     // Print as it arrives; a build should not look hung while it works.
@@ -87,7 +112,7 @@ impl HostProbe for RealHost {
     }
 
     fn git_common_dir(&self, root: &Path) -> Option<PathBuf> {
-        crate::net::runtime::git_common_dir(root)
+        crate::project::git_common_dir(root)
     }
 
     fn expand(&self, raw: &str) -> Option<PathBuf> {
