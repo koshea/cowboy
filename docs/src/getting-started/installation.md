@@ -2,14 +2,29 @@
 
 ## Requirements
 
-- **Linux** or **macOS** (Docker Desktop). The network gateway runs as a sidecar
-  inside the agent's container netns, so the host needs no `nftables` itself — the
-  enforcement uses the Docker (VM) kernel's netfilter.
-- **Docker** and **`docker compose`**. On macOS, Docker Desktop (its Linux VM is
-  where containers and the gateway run).
+**Linux only.** The sandbox is built from Linux kernel features — namespaces,
+Landlock, seccomp, nftables — and there is no container or VM to run it in
+elsewhere.
+
+- A kernel providing **Landlock ABI 6 or newer** (Linux 6.10+), with
+  `CONFIG_SECURITY_LANDLOCK` and `landlock` in `CONFIG_LSM`.
+- **`CONFIG_SECCOMP_FILTER`** and **unprivileged user namespaces**
+  (`CONFIG_USER_NS`, with `sysctl user.max_user_namespaces` above zero).
+- **bubblewrap** (`bwrap`), and it must *not* be setuid — nothing here needs a
+  privileged helper.
+- **`unshare`** (util-linux), **`ip`** (iproute2), **`nft`** (nftables), `sysctl`.
+- Optional but recommended: a **systemd user session**, which delegates the cgroup
+  subtree used for memory/CPU/process ceilings. Without it the sandbox still
+  confines correctly; the ceilings just do not apply.
 - An **OpenAI-compatible model endpoint** (see below).
 
-`cowboy doctor` checks all of these and reports what's missing.
+`cowboy doctor` checks every one of these *by performing it* — it creates a user
+namespace, asks the kernel its Landlock ABI, and loads the real interception
+ruleset into a throwaway namespace — and tells you the kernel option or package to
+change for anything missing.
+
+No Docker. No images to pull or build. The agent uses the toolchain already
+installed on your machine, which is the point.
 
 ## Recommended: an LLM gateway
 
@@ -42,35 +57,25 @@ cargo install --git https://github.com/koshea/cowboy cowboy-cli
 
 This builds and installs `cowboy` (and the `cowboyd` daemon) to `~/.cargo/bin`.
 
-## Container images
+## The toolchain the agent gets
 
-You don't build anything. On first run, cowboy **pulls** its agent and gateway
-images from GHCR, **pinned to your binary's version** so they always match:
+Yours. `/usr` and `/opt` are exposed read-only inside the sandbox, so the agent
+runs the compilers, language runtimes and CLIs you have installed, at the versions
+you installed — nothing to build, pull, or keep in sync with an image.
 
-- `ghcr.io/koshea/cowboy/agent:<version>` (multi-arch: amd64 + arm64)
-- `ghcr.io/koshea/cowboy/gateway:<version>`
-
-Upgrading the binary (`cargo install --git … --force`) moves you to the matching
-images automatically. To customize the agent image, commit a
-[`.cowboy/Dockerfile`](../how-to.md) (`FROM` the base) — it's built per-repo on top
-of the pulled base, so contributors share it without any local image work.
+If a project needs a toolchain you do not have on the host, install it on the host
+(or let the project's own `mise`/`asdf` setup do it in the workspace, which is
+writable).
 
 ## Developing cowboy
 
-If you've **cloned the repo**, cowboy builds the images from *your* source instead
-of pulling — so local Dockerfile changes take effect with no extra steps:
-
 ```sh
 git clone https://github.com/koshea/cowboy && cd cowboy
-cargo install --path crates/cowboy-cli   # source-installed binary auto-builds local images
+cargo install --path crates/cowboy-cli
 ```
 
-- `docker/build.sh [agent|gateway]` builds them explicitly (tagged with the
-  version-pinned names, so the binary picks them up without pulling).
-- `COWBOY_SRC=/path/to/cowboy` forces source builds from any binary.
-
-A binary installed via `cargo install --git` is treated as an *end user* (it pulls),
-even though cargo caches the checkout under `~/.cargo`.
+See [Contributing](../contributing.md) for the test suite, including the sandbox
+integration tests and how to stop them skipping silently.
 
 ## Configure a model provider
 
@@ -89,5 +94,10 @@ the agent can never reach your credentials.
 ## Verify
 
 ```sh
-cowboy doctor                   # platform, Docker, model config, gateway image, Compose
+cowboy doctor                   # kernel prerequisites, model config, daemon
+cowboy sandbox plan             # exactly what the next command will be able to see
 ```
+
+`cowboy sandbox plan` is worth running once before you start: it prints the real
+bind list, what is masked, the kernel-level lockdown, and the paths that can never
+be granted — so the boundary is something you read rather than something you trust.

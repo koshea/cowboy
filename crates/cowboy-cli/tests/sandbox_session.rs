@@ -493,7 +493,7 @@ async fn a_memory_ceiling_kills_a_runaway_command_and_not_the_machine() {
     }
     let p = Project::new();
     let security = SecurityConfig {
-        container: cowboy_core::config::ContainerConfig {
+        sandbox: cowboy_core::config::SandboxConfig {
             memory: Some("128m".into()),
             ..Default::default()
         },

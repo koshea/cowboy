@@ -18,7 +18,7 @@ work turn by turn.
 When the network policy says `ask`, an approval modal appears: allow **once /
 session / project / global**, or deny. Project/global choices persist to
 `.cowboy/approvals.json` and merge into the policy on the next run. See
-[Network gateway](../security/network.md).
+[Network egress](../security/network.md).
 
 ## Questions with options
 

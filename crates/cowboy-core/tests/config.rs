@@ -46,10 +46,50 @@ fn security_config_save_roundtrips() {
     assert_eq!(reloaded.networks.compose.approved, vec!["myapp_default"]);
 }
 
+/// A config still using the pre-sandbox `container:` key is refused by name.
+///
+/// Silently ignoring the unknown section is the dangerous outcome, not the annoying
+/// one: every mount under it would vanish, leaving the agent with only the default
+/// workspace mount and no indication why the paths it had yesterday are gone.
+#[test]
+fn the_old_container_section_is_refused_with_a_clear_message() {
+    let dir = tempdir();
+    let p = dir.0.join("security.yaml");
+    std::fs::write(
+        &p,
+        "version: 1\ncontainer:\n  workdir: /workspace\n  mounts:\n    - source: /data\n      \
+         target: /data\n      mode: rw\n",
+    )
+    .unwrap();
+
+    let err = SecurityConfig::load(&p).expect_err("the old key must be refused");
+    let msg = err.to_string();
+    assert!(matches!(err, Error::SecurityInvariant(_)), "got {err:?}");
+    assert!(msg.contains("container:"), "name the old key: {msg}");
+    assert!(msg.contains("sandbox:"), "and the new one: {msg}");
+}
+
+/// The new key loads, and its mounts survive — the other half of the check above.
+#[test]
+fn the_sandbox_section_loads_its_mounts() {
+    let dir = tempdir();
+    let p = dir.0.join("security.yaml");
+    std::fs::write(
+        &p,
+        "version: 1\nsandbox:\n  workdir: /workspace\n  mounts:\n    - source: /data\n      \
+         target: /data\n      mode: rw\n",
+    )
+    .unwrap();
+
+    let cfg = SecurityConfig::load(&p).expect("the new key must load");
+    assert_eq!(cfg.sandbox.mounts.len(), 1);
+    assert_eq!(cfg.sandbox.mounts[0].source, "/data");
+}
+
 #[test]
 fn security_invariant_rejects_mounting_security_file() {
     let mut cfg = SecurityConfig::default();
-    cfg.container.mounts.push(Mount {
+    cfg.sandbox.mounts.push(Mount {
         source: ".cowboy/security.yaml".into(),
         target: "/workspace/.cowboy/security.yaml".into(),
         mode: "ro".into(),
@@ -61,7 +101,7 @@ fn security_invariant_rejects_mounting_security_file() {
 #[test]
 fn security_invariant_rejects_mounting_cowboy_dir() {
     let mut cfg = SecurityConfig::default();
-    cfg.container.mounts.push(Mount {
+    cfg.sandbox.mounts.push(Mount {
         source: ".cowboy".into(),
         target: "/workspace/.cowboy".into(),
         mode: "rw".into(),
@@ -78,7 +118,7 @@ fn security_invariant_rejects_mounting_providers_or_home_config() {
         "~/.config/cowboy", // home config dir (basename "cowboy")
     ] {
         let mut cfg = SecurityConfig::default();
-        cfg.container.mounts.push(Mount {
+        cfg.sandbox.mounts.push(Mount {
             source: source.into(),
             target: "/tmp/x".into(),
             mode: "ro".into(),
@@ -104,7 +144,7 @@ fn security_invariant_rejects_mounting_an_ancestor_of_the_config_dir() {
     // exact dir/file (basename) like before.
     for source in ["~", "~/.config"] {
         let mut cfg = SecurityConfig::default();
-        cfg.container.mounts.push(Mount {
+        cfg.sandbox.mounts.push(Mount {
             source: source.into(),
             target: "/tmp/x".into(),
             mode: "ro".into(),
@@ -120,7 +160,7 @@ fn security_invariant_rejects_mounting_an_ancestor_of_the_config_dir() {
 fn security_invariant_rejects_unknown_mount_mode() {
     // A typo'd mode must fail closed rather than silently become read-write.
     let mut cfg = SecurityConfig::default();
-    cfg.container.mounts.push(Mount {
+    cfg.sandbox.mounts.push(Mount {
         source: "/tmp/data".into(),
         target: "/data".into(),
         mode: "readonly".into(),
@@ -202,8 +242,8 @@ fn expand_path_resolves_tilde_and_vars() {
 fn warnings_flag_dangerous_options() {
     let mut cfg = SecurityConfig::default();
     assert!(cfg.warnings().is_empty());
-    cfg.container.privileged = true;
-    cfg.container.docker_socket = true;
+    cfg.sandbox.privileged = true;
+    cfg.sandbox.docker_socket = true;
     assert_eq!(cfg.warnings().len(), 2);
 }
 
@@ -343,16 +383,16 @@ fn partial_agent_yaml_uses_defaults() {
 #[test]
 fn cpus_accepts_number_or_auto() {
     // A bare number.
-    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\ncpus: 2\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\ncpus: 2\n").unwrap();
     assert_eq!(c.cpus, Some(CpuLimit::Cores(2.0)));
     // The `auto` keyword (case-insensitive).
-    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\ncpus: auto\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\ncpus: auto\n").unwrap();
     assert_eq!(c.cpus, Some(CpuLimit::Auto));
     // Absent → None (unlimited).
-    let c: ContainerConfig = serde_yaml_ng::from_str("image: x\n").unwrap();
+    let c: SandboxConfig = serde_yaml_ng::from_str("image: x\n").unwrap();
     assert_eq!(c.cpus, None);
     // Garbage is rejected.
-    assert!(serde_yaml_ng::from_str::<ContainerConfig>("image: x\ncpus: lots\n").is_err());
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("image: x\ncpus: lots\n").is_err());
     // Round-trips.
     let yaml = serde_yaml_ng::to_string(&CpuLimit::Auto).unwrap();
     assert_eq!(yaml.trim(), "auto");

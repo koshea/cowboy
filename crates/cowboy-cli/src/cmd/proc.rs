@@ -40,7 +40,7 @@ pub async fn run(args: ProcArgs) -> Result<()> {
     let security = SecurityConfig::load(&paths.security)
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
     let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
-    let workdir = security.container.workdir.clone();
+    let workdir = security.sandbox.workdir.clone();
     let proc_dir = format!("{workdir}/.cowboy/proc");
     let runtime = AgentRuntime::new(Box::new(CliDocker::new()), root.clone(), security)?;
 

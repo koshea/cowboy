@@ -9,20 +9,40 @@ and gotchas. This page summarizes the essentials and the **docs workflow**.
 
 ```sh
 cargo build
-cargo nextest run                          # unit + integration (Docker E2E auto-skips if absent)
+cargo nextest run                          # unit + integration
 cargo test --doc
 cargo clippy --workspace --all-targets     # must be clean
 cargo fmt --all                            # rustfmt defaults
-docker/build.sh                            # build the agent + gateway images from source
 ```
 
-A source checkout builds the agent/gateway images from your tree automatically
-(installed-from-git binaries pull from GHCR instead); `docker/build.sh` just does
-it eagerly. Set `COWBOY_SRC` to force source builds from any binary.
+### The sandbox suites, and how to stop them lying
+
+`tests/sandbox_exec.rs`, `sandbox_session.rs` and `sandbox_egress.rs` exercise real
+namespaces, real Landlock, real nftables and a real relay. They **self-skip** when
+the host cannot run them — which means a broken probe can make the whole file pass
+while doing nothing. That happened during development, so there is a guard:
+
+```sh
+COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
+    --test sandbox_exec --test sandbox_session --test sandbox_egress
+```
+
+`required` turns a skip into a failure. Always verify with it. The wall-clock tell
+is obvious once you know it: a few seconds when they run, a few milliseconds when
+they skip.
+
+Two traps worth knowing before you write a test here:
+
+- **A successful `connect()` is not evidence of egress.** Under transparent
+  interception *every* `connect()` succeeds — it reaches the relay on loopback, and
+  policy has not been consulted yet. Attempt a data transfer; a refusal appears as a
+  connection reset on the first read.
+- **Denial tests pass vacuously when the network is down.** `skip_if_offline!()` is
+  separate from `skip_if_unsupported!()` for exactly that reason.
 
 The `#[ignore]` end-to-end tests are the **manually-run suite** for model-dependent
 behavior (run with `cargo test -p cowboy-cli --test daemon_e2e -- --ignored`).
-Always clean up containers/worktrees they create.
+Always clean up the worktrees they create.
 
 ## Keeping these docs up to date
 

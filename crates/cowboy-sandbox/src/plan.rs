@@ -242,7 +242,7 @@ impl SandboxPlan {
     /// **last** — so no later entry can re-expose what the mask hid.
     pub fn build(inputs: &PlanInputs<'_>, probe: &dyn HostProbe) -> Result<Self> {
         let sec = inputs.security;
-        let workdir = sec.container.workdir.clone();
+        let workdir = sec.sandbox.workdir.clone();
         let denylist = Denylist::build(probe, inputs.root);
         let mut binds = Vec::new();
 
@@ -273,7 +273,7 @@ impl SandboxPlan {
         //    than being hardcoded — one source of truth, and no second bind that
         //    could silently downgrade the project to read-only by landing later.
         let mut mounts_workdir = false;
-        for m in &sec.container.mounts {
+        for m in &sec.sandbox.mounts {
             let source = resolve_source(inputs.root, &m.source);
             // The same invariant `SecurityConfig::validate` enforces, re-checked
             // here because a mount can also arrive via the user's personal
@@ -534,11 +534,11 @@ fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str, tmpfs: &[String]) -
 
 /// Resolve `auto` limits and the build parallelism that follows from the CPU quota.
 fn resolve_limits(sec: &SecurityConfig) -> ResourceLimits {
-    let cpus = sec.container.cpus.as_ref().map(|c| match c {
+    let cpus = sec.sandbox.cpus.as_ref().map(|c| match c {
         config::CpuLimit::Auto => config::auto_cpus(num_cpus()),
         config::CpuLimit::Cores(n) => *n,
     });
-    let memory_mib = sec.container.memory.as_deref().and_then(|m| {
+    let memory_mib = sec.sandbox.memory.as_deref().and_then(|m| {
         if m.eq_ignore_ascii_case("auto") {
             Some(config::auto_mem_mib(host_mem_mib()))
         } else {
@@ -691,7 +691,7 @@ mod tests {
     fn masks_host_owned_config() {
         let sec = SecurityConfig::default();
         let plan = plan_with(&sec, &[], &host()).unwrap();
-        let workdir = &sec.container.workdir;
+        let workdir = &sec.sandbox.workdir;
         for f in ["security.yaml", "models.yaml"] {
             let target = format!("{workdir}/.cowboy/{f}");
             let bind = plan
@@ -784,7 +784,7 @@ mod tests {
         let b = plan
             .binds
             .iter()
-            .find(|b| b.target == sec.container.workdir)
+            .find(|b| b.target == sec.sandbox.workdir)
             .unwrap();
         assert_eq!(b.source, Path::new("/srv/proj"));
         assert_eq!(b.mode, BindMode::ReadWrite);
@@ -799,7 +799,7 @@ mod tests {
         let n = plan
             .binds
             .iter()
-            .filter(|b| b.target == sec.container.workdir)
+            .filter(|b| b.target == sec.sandbox.workdir)
             .count();
         assert_eq!(n, 1, "duplicate workdir binds: {:#?}", plan.binds);
     }
@@ -812,7 +812,7 @@ mod tests {
     fn refuses_a_bind_that_would_shadow_proc_or_dev() {
         for target in ["/proc", "/dev", "/"] {
             let mut sec = SecurityConfig::default();
-            sec.container.mounts.push(Mount {
+            sec.sandbox.mounts.push(Mount {
                 source: "/srv/proj".into(),
                 target: target.into(),
                 mode: "rw".into(),
@@ -826,7 +826,7 @@ mod tests {
     #[test]
     fn refuses_config_with_no_mount_at_the_workdir() {
         let mut sec = SecurityConfig::default();
-        sec.container.mounts.clear();
+        sec.sandbox.mounts.clear();
         let err = plan_with(&sec, &[], &host()).expect_err("must refuse");
         let msg = err.to_string();
         assert!(msg.contains("no mount targets the workdir"), "{msg}");
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn refuses_a_configured_mount_that_exposes_credentials() {
         let mut sec = SecurityConfig::default();
-        sec.container.mounts.push(Mount {
+        sec.sandbox.mounts.push(Mount {
             source: "/home/dev/.aws".into(),
             target: "/workspace/aws".into(),
             mode: "ro".into(),
@@ -1013,7 +1013,7 @@ mod tests {
     #[test]
     fn cpu_limit_bounds_build_parallelism() {
         let mut sec = SecurityConfig::default();
-        sec.container.cpus = Some(config::CpuLimit::Cores(4.0));
+        sec.sandbox.cpus = Some(config::CpuLimit::Cores(4.0));
         let plan = plan_with(&sec, &[], &host()).unwrap();
         assert_eq!(plan.limits.jobs, Some(4));
         let makeflags = plan
@@ -1027,7 +1027,7 @@ mod tests {
     #[test]
     fn memory_is_parsed_and_pids_are_bounded() {
         let mut sec = SecurityConfig::default();
-        sec.container.memory = Some("8g".into());
+        sec.sandbox.memory = Some("8g".into());
         let plan = plan_with(&sec, &[], &host()).unwrap();
         assert_eq!(plan.limits.memory_mib, Some(8192));
         assert_eq!(plan.limits.pids, Some(4096), "fork-bomb resilience");
@@ -1036,8 +1036,8 @@ mod tests {
     #[test]
     fn plan_snapshot() {
         let mut sec = SecurityConfig::default();
-        sec.container.cpus = Some(config::CpuLimit::Cores(2.0));
-        sec.container.memory = Some("4g".into());
+        sec.sandbox.cpus = Some(config::CpuLimit::Cores(2.0));
+        sec.sandbox.memory = Some("4g".into());
         let probe = host().as_linked_worktree("/srv/main/.git/worktrees/wt");
         let grants = [Grant {
             path: PathBuf::from("/srv/other-repo"),

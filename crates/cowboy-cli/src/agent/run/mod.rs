@@ -2021,8 +2021,8 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// The configured idle-container timeout (0 = disabled).
-    pub fn idle_container_timeout_seconds(&self) -> u64 {
-        self.behavior.idle_container_timeout_seconds
+    pub fn idle_sandbox_timeout_seconds(&self) -> u64 {
+        self.behavior.idle_sandbox_timeout_seconds
     }
 
     /// Plan every `subagent` call in this turn, announce them, then execute them
@@ -2477,7 +2477,7 @@ mod tests {
     fn runtime_with(docker: MockDockerCli) -> AgentRuntime {
         let tmp = assert_fs::TempDir::new().unwrap();
         let mut security = SecurityConfig {
-            container: cowboy_core::config::ContainerConfig {
+            sandbox: cowboy_core::config::SandboxConfig {
                 image: "img".into(),
                 mounts: vec![Mount {
                     source: ".".into(),
@@ -2566,7 +2566,7 @@ mod tests {
 
         let build = |root: &std::path::Path| {
             let mut security = SecurityConfig {
-                container: cowboy_core::config::ContainerConfig {
+                sandbox: cowboy_core::config::SandboxConfig {
                     image: "img".into(),
                     mounts: vec![Mount {
                         source: ".".into(),

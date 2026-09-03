@@ -36,7 +36,7 @@ fn down_removes_a_started_container() {
     tmp.child(".cowboy/security.yaml")
         .write_str(
             "version: 1\n\
-             container:\n\
+             sandbox:\n\
              \x20 image: busybox:latest\n\
              \x20 workdir: /workspace\n\
              \x20 mounts:\n\

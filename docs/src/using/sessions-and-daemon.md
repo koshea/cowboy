@@ -5,16 +5,23 @@ local daemon, **`cowboyd`**, which is started automatically when needed.
 
 ## How a session works
 
-1. `cowboy` loads host-owned `security.yaml` (never mounted into the container).
-2. It builds/starts the agent container with the project mounted at `/workspace`
-   and the host-owned config **masked**.
-3. With isolation enabled (default), it brings up the sole-egress network gateway
-   and forces the agent's only route out through it (see
-   [Network gateway](../security/network.md)).
+1. `cowboy` loads host-owned `security.yaml` (never visible to the agent).
+2. It creates the session's namespaces — user, network, IPC, UTS — held open by a
+   small holder process whose lifetime is tied to the worker's, so nothing outlives
+   a crash.
+3. Inside that network namespace it installs egress interception and starts the
+   relay, **then** reports readiness — so there is no window in which a command
+   could run unpoliced (see [Network egress](../security/network.md)).
 4. The agent loop calls an OpenAI-compatible model with a tool surface (see
-   [The agent & its tools](agent-and-tools.md)).
-5. Shell commands run in the container; output is streamed to the UI and fed back
-   to the model. The session is logged under `.cowboy/sessions/<id>/`.
+   [The agent & its tools](agent-and-tools.md)). The loop runs on the host.
+5. Each shell command gets its **own** mount and PID namespace, built from the
+   current grant set, with Landlock and seccomp applied before `exec`. Output is
+   streamed to the UI and fed back to the model. The session is logged under
+   `.cowboy/sessions/<id>/`.
+
+Commands share the session's network namespace — so a dev server one command starts
+is reachable from the next — but not its PID namespace, so ending a command reaps
+exactly its own processes and one command cannot signal another's.
 
 ## The daemon (`cowboyd`)
 
@@ -34,10 +41,9 @@ state to `$XDG_STATE_HOME/cowboy/daemon/state.json`.
 
 ## Upgrades
 
-`cowboy` and `cowboyd` are version-locked, as are the agent/gateway container
-images (each is pinned to the binary version). After you upgrade the binary,
-cowboy keeps the two in sync automatically — you should never end up driving a
-new CLI against a stale daemon or a stale container:
+`cowboy` and `cowboyd` are version-locked. After you upgrade the binary, cowboy
+keeps the two in sync automatically — you should never end up driving a new CLI
+against a stale daemon:
 
 - **Daemon roll.** The first `cowboy` command after an upgrade notices the
   running `cowboyd` is a different version and rolls it: the old daemon is asked
@@ -45,11 +51,9 @@ new CLI against a stale daemon or a stale container:
   In-flight sessions survive — their workers re-register with the new daemon and
   stay attachable. Set `COWBOY_NO_DAEMON_AUTORESTART=1` to refuse instead (the
   command errors and tells you to restart `cowboyd` yourself).
-- **Container recreate.** A session's agent/gateway container is stamped with the
-  version that created it. If a new binary finds a container left by an older
-  version, it removes and recreates it from the current image rather than
-  reusing it — so you never silently run a stale (possibly outdated) sandbox or
-  gateway. A live, same-version session keeps its container untouched.
+There is no image or long-lived container to fall out of step: a sandbox is built
+from the running binary's own plan every time a command starts, so an upgraded
+binary is in force from its next command.
 
 ## Worktree collisions
 

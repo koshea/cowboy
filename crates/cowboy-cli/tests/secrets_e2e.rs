@@ -58,7 +58,7 @@ fn credential_grant_is_mounted_read_only_and_host_is_unchanged() {
     tmp.child(".cowboy/security.yaml")
         .write_str(&format!(
             "version: 1\n\
-             container:\n\
+             sandbox:\n\
              \x20 image: busybox:latest\n\
              \x20 workdir: /workspace\n\
              \x20 mounts:\n\

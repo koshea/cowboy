@@ -124,7 +124,7 @@ When the foreman delegates **several** sub-tasks in one turn, Cowboy runs them
 **concurrently** and joins the results — the efficiency payoff. Fan-out is capped
 by `delegation.max_parallel` (a local throughput hint; the gateway is the real
 backpressure). Independent read/explore/review work parallelizes safely in the
-shared container; isolated parallel *writers* compose with
+shared sandbox; isolated parallel *writers* compose with
 [Ranch](../ranch/overview.md) worktrees.
 
 Once the roster is set up, delegation is frictionless — no per-task approvals, no

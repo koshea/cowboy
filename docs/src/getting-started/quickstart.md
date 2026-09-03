@@ -3,7 +3,7 @@
 ```sh
 cd your-project
 cowboy init                 # writes .cowboy/{security,agent,models}.yaml
-cowboy doctor               # check Docker, Linux, model, network gateway, Compose
+cowboy doctor               # kernel prerequisites, model config, daemon
 cowboy "run the tests and fix one simple failure"
 ```
 
@@ -12,7 +12,7 @@ cowboy "run the tests and fix one simple failure"
 On a terminal, `cowboy` (no task, or with a seed task) is a persistent
 conversational REPL — like Claude Code. The agent answers a turn, then returns to
 the prompt for your next message, keeping the **full conversation and the same
-container** alive. The `final` tool ends a *turn*, not the session.
+sandbox** alive. The `final` tool ends a *turn*, not the session.
 
 - **Ctrl-C** opens an interrupt menu: `k` cancels the current turn (you keep
   going), `e` ends the session (finalizes the log).
@@ -29,15 +29,15 @@ cowboy                       # interactive conversational TUI (multi-turn)
 cowboy "fix the tests"       # seed the conversation (TTY) / one-shot (piped)
 cowboy init [--git]          # write .cowboy/{security,agent,models}.yaml
 cowboy doctor                # environment checks
-cowboy run <cmd>             # run a command in the agent container
-cowboy shell                 # interactive shell in the agent container
+cowboy run <cmd>             # run a command in the sandbox
+cowboy shell                 # interactive shell in the sandbox
 cowboy patch show|save|apply|check|revert
 cowboy proc list|start|stop|restart|logs <name>
 cowboy skill list|show <name>
 cowboy sessions              # list live/registered sessions
 cowboy logs                  # list past sessions
 cowboy replay <id>           # replay a past session
-cowboy down [--all]          # stop/remove this project's (or all) containers + networks
+cowboy down [--all]          # tear down this project's (or every) sandbox
 ```
 
 See the [CLI reference](../reference/cli.md) for the full, auto-generated command

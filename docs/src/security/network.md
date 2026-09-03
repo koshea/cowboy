@@ -1,128 +1,163 @@
-# Network gateway
+# Network egress
 
-Outbound network access is enforced by **in-namespace interception + dropped
-capabilities**, not by asking the model. This is the security thesis.
+Outbound access is enforced by **an empty network namespace plus a host-side policy
+engine**, not by asking the model. This is the security thesis, and it is worth
+stating in the order that matters:
 
-## Topology (per project)
+1. The sandbox's network namespace contains **no device connected to anything**.
+2. Interception makes its traffic *visible* to the policy engine.
+3. The engine, which runs in the host process, decides and then dials.
+
+Step 1 is containment; steps 2 and 3 are transparency. So a broken or missing
+ruleset means the agent reaches **nothing** — not everything. Under the previous
+container design the namespace had a real route out and the firewall was the only
+thing standing in front of it; that inversion is the single biggest reason the
+rewrite was worth doing.
+
+## Topology (per session)
 
 ```
-agent container ──(cowboy-net)──►  internet
-   ▲ shares network namespace
-gateway sidecar (--network container:<agent>, NET_ADMIN)
-   nft REDIRECT in the shared netns → in-process proxy → allow/deny/ask
-   agent has NET_ADMIN / NET_RAW dropped; fails closed
+   ┌─ sandbox network namespace ──────────────────────┐
+   │                                                  │
+   │  agent command ──connect()──► nft dnat ──► relay │
+   │                                              │   │
+   │   black-hole veth (169.254.11.2/24)          │   │
+   │   default route → 169.254.11.1 (nothing)     │   │
+   └──────────────────────────────────────────────┼───┘
+                                                  │ anonymous socketpair
+                                                  │ (request; fd back)
+   ┌─ host (the worker process) ──────────────────▼───┐
+   │  broker → policy engine → connect() in the host  │
+   │  namespace → passes the connected fd back        │
+   └──────────────────────────────────────────────────┘
 ```
 
-- The gateway runs as a **sidecar inside the agent's network namespace**, not as a
-  separate routing hop. It installs an nftables `nat output` REDIRECT that captures
-  the agent's locally-generated TCP and DNS and hands it to the in-process
-  proxy/resolver. The gateway runs as root and exempts its own uid, so its relayed
-  (upstream) connections aren't re-intercepted; the agent runs unprivileged with
-  `NET_ADMIN`/`NET_RAW` dropped, so it cannot alter the rules.
-- Co-locating in the agent's netns means the proxy recovers the original
-  destination locally (`SO_ORIGINAL_DST`) and there is **no container-to-router
-  forwarding**. That is what lets the same design run on **macOS** (Docker Desktop),
-  whose gvisor network backend does not forward traffic through a container acting
-  as a router — see [installation](../getting-started/installation.md).
+- A **black-hole veth** exists only so the routing decision succeeds. A
+  loopback-only namespace fails `connect()` with `ENETUNREACH` *before* nftables
+  sees the packet, so there would be nothing to intercept. Its address is
+  link-local — unroutable by definition — and its peer is attached to nothing.
+- **nftables** `nat output` rewrites every TCP destination to the relay on
+  loopback, and every packet to port 53 to the resolver port. A `filter output`
+  chain then drops by default, catching the residue the nat hook cannot carry
+  (non-DNS UDP, ICMP) and IPv6 entirely.
+- The **relay** runs in the session's namespace and is deliberately *not a proxy*.
+- The **broker** and the policy engine run host-side, in the worker.
 
-## What the gateway enforces (`cowboy-gateway`)
+## The relay never creates an outbound socket
 
-Fail-closed: if the nftables ruleset cannot be applied, the gateway refuses to
-run rather than leave the agent un-sandboxed.
+For each intercepted connection the relay reports the original destination
+(`SO_ORIGINAL_DST`) to the engine and, if allowed, receives an **already-connected
+file descriptor** that the engine created in the *host* network namespace. A passed
+descriptor keeps the namespace it was created in, so the relay's traffic never
+traverses the sandbox's own routing or firewall rules at all.
 
-- **nftables**: a `nat output` REDIRECT in the agent's netns sends **all** of the
-  agent's TCP to the in-process proxy and **all** of its DNS (`:53`) to the
-  resolver — the DNS redirect runs ahead of Docker's own embedded resolver
-  (`127.0.0.11`), so queries can't slip around the gateway. A `filter output` chain
-  then **drops by default** — for TCP too, not just the residue the REDIRECT can't
-  carry (non-DNS UDP, ICMP). Redirected TCP reaches the proxy because the REDIRECT
-  has already rewritten its destination to loopback by the time the filter hook
-  sees it, so the chain needs no TCP exemption and stays a genuine backstop: if the
-  REDIRECT ever failed to apply, the traffic is dropped rather than escaping. The
-  gateway's own root-uid egress is exempt so it can reach upstream and the host
-  control channel; the agent is kept non-root so it never inherits that exemption.
-  Approved Compose subnets bypass the proxy.
-- **DNS answers are bound to the query that was approved**: the resolver forwards
-  on a *connected* UDP socket (so the kernel drops datagrams from anyone but the
-  upstream resolver) and accepts a reply only if its transaction id **and** question
-  match what was sent. This matters because the agent authors the query — it knows
-  the transaction id — and shares the netns, so an unvalidated reply would let it
-  forge an answer mapping any IP onto an allow-listed name and buy itself egress to
-  that IP. Only a reply that passes both checks is recorded in the `ip → {domains}`
-  map that authorizes connections.
-- **Transparent proxy** (`:8443`, every port): authorizes a connection by the
-  hostname(s) **the gateway itself resolved** for the destination IP — *not* the
-  client-presented SNI/Host, which the (untrusted) agent controls. It still sniffs
-  the first bytes (TLS SNI / HTTP Host) but only to classify the protocol and to
-  flag a name that wasn't among what the gateway resolved (a spoof attempt). No
-  MITM, no decryption. A raw-IP connection with no prior lookup falls to CIDR/`ask`
-  by `ip:port`.
-- **Explicit CONNECT proxy** for proxy-aware clients (the named host is what gets
-  dialed, so it's authorized directly).
-- **DNS resolver** (`:53`): **policy-enforced** — see below. All agent DNS is
-  routed here first (then forwarded to Docker's embedded resolver, preserving
-  Compose service discovery), and every answer is recorded `ip → {domains}` so a
-  connection's destination IP maps back to the name(s) that resolved to it.
-- **Policy**: deny-list wins, then allow-list (domain matched against the
-  gateway-resolved name for the IP, or CIDR by the real destination IP; with
-  optional port restriction), else `default_external`. A domain allow only grants a
-  **public** IP (it can't become a path to an internal address). `ask` is sent to
-  the host; with no approver it fails closed.
+This removes a whole class of bug. The container design needed the ruleset to
+exempt the gateway's own egress by uid, or its upstream connections would have been
+redirected back into itself. That exemption would have been actively dangerous
+here, because the agent is uid 0 in its user namespace — `skuid 0` would have
+exempted the *agent*. With descriptor passing there is nothing to exempt, so there
+is no exemption to get wrong.
 
-## DNS policy
+Connecting directly to the relay's port is not a way to become a proxy: such a
+connection never passed through the nat hook, so it has no original destination and
+is refused rather than forwarded somewhere guessed.
 
-DNS is a decision point, not a blind relay — otherwise a name lookup
-(`<encoded-data>.evil.com`) would be an exfiltration channel even when no
-connection to `evil.com` is ever allowed. The resolver:
+## The trust boundary is one socket
 
-- **Gates resolution by the policy** (`network_policy.dns.enforce`, default on):
-  every query name runs through the same allow/deny/default rules; only names the
-  policy **Allows** or you **approve** are forwarded upstream. Denied/unknown names
-  are answered **REFUSED locally** and never sent out. (Approving a name covers both
-  its resolution and the subsequent connection — one prompt.)
-- **Refuses tunnel-prone record types** by default (`TXT`, `NULL`, `ANY`, `AXFR`,
-  `IXFR`) — the classic DNS-tunnel/C2 carriers. Opt in per-type via
+Everything else is enforced by the kernel. The relay, though, *reports* a
+connection's destination and the engine trusts that report — forge the report and
+every domain rule is defeated with all the kernel controls perfectly intact.
+
+So the channel is an **anonymous `socketpair`**, inherited across fork. It has no
+name in the filesystem and none in any abstract namespace, so it cannot be opened,
+connected to, or enumerated: reaching it requires already holding the descriptor.
+Three independent controls back that up, none of which the agent can influence:
+
+- the relay lives in a different PID namespace from every agent command, so no
+  agent process can see it, let alone read its `/proc/<pid>/fd`;
+- agent commands run with an empty capability bounding set;
+- `ptrace` is refused by the seccomp filter, and yama `ptrace_scope=1` would
+  restrict it to descendants anyway — and the relay is nobody's descendant.
+
+## What authorizes a connection
+
+The name **the resolver recorded** for the destination IP — never the name the
+client presents.
+
+The relay does peek at the first bytes, and forwards them, but only to *classify*
+(is this TLS, is it HTTP) and to notice a name that disagrees with what the resolver
+saw. The agent writes those bytes, so a request could claim any SNI it liked. There
+is no TLS interception and no decryption.
+
+Policy order: deny-list wins; then the allow-list (a domain matched against the
+resolved name for that IP, or a CIDR against the real destination IP, with optional
+port restriction); otherwise the default for the destination's class. A domain allow
+only ever grants a **public** address, so it cannot become a path to an internal
+one. `ask` goes to you; with no approver it fails closed.
+
+## DNS
+
+DNS is a decision point, not a blind relay — otherwise a lookup of
+`<encoded-data>.evil.com` is an exfiltration channel even when no connection to
+`evil.com` is ever allowed. It is also what makes domain rules enforceable at all:
+`allow: github.com` works because the resolver records `ip → name` and the
+connection is admitted on the strength of that record.
+
+Inside the sandbox, DNS is a **dumb pipe**. The relay reads a datagram off a
+loopback socket, forwards the bytes, and writes back whatever comes home. It does
+not parse DNS, does not know which names are allowed, and does not even hold the
+address of a resolver — so there is no DNS policy inside the boundary to subvert.
+Every gate is host-side:
+
+- **Resolution is gated by the policy** (`network_policy.dns.enforce`, default on).
+  Denied names are answered **REFUSED locally** and never sent out.
+- **Tunnel-prone record types are refused** by default (`TXT`, `NULL`, `ANY`,
+  `AXFR`, `IXFR`) — the classic tunnel and C2 carriers. Opt in per type via
   `network_policy.dns.allowed_qtypes`.
-- **Detects tunneling** (`network_policy.dns.tunnel_detection`, default on): very
-  long/high-entropy names, deeply-chunked subdomains, or a high query rate to one
-  parent domain are escalated to an **`ask`** prompt (default-deny on timeout), so
-  legitimate edge cases aren't silently broken.
+- **Tunnel shapes are refused** (`network_policy.dns.tunnel_detection`, default
+  on): very long or high-entropy names, deeply chunked subdomains, or a high query
+  rate to one parent. This catches `<payload>.allowed.com`, which a name allow-list
+  alone cannot.
+- **Answers are bound to the question that was approved**: the upstream socket is
+  `connect()`ed, so the kernel drops datagrams from anyone but the resolver, and a
+  reply is accepted only if its transaction id **and** question match what was
+  sent. Only a reply that passes both is recorded in the map that authorizes
+  connections.
 
-Configure under `network_policy.dns` in `.cowboy/security.yaml`. All of it is
-fail-closed: a parse failure, disallowed type, denied name, or unreachable approver
-yields REFUSED.
+An *unknown* name deliberately **does** resolve. This reads like a hole and is not
+one: a resolver that parked a query on a human prompt would simply time out, and
+resolving is not egress — the connection to whatever it resolved to is gated at
+connect time, where prompting works and a verdict can be cached per host. Only
+denied names, disallowed types and tunnel shapes are refused at the DNS layer,
+because a tunnel's payload *is* the query and there is no later connection to gate.
+
+Port 53 is intercepted **wherever it is aimed**, so the agent cannot pick its own
+resolver by writing a `resolv.conf` or passing `dig @8.8.8.8`. DNS over TCP
+dead-ends deliberately: forwarding it as an ordinary connection would carry queries
+straight past every gate above.
 
 ## Live approvals
 
-In the TUI, an `ask` opens an approval modal — allow once / session / project /
-global, or deny. Project/global approvals persist to `.cowboy/approvals.json` and
-merge into the policy on the next run. Non-interactive runs fail closed (deny) and
-log the decision.
-
-## Approved Compose/Docker networks
-
-`networks.compose.approved` networks are attached directly to the agent. That
-traffic routes peer-to-peer over Docker's own bridge and **bypasses the gateway**
-entirely — no prompt. Approve such networks deliberately.
+An `ask` opens an approval modal in the TUI — allow once / session / project /
+global, or deny. Project and global approvals persist host-side (never in the
+workspace) and merge into the policy on the next run. Non-interactive runs fail
+closed and log the decision. When several commands run at once, the prompt names
+the one that is asking.
 
 ## Honest scope
 
-- **Every** outbound TCP port is intercepted and gated by domain/CIDR with
-  allow/deny/ask. Connections are attributed by the name the gateway resolved for
-  the destination IP (never the agent-supplied SNI/Host), or by CIDR on the real
-  IP; a raw IP with no prior lookup → `ask` by `ip:port`.
-- DNS only via the gateway resolver, **policy-gated** (strict allowlist + tunnel
-  detection; risky record types refused) — including queries the agent aims at
-  Docker's embedded resolver.
-- Non-DNS UDP, ICMP, and IPv6 are deny-by-default (IPv6 disabled; the rest dropped
-  by the `filter output` chain).
+- **Every** outbound TCP port is intercepted and gated. Attribution is by the
+  resolved `ip → {domains}` map or by CIDR on the real IP; a raw IP with no prior
+  lookup falls to `ask` by `ip:port`.
+- Non-DNS UDP, ICMP and IPv6 are dropped.
 - Cloud metadata (`169.254.169.254`) is denied by policy on every port.
-- SNI-less / encrypted-ClientHello TLS → ask by IP:port.
-- No TLS MITM. DNS is UDP-only (no TCP/53 large-response fallback yet); tunnel
-  detection is heuristic (entropy/length/rate), not a guarantee.
-- Attribution is by the gateway-resolved `ip → {domains}` map, so it inherits the
-  limits of IP-based filtering **without** MITM: a host **co-located on an
-  allow-listed CDN IP** is reachable (e.g. another site behind the same Cloudflare
-  anycast address as an allowed domain), and an IP-literal with no prior lookup →
-  `ask`. Closing the co-hosting gap would require MITM/SNI-pinning.
-- Arbitrary **UDP is dropped, not proxied** — proxying it would need TPROXY.
+- SNI-less or encrypted-ClientHello TLS → `ask` by `ip:port`.
+- No TLS MITM. DNS is UDP-only, so there is no large-response TCP fallback; tunnel
+  detection is heuristic (entropy, length, rate), not a guarantee.
+- IP-based attribution without MITM inherits IP-based limits: a host **co-located
+  on an allow-listed CDN address** is reachable — another site behind the same
+  Cloudflare anycast IP as an allowed domain, for instance. Closing that gap would
+  require MITM or SNI pinning.
+- Arbitrary UDP is dropped rather than proxied; proxying it would need TPROXY.
+- The `command_pid` shown in a prompt is a **label**, recovered from inside the
+  boundary on a best-effort basis. It never authorizes anything.

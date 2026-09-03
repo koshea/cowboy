@@ -81,7 +81,7 @@ impl AgentRuntime {
             .unwrap_or_else(|| container_name_for(&root));
         // Resolve the effective image: a committed `.cowboy/Dockerfile` produces a
         // per-repo image built on demand; otherwise the configured image.
-        let (image, derived) = resolve_image(&root, &security.container);
+        let (image, derived) = resolve_image(&root, &security.sandbox);
         // Fail CLOSED: if network isolation is requested but the gateway can't be
         // built, refuse to run rather than silently dropping to an unsandboxed
         // container (default bridge, full egress, caps intact). `None` means
@@ -188,7 +188,7 @@ impl AgentRuntime {
 
     /// Build the container spec, applying mounts and the security mask.
     pub fn build_spec(&self) -> Result<ContainerSpec> {
-        let c = &self.security.container;
+        let c = &self.security.sandbox;
         let mut mounts = Vec::new();
 
         // Project mount(s) from config.
@@ -614,7 +614,7 @@ impl AgentRuntime {
         self.docker
             .exec(
                 &self.container_name,
-                &self.security.container.workdir,
+                &self.security.sandbox.workdir,
                 self.user(),
                 argv,
             )
@@ -633,7 +633,7 @@ impl AgentRuntime {
         chunks: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<(ExecResult, String)> {
         self.ensure_running().await?;
-        let workdir = cwd.unwrap_or(&self.security.container.workdir);
+        let workdir = cwd.unwrap_or(&self.security.sandbox.workdir);
         // Inject `source_command` secrets fresh (TTL-cached) into shell commands
         // — e.g. `GH_TOKEN` from `gh auth token` — so short-lived tokens refresh
         // mid-session without recreating the container. Exported in the command's
@@ -705,7 +705,7 @@ impl AgentRuntime {
         self.docker
             .exec_stdin(
                 &self.container_name,
-                &self.security.container.workdir,
+                &self.security.sandbox.workdir,
                 self.user(),
                 &argv,
                 payload,
@@ -721,7 +721,7 @@ impl AgentRuntime {
         {
             return Ok(());
         }
-        let dir = format!("{}/.cowboy/proc", self.security.container.workdir);
+        let dir = format!("{}/.cowboy/proc", self.security.sandbox.workdir);
         let script = format!(
             "for f in {dir}/*.pid; do [ -f \"$f\" ] && \
              kill -TERM -\"$(cat \"$f\")\" 2>/dev/null; done; true"
@@ -731,7 +731,7 @@ impl AgentRuntime {
             .docker
             .exec_capture(
                 &self.container_name,
-                &self.security.container.workdir,
+                &self.security.sandbox.workdir,
                 self.user(),
                 &argv,
             )
@@ -750,7 +750,7 @@ impl AgentRuntime {
         timeout_secs: u64,
     ) -> Result<(ExecResult, String)> {
         self.ensure_running().await?;
-        let workdir = cwd.unwrap_or(&self.security.container.workdir);
+        let workdir = cwd.unwrap_or(&self.security.sandbox.workdir);
         // Non-login `sh -c` so the container's ENV PATH (rust/go toolchains) is
         // inherited; a login shell would reset PATH via /etc/profile.
         let argv = vec!["sh".to_string(), "-c".to_string(), command.to_string()];
@@ -776,7 +776,7 @@ impl AgentRuntime {
         self.docker
             .exec_interactive(
                 &self.container_name,
-                &self.security.container.workdir,
+                &self.security.sandbox.workdir,
                 self.user(),
                 &argv,
             )
@@ -993,7 +993,7 @@ struct ResolvedResources {
 
 /// Resolve `container.cpus`/`memory` (honoring `auto`) into concrete limits and the
 /// build job count. `jobs` is `None` when cpus is unlimited (keep host parallelism).
-fn resolve_resources(c: &config::ContainerConfig) -> ResolvedResources {
+fn resolve_resources(c: &config::SandboxConfig) -> ResolvedResources {
     let cpus: Option<f64> = match c.cpus {
         None => None,
         Some(config::CpuLimit::Cores(n)) => Some(n),
@@ -1037,10 +1037,7 @@ fn host_total_mib() -> Option<u64> {
 /// customization) → a derived image tagged by project + the Dockerfile's content
 /// hash (so editing it rebuilds), built `FROM` the base image; else the plain
 /// configured image (default base or a registry image).
-fn resolve_image(
-    root: &Path,
-    container: &config::ContainerConfig,
-) -> (String, Option<DerivedImage>) {
+fn resolve_image(root: &Path, container: &config::SandboxConfig) -> (String, Option<DerivedImage>) {
     if let Some(df) = &container.dockerfile {
         return (
             container.image.clone(),
@@ -1396,7 +1393,7 @@ mod tests {
         std::fs::write(cowboy.join("agent.yaml"), "version: 1\n").unwrap();
 
         let mut security = SecurityConfig {
-            container: cowboy_core::config::ContainerConfig {
+            sandbox: cowboy_core::config::SandboxConfig {
                 image: "test/img:local".into(),
                 mounts: vec![Mount {
                     source: ".".into(),
@@ -1592,14 +1589,14 @@ mod tests {
         let (mut rt, _tmp) = fixture(false, MockDockerCli::new());
 
         // No cpu limit → no build-jobs env (keep host parallelism), no cpus on spec.
-        rt.security.container.cpus = None;
+        rt.security.sandbox.cpus = None;
         let spec = rt.build_spec().unwrap();
         assert!(!spec.env.iter().any(|(k, _)| k == "MAKEFLAGS"));
         assert!(spec.cpus.is_none());
 
         // cpus: 2 → -j2 across the native-build env, and the spec carries cpus=2.
-        rt.security.container.cpus = Some(CpuLimit::Cores(2.0));
-        rt.security.container.memory = Some("8g".into());
+        rt.security.sandbox.cpus = Some(CpuLimit::Cores(2.0));
+        rt.security.sandbox.memory = Some("8g".into());
         let spec = rt.build_spec().unwrap();
         let get = |k: &str| {
             spec.env
@@ -1705,10 +1702,10 @@ mod tests {
 
     #[test]
     fn resolve_image_precedence_and_content_hash() {
-        use cowboy_core::config::ContainerConfig;
+        use cowboy_core::config::SandboxConfig;
         let tmp = assert_fs::TempDir::new().unwrap();
         let root = tmp.path();
-        let base = ContainerConfig {
+        let base = SandboxConfig {
             image: "cowboy/agent:local".into(),
             ..Default::default()
         };
@@ -1742,7 +1739,7 @@ mod tests {
         // 3. An explicit container.dockerfile wins over auto-detect, keeps the
         //    configured image tag, and does NOT force a base build.
         std::fs::write(root.join("Custom.Dockerfile"), "FROM scratch\n").unwrap();
-        let explicit = ContainerConfig {
+        let explicit = SandboxConfig {
             image: "myorg/custom:dev".into(),
             dockerfile: Some("Custom.Dockerfile".into()),
             ..Default::default()
@@ -2000,7 +1997,7 @@ mod tests {
         );
         // The cowboy-core config default must match the cli's runtime default.
         assert_eq!(
-            cowboy_core::config::ContainerConfig::default().image,
+            cowboy_core::config::SandboxConfig::default().image,
             DEFAULT_IMAGE
         );
     }

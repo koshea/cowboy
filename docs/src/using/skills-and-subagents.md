@@ -30,7 +30,7 @@ frontmatter — Cowboy's routing stays in charge.
 ## Subagents
 
 **Subagents** let the agent delegate a focused sub-task via the `subagent` tool.
-It recursively invokes `cowboy` in one-shot mode, reusing the same container (so
+It recursively invokes `cowboy` in one-shot mode, reusing the same sandbox (so
 the subagent shares the workspace and gateway), and folds the subagent's final
 answer back into the parent's context. Nesting is depth-limited to prevent runaway
 recursion.

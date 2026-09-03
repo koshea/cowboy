@@ -15,7 +15,7 @@ cowboy "add a --json flag to the export command"   # start with a task
 cowboy                                              # or start empty and type
 ```
 
-Cowboy runs the agent in a Docker sandbox, opens the TUI, and streams the work.
+Cowboy brings up the sandbox, opens the TUI, and streams the work.
 Send a follow-up any time the agent is idle: **Enter** sends, **Shift+Enter**
 inserts a newline. The first run builds the agent image (a few minutes, shown as
 a step) and, if the repo uses [mise](https://mise.jdx.dev), installs the toolchain
@@ -241,43 +241,43 @@ cowboy secrets list                 # show grants + whether the host source exis
 
 Presets cover common tools (`gh`, `aws`, `gcloud`, `kubectl`, `git`, `ssh`) — see
 `cowboy secrets add --help`. Grants live in `.cowboy/security.yaml` (or the home
-overlay); the credential is mounted read-only and its *value* never lands in
+overlay); the credential is exposed read-only and its *value* never lands in
 config. See [Configuration](getting-started/configuration.md).
 
-## Customize the agent image (per repo)
+## Give the agent a tool it doesn't have
 
-When a repo needs tools the base image lacks (system libraries, extra languages,
-build headers like `libpq-dev` for the `pg` gem), commit a **`.cowboy/Dockerfile`**
-that extends the base image:
+The sandbox exposes `/usr` and `/opt` read-only, so the agent already has whatever
+you have installed. When something is missing there are three answers, in order of
+preference:
 
-```dockerfile
-# .cowboy/Dockerfile
-FROM ghcr.io/koshea/cowboy/agent:0.1.0
-RUN apt-get update && apt-get install -y --no-install-recommends libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-```
+1. **Commit a mise config.** `mise.toml` (or `.tool-versions`) declares per-project
+   language runtimes and CLIs, and Cowboy runs `mise install` automatically at
+   session start. This is the portable answer: every contributor's session comes up
+   with the same toolchain, and nothing is installed system-wide.
 
-That's it — commit it and **every contributor's next session automatically builds
-and uses it**; no flags or extra config. Cowboy builds the base first, then your
-image, tagged by the file's content so **editing the Dockerfile rebuilds it** (end
-the session / `cowboy down` first so the container is recreated on the new image).
+2. **Install it on the host.** For system libraries and build headers
+   (`libpq-dev` for the `pg` gem, say), install the package the way you normally
+   would. The agent picks it up on its next command — no rebuild, no restart,
+   because there is no image to invalidate.
 
-Notes:
-- Always `FROM` the cowboy base image (`ghcr.io/koshea/cowboy/agent:<version>`) so
-  you inherit the toolchains, `mise`, the in-container `cowboy` helper, and the
-  security wiring. Match the tag to your installed `cowboy --version` (contributors
-  building from source get that tag built locally); cowboy ensures the base exists
-  before building your image.
-- The build context is the repo root, so you can `COPY` project files; add a
-  `.dockerignore` if the repo is large.
-- Building runs the Dockerfile on each contributor's machine — the same trust as
-  the repo's other build scripts (it changes only what's *inside* the sandbox; the
-  network/credential boundary is unchanged).
-- For a fully custom or registry image instead, set `container.image` (and
-  optionally `container.dockerfile`) in `.cowboy/security.yaml`.
-- If a build is killed with `exit 137` (out of memory), raise `cpus`/`memory` in
-  `.cowboy/security.yaml` (build parallelism follows `cpus`) — see
-  [Configuration](getting-started/configuration.md).
+3. **Grant a path.** If the tool lives somewhere outside `/usr` and `/opt`:
+
+   ```sh
+   cowboy grant /opt/weird-vendor-sdk --ro
+   ```
+
+   That applies to the next command, in this session and future ones. The agent can
+   also ask for a path itself with `request_path`, which prompts you with the path
+   and its reason.
+
+There is deliberately no per-repo image to customize. That mechanism existed to
+work around a container that could not see your machine; the sandbox does not have
+that problem, and dropping it removes a build step, a registry dependency, and a
+tag that had to be kept in step with your binary.
+
+If a build is killed with `exit 137` it hit the memory ceiling — raise
+`cpus`/`memory` under `sandbox:` in `.cowboy/security.yaml` (build parallelism
+follows `cpus`). See [Configuration](getting-started/configuration.md).
 
 ## Use a skill
 
@@ -289,7 +289,7 @@ available skills and commands, or `/skills` to list them; run one with
 
 [MCP](https://modelcontextprotocol.io) servers give the agent external tools —
 issue trackers, docs search, internal APIs. They're **trusted integrations you
-configure**: they run on the host (outside the agent's container), the agent can
+configure**: they run on the host (outside the sandbox), the agent can
 *call* them but never add or edit them, and their config + credentials stay
 host-owned in `~/.config/cowboy/mcp.yaml`.
 

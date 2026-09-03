@@ -43,7 +43,15 @@ pub struct SecurityConfig {
     #[serde(default = "default_version")]
     pub version: u32,
     #[serde(default)]
-    pub container: ContainerConfig,
+    pub sandbox: SandboxConfig,
+    /// Set only when a config still uses the pre-sandbox `container:` key.
+    ///
+    /// Kept solely so [`SecurityConfig::validate`] can refuse it by name. Ignoring an
+    /// unknown section would be the dangerous outcome: the mounts under it would
+    /// silently vanish, leaving the agent with only the default workspace mount and
+    /// no indication why its paths disappeared.
+    #[serde(default, skip_serializing, rename = "container")]
+    pub legacy_container: Option<serde_yaml_ng::Value>,
     #[serde(default)]
     pub networks: NetworksConfig,
     #[serde(default)]
@@ -52,8 +60,15 @@ pub struct SecurityConfig {
     pub secrets: SecretsConfig,
 }
 
+/// How the agent's sandbox is shaped: what it can see, and how much of the machine
+/// it may use.
+///
+/// Named `sandbox` since the boundary stopped being a container. The `image`,
+/// `dockerfile` and `build` fields are vestiges of that era and no longer describe
+/// anything the sandbox does — the agent uses the host's own toolchain, which is the
+/// point.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ContainerConfig {
+pub struct SandboxConfig {
     #[serde(default = "default_image")]
     pub image: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,13 +83,13 @@ pub struct ContainerConfig {
     pub privileged: bool,
     #[serde(default)]
     pub docker_socket: bool,
-    /// Container memory limit (e.g. `8g`), or `auto` to size from the host. None =
-    /// unlimited. See [`crate::config`] resolution in the runtime.
+    /// Memory ceiling (e.g. `8g`), or `auto` to size from the host. None = unlimited.
+    /// Enforced with a cgroup v2 `memory.max`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
-    /// Container CPU limit: a number (e.g. `2`) or `auto` (sized from the host).
-    /// Also bounds build parallelism — the runtime injects `-j{cpus}` build env so
-    /// `make`/`ruby-build`/etc. don't run host-`nproc`-many jobs. None = unlimited.
+    /// CPU ceiling: a number (e.g. `2`) or `auto` (sized from the host). Enforced with
+    /// a cgroup v2 `cpu.max`, and also bounds build parallelism — `-j{cpus}` build env
+    /// is injected, because not every tool reads the quota.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<CpuLimit>,
 }
@@ -359,8 +374,18 @@ pub struct AgentBehavior {
     /// Stop a detached, idle session's container after this many seconds with no
     /// running turn and no attached client, to free its RAM (the next command
     /// restarts it). `0` disables idle teardown.
-    #[serde(default = "default_idle_container_timeout")]
-    pub idle_container_timeout_seconds: u64,
+    /// Tear down an idle detached session's sandbox after this many seconds
+    /// (`0` = never). The session stays resumable; the next command brings it back.
+    ///
+    /// The old name is accepted so a rename in non-security config does not break
+    /// every project's `agent.yaml` for no benefit. Unlike the `container:` →
+    /// `sandbox:` move in `security.yaml`, silently falling back to the default
+    /// here costs a timeout, not a boundary.
+    #[serde(
+        default = "default_idle_sandbox_timeout",
+        alias = "idle_container_timeout_seconds"
+    )]
+    pub idle_sandbox_timeout_seconds: u64,
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
     #[serde(default = "default_max_output")]
@@ -607,7 +632,7 @@ fn default_command_timeout() -> u64 {
 fn default_model_timeout() -> u64 {
     120
 }
-fn default_idle_container_timeout() -> u64 {
+fn default_idle_sandbox_timeout() -> u64 {
     1800 // 30 min: free a detached, idle session's container RAM (restarts on use)
 }
 fn default_max_iterations() -> u32 {
@@ -665,7 +690,7 @@ fn default_allow_rules() -> RuleSet {
     }
 }
 
-impl Default for ContainerConfig {
+impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             image: default_image(),
@@ -704,7 +729,8 @@ impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
             version: 1,
-            container: ContainerConfig::default(),
+            sandbox: SandboxConfig::default(),
+            legacy_container: None,
             networks: NetworksConfig::default(),
             network_policy: NetworkPolicy::default(),
             secrets: SecretsConfig::default(),
@@ -717,7 +743,7 @@ impl Default for AgentBehavior {
         Self {
             command_timeout_seconds: default_command_timeout(),
             model_timeout_seconds: default_model_timeout(),
-            idle_container_timeout_seconds: default_idle_container_timeout(),
+            idle_sandbox_timeout_seconds: default_idle_sandbox_timeout(),
             max_iterations: default_max_iterations(),
             max_command_output_bytes: default_max_output(),
             token_budget: 0,
@@ -796,7 +822,15 @@ impl SecurityConfig {
     /// Enforce the non-negotiable security invariants. Returns an error rather
     /// than silently honoring a dangerous configuration.
     pub fn validate(&self) -> Result<()> {
-        for mount in &self.container.mounts {
+        if self.legacy_container.is_some() {
+            return Err(Error::SecurityInvariant(
+                "security.yaml uses `container:`, which is now `sandbox:`. The agent no \
+                 longer runs in a container — rename the section. `image`, `dockerfile` \
+                 and `build` under it no longer do anything and can be deleted."
+                    .to_string(),
+            ));
+        }
+        for mount in &self.sandbox.mounts {
             if mount_targets_host_secret(&mount.source) {
                 return Err(Error::SecurityInvariant(format!(
                     "mount source {:?} would expose host-owned secrets to the agent; \
@@ -815,7 +849,7 @@ impl SecurityConfig {
         }
         // Credential grants: never re-expose host config, and never shadow the
         // workspace or the masked `.cowboy/` config with a mount target.
-        let workdir = self.container.workdir.trim_end_matches('/');
+        let workdir = self.sandbox.workdir.trim_end_matches('/');
         for grant in &self.secrets.files {
             if mount_targets_host_secret(&grant.source) {
                 return Err(Error::SecurityInvariant(format!(
@@ -857,14 +891,14 @@ impl SecurityConfig {
     /// should surface these to the user; they do not block startup.
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.container.privileged {
+        if self.sandbox.privileged {
             out.push(
                 "container.privileged is set but NOT honored by cowboy (a privileged agent would \
                  not be sandboxed); remove it"
                     .to_string(),
             );
         }
-        if self.container.docker_socket {
+        if self.sandbox.docker_socket {
             out.push(
                 "container.docker_socket is set but NOT honored by cowboy (Docker-daemon access \
                  is a container escape); remove it"
@@ -1268,27 +1302,23 @@ pub fn agent_template() -> String {
 const SECURITY_TEMPLATE: &str = r#"version: 1
 
 # HOST-OWNED security config. The cowboy host process reads this; it is NEVER
-# mounted into the agent container. The agent cannot see or edit this file.
+# visible inside the sandbox. The agent cannot see or edit this file.
 
-container:
-  # The agent image. Omitted = the version-pinned default
-  # (ghcr.io/koshea/cowboy/agent:<version>), pulled from GHCR on first run so it
-  # tracks your `cowboy` binary on upgrade. Uncomment to pin or use your own.
-  # image: ghcr.io/koshea/cowboy/agent:0.1.0
-  # A committed .cowboy/Dockerfile (FROM the base) is auto-detected and built
-  # per-repo; or point `dockerfile:` at your own.
-  # dockerfile: ./Dockerfile.cowboy
-  build: false
+sandbox:
+  # Where the project appears inside the sandbox, and what else it can see.
   workdir: /workspace
   mounts:
     - source: .
       target: /workspace
       mode: rw
-  privileged: false
-  docker_socket: false
-  # Resource limits. `cpus` also bounds build parallelism: the agent runs builds
-  # with `-j{cpus}` (make/ruby-build/cargo/npm/cmake) so a `make` can't spawn
-  # host-nproc-many jobs and OOM the container. Use `auto` to size from the host
+  # Add a path here to expose it permanently, or grant one as you go with
+  # `cowboy grant <path>` — the sandbox picks it up on the next command, with no
+  # restart. Credential stores (~/.aws, ~/.ssh, …) are always refused; use
+  # `cowboy secrets add` for those.
+  #
+  # Resource ceilings, enforced with a cgroup. `cpus` also bounds build
+  # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
+  # every tool reads the CPU quota. Use `auto` to size from the host
   # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
   memory: 8g
   cpus: 2
@@ -1371,7 +1401,7 @@ agent:
   # Stop a detached, idle session's container after this many seconds (no running
   # turn, no attached client) to free its RAM; the next command restarts it.
   # 0 disables. The container is *removed* outright when the session ends.
-  idle_container_timeout_seconds: 1800
+  idle_sandbox_timeout_seconds: 1800
   max_iterations: 100
   max_command_output_bytes: 60000
   # Optional usage budgets (0 = no limit). The session stops once a budget is

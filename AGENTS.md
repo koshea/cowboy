@@ -7,26 +7,28 @@ product overview and the security rationale, read `README.md` and the docs site
 ## What this is
 
 `cowboy` (binary `cowboy`, daemon `cowboyd`) is an opinionated local coding agent
-that runs the AI inside a Docker-contained dev environment while the **host**
-enforces security at the container + network layer.
+that runs the AI in a **host-native sandbox** — Linux namespaces, Landlock,
+seccomp, an empty capability set — while the **host** enforces security at the
+kernel + network layer.
 
 **The one inviolable principle:** the agent is **not** part of the security
-boundary. Security is enforced by Docker, host-owned config, and a Cowboy-owned
-network gateway — *never* by prompting the model. When you change anything near
+boundary. Security is enforced by the kernel, host-owned config, and a host-side
+policy engine — *never* by prompting the model. When you change anything near
 config, mounts, networking, credentials, or the agent loop, preserve this. See
-`docs/src/security/model.md`.
+`docs/src/security/model.md`, and `docs/src/security/sandbox-decisions.md` for the
+evidence behind each mechanism (read it before redesigning any of them — most of
+the obvious alternatives were tried and rejected for recorded reasons).
 
 ## Build / test / run
 
 ```sh
 cargo build                                  # whole workspace
-cargo nextest run                            # unit + integration (Docker E2E auto-skips if absent)
+cargo nextest run                            # unit + integration
 cargo test --doc                             # doctests (nextest skips these)
 cargo test --workspace                       # works too if you don't have nextest
 cargo clippy --workspace --all-targets       # must be clean (no custom lint config; defaults)
 cargo fmt --all                              # rustfmt defaults; CI-style check: `--all -- --check`
 
-docker/build.sh                              # build agent + gateway images (or `… agent|gateway`)
 ```
 
 Run a one-off task locally: `cowboy "do X"` (in a project with `.cowboy/`). The
@@ -40,15 +42,27 @@ over a unix socket.
   `cmd/ranch.rs::reconcile_and_pick`) rather than reaching for a daemon/disk.
 - **Snapshot tests** use `insta` (e.g. the agent tool surface, TUI rendering).
   Update intentionally: `INSTA_UPDATE=always cargo test …`, then review the diff.
+- **Sandbox suites** (`tests/sandbox_exec.rs`, `sandbox_session.rs`,
+  `sandbox_egress.rs`) exercise real namespaces, Landlock, nftables and the relay.
+  They **self-skip** when the host cannot run them, so a broken probe can make a
+  whole file pass while doing nothing — that has happened. Always verify with:
+  ```sh
+  COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
+      --test sandbox_exec --test sandbox_session --test sandbox_egress
+  ```
+  `required` turns a skip into a failure. Two traps: **a successful `connect()` is
+  not evidence of egress** (under transparent interception every connect succeeds —
+  attempt a data transfer), and **denial tests pass vacuously offline** (hence a
+  separate `skip_if_offline!()`).
 - **`#[ignore]` end-to-end tests** are the **manually-run suite** — they spawn real
-  worker processes, and some need Docker + a real model provider. They self-skip
-  when prerequisites are absent, so `--ignored` is safe to run anywhere:
+  worker processes and need a real model provider. They self-skip when
+  prerequisites are absent, so `--ignored` is safe to run anywhere:
   ```sh
   cargo test -p cowboy-cli --test daemon_e2e -- --ignored
   ```
   This is the regression net for model-dependent behavior (prompts, tool use,
   Ranch coordination) — keep adding to it as features land, and **always clean up**
-  (`reap_new_docker` helper / end the worker / remove the worktree).
+  (end the worker / remove the worktree / let the session's namespaces be reaped).
 
 ## Workspace & where things live
 
@@ -58,28 +72,35 @@ crates/
     src/cli.rs       clap command tree            src/main.rs  dispatch
     src/cmd/         one module per CLI command (daemon.rs, worker.rs, ranch.rs, session.rs, web.rs, …)
     src/agent/       the agent loop (run.rs), tool defs (tools.rs), UI impls (ui.rs/tui.rs/socket_ui.rs)
-    src/net/         docker (docker.rs, bollard API; build+interactive shell out), runtime spec (runtime.rs), gateway, worktree, control socket
+    src/sandbox/     THE BOUNDARY: session.rs (namespaces + holder), native.rs (the Sandbox impl),
+                     bwrap.rs, exec.rs, shim.rs, lockdown.rs (Landlock+seccomp+caps), cgroup.rs,
+                     grants.rs, preflight.rs, policy.rs, transport/ (nft.rs, relay.rs, broker.rs,
+                     channel.rs = the enforcement boundary)
+    src/net/         legacy docker path (deleted once the seams are unwired), worktree, approvals
     src/session/     session logging / replay
   cowboy-core/     shared types, pure logic, + the model transport
     config.rs model.rs policy.rs ranch.rs scope.rs artifact.rs
     lifecycle.rs decision.rs memory.rs tokens.rs usersecrets.rs error.rs
   cowboy-proto/    wire types (daemonproto, netproto) — serde-only, also compiles to wasm
   cowboy-tui/      ratatui rendering (snapshot-tested)
-  cowboy-gateway/  the sole-egress gateway binary (proxy + DNS + nft policy)
+  cowboy-sandbox/  the sandbox plan as PURE LOGIC (binds, Landlock rules, seccomp, denylist)
+  cowboy-gateway/  the policy engine as a LIBRARY (proxy, DNS, ip->domain attribution)
   cowboy-web-ui/   Yew/WASM remote-control frontend (NOT a workspace member —
                    wasm32-only; `trunk build` in this dir, embedded by cowboy-cli.
                    cowboy-cli/build.rs embeds an existing dist/, or builds one
                    when COWBOY_WEB_UI=1; plain dev builds skip it → placeholder)
-docker/  docs/
+docker/ (legacy, removed with the Docker path)  docs/
 ```
 
 Rough split: **`cowboy-core`** = data types + pure logic (serde structs, policy,
 the wire protocols) **plus the model transport** — the `ModelClient` trait and
 the streaming OpenAI-compatible `OpenAiClient` live here (`model.rs`), since the
-HTTP/SSE client is shared and has no CLI/daemon dependencies. **`cowboy-cli`** =
-everything else: Docker, the daemon, the agent loop, the CLI. The **agent loop
-runs host-side** in the worker process; the Docker container is the sandbox for
-the agent's *shell commands*, not for the loop.
+HTTP/SSE client is shared and has no CLI/daemon dependencies. **`cowboy-sandbox`**
+= the plan as pure logic, so what the boundary *is* can be unit-tested and
+snapshotted without creating a namespace. **`cowboy-cli`** = everything else: the
+sandbox executor, the daemon, the agent loop, the CLI. The **agent loop runs
+host-side** in the worker process; the sandbox confines the agent's *shell
+commands*, not the loop.
 
 ## Conventions
 
@@ -88,6 +109,11 @@ the agent's *shell commands*, not for the loop.
   on `kind` (snake_case); `ServerMsg`/`ClientMsg`/`UiEventMsg` are externally
   tagged snake_case. Avoid internally-tagged enums with newtype-string variants
   (they break serde here) — use struct variants or external tagging.
+- **Config:** the `security.yaml` section is `sandbox:` (was `container:`). A config
+  still using the old key is **refused with a clear error**, not silently ignored —
+  ignoring it would drop every mount under it without saying so. In non-security
+  config (`agent.yaml`) a serde `alias` is the friendlier choice, since a silent
+  default there costs a timeout rather than a boundary.
 - **Timestamps:** `u64` milliseconds since epoch via a local `now_ms()`. **No
   `chrono`.**
 - **Errors:** `anyhow::Result` in `cowboy-cli`; `cowboy_core::error::{Error,Result}`
@@ -106,18 +132,34 @@ the agent's *shell commands*, not for the loop.
 ## Security invariants — do not break
 
 - Provider credentials live only in `~/.config/cowboy/providers.yaml` (`0600`),
-  consumed host-side; never written into a project or mounted.
-- Host-owned `security.yaml` / `models.yaml` are masked inside the container;
-  `SecurityConfig::validate` refuses mounts that expose `.cowboy`/`security.yaml`.
-- Network egress is route-enforced through the gateway; default policy `ask`
-  **fails closed** with no approver. Never substitute prompting for enforcement.
-- The gateway↔host control channel is **TCP + a per-session token** (gated:
-  unauthenticated connections are dropped), bound to the docker bridge IP — never
-  `0.0.0.0`. TCP (not a bind-mounted unix socket) so it works inside the macOS
-  Docker VM. The token reaches only the gateway's env; the agent container never
-  sees it, so it can't authenticate even though it shares the bridge.
-- Don't widen the boundary silently — `privileged`/`docker_socket` are surfaced by
-  `cowboy doctor` as warnings on purpose.
+  consumed host-side; never written into a project or bound into the sandbox.
+- Host-owned `security.yaml` / `models.yaml` are masked inside the sandbox (the
+  mask bind is **last** so nothing re-exposes it); `SecurityConfig::validate`
+  refuses mounts that expose `.cowboy`/`security.yaml`.
+- **Containment must not depend on the nftables ruleset.** The session netns holds
+  no host-connected device, so a transport that fails to install leaves *no* egress
+  rather than open egress. If you change the transport, preserve that inversion —
+  it is the property that justified the rewrite.
+- **The relay↔engine channel is the enforcement boundary** (`transport/channel.rs`).
+  It is an anonymous `socketpair` with no filesystem or abstract name. Never give it
+  a name, and never let the relay's *report* of a destination be the only thing
+  standing between the agent and egress in a new code path.
+- The relay **never creates an outbound socket** — the engine dials in the host
+  netns and passes the connected fd. So there is no uid exemption in the ruleset,
+  and there must never be one: the agent is uid 0 in its own user namespace, so
+  `skuid 0` would exempt the *agent*.
+- **Landlock is a hard requirement, not best-effort**, and its rules use
+  sandbox-internal (bind *target*) paths. A missing rule path is a hard error — an
+  earlier `filter_map(ok)` silently produced a zero-rule domain that looked like
+  working confinement.
+- **Runtime grants and network approvals are stored host-side**
+  (`~/.config/cowboy/{grants,approvals}/`), never in the workspace — it is writable
+  from inside, so a file there would let a hostile repo widen its own access. The
+  credential denylist is re-checked **at use**, not only at write.
+- Default policy `ask` **fails closed** with no approver. Never substitute
+  prompting for enforcement.
+- Resource limits (cgroup v2) are **not** part of the boundary. Keep that
+  distinction: `doctor` warns for them and fails for the rest.
 
 ## Ranch Plans (multi-workstream orchestration)
 
@@ -157,17 +199,19 @@ Two guards keep it honest (both run under `cargo test`):
 ## Gotchas
 
 - **Never `pkill -f cowboyd`** — the pattern matches the shell running the command
-  and kills it. Use `pkill -x cowboyd` / `pgrep -x cowboyd`.
-- Per-project teardown: `cowboy down`. Reap stray containers:
-  `docker rm -f $(docker ps -aq --filter label=cowboy=1)`.
+  and kills it. Use `pkill -x cowboyd` / `pgrep -x cowboyd`. Same trap applies to
+  `pgrep -f` in tests: count processes by reading `/proc` instead.
+- Per-project teardown: `cowboy down`.
 - The daemon persists state to `$XDG_STATE_HOME/cowboy/daemon/state.json`; sockets
   live under `$XDG_RUNTIME_DIR/cowboy`.
-- Linux or macOS (Docker Desktop) + Docker are required for the full stack
-  (`cowboy doctor` checks them). The gateway runs as a **sidecar in the agent's
-  container netns** (not a separate routing hop), so the host needs no `nftables`
-  itself — enforcement uses the Docker (VM) kernel's netfilter, which is also what
-  makes it work under Docker Desktop's gvisor networking. See
-  `docs/src/security/network.md`.
+- **Linux only**, and currently targeted at one host: a current kernel with
+  Landlock ABI 6+, unprivileged user namespaces, and a delegated cgroup v2 subtree.
+  `cowboy doctor` checks each by performing it. Porting to other distributions is a
+  deliberate follow-up — see the notes in `docs/src/security/sandbox-decisions.md`.
+- `--die-with-parent` is **load-bearing** for reaping bwrap's process tree, and
+  `--remount-ro /` must stay the **last** mount operation. Special filesystems
+  (`--proc`/`--dev`/`--tmpfs`) come **before** the binds, or a tmpfs shadows grants
+  under `/tmp`.
 
 ## Before you commit
 

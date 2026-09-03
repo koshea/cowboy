@@ -370,8 +370,8 @@ fn image_present(image: &str, warn: &str) -> Status {
 
 fn check_image(security: &Path) -> Status {
     let image = SecurityConfig::load(security)
-        .map(|c| c.container.image)
-        .unwrap_or_else(|_| cowboy_core::config::ContainerConfig::default().image);
+        .map(|c| c.sandbox.image)
+        .unwrap_or_else(|_| cowboy_core::config::SandboxConfig::default().image);
     image_present(
         &image,
         &format!("{image} missing; pulled from GHCR on first run (or `docker/build.sh agent`)"),

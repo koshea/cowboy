@@ -2,15 +2,20 @@
 
 [![CI](https://github.com/koshea/cowboy/actions/workflows/ci.yml/badge.svg)](https://github.com/koshea/cowboy/actions/workflows/ci.yml)
 
-An opinionated local coding agent that lets the AI run wild inside a
-Docker-contained development environment, while the **host** enforces security
-at the container and network layer.
+An opinionated local coding agent that lets the AI run wild in a sandbox built
+from your own machine, while the **host** enforces security at the kernel and
+network layer.
 
 > The agent can run wild because the runtime owns the corral.
 
-The agent is **not** part of the security boundary. Security is enforced by
-Docker, host-owned configuration, and a Cowboy-controlled network gateway —
-never by prompting the model.
+The agent is **not** part of the security boundary. Security is enforced by Linux
+namespaces, Landlock, seccomp, host-owned configuration, and a policy engine that
+runs in the host process — never by prompting the model.
+
+The agent gets **your** toolchain, read-only: the compilers and CLIs you actually
+installed, at your versions, with no image to build or pull. Need it to see a
+folder outside the project? It asks, or you run `cowboy grant <path>`, and the next
+command sees it — no restart.
 
 ## Quick start
 
@@ -19,7 +24,7 @@ cargo install --git https://github.com/koshea/cowboy cowboy-cli   # installs `co
 cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
 cd your-project
 cowboy init                              # writes .cowboy/{security,agent}.yaml
-cowboy doctor                            # check platform, Docker, model, gateway image, Compose
+cowboy doctor                            # kernel prerequisites, model config, daemon
 cowboy "run the tests and fix one simple failure"
 ```
 
@@ -47,9 +52,6 @@ rustup target add wasm32-unknown-unknown  #  or `cargo binstall trunk` anywhere)
 Already installed at the same version? Add `--force` so cargo actually rebuilds
 (it skips a same-commit reinstall otherwise, and the flag would have no effect).
 
-The agent + gateway images are **pulled from GHCR on first run**, pinned to your
-binary's version (`ghcr.io/koshea/cowboy/{agent,gateway}`) — no image build step.
-
 **Providers vs. models.** Provider credentials (endpoint URL + API key) are
 host-owned: `cowboy models setup` saves them to `~/.config/cowboy/providers.yaml`
 (`0600`), never in a project, so the agent can't reach them. Models (which
@@ -63,8 +65,9 @@ credentials); set the default with `cowboy models use [-g] <name>` and review wi
 Full documentation lives at **[cowboycode.io](https://cowboycode.io)**.
 
 Highlights: [Quick start](https://cowboycode.io/getting-started/quickstart.html) ·
-[Security model](https://cowboycode.io/security/model.html) ·
-[Network gateway](https://cowboycode.io/security/network.html) ·
+[The boundary](https://cowboycode.io/security/model.html) ·
+[Network egress](https://cowboycode.io/security/network.html) ·
+[Sandbox design decisions](https://cowboycode.io/security/sandbox-decisions.html) ·
 [Configuration](https://cowboycode.io/getting-started/configuration.html) ·
 [Ranch Plans](https://cowboycode.io/ranch/overview.html) ·
 [CLI reference](https://cowboycode.io/reference/cli.html).
@@ -76,33 +79,40 @@ The site is an [mdBook](https://rust-lang.github.io/mdBook/) built from
 
 ```
 crates/
-  cowboy-cli/      # the `cowboy` binary: CLI, agent loop, docker + gateway orchestration, session
+  cowboy-cli/      # the `cowboy` binary: CLI, agent loop, the sandbox, sessions
   cowboy-core/     # config, OpenAI-compatible model client, network policy, shared types
+  cowboy-sandbox/  # the sandbox plan as pure logic (binds, Landlock, seccomp, denylist)
   cowboy-tui/      # ratatui rendering (snapshot-tested)
-  cowboy-gateway/  # the sole-egress gateway binary (proxy + DNS + nft policy)
-docker/            # agent + gateway images
+  cowboy-gateway/  # the policy engine: proxy, DNS, ip→domain attribution (a library)
 docs/
 ```
 
 ## Requirements
 
-- Linux or macOS (Docker Desktop) — the gateway runs as a sidecar in the agent's
-  container netns, so the host needs no `nftables` itself
-- Docker and `docker compose` (`cowboy doctor` checks these)
+**Linux only** — the sandbox is namespaces, Landlock, seccomp and nftables, and
+there is no container or VM in the design to borrow them from.
+
+- A kernel with **Landlock ABI 6+** (Linux 6.10+), `CONFIG_SECCOMP_FILTER`, and
+  unprivileged user namespaces
+- **bubblewrap** (non-setuid), `unshare`, `ip`, `nft`
 - An OpenAI-compatible model endpoint
+
+`cowboy doctor` checks each of these *by performing it* and names the kernel option
+or package to change for anything missing.
 
 ## Development
 
-Install from a checkout (`cargo install --path crates/cowboy-cli`) and cowboy
-builds the agent/gateway images from *your* source instead of pulling, so local
-Dockerfile changes take effect automatically. `docker/build.sh` builds them
-explicitly; `COWBOY_SRC=/path/to/cowboy` forces source builds from any binary.
+Install from a checkout with `cargo install --path crates/cowboy-cli`.
 
 ```sh
-cargo nextest run                   # unit + integration (Docker E2E auto-skips if absent)
+cargo nextest run                   # unit + integration
 cargo test --doc                    # doctests (nextest doesn't run these)
-cargo test -- --ignored gateway     # the full network-boundary E2E (builds the gateway image)
 cargo clippy --workspace --all-targets
+
+# The sandbox suites self-skip when the host can't run them, which can hide a
+# broken probe. `required` turns a skip into a failure — always verify with it.
+COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
+    --test sandbox_exec --test sandbox_session --test sandbox_egress
 
 # Coverage (cargo-llvm-cov). On a rustup toolchain `llvm-tools-preview` is used
 # automatically; on a system-LLVM toolchain point it at the matching version:

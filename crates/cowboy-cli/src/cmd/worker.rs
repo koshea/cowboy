@@ -497,7 +497,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 // If we sit idle with no client attached past the configured
                 // timeout, stop the container to free its RAM (the next command
                 // restarts it); keep waiting so the session itself stays resumable.
-                let idle_secs = agent.idle_container_timeout_seconds();
+                let idle_secs = agent.idle_sandbox_timeout_seconds();
                 let msg = loop {
                     let idle_tick = async {
                         if idle_secs == 0 {

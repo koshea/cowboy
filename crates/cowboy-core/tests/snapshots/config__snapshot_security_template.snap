@@ -5,27 +5,23 @@ expression: security_template()
 version: 1
 
 # HOST-OWNED security config. The cowboy host process reads this; it is NEVER
-# mounted into the agent container. The agent cannot see or edit this file.
+# visible inside the sandbox. The agent cannot see or edit this file.
 
-container:
-  # The agent image. Omitted = the version-pinned default
-  # (ghcr.io/koshea/cowboy/agent:<version>), pulled from GHCR on first run so it
-  # tracks your `cowboy` binary on upgrade. Uncomment to pin or use your own.
-  # image: ghcr.io/koshea/cowboy/agent:0.1.0
-  # A committed .cowboy/Dockerfile (FROM the base) is auto-detected and built
-  # per-repo; or point `dockerfile:` at your own.
-  # dockerfile: ./Dockerfile.cowboy
-  build: false
+sandbox:
+  # Where the project appears inside the sandbox, and what else it can see.
   workdir: /workspace
   mounts:
     - source: .
       target: /workspace
       mode: rw
-  privileged: false
-  docker_socket: false
-  # Resource limits. `cpus` also bounds build parallelism: the agent runs builds
-  # with `-j{cpus}` (make/ruby-build/cargo/npm/cmake) so a `make` can't spawn
-  # host-nproc-many jobs and OOM the container. Use `auto` to size from the host
+  # Add a path here to expose it permanently, or grant one as you go with
+  # `cowboy grant <path>` — the sandbox picks it up on the next command, with no
+  # restart. Credential stores (~/.aws, ~/.ssh, …) are always refused; use
+  # `cowboy secrets add` for those.
+  #
+  # Resource ceilings, enforced with a cgroup. `cpus` also bounds build
+  # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
+  # every tool reads the CPU quota. Use `auto` to size from the host
   # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
   memory: 8g
   cpus: 2

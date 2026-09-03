@@ -19,7 +19,7 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 
 | Path | Mounted? | Purpose |
 |------|----------|---------|
-| `.cowboy/security.yaml` | **masked** | Container, mounts, networks, policy, secrets (host-owned). |
+| `.cowboy/security.yaml` | **masked** | Sandbox mounts + limits, networks, policy, secrets (host-owned). |
 | `.cowboy/agent.yaml` | yes | Non-security agent behavior, processes, command aliases. |
 | `.cowboy/models.yaml` | **masked** | Project model definitions (no credentials). |
 | `.mcp.json` | — | Project-declared [MCP](../how-to.md) servers (trust-gated; the format other MCP clients use). |
