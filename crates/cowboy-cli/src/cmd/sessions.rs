@@ -108,7 +108,7 @@ pub async fn cleanup(dry_run: bool) -> Result<()> {
         }
     }
     println!(
-        "\nworktrees and branches are left untouched; remove orphaned containers \
+        "\nworktrees and branches are left untouched; end orphaned sessions \
          with `cowboy down`."
     );
     Ok(())

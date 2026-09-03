@@ -329,7 +329,7 @@ pub fn definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: TOOL_SHELL.into(),
-            description: "Run a shell command inside the container and observe its output. \
+            description: "Run a shell command inside the sandbox and observe its output. \
                           Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. \
                           For reading or editing files, prefer the `read`/`edit`/`write` tools."
                 .into(),

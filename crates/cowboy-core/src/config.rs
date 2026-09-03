@@ -828,7 +828,7 @@ impl SecurityConfig {
             let target = grant.target.trim_end_matches('/');
             if !target.starts_with('/') {
                 return Err(Error::SecurityInvariant(format!(
-                    "credential grant target {:?} must be an absolute container path",
+                    "credential grant target {:?} must be an absolute path inside the sandbox",
                     grant.target
                 )));
             }

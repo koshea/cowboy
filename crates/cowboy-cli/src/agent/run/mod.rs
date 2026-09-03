@@ -1448,7 +1448,7 @@ impl<'a> AgentLoop<'a> {
                         Some(msg) = self.runtime_status.recv() => self.ui.notice(&msg),
                         res = &mut fut => {
                             if let Err(e) = res {
-                                self.ui.notice(&format!("container startup failed: {e:#}"));
+                                self.ui.notice(&format!("sandbox startup failed: {e:#}"));
                             }
                             break;
                         }

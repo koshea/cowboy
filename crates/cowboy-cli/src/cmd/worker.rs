@@ -858,7 +858,7 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
     for e in std::mem::take(&mut security.secrets.env) {
         if e.needs_approval() && std::env::var(&e.source_env).is_ok() {
             let prompt = format!(
-                "credential: inject env {} (from ${}) into the container?",
+                "credential: inject env {} (from ${}) into the sandbox?",
                 e.name, e.source_env
             );
             let (verdict, _scope) = ui.request_approval(prompt).await;
@@ -881,7 +881,7 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
         if f.needs_approval() && present_file(&f) {
             let mode = if f.read_only { "read-only" } else { "writable" };
             let prompt = format!(
-                "credential: mount {} → {} ({mode}) into the container?",
+                "credential: mount {} → {} ({mode}) into the sandbox?",
                 f.source, f.target
             );
             let (verdict, _scope) = ui.request_approval(prompt).await;

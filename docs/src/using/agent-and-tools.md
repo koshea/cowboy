@@ -63,10 +63,46 @@ toolchain every session.
 
 ## Context management
 
-Conversation history is kept within the model's window using `tiktoken`-based
-token counting (oldest history is pruned, or compacted into a summary); command
-output is additionally byte-capped (`agent.max_command_output_bytes`). Token and
-estimated-cost totals are tracked per session, with optional budgets.
+Everything sent to the model competes for one window, and the loop's job is to keep the
+request inside it while losing as little as possible.
+
+**The budget.** The window is not all yours: room is reserved for the model's reply, for
+the tool schemas (~3.6k tokens, sent on *every* request), and for a small headroom
+floor. What is left is the conversation's budget. If the window cannot even hold the
+reserve, Cowboy says so — naming the window, the model's `max_tokens` and the schema
+cost — rather than letting the request fail at the provider with an error that explains
+none of that.
+
+**`/context`** shows where you stand at any time, including mid-turn:
+
+```
+context  84,500/160,000 tokens of the conversation budget (52%)
+         window 200,000 · reserved 40,000 for the reply, tool schemas and headroom
+         largest first:
+           tool results             41,000  █████████
+           model reasoning          22,000  █████
+           assistant messages       12,500  ██
+           tool schemas              3,650
+```
+
+Grouped by what produced it, because the useful question is which *kind* of thing is
+filling the window.
+
+**What is shed, in order of cheapness.** Reasoning models return their thinking, and it
+is sent back on every subsequent request to keep them on plan across tool calls — but
+only the last couple of turns need it, so older reasoning is dropped before each call.
+This is free and happens first, which often means there is nothing left to compact. Then
+every tool result is capped (`agent.max_command_output_bytes`, 60 KB) — all of them,
+including subagent answers and MCP responses. Only if the conversation still overflows
+does Cowboy compact: the oldest whole turns are folded into a model-written summary
+(itself capped, so a fold always shrinks). Dropping history without summarizing is the
+last resort, and it says so each time it happens, with a count.
+
+**What never goes.** The system prompt and your current task statement. The task is
+tracked by content, so it survives every fold and prune wherever it sits — including
+after `--resume`, where the previous session's transcript sits in front of it. A resume
+loads at most half the budget, newest first, so continuing an old session cannot blow
+the window on the first request.
 
 If a reasoning model burns its whole output budget thinking and returns no answer
 or tool call, Cowboy warns that its `max_tokens` may be too low and then recovers
@@ -84,7 +120,9 @@ lower `reasoning_effort`. The low-effort request lasts for the retry only, so a 
 that recovers keeps its normal reasoning for the rest of the session. Both the
 compaction and recovery summaries use the optional
 [`summarizer`](../getting-started/configuration.md) model when configured,
-falling back to the main model otherwise.
+falling back to the main model otherwise, and always request minimal reasoning —
+summarizing is mechanical, and a model that just truncated while thinking would
+otherwise do the same on the summary and come back empty.
 
 ## What a session records
 

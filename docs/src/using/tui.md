@@ -12,6 +12,10 @@ work turn by turn.
   going), `e` ends the session.
 - **Scrolling** follows the tail by exact wrapped-line counts, so the latest
   output is never cut off under the input box.
+- **`/help`** lists the slash commands; **`/context`** shows how much of the model's
+  window the conversation is using and what is filling it (see
+  [Context management](agent-and-tools.md#context-management)), and completion
+  suggestions appear as you type `/`.
 
 ## Approvals
 

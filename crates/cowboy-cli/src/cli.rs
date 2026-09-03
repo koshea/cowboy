@@ -6,10 +6,10 @@ use clap::{Args, Parser, Subcommand};
 #[command(
     name = "cowboy",
     version,
-    about = "An opinionated local coding agent that runs wild inside a Docker corral.",
-    long_about = "cowboy runs an AI coding agent inside a Docker container while the host \
-                  enforces security at the container and network layer. The agent is never \
-                  trusted to self-police."
+    about = "An opinionated local coding agent that runs wild inside a corral you own.",
+    long_about = "cowboy runs an AI coding agent in a sandbox built from your own machine \
+                  — namespaces, Landlock, seccomp and a sole-egress gateway — while the \
+                  host enforces the boundary. The agent is never trusted to self-police."
 )]
 pub struct Cli {
     /// Optional one-shot task. With no subcommand, `cowboy 'fix the tests'`
@@ -98,7 +98,7 @@ pub enum Command {
     /// Create initial project config files under `.cowboy/`.
     Init(InitArgs),
 
-    /// Check Docker, Linux support, model config, network gateway, and Compose.
+    /// Check kernel prerequisites, model config, and the egress gateway.
     Doctor,
 
     /// Inspect the sandbox boundary for this project.
@@ -111,17 +111,17 @@ pub enum Command {
     /// use `cowboy secrets add` for those.
     Grant(GrantArgs),
 
-    /// Open an interactive shell inside the agent container.
+    /// Open an interactive shell inside the agent sandbox.
     Shell,
 
-    /// Run a command inside the agent container.
+    /// Run a command inside the agent sandbox.
     Run {
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
         command: Vec<String>,
     },
 
-    /// Patch helper (wraps git inside the container).
+    /// Patch helper (wraps git inside the sandbox).
     Patch(PatchArgs),
 
     /// Managed long-running process commands.
@@ -136,7 +136,7 @@ pub enum Command {
     /// List or show agent definitions (specialist personas under .claude/agents/).
     Agents(AgentsArgs),
 
-    /// Stop and remove this project's agent + gateway containers and networks.
+    /// End this project's running sessions and release their sandboxes.
     Down(DownArgs),
 
     /// Serve a web UI to attach to running sessions from a browser (e.g. a phone
@@ -161,7 +161,7 @@ pub enum Command {
     /// Inspect the agent's saved memory (project + global).
     Memory(MemoryCmdArgs),
 
-    /// Grant host credentials (gh, gcloud, kubectl, …) into the container.
+    /// Grant host credentials (gh, gcloud, kubectl, …) into the sandbox.
     Secrets(SecretsCmdArgs),
 
     /// Configure MCP servers the agent can discover and call (host-owned).
@@ -222,7 +222,7 @@ pub enum Command {
         session_id: String,
     },
 
-    /// Internal: in-container worker for the structured file tools (reads a JSON
+    /// Internal: in-sandbox worker for the structured file tools (reads a JSON
     /// request on stdin). Not for direct use.
     #[command(name = "x-fileop", hide = true)]
     XFileop,
@@ -354,7 +354,7 @@ pub struct ProcArgs {
 
 #[derive(Debug, Args)]
 pub struct DownArgs {
-    /// Remove ALL cowboy-managed containers and networks (every project).
+    /// End sessions for EVERY project, not just this one.
     #[arg(long)]
     pub all: bool,
 }
@@ -475,7 +475,7 @@ pub enum SecretsCommand {
 pub struct SecretsAddArgs {
     /// A known tool preset: gh, gcloud, kubectl, aws, git, ssh.
     pub preset: Option<String>,
-    /// Grant an env var into the container: `NAME` or `NAME=HOST_ENV`.
+    /// Grant an env var into the sandbox: `NAME` or `NAME=HOST_ENV`.
     #[arg(long = "env", value_name = "NAME[=HOST_ENV]")]
     pub env: Vec<String>,
     /// Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET`.

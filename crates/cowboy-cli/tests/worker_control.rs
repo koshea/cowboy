@@ -238,27 +238,59 @@ fn interrupt_cancels_a_running_turn() {
     let ws = start(&fx, Some("do a thing"));
     let mut c = Client::connect(&ws, Duration::from_secs(8));
 
-    // Give the worker a moment to reach the (hanging) model call.
-    std::thread::sleep(Duration::from_millis(800));
+    // Wait for evidence the turn actually started rather than sleeping and hoping. The
+    // worker journals the user message before it calls the model, so seeing it means
+    // the turn is under way; interrupting before that point is a no-op against an idle
+    // session, and on a loaded machine a fixed sleep loses that race.
+    let started = Instant::now();
+    let mut turn_started = false;
+    while started.elapsed() < Duration::from_secs(20) {
+        match c.recv_outcome() {
+            Recv::Msg(m) => {
+                if matches!(
+                    &*m,
+                    ServerMsg::Event {
+                        event: UiEventMsg::UserMessage(_),
+                        ..
+                    }
+                ) {
+                    turn_started = true;
+                    break;
+                }
+            }
+            Recv::Garbage | Recv::Timeout => continue,
+            Recv::Closed => break,
+        }
+    }
+    assert!(
+        turn_started,
+        "the turn never started, so there was nothing to interrupt"
+    );
 
     let started = Instant::now();
     c.send(&ClientMsg::Interrupt {
         kind: InterruptKind::Turn,
     });
 
-    // The turn must end promptly; without the fix TurnDone never arrives.
+    // The turn must end promptly; without the fix TurnDone never arrives. A read
+    // timeout means "not yet" — only a closed socket means "never".
     let mut saw_turn_done = false;
-    while started.elapsed() < Duration::from_secs(6) {
-        match c.recv() {
-            Some(ServerMsg::Event {
-                event: UiEventMsg::TurnDone,
-                ..
-            }) => {
-                saw_turn_done = true;
-                break;
+    while started.elapsed() < Duration::from_secs(20) {
+        match c.recv_outcome() {
+            Recv::Msg(m) => {
+                if matches!(
+                    &*m,
+                    ServerMsg::Event {
+                        event: UiEventMsg::TurnDone,
+                        ..
+                    }
+                ) {
+                    saw_turn_done = true;
+                    break;
+                }
             }
-            Some(_) => continue,
-            None => break,
+            Recv::Garbage | Recv::Timeout => continue,
+            Recv::Closed => break,
         }
     }
     assert!(

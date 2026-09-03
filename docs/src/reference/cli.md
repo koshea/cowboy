@@ -4,7 +4,7 @@
      Do not edit by hand. Regenerate with:
      COWBOY_REGEN_DOCS=1 cargo test -p cowboy-cli --test cli_docs -->
 
-An opinionated local coding agent that runs wild inside a Docker corral.
+An opinionated local coding agent that runs wild inside a corral you own.
 
 ## `cowboy` (global options)
 
@@ -150,16 +150,16 @@ Show one decision by id
 
 ## `cowboy doctor`
 
-Check Docker, Linux support, model config, network gateway, and Compose
+Check kernel prerequisites, model config, and the egress gateway
 
 
 ## `cowboy down`
 
-Stop and remove this project's agent + gateway containers and networks
+End this project's running sessions and release their sandboxes
 
 | Arg | Description |
 |-----|-------------|
-| `--all` | Remove ALL cowboy-managed containers and networks (every project) |
+| `--all` | End sessions for EVERY project, not just this one |
 
 
 ## `cowboy grant`
@@ -381,7 +381,7 @@ Set the default model. Writes to the project unless `--global`
 
 ## `cowboy patch`
 
-Patch helper (wraps git inside the container)
+Patch helper (wraps git inside the sandbox)
 
 
 ### `cowboy patch apply`
@@ -639,7 +639,7 @@ Read-only review of a session's output (or a branch): prints a bundle and record
 
 ## `cowboy run`
 
-Run a command inside the agent container
+Run a command inside the agent sandbox
 
 | Arg | Description |
 |-----|-------------|
@@ -667,7 +667,7 @@ Print the confinement plan for this project: what the agent can read, write, and
 
 ## `cowboy secrets`
 
-Grant host credentials (gh, gcloud, kubectl, …) into the container
+Grant host credentials (gh, gcloud, kubectl, …) into the sandbox
 
 
 ### `cowboy secrets add`
@@ -677,7 +677,7 @@ Print a paste-ready grant (a known preset and/or explicit env/file grants) to ad
 | Arg | Description |
 |-----|-------------|
 | `<PRESET>` | A known tool preset: gh, gcloud, kubectl, aws, git, ssh |
-| `--env` | Grant an env var into the container: `NAME` or `NAME=HOST_ENV` |
+| `--env` | Grant an env var into the sandbox: `NAME` or `NAME=HOST_ENV` |
 | `--file` | Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET` |
 | `--global` | Write to the cross-project user overlay instead of this worktree's |
 | `--repo` | Print a snippet to paste into the repo's .cowboy/security.yaml instead of writing your personal (home-dir) overlay |
@@ -709,7 +709,7 @@ List sessions tracked by the daemon
 
 ## `cowboy shell`
 
-Open an interactive shell inside the agent container
+Open an interactive shell inside the agent sandbox
 
 
 ## `cowboy skill`
@@ -797,7 +797,7 @@ Summarize a branch's changes + mergeability vs HEAD (read-only)
 
 ## `cowboy x-fileop`
 
-Internal: in-container worker for the structured file tools (reads a JSON request on stdin). Not for direct use
+Internal: in-sandbox worker for the structured file tools (reads a JSON request on stdin). Not for direct use
 
 
 ## `cowboy x-sandbox-holder`

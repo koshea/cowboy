@@ -186,9 +186,15 @@ window (prompt + completion); Cowboy prunes history to fit it. `max_tokens` is t
 cap on a *single response's output* — not always 8192. Tune it to the model's real
 max output (e.g. Claude Sonnet 4.6 ≈ 64k, Opus 4.8 ≈ 128k) but keep it a sane
 agent cap (16k–32k is a good sweet spot — enough for a long file/edit without
-letting one response run away). Cowboy reserves `max_tokens` of the window for the
-answer when pruning, so `prompt + output` never exceeds `context_window`; setting
-it accurately keeps requests valid even when the context is nearly full.
+letting one response run away).
+
+Cowboy reserves `max_tokens` from the window for the answer, plus the tool schemas
+(~3.6k tokens, sent on every request) and a small headroom floor; what remains is the
+budget the conversation may occupy. So the two settings interact: a large `max_tokens`
+against a modest `context_window` leaves little room for history and makes compaction
+frequent. `/context` shows the split for the current session, and if the window cannot
+hold the reserve at all Cowboy tells you which number to change rather than letting the
+request fail at the provider.
 
 **`summarizer`** (optional): names a model used for Cowboy's internal
 summarization — folding old history into a summary when the context window fills,
