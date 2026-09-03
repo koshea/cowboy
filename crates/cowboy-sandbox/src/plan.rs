@@ -178,6 +178,64 @@ pub const SHIM_PATH: &str = "/.cowboy-shim";
 /// versions they actually installed, with nothing to build or pull.
 const HOST_TOOLCHAIN_DIRS: &[&str] = &["/usr", "/opt"];
 
+/// The user's own tool directories, exposed read-only when `sandbox.host_tools` is on.
+///
+/// `/usr` covers what the system package manager installed and nothing else, which
+/// leaves the agent with a quietly *different* toolchain from the person directing it.
+/// On a machine where `cargo` is a rustup shim in `~/.cargo/bin`, the agent silently
+/// got Gentoo's `/usr/bin/cargo` instead — a different version — and nothing installed
+/// with `pipx`, `uv tool`, `npm -g --prefix=~/.local`, `go install` or `cargo install`
+/// existed at all.
+///
+/// Bound at their **host paths**, not somewhere tidier, because that is what the
+/// contents refer to: these directories are full of interpreter shebangs and symlinks
+/// written as absolute host paths, and a script relocated out from under them breaks.
+///
+/// Read-only throughout. The agent may run the user's tools; it may not rewrite them,
+/// which would be host code execution on the user's next shell command.
+const HOST_USER_BIN_DIRS: &[&str] = &["~/.local/bin", "~/bin", "~/.cargo/bin", "~/go/bin"];
+
+/// Support directories the entries in [`HOST_USER_BIN_DIRS`] resolve *into*.
+///
+/// Binding the `bin` directory alone is a half-measure that fails in a confusing way:
+/// `~/.cargo/bin/cargo` is a rustup shim that needs `~/.rustup` to find a toolchain,
+/// and much of `~/.local/bin` is symlinks into `~/.local/share/uv`. The tool appears
+/// to be installed and then fails to run.
+///
+/// Deliberately specific rather than `~/.local/share`, which also holds `keyrings`.
+/// The denylist refuses that either way — this list is checked against it like any
+/// other bind — but naming the tool directories keeps the intent legible instead of
+/// relying on a refusal to trim an over-broad request.
+const HOST_USER_TOOL_DIRS: &[&str] = &[
+    "~/.rustup",
+    "~/.local/share/uv",
+    "~/.local/share/pnpm",
+    "~/.local/lib",
+];
+
+/// Environment variables that point a tool at its data directory, for tools that
+/// would otherwise look under `$HOME` — which the sandbox redirects into the project.
+///
+/// Without `RUSTUP_HOME`, binding `~/.cargo/bin` gets you a rustup shim that resolves
+/// on `PATH` and then refuses to run: *"could not choose a version of cargo to run,
+/// because ... no default is configured"*, because it looked for its settings under
+/// the redirected `HOME` and found nothing. The bind is useless without the variable,
+/// so they belong together.
+///
+/// Only set when the directory in question was actually bound. Each points at a
+/// **read-only** bind, so the tool can run what the user installed but not modify it:
+/// `cargo build` works, `rustup update` does not. That is the intended asymmetry —
+/// mutating the user's toolchain from inside a sandbox is not a thing an agent should
+/// be able to do on its own.
+///
+/// `CARGO_HOME` is deliberately absent. It is where cargo *writes* its registry cache,
+/// so pointing it at the read-only `~/.cargo` would break every build; it stays under
+/// the sandbox's own `HOME`.
+const HOST_TOOL_ENV: &[(&str, &str)] = &[
+    ("~/.rustup", "RUSTUP_HOME"),
+    ("~/.local/share/pnpm", "PNPM_HOME"),
+];
+
 /// Symlinks recreating a merged-`/usr` layout, so `/bin/sh` and `/lib64/ld.so`
 /// resolve after `pivot_root` onto a fresh root.
 const USR_SYMLINKS: &[(&str, &str)] = &[
@@ -286,6 +344,49 @@ impl SandboxPlan {
             let p = PathBuf::from(entry);
             if probe.exists(&p) {
                 binds.push(Bind::ro(p, *entry, "toolchain configuration"));
+            }
+        }
+
+        // 1b. The user's own tools, read-only. Collected separately because the bin
+        //     directories also go on `PATH` — the sandbox starts from a cleared
+        //     environment, so a directory the agent cannot find is a directory it does
+        //     not have.
+        let mut user_bin_dirs: Vec<String> = Vec::new();
+        let mut tool_env: Vec<(String, String)> = Vec::new();
+        if sec.sandbox.host_tools {
+            for (raw, why) in HOST_USER_BIN_DIRS
+                .iter()
+                .map(|r| (r, "your tools (read-only)"))
+                .chain(
+                    HOST_USER_TOOL_DIRS
+                        .iter()
+                        .map(|r| (r, "toolchain data for your tools (read-only)")),
+                )
+            {
+                let Some(path) = probe.expand(raw) else {
+                    continue;
+                };
+                if !probe.exists(&path) {
+                    continue;
+                }
+                // Checked against the denylist like any other bind. These are
+                // hardcoded, but the denylist is the one place that knows what counts
+                // as a secret store, and a home-relative default has no business
+                // being the exception to it. Read-only exposure only — see
+                // `DenyReason::blocks_read_only`.
+                if let Some(reason) = denylist.check(&path) {
+                    if reason.blocks_read_only() {
+                        continue;
+                    }
+                }
+                let target = path.to_string_lossy().into_owned();
+                if HOST_USER_BIN_DIRS.contains(raw) {
+                    user_bin_dirs.push(target.clone());
+                }
+                if let Some((_, var)) = HOST_TOOL_ENV.iter().find(|(d, _)| *d == *raw) {
+                    tool_env.push((var.to_string(), target.clone()));
+                }
+                binds.push(Bind::ro(path, target, why));
             }
         }
 
@@ -422,7 +523,7 @@ impl SandboxPlan {
         }
 
         let limits = resolve_limits(sec);
-        let env = build_env(sec, &workdir, &limits);
+        let env = build_env(sec, &workdir, &limits, &user_bin_dirs, tool_env);
         let proc_at = "/proc".to_string();
         let dev_at = "/dev".to_string();
 
@@ -581,15 +682,46 @@ fn resolve_limits(sec: &SecurityConfig) -> ResourceLimits {
 /// Environment for the command. No `HOME=/tmp` workaround is needed any more:
 /// under Docker the agent ran as a uid with no passwd entry, so `HOME` had to
 /// point somewhere world-writable. Here it gets an ordinary, confined home.
+/// `PATH` for the sandbox: the user's tool directories first, then the system's.
+///
+/// Set explicitly because the environment is cleared, and until now nothing set it —
+/// the shell's compiled-in fallback happened to be reasonable, which is not the same
+/// as it being decided. A bound directory the shell does not look in is a directory
+/// the agent does not have.
+///
+/// User directories come **first**, which is where they sit in the user's own `PATH`
+/// and is the point of the exercise: the agent should resolve `cargo` to the same
+/// binary its user does, not to a different version of it further down.
+fn sandbox_path(user_bin_dirs: &[String]) -> String {
+    const SYSTEM: &[&str] = &[
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    ];
+    user_bin_dirs
+        .iter()
+        .map(String::as_str)
+        .chain(SYSTEM.iter().copied())
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
 fn build_env(
     sec: &SecurityConfig,
     workdir: &str,
     limits: &ResourceLimits,
+    user_bin_dirs: &[String],
+    tool_env: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("HOME".to_string(), format!("{workdir}/.cowboy/home")),
         ("COWBOY_SANDBOX".to_string(), "1".to_string()),
+        ("PATH".to_string(), sandbox_path(user_bin_dirs)),
     ];
+    env.extend(tool_env);
     if let Some(j) = limits.jobs {
         let j = j.to_string();
         for k in [
@@ -710,6 +842,163 @@ mod tests {
         let root = Path::new("/srv/proj");
         let mask = Path::new("/run/cowboy/mask");
         SandboxPlan::build(&inputs(root, security, grants, mask), probe)
+    }
+
+    /// A host with the user's own tool directories present.
+    fn host_with_user_tools() -> FakeHost {
+        host().with_existing([
+            "/home/dev/.local/bin",
+            "/home/dev/.cargo/bin",
+            "/home/dev/go/bin",
+            "/home/dev/.rustup",
+            "/home/dev/.local/share/uv",
+        ])
+    }
+
+    fn ro_targets(plan: &SandboxPlan) -> Vec<&str> {
+        plan.binds
+            .iter()
+            .filter(|b| b.mode == BindMode::ReadOnly)
+            .map(|b| b.target.as_str())
+            .collect()
+    }
+
+    fn env_of<'a>(plan: &'a SandboxPlan, key: &str) -> Option<&'a str> {
+        plan.env
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The user's tools are exposed read-only and **at their host paths**. The path is
+    /// not cosmetic: these directories are full of absolute interpreter shebangs and
+    /// symlinks, so a script relocated somewhere tidier stops working.
+    #[test]
+    fn the_users_own_tool_directories_are_exposed_read_only() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host_with_user_tools()).unwrap();
+        for dir in [
+            "/home/dev/.local/bin",
+            "/home/dev/.cargo/bin",
+            "/home/dev/go/bin",
+            "/home/dev/.rustup",
+            "/home/dev/.local/share/uv",
+        ] {
+            let bind = plan
+                .binds
+                .iter()
+                .find(|b| b.target == dir)
+                .unwrap_or_else(|| panic!("{dir} should be exposed"));
+            assert_eq!(bind.source, Path::new(dir), "bound at its host path");
+            assert_eq!(bind.mode, BindMode::ReadOnly, "{dir} must not be writable");
+        }
+        // A directory the host does not have is simply absent, not a failure.
+        assert!(!ro_targets(&plan).contains(&"/home/dev/bin"));
+    }
+
+    /// A bound directory the shell does not search is a directory the agent does not
+    /// have: the environment is cleared, so `PATH` has to be set here. The user's
+    /// directories come first, so `cargo` resolves to the same binary its user gets
+    /// rather than to a different version further down.
+    #[test]
+    fn path_puts_the_users_tools_ahead_of_the_system() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host_with_user_tools()).unwrap();
+        let path = env_of(&plan, "PATH").expect("PATH must be set explicitly");
+        let entries: Vec<&str> = path.split(':').collect();
+        let local = entries
+            .iter()
+            .position(|e| *e == "/home/dev/.local/bin")
+            .expect("~/.local/bin on PATH");
+        let usr = entries
+            .iter()
+            .position(|e| *e == "/usr/bin")
+            .expect("/usr/bin on PATH");
+        assert!(local < usr, "the user's tools come first: {path}");
+        // Only bin directories go on PATH; the data directories are not searched.
+        assert!(!entries.contains(&"/home/dev/.rustup"));
+    }
+
+    /// Binding `~/.cargo/bin` without `RUSTUP_HOME` yields a shim that resolves and
+    /// then refuses to run, because it looks for its settings under the redirected
+    /// `HOME`. `CARGO_HOME` must NOT be redirected the same way: that is where cargo
+    /// *writes* its registry cache, and pointing it at a read-only bind breaks builds.
+    #[test]
+    fn a_bound_toolchain_dir_gets_the_variable_that_finds_it() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host_with_user_tools()).unwrap();
+        assert_eq!(env_of(&plan, "RUSTUP_HOME"), Some("/home/dev/.rustup"));
+        assert_eq!(
+            env_of(&plan, "CARGO_HOME"),
+            None,
+            "CARGO_HOME must stay writable under the sandbox's own HOME"
+        );
+        // Not set when the directory is not there to point at.
+        let bare = plan_with(&sec, &[], &host()).unwrap();
+        assert_eq!(env_of(&bare, "RUSTUP_HOME"), None);
+    }
+
+    /// `host_tools: false` is a real off switch, for a sandbox that should see only
+    /// what the system package manager installed.
+    #[test]
+    fn host_tools_can_be_turned_off() {
+        let sec = SecurityConfig {
+            sandbox: cowboy_core::config::SandboxConfig {
+                host_tools: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_with(&sec, &[], &host_with_user_tools()).unwrap();
+        for dir in ["/home/dev/.local/bin", "/home/dev/.cargo/bin"] {
+            assert!(!ro_targets(&plan).contains(&dir), "{dir} should be absent");
+        }
+        let path = env_of(&plan, "PATH").unwrap();
+        assert!(!path.contains("/home/dev"), "no user dirs on PATH: {path}");
+        // The system toolchain is still there — this switch is about the user's extras.
+        assert!(ro_targets(&plan).contains(&"/usr"));
+    }
+
+    /// The default list is checked against the denylist like any other bind. A
+    /// home-relative default has no business being the exception to the one place that
+    /// knows what a secret store is.
+    #[test]
+    fn a_tool_directory_that_the_denylist_refuses_is_not_exposed() {
+        // `~/.local/share/keyrings` is a denied store; the plan must never expose it,
+        // and the specific tool directories it lists must not widen to cover it.
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host_with_user_tools()).unwrap();
+        for t in ro_targets(&plan) {
+            assert!(
+                !t.ends_with("/.local/share") && !t.contains("keyrings"),
+                "{t} would expose a secret store"
+            );
+        }
+    }
+
+    /// `~/.cargo/bin` is where `cargo install` puts things — including cowboy itself on
+    /// most machines. The denylist refuses that directory because a *writable* grant
+    /// for it would be host code execution, but a read-only bind is not that hazard:
+    /// the agent can already read and execute the cowboy binary, which the plan binds
+    /// at `SHIM_PATH` by design. Refusing here would cost every `cargo install` user
+    /// their tools to protect nothing.
+    #[test]
+    fn a_read_only_bind_is_not_refused_merely_for_containing_the_cowboy_binary() {
+        let probe = FakeHost {
+            self_exe: Some(PathBuf::from("/home/dev/.cargo/bin/cowboy")),
+            ..host_with_user_tools()
+        };
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &probe).unwrap();
+        assert!(ro_targets(&plan).contains(&"/home/dev/.cargo/bin"));
+
+        // …but a runtime grant for the same path is still refused, because that is the
+        // writable route this protects.
+        let denylist = Denylist::build(&probe, Path::new("/srv/proj"));
+        let reason = denylist
+            .check(Path::new("/home/dev/.cargo/bin"))
+            .expect("a grant for it must still be refused");
+        assert!(!reason.blocks_read_only(), "but only for write access");
     }
 
     /// The invariant with a dedicated E2E test under Docker, preserved here.

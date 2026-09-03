@@ -84,6 +84,16 @@ pub struct SandboxConfig {
     /// is injected, because not every tool reads the quota.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<CpuLimit>,
+    /// Expose the user's own tool directories (`~/.local/bin`, `~/.cargo/bin` and
+    /// friends) read-only, so the agent runs the same tools the user does.
+    ///
+    /// On by default: `/usr` alone means the agent silently has a *different*
+    /// toolchain from the person directing it — a different `cargo`, and none of the
+    /// things installed with `pipx`, `uv tool`, `npm -g --prefix=~/.local`, `go
+    /// install` or `cargo install`. Set false for a sandbox that sees only what the
+    /// system package manager put on the machine.
+    #[serde(default = "default_true")]
+    pub host_tools: bool,
 }
 
 /// A CPU limit: an explicit core count, or `auto` (resolved from the host).
@@ -663,6 +673,7 @@ impl Default for SandboxConfig {
             mounts: default_mounts(),
             memory: None,
             cpus: None,
+            host_tools: true,
         }
     }
 }
@@ -1282,6 +1293,12 @@ sandbox:
   # restart. Credential stores (~/.aws, ~/.ssh, …) are always refused; use
   # `cowboy secrets add` for those.
   #
+  # Expose your own tool directories read-only (~/.local/bin, ~/bin,
+  # ~/.cargo/bin, ~/go/bin, plus the data dirs they resolve into) and put them on
+  # PATH ahead of the system ones, so the agent runs the same tools you do. With
+  # this off it sees only what your package manager installed — a different
+  # `cargo`, and nothing from pipx / uv tool / go install / cargo install.
+  host_tools: true
   # Resource ceilings, enforced with a cgroup. `cpus` also bounds build
   # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
   # every tool reads the CPU quota. Use `auto` to size from the host

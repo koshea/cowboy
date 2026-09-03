@@ -38,6 +38,24 @@ pub enum DenyReason {
 }
 
 impl DenyReason {
+    /// Does this reason still apply when the exposure is **read-only**?
+    ///
+    /// True for everything except [`DenyReason::CowboyBinary`], whose whole hazard is
+    /// *write* access — "write access to it is arbitrary host code execution on the
+    /// next run". The agent can already read and execute the cowboy binary by design:
+    /// the plan binds it read-only at `SHIM_PATH`, and a system install puts it inside
+    /// the read-only `/usr` bind too. Refusing a read-only bind of a directory that
+    /// happens to contain it would protect nothing and would exclude `~/.cargo/bin` on
+    /// every machine where cowboy was installed with `cargo install` — which is most
+    /// of them.
+    ///
+    /// Every other reason is a *read* hazard: credentials, secret stores, provider
+    /// keys, and the host-owned config that defines the boundary are all compromised
+    /// by being read, so read-only changes nothing about them.
+    pub fn blocks_read_only(&self) -> bool {
+        !matches!(self, DenyReason::CowboyBinary)
+    }
+
     /// A message that tells the user what to do instead, not just "no".
     pub fn explain(&self) -> String {
         match self {

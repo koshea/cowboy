@@ -35,7 +35,7 @@ pub fn run(args: InitArgs) -> Result<()> {
         paths.dir.display()
     );
     println!("  - {} (host-owned, never mounted)", config::SECURITY_FILE);
-    println!("  - {} (mounted into the container)", config::AGENT_FILE);
+    println!("  - {} (read by the agent loop)", config::AGENT_FILE);
 
     // Point the user at provider setup if no home provider is configured yet.
     let has_provider = ProvidersConfig::load_global()

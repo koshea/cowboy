@@ -228,20 +228,92 @@ async fn the_host_toolchain_is_usable() {
     assert!(out.contains("git"), "{out}");
 }
 
+/// The host home is exposed only where the plan says so — the user's tool directories,
+/// read-only — and is otherwise not reachable.
+///
+/// Asserted as a property rather than as one error message. It used to check for "No
+/// such file", which stopped being the truth once tool directories were bound: bwrap
+/// creates `~` as a mount point for them, so the refusal now comes from Landlock
+/// instead. Enumeration being refused is the stronger claim anyway, since it means an
+/// unexposed path cannot even be discovered.
 #[tokio::test]
-async fn the_host_home_directory_is_not_visible() {
+async fn the_host_home_directory_is_not_browsable() {
     skip_if_unsupported!();
     let p = Project::new();
     let home = cowboy_core::config::expand_path("~").unwrap();
+
     let (_code, out) = run(
         &p.path(),
-        &format!("ls {} 2>&1 || true", home.display()),
+        &format!("ls {}/ 2>&1 || true", home.display()),
         60,
     )
     .await;
     assert!(
-        out.contains("No such file") || out.contains("cannot access"),
-        "the host home directory must not be reachable: {out}"
+        out.contains("Permission denied") || out.contains("No such file"),
+        "the host home directory must not be enumerable: {out}"
+    );
+
+    // Directories that exist on the host and were not exposed stay unreachable, and
+    // `~/.local/share` in particular must not be listable — that is where the login
+    // keyring lives, and binding `~/.local/share/uv` must not open its parent.
+    for sub in [".cache", ".local/share", ".config"] {
+        let path = home.join(sub);
+        if !path.exists() {
+            continue;
+        }
+        let (_code, out) = run(
+            &p.path(),
+            &format!("ls {}/ 2>&1 || true", path.display()),
+            60,
+        )
+        .await;
+        assert!(
+            out.contains("Permission denied") || out.contains("No such file"),
+            "~/{sub} was not exposed and must not be reachable: {out}"
+        );
+    }
+}
+
+/// The other half: the tool directories that *are* exposed work, and are read-only.
+///
+/// Without this the test above could pass by exposing nothing at all, which is exactly
+/// the failure mode that made the agent's toolchain differ from its user's.
+#[tokio::test]
+async fn the_users_own_tools_are_runnable_but_not_writable() {
+    skip_if_unsupported!();
+    let home = cowboy_core::config::expand_path("~").unwrap();
+    let bin = home.join(".local/bin");
+    if !bin.exists() {
+        eprintln!("skipping: this host has no ~/.local/bin");
+        return;
+    }
+    let p = Project::new();
+
+    let (code, out) = run(&p.path(), &format!("ls {}/ >/dev/null", bin.display()), 60).await;
+    assert_eq!(code, 0, "~/.local/bin should be readable: {out}");
+
+    let (_code, out) = run(
+        &p.path(),
+        &format!("touch {}/EVIL 2>&1 || true", bin.display()),
+        60,
+    )
+    .await;
+    assert!(
+        out.contains("Read-only file system") || out.contains("Permission denied"),
+        "the user's tools must not be writable — that is host code execution on their \
+         next shell command: {out}"
+    );
+    assert!(
+        !bin.join("EVIL").exists(),
+        "nothing may be created in the user's bin directory"
+    );
+
+    // And it is actually on PATH, which is what makes the bind useful.
+    let (code, out) = run(&p.path(), "echo $PATH", 60).await;
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains(&bin.display().to_string()),
+        "~/.local/bin must be on PATH: {out}"
     );
 }
 

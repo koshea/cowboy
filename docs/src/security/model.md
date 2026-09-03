@@ -43,9 +43,19 @@ $ cowboy sandbox plan
   compilers and runtimes you actually installed, at your versions, with nothing to
   build or pull. `/etc` is an allowlist rather than the whole directory, because
   `/etc` holds shadow, ssh host keys, and every service credential on the box.
+- **Your own tool directories, read-only** — `~/.local/bin`, `~/bin`,
+  `~/.cargo/bin`, `~/go/bin`, and the data directories they resolve into
+  (`~/.rustup`, `~/.local/share/uv`, …). `/usr` alone covers only what your package
+  manager installed, which leaves the agent with a quietly *different* toolchain from
+  yours: a different `cargo`, and nothing from `pipx`, `uv tool`, `go install` or
+  `cargo install` at all. They go on `PATH` ahead of the system directories, so the
+  agent resolves a command to the same binary you do. Set
+  `sandbox.host_tools: false` for a sandbox that sees only system packages.
 - **The project, read-write**, at the workdir (`/workspace` by default).
-- **Nothing else.** Your home directory, other projects, and the rest of the
-  machine are simply absent — not merely unreadable.
+- **Nothing else.** Other projects and the rest of the machine are simply absent.
+  Your home directory is not *browsable*: only the directories named above are
+  exposed, and `~` itself cannot even be listed, so an unexposed path under it cannot
+  be discovered — `~/.local/share/uv` is reachable while `~/.local/share` is not.
 - **The root filesystem is remounted read-only** as the last mount operation.
   Without it the synthetic root is writable, which would put `/etc/ld.so.preload`
   within reach.

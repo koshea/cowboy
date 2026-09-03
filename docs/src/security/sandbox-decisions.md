@@ -335,8 +335,64 @@ on one project are two independent sessions. Sharing one directory meant
 deleted it on the way out. A directory whose owner is gone is reaped on the next
 start, since `SIGKILL` leaves nothing a chance to clean up after itself.
 
-## The config mask must not be a shared path
+## The user's tools have to come along, at their host paths
 
+`/usr` and `/opt` alone are not "the machine's toolchain". They are what the package
+manager installed, and on a developer's box a great deal of the toolchain is not
+there. Measured on the machine this was written on: `cargo` resolved to Gentoo's
+`/usr/bin/cargo` 1.97.1 inside the sandbox while the user's own shell got the rustup
+shim's 1.97.0, and 91 tools in `~/.local/bin` — `uv tool` installs, `pipx` scripts,
+language servers — did not exist at all. An agent quietly using a different toolchain
+from the person directing it produces failures that are very hard to attribute.
+
+So `~/.local/bin`, `~/bin`, `~/.cargo/bin` and `~/go/bin` are bound read-only by
+default (`sandbox.host_tools`, on), and go on `PATH` **ahead** of the system
+directories — the same order the user's own `PATH` has, for the same reason.
+
+Three things that are not obvious:
+
+- **Bound at their host paths**, not somewhere tidier. These directories are full of
+  absolute interpreter shebangs (`#!/usr/bin/python3.9`) and symlinks into
+  `~/.local/share/uv/tools/...`; a script relocated out from under them breaks.
+- **The bin directory alone is a half-measure.** `~/.cargo/bin/cargo` is a rustup shim
+  that needs `~/.rustup`, and much of `~/.local/bin` is symlinks into
+  `~/.local/share/uv`. So the data directories those resolve into are bound too, and
+  `RUSTUP_HOME` is set — without it the shim resolves on `PATH` and then refuses to
+  run, reporting no default toolchain, because it looked under the sandbox's
+  redirected `HOME`. A bind that needs a variable to be usable belongs with it.
+- **`CARGO_HOME` is deliberately not redirected.** That is where cargo *writes* its
+  registry cache; pointing it at the read-only `~/.cargo` would break every build. It
+  stays under the sandbox's own `HOME`, so the agent has its own cache.
+
+`PATH` is now set explicitly, which it was not before — the environment is cleared, so
+the shell had been falling back to its compiled-in default. That happened to be
+reasonable, which is not the same as it being decided, and a bound directory the shell
+does not search is a directory the agent does not have.
+
+### What this widens, and what it does not
+
+This is a real widening of the default boundary, so it is worth being precise about
+its shape. It is **read-only** throughout: the agent may run the user's tools and may
+not rewrite them, which would be host code execution on the user's next shell command.
+The home directory does not become browsable — `~` and `~/.local/share` cannot even be
+*listed*, because only the named directories get a Landlock rule, so an unexposed path
+under them cannot be discovered. `~/.local/share/uv` is reachable; `~/.local/share`,
+and therefore `~/.local/share/keyrings`, is not.
+
+The default list is checked against the runtime-grant denylist like any other bind.
+A home-relative default has no business being the exception to the one place that
+knows what counts as a secret store.
+
+The single exception is deliberate and narrow: `DenyReason::CowboyBinary` does not
+refuse a **read-only** bind. Its hazard is write access — "arbitrary host code
+execution on the next run" — and the agent can already read and execute the cowboy
+binary, which the plan binds at `/.cowboy-shim` by design and which a system install
+puts inside the read-only `/usr` bind anyway. Refusing here would exclude
+`~/.cargo/bin` on every machine where cowboy was installed with `cargo install`, to
+protect nothing. A *grant* for that directory is still refused, because that is the
+writable route.
+
+## The config mask must not be a shared path
 The empty file bound over `security.yaml` and `models.yaml` started life as one path
 under the cache directory, rewritten (fresh temp file, `rename` into place) by every
 cowboy process that opened a sandbox. On a machine running several at once, many
