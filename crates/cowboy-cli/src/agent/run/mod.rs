@@ -149,7 +149,6 @@ pub struct AgentLoop<'a> {
     cancel: CancellationToken,
     /// Model context window (tokens) for history pruning.
     context_window: usize,
-    pruned_notified: bool,
     /// Consecutive summarize-and-reprime attempts after a reasoning-budget
     /// truncation, reset to 0 whenever a turn produces content or a tool call.
     /// Bounds recovery so a model that always truncates can't spin.
@@ -163,6 +162,13 @@ pub struct AgentLoop<'a> {
     reasoning_shed_notified: bool,
     /// Cached token cost of `tools`, which is fixed once MCP tools are merged in.
     tools_tokens_cache: std::sync::OnceLock<usize>,
+    /// The current task statement, remembered so pruning and compaction can protect
+    /// it wherever it sits.
+    ///
+    /// Held as content rather than an index because every prune and fold rebuilds
+    /// `messages`, and an index would need fixing up at each one — the kind of
+    /// bookkeeping that silently rots. Identified by content, which cannot go stale.
+    task: Option<String>,
     /// One-shot latch so the "output limit may be too low" warning fires once.
     output_limit_warned: bool,
     /// Recursion depth for subagents (0 = top-level).
@@ -539,11 +545,11 @@ impl<'a> AgentLoop<'a> {
             behavior,
             cancel,
             context_window,
-            pruned_notified: false,
             reprime_attempts: 0,
             minimize_reasoning_next_turn: false,
             reasoning_shed_notified: false,
             tools_tokens_cache: std::sync::OnceLock::new(),
+            task: None,
             output_limit_warned: false,
             subagent_depth,
             last_final: None,
@@ -940,6 +946,9 @@ impl<'a> AgentLoop<'a> {
 
         let old: Vec<Message> = self.messages[1..keep_from].to_vec();
         let folded = old.len();
+        // A resumed session has the task somewhere in this span rather than at the
+        // head; carry it through verbatim instead of summarizing it away.
+        let task = self.task_in(1..keep_from);
         let summary = match self.summarize(&old).await {
             Ok(s) if !s.trim().is_empty() => s,
             _ => {
@@ -947,8 +956,11 @@ impl<'a> AgentLoop<'a> {
                 return;
             }
         };
-        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 1);
+        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 2);
         rebuilt.push(self.messages[0].clone());
+        if let Some(task) = task {
+            rebuilt.push(task);
+        }
         rebuilt.push(Message::system(format!(
             "[Summary of earlier conversation, compacted to save context]\n{summary}"
         )));
@@ -964,11 +976,37 @@ impl<'a> AgentLoop<'a> {
     /// agent that loses its task keeps working with no idea what it's working on —
     /// the classic goal-drift failure of a long autonomous run.
     fn pinned(&self) -> usize {
-        if self.messages.len() > 1 && self.messages[1].role == Role::User {
-            2
-        } else {
-            1
+        let Some(first) = self.messages.get(1) else {
+            return 1;
+        };
+        if first.role != Role::User {
+            return 1;
         }
+        match self.task.as_deref() {
+            // The task is known: pin it only if it really is at the head.
+            Some(task) => usize::from(first.content == task) + 1,
+            // No task recorded (a caller that seeded `messages` directly): fall back
+            // to the old positional guess, so this is never worse than before.
+            None => 2,
+        }
+    }
+
+    /// The task statement, if a fold over `span` would swallow it.
+    ///
+    /// After `--resume` the task is **not** at index 1: `with_history` inserts the
+    /// previous session's transcript there, so `messages[1]` is that session's oldest
+    /// user message. `pinned()` used to return 2 for any user message in that slot,
+    /// which meant a resumed session pinned stale history and left the real task
+    /// protected only by being recent — until a fold reached it. Whatever survives, the
+    /// task must: an agent that loses it keeps working with no idea what it is working
+    /// on, which is the goal-drift failure the pin exists to prevent.
+    fn task_in(&self, span: std::ops::Range<usize>) -> Option<Message> {
+        let task = self.task.as_deref()?;
+        self.messages
+            .get(span)?
+            .iter()
+            .find(|m| m.role == Role::User && m.content == task)
+            .cloned()
     }
 
     /// Fold the middle of an over-long *single turn* into a summary, keeping the
@@ -997,6 +1035,7 @@ impl<'a> AgentLoop<'a> {
 
         let old: Vec<Message> = self.messages[pin..cut].to_vec();
         let folded = old.len();
+        let task = self.task_in(pin..cut);
         let Ok(summary) = self.summarize(&old).await else {
             self.drop_oldest(budget);
             return;
@@ -1005,8 +1044,11 @@ impl<'a> AgentLoop<'a> {
             self.drop_oldest(budget);
             return;
         }
-        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 1);
+        let mut rebuilt = Vec::with_capacity(self.messages.len() - folded + 2);
         rebuilt.extend_from_slice(&self.messages[..pin]);
+        if let Some(task) = task {
+            rebuilt.push(task);
+        }
         rebuilt.push(Message::system(format!(
             "[Summary of earlier work on this task, compacted to save context]\n{summary}"
         )));
@@ -1097,22 +1139,61 @@ impl<'a> AgentLoop<'a> {
     /// Last-resort pruning: drop the oldest messages, never the pinned head (the
     /// system prompt **and the task**), skipping orphaned tool results, until
     /// within budget.
+    /// Last resort when a summary can't be made: drop the oldest history until the
+    /// conversation fits.
+    ///
+    /// Rebuilds rather than removing repeatedly. The old loop called `total_tokens()`
+    /// once per removed message, re-tokenizing the whole conversation each time — O(n²)
+    /// on the path taken when the model is already struggling. This walks backwards
+    /// once, keeping the newest messages that fit.
+    ///
+    /// The system prompt and the task statement always survive, wherever the task sits
+    /// (after `--resume` it is not in the head). A tool result is only kept if the
+    /// assistant turn that called it is kept too, since providers reject a result with
+    /// no matching call.
     fn drop_oldest(&mut self, budget: usize) {
-        let mut pruned = false;
         let pin = self.pinned();
-        while self.messages.len() > pin + 1 && self.total_tokens() > budget {
-            self.messages.remove(pin);
-            // Removing an assistant turn orphans its tool results — drop those too,
-            // or the provider sees results with no matching call.
-            while self.messages.len() > pin && self.messages[pin].role == Role::Tool {
-                self.messages.remove(pin);
+        let head: Vec<Message> = self.messages[..pin].to_vec();
+        let task = self.task_in(pin..self.messages.len());
+        let mut used: usize = head.iter().map(Self::message_tokens).sum();
+        used += task.as_ref().map(Self::message_tokens).unwrap_or(0);
+
+        // Newest-first, stopping at the budget.
+        let mut tail: Vec<Message> = Vec::new();
+        for m in self.messages[pin..].iter().rev() {
+            if Some(&m.content) == self.task.as_ref() && m.role == Role::User {
+                continue; // already accounted for above
             }
-            pruned = true;
+            let cost = Self::message_tokens(m);
+            if used + cost > budget {
+                break;
+            }
+            used += cost;
+            tail.push(m.clone());
         }
-        if pruned && !self.pruned_notified {
-            self.pruned_notified = true;
-            self.ui.notice("context window full; pruned older history");
+        tail.reverse();
+        // A leading tool result would answer a call that is no longer present.
+        while tail.first().is_some_and(|m| m.role == Role::Tool) {
+            tail.remove(0);
         }
+
+        let dropped = self.messages.len() - (head.len() + usize::from(task.is_some()) + tail.len());
+        if dropped == 0 {
+            return;
+        }
+        let mut rebuilt = head;
+        if let Some(task) = task {
+            rebuilt.push(task);
+        }
+        rebuilt.extend(tail);
+        self.messages = rebuilt;
+
+        // Reported every time, with a count. This used to be a one-shot notice, so a
+        // session that kept shedding history looked like it had shed it once — and
+        // dropping history is the lossy path, the one worth knowing about repeatedly.
+        self.ui.notice(&format!(
+            "context window full; dropped {dropped} older message(s) without summarizing"
+        ));
     }
 
     /// Attach a session logger (records transcript, commands, final summary).
@@ -1145,11 +1226,46 @@ impl<'a> AgentLoop<'a> {
     /// session keeps its own system prompt; `history` should be system-free
     /// (see [`crate::session::load_history`]).
     pub fn with_history(mut self, history: Vec<Message>) -> Self {
+        // Bound what a resume drags in. The transcript on disk is unbounded and has no
+        // relationship to the window of whatever model is resuming it, so loading it
+        // whole meant the first request either overflowed or immediately paid for a
+        // compaction call that threw most of it away. Half the budget leaves room for
+        // the turn the user actually came to run.
+        let allowance = self.context_budget() / 2;
+        let history = Self::tail_within(history, allowance);
         // Insert after messages[0] (system), preserving order, before any task.
         for (i, m) in history.into_iter().enumerate() {
             self.messages.insert(1 + i, m);
         }
         self
+    }
+
+    /// The newest messages of `history` that fit in `allowance`, in order.
+    ///
+    /// Trims from the front, then drops any leading `Tool` message and any leading
+    /// assistant turn whose tool calls were left behind — a result with no call, or a
+    /// call with no result, is the shape providers reject.
+    fn tail_within(history: Vec<Message>, allowance: usize) -> Vec<Message> {
+        let mut kept: std::collections::VecDeque<Message> = std::collections::VecDeque::new();
+        let mut used = 0usize;
+        for m in history.into_iter().rev() {
+            let cost = Self::message_tokens(&m);
+            if used + cost > allowance && !kept.is_empty() {
+                break;
+            }
+            used += cost;
+            kept.push_front(m);
+            if used >= allowance {
+                break;
+            }
+        }
+        while kept
+            .front()
+            .is_some_and(|m| m.role == Role::Tool || !m.tool_calls.is_empty())
+        {
+            kept.pop_front();
+        }
+        kept.into()
     }
 
     /// Set the active model's per-1M-token USD pricing (used for the running
@@ -1446,6 +1562,7 @@ impl<'a> AgentLoop<'a> {
             l.log_message(&user_msg);
         }
         self.messages.push(user_msg);
+        self.task = Some(task.to_string());
 
         for _ in 0..self.behavior.max_iterations {
             if self.cancel.is_cancelled() {
@@ -3991,6 +4108,198 @@ mod tests {
     /// dispatch rather than by calling the helper, because the bug was that three arms
     /// never reached the helper: `subagent` (a child process's whole stdout, times
     /// however many ran in parallel), `mcp` (third-party bytes), and `memory recall`.
+    /// After `--resume`, the task is **not** at index 1 — `with_history` puts the
+    /// previous session's transcript there. `pinned()` used to return 2 for any user
+    /// message in that slot, so a resumed session pinned the *old* session's first
+    /// message and left the real task exposed to the next fold.
+    #[tokio::test]
+    async fn a_resumed_session_pins_the_current_task_not_the_old_one() {
+        let mut ui = RecordingUi::default();
+        let history = vec![
+            Message::user("LAST SESSION: add a parser"),
+            Message::new(Role::Assistant, "did the parser"),
+        ];
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_history(history);
+        // What `run_inner` does when the turn starts.
+        agent
+            .messages
+            .push(Message::user("THE TASK: migrate the db"));
+        agent.task = Some("THE TASK: migrate the db".into());
+
+        // The resumed message is not the task, so only the system prompt is head-pinned.
+        assert_eq!(agent.pinned(), 1);
+
+        for i in 0..60 {
+            agent.messages.push(Message::new(
+                Role::Assistant,
+                format!("intermediate step {i} with plenty of words to spend budget"),
+            ));
+        }
+        agent.drop_oldest(60);
+
+        assert_eq!(agent.messages[0].role, Role::System, "system kept");
+        let contents: Vec<&String> = agent.messages.iter().map(|m| &m.content).collect();
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.contains("THE TASK: migrate the db")),
+            "the current task must survive: {contents:?}"
+        );
+        assert!(
+            !contents.iter().any(|c| c.contains("LAST SESSION")),
+            "stale resumed history should be droppable, not pinned: {contents:?}"
+        );
+    }
+
+    /// The same protection has to hold when history is *summarized* rather than
+    /// dropped: a fold whose span contains the task must carry it through verbatim.
+    #[tokio::test]
+    async fn compaction_carries_the_task_through_verbatim() {
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some("SUMMARY: earlier work".into()),
+            tool_calls: vec![],
+        }]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_history(vec![Message::user("LAST SESSION: something else")]);
+        agent.messages.push(Message::user("THE TASK: ship the fix"));
+        agent.task = Some("THE TASK: ship the fix".into());
+        for i in 0..12 {
+            agent
+                .messages
+                .push(Message::new(Role::Assistant, format!("step {i} detail")));
+            agent.messages.push(Message::user(format!("next {i}")));
+        }
+        set_context_budget(&mut agent, 60);
+        agent.fit_context().await;
+
+        let contents: Vec<&String> = agent.messages.iter().map(|m| &m.content).collect();
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.contains("THE TASK: ship the fix")),
+            "the task must survive compaction verbatim: {contents:?}"
+        );
+    }
+
+    /// A resume must not drag in an unbounded transcript. The file on disk has no
+    /// relationship to the window of whatever model is resuming it, so loading it whole
+    /// either overflowed the first request or paid for a compaction call that
+    /// immediately discarded most of what was just read.
+    #[tokio::test]
+    async fn resumed_history_is_bounded_to_part_of_the_budget() {
+        let mut ui = RecordingUi::default();
+        // A long prior session: 400 turns of real text.
+        let history: Vec<Message> = (0..400)
+            .flat_map(|i| {
+                [
+                    Message::user(format!("prior request {i} with a fair few words in it")),
+                    Message::new(
+                        Role::Assistant,
+                        format!("prior answer {i} with a fair few words in it too"),
+                    ),
+                ]
+            })
+            .collect();
+        // A modest window, so the allowance is smaller than the transcript — which is
+        // the situation being guarded against.
+        let agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            20_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_history(history.clone());
+
+        let loaded = agent.messages.len() - 1; // minus the system prompt
+        assert!(
+            loaded < history.len(),
+            "the whole transcript should not be loaded ({loaded} of {})",
+            history.len()
+        );
+        // It kept the *newest* end, which is the part that matters for continuing.
+        let contents: Vec<&String> = agent.messages.iter().map(|m| &m.content).collect();
+        assert!(
+            contents.iter().any(|c| c.contains("prior answer 399")),
+            "the most recent history should be kept"
+        );
+        assert!(
+            !contents.iter().any(|c| c.contains("prior request 0")),
+            "the oldest history should be dropped"
+        );
+        // And what was loaded fits the allowance it was given.
+        let used: usize = agent.messages[1..]
+            .iter()
+            .map(AgentLoop::message_tokens)
+            .sum();
+        assert!(
+            used <= agent.context_budget() / 2 + 64,
+            "loaded {used} tokens against an allowance of {}",
+            agent.context_budget() / 2
+        );
+    }
+
+    /// A bounded resume must not start mid-tool-call: a `Tool` result whose call was
+    /// trimmed away, or an assistant turn whose results were, is the shape providers
+    /// reject outright.
+    #[test]
+    fn a_bounded_resume_does_not_begin_mid_tool_call() {
+        let history = vec![
+            Message::user("older"),
+            {
+                let mut m = Message::new(Role::Assistant, "calling a tool");
+                m.tool_calls = vec![ToolCall {
+                    id: "c1".into(),
+                    name: "shell".into(),
+                    arguments: "{}".into(),
+                }];
+                m
+            },
+            Message::tool_result("c1", "the result"),
+            Message::new(Role::Assistant, "a clean finish"),
+        ];
+        // An allowance small enough to cut into the tool exchange.
+        let kept = AgentLoop::tail_within(history, 12);
+        assert!(
+            kept.first().is_none_or(|m| m.role != Role::Tool),
+            "must not lead with an orphaned tool result: {kept:?}"
+        );
+        assert!(
+            kept.first().is_none_or(|m| m.tool_calls.is_empty()),
+            "must not lead with an unanswered tool call: {kept:?}"
+        );
+    }
+
+    /// The bound must not be so eager that a short resume loses anything.
+    #[test]
+    fn a_short_resume_is_kept_whole() {
+        let history = vec![
+            Message::user("just one exchange"),
+            Message::new(Role::Assistant, "and its answer"),
+        ];
+        let kept = AgentLoop::tail_within(history.clone(), 100_000);
+        assert_eq!(kept.len(), history.len());
+    }
+
     #[tokio::test]
     async fn tool_results_are_capped_however_they_were_produced() {
         let mut ui = RecordingUi::default();
@@ -4136,7 +4445,13 @@ mod tests {
         agent.fit_context().await;
         assert!(agent.messages.len() < before, "should have pruned");
         assert_eq!(agent.messages[0].role, Role::System, "system kept");
-        assert!(ui.notices.iter().any(|n| n.contains("pruned")));
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("dropped") && n.contains("without summarizing")),
+            "dropping history is lossy and should say so: {:?}",
+            ui.notices
+        );
     }
 
     #[tokio::test]
