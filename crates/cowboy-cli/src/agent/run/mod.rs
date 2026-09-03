@@ -158,6 +158,11 @@ pub struct AgentLoop<'a> {
     /// minimal reasoning effort. One turn only — a model that answered is not the
     /// problem, and permanently dulling its thinking would be a poor trade.
     minimize_reasoning_next_turn: bool,
+    /// One-shot notice that older reasoning is being shed, so a long session does not
+    /// repeat it every turn.
+    reasoning_shed_notified: bool,
+    /// Cached token cost of `tools`, which is fixed once MCP tools are merged in.
+    tools_tokens_cache: std::sync::OnceLock<usize>,
     /// One-shot latch so the "output limit may be too low" warning fires once.
     output_limit_warned: bool,
     /// Recursion depth for subagents (0 = top-level).
@@ -478,6 +483,13 @@ const MAX_REPRIME_ATTEMPTS: u32 = 2;
 
 /// Tokens reserved for the model's response + tool schemas when budgeting.
 const RESPONSE_HEADROOM: usize = 4096;
+
+/// How many recent assistant turns keep their `reasoning` for the round-trip.
+///
+/// Two, because the purpose is continuity across a tool call: the model needs the
+/// thinking that led to the call it is now seeing the result of. Older thinking is
+/// re-derivable from the messages themselves and is pure prompt weight.
+const REASONING_TURNS_KEPT: usize = 2;
 /// Maximum subagent nesting depth (prevents runaway recursion).
 const MAX_SUBAGENT_DEPTH: usize = 2;
 
@@ -530,6 +542,8 @@ impl<'a> AgentLoop<'a> {
             pruned_notified: false,
             reprime_attempts: 0,
             minimize_reasoning_next_turn: false,
+            reasoning_shed_notified: false,
+            tools_tokens_cache: std::sync::OnceLock::new(),
             output_limit_warned: false,
             subagent_depth,
             last_final: None,
@@ -756,17 +770,89 @@ impl<'a> AgentLoop<'a> {
         self.messages.iter().map(Self::message_tokens).sum()
     }
 
+    /// Drop `reasoning` from all but the most recent assistant turns.
+    ///
+    /// Reasoning is round-tripped to the provider on **every** request
+    /// (`inject_reasoning_content`) so an agentic reasoning model keeps its plan
+    /// across tool-use turns. Nothing ever shed it, so it accumulated for the life of
+    /// the session and was re-sent in full each call: measured on a reasoning model at
+    /// ~3k reasoning tokens per turn, turn 31 was carrying ~90k tokens of old thinking
+    /// — far more than the actual work, and the dominant reason a long session starts
+    /// truncating and compacting.
+    ///
+    /// Keeping the plan across tool calls needs the last turn or two, not all of them,
+    /// so this is a large reduction that costs no extra model call. It runs every
+    /// iteration rather than only under pressure: shedding early keeps the
+    /// conversation from ever reaching the point where compaction (which does cost a
+    /// call) is needed.
+    ///
+    /// Only the in-memory copy is trimmed. `transcript.jsonl` was written when each
+    /// message was recorded, so replay and `--resume` still have the full reasoning.
+    fn shed_reasoning(&mut self) -> usize {
+        let mut kept = 0usize;
+        let mut freed = 0usize;
+        for m in self.messages.iter_mut().rev() {
+            let Some(r) = m.reasoning.as_deref() else {
+                continue;
+            };
+            if kept < REASONING_TURNS_KEPT {
+                kept += 1;
+                continue;
+            }
+            freed += cowboy_core::tokens::count(r);
+            m.reasoning = None;
+        }
+        freed
+    }
+
+    /// Tokens the tool schemas add to every request.
+    ///
+    /// Computed once and cached: the set is fixed after construction (MCP tools are
+    /// merged in by `enable_mcp` before the first turn), and re-tokenizing ~16 JSON
+    /// schemas on every iteration would be pure waste.
+    ///
+    /// This is not a rounding error. Measured on the default tool surface: 16
+    /// definitions, ~15.8 KB of JSON, **~3.6k tokens** — sent on every single call and
+    /// previously invisible to the budget, which counted only `messages`.
+    fn tools_tokens(&self) -> usize {
+        *self.tools_tokens_cache.get_or_init(|| {
+            self.tools
+                .iter()
+                .map(|d| {
+                    cowboy_core::tokens::count(&d.name)
+                        + cowboy_core::tokens::count(&d.description)
+                        + serde_json::to_string(&d.parameters)
+                            .map(|s| cowboy_core::tokens::count(&s))
+                            .unwrap_or(0)
+                        + 4
+                })
+                .sum()
+        })
+    }
+
+    /// What the conversation may occupy, after reserving room for everything else in
+    /// the request.
+    ///
+    /// The reserve is the response budget **plus** the tool schemas, plus a small
+    /// floor. It used to be `max(max_output_tokens, RESPONSE_HEADROOM)`, whose comment
+    /// claimed the floor "also covers tool-schema overhead" — but `max` means the
+    /// floor is superseded the moment `max_output_tokens` exceeds it, which is the
+    /// normal case. So the schemas had no allowance at all: with `max_tokens: 32768`
+    /// against a 200k window the slack absorbed them, while a model with
+    /// `max_tokens: 2048` in an 8k window computed a 4096-token budget for a request
+    /// that also carried ~3.6k of schemas — and overflowed at the provider.
+    fn context_budget(&self) -> usize {
+        let reserve = self.model.max_output_tokens() + self.tools_tokens() + RESPONSE_HEADROOM;
+        self.context_window.saturating_sub(reserve)
+    }
+
     /// Keep the conversation within the context window. When it overflows, fold
     /// the oldest whole turns into a single model-generated summary message
     /// rather than dropping them, so earlier decisions, edits, and facts survive.
     /// Compaction happens at user-turn boundaries (turn starts) so a tool result
     /// is never orphaned. Falls back to dropping if a summary can't be made.
     async fn fit_context(&mut self) {
-        // Reserve room for the response: the model's own max output tokens (so
-        // prompt + output never exceeds the window), with RESPONSE_HEADROOM as a
-        // floor that also covers tool-schema overhead.
-        let reserve = self.model.max_output_tokens().max(RESPONSE_HEADROOM);
-        let budget = self.context_window.saturating_sub(reserve);
+        let budget = self.context_budget();
         if budget == 0 || self.total_tokens() <= budget {
             return;
         }
@@ -1325,6 +1411,19 @@ impl<'a> AgentLoop<'a> {
             }
             self.maybe_warn_budget();
 
+            // Shed old reasoning first: it is the largest re-sent term for a
+            // reasoning model, and dropping it is free. Doing it before
+            // `fit_context` often means there is nothing left to compact, which
+            // saves a summarization call.
+            let freed = self.shed_reasoning();
+            if freed > 0 && !self.reasoning_shed_notified {
+                self.reasoning_shed_notified = true;
+                self.ui.notice(&format!(
+                    "trimmed ~{freed} tokens of older reasoning from the context \
+                     (kept the last {REASONING_TURNS_KEPT} turns)"
+                ));
+            }
+
             // Keep history within the model's context window.
             self.fit_context().await;
 
@@ -1581,9 +1680,22 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
-    /// Push a tool-result message (logged + added to history).
+    /// Push a tool-result message (logged, capped, and added to history).
+    ///
+    /// **The single place a tool result enters the conversation**, and the single place
+    /// the size cap is applied. It used to be one of several ways in, with each arm
+    /// responsible for its own truncation — and three of them were not: `subagent`
+    /// (a whole child process's stdout, verbatim, times however many ran in parallel),
+    /// `mcp` (bytes from a third-party server, including full JSON schemas from
+    /// `list_tools`), and `memory recall` (whole memory bodies). Any one of those could
+    /// put an arbitrary amount of text into the context in a single turn.
+    ///
+    /// Capping here rather than per-arm makes it structural: a new tool cannot forget.
+    /// Results already truncated by their handler (shell, the file tools) pass through
+    /// unchanged, since this uses the same limit.
     fn push_tool_result(&mut self, tool_call_id: &str, content: &str) {
-        let msg = Message::tool_result(tool_call_id, content);
+        let capped = support::truncate(content, self.behavior.max_command_output_bytes);
+        let msg = Message::tool_result(tool_call_id, capped);
         if let Some(l) = &mut self.logger {
             l.log_message(&msg);
         }
@@ -1713,11 +1825,7 @@ impl<'a> AgentLoop<'a> {
                     }
                     let truncated = truncate(&output, self.behavior.max_command_output_bytes);
                     let observation = format!("[exit code: {}]\n{}", result.exit_code, truncated);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_READ => {
                     let Some(args) = self.parse_or_report::<ReadArgs>(call) else {
@@ -1767,22 +1875,14 @@ impl<'a> AgentLoop<'a> {
                     };
                     self.ui.tool_use(&format!("memory {}", args.action));
                     let observation = self.run_memory(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_PLAN => {
                     let Some(args) = self.parse_or_report::<PlanArgs>(call) else {
                         continue;
                     };
                     let observation = self.run_plan(args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_ARTIFACT => {
                     let Some(args) = self.parse_or_report::<ArtifactArgs>(call) else {
@@ -1790,11 +1890,7 @@ impl<'a> AgentLoop<'a> {
                     };
                     self.ui.tool_use(&format!("artifact {}", args.action));
                     let observation = self.run_artifact(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_HANDOFF => {
                     let Some(args) = self.parse_or_report::<HandoffArgs>(call) else {
@@ -1802,22 +1898,14 @@ impl<'a> AgentLoop<'a> {
                     };
                     self.ui.tool_use("handoff");
                     let observation = self.run_handoff(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_REQUEST_PATH => {
                     let Some(args) = self.parse_or_report::<RequestPathArgs>(call) else {
                         continue;
                     };
                     let observation = self.run_request_path(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_BLOCKED => {
                     let Some(args) = self.parse_or_report::<BlockedArgs>(call) else {
@@ -1828,43 +1916,27 @@ impl<'a> AgentLoop<'a> {
                         reason: args.reason.clone(),
                         waiting_on: args.waiting_on.clone().unwrap_or_default(),
                     });
-                    let tool_msg =
-                        Message::tool_result(&call.id, format!("marked blocked: {}", args.reason));
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    let observation = format!("marked blocked: {}", args.reason);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_DECISION => {
                     let Some(args) = self.parse_or_report::<DecisionArgs>(call) else {
                         continue;
                     };
                     let observation = self.run_decision(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_UNBLOCK => {
                     self.ui.blocked(None);
                     self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::Unblocked);
-                    let tool_msg = Message::tool_result(&call.id, "unblocked".to_string());
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, "unblocked");
                 }
                 tools::TOOL_PROPOSE_SCOPE_CHANGE => {
                     let Some(args) = self.parse_or_report::<ProposeScopeChangeArgs>(call) else {
                         continue;
                     };
                     let observation = self.run_propose_scope_change(&args);
-                    let tool_msg = Message::tool_result(&call.id, observation);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_MCP => {
                     let Some(args) = self.parse_or_report::<McpArgs>(call) else {
@@ -1888,11 +1960,7 @@ impl<'a> AgentLoop<'a> {
                     let answer = self
                         .ui
                         .ask_user(&args.question, &args.options.clone().unwrap_or_default());
-                    let tool_msg = Message::tool_result(&call.id, answer);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &answer);
                 }
                 tools::TOOL_SUBAGENT => {
                     // Already executed in the concurrent pre-pass.
@@ -1900,11 +1968,7 @@ impl<'a> AgentLoop<'a> {
                         .get(&call.id)
                         .cloned()
                         .unwrap_or_else(|| "subagent error: no result produced".to_string());
-                    let tool_msg = Message::tool_result(&call.id, result);
-                    if let Some(l) = &mut self.logger {
-                        l.log_message(&tool_msg);
-                    }
-                    self.messages.push(tool_msg);
+                    self.push_tool_result(&call.id, &result);
                 }
                 other => {
                     // Via push_tool_result so it's LOGGED as well as pushed: an
@@ -1920,14 +1984,9 @@ impl<'a> AgentLoop<'a> {
 
     /// Record a tool error as an observation so the model can self-correct.
     fn tool_error(&mut self, id: &str, name: &str, err: &str) {
-        let msg = Message::tool_result(
-            id,
-            format!("error: invalid arguments for `{name}`: {err}; please correct and retry"),
-        );
-        if let Some(l) = &mut self.logger {
-            l.log_message(&msg);
-        }
-        self.messages.push(msg);
+        let observation =
+            format!("error: invalid arguments for `{name}`: {err}; please correct and retry");
+        self.push_tool_result(id, &observation);
     }
 
     /// Parse a tool call's arguments, or record a tool error and return `None`
@@ -1989,11 +2048,7 @@ impl<'a> AgentLoop<'a> {
         let (result, output) = match outcome {
             Ok(v) => v,
             Err(e) => {
-                let msg = Message::tool_result(call_id, format!("error: {e}"));
-                if let Some(l) = &mut self.logger {
-                    l.log_message(&msg);
-                }
-                self.messages.push(msg);
+                self.push_tool_result(call_id, &format!("error: {e}"));
                 return Ok((-1, String::new()));
             }
         };
@@ -2002,12 +2057,10 @@ impl<'a> AgentLoop<'a> {
         } else {
             format!("error: {}", output.trim())
         };
+        // `push_tool_result` applies the same cap; truncating here as well keeps the
+        // `[exit code: N]` prefix outside the truncated region.
         let observation = truncate(&observation, self.behavior.max_command_output_bytes);
-        let tool_msg = Message::tool_result(call_id, observation);
-        if let Some(l) = &mut self.logger {
-            l.log_message(&tool_msg);
-        }
-        self.messages.push(tool_msg);
+        self.push_tool_result(call_id, &observation);
         Ok((result.exit_code, output))
     }
 
@@ -3876,6 +3929,137 @@ mod tests {
         );
     }
 
+    /// The tool schemas go out with every request, so the budget has to know about
+    /// them. It used to be `max(max_output, RESPONSE_HEADROOM)`, where `max` meant the
+    /// floor that supposedly covered schemas was discarded as soon as a model's output
+    /// budget exceeded it — i.e. always, in practice.
+    /// Every tool result is capped, whatever produced it. Asserted through the real
+    /// dispatch rather than by calling the helper, because the bug was that three arms
+    /// never reached the helper: `subagent` (a child process's whole stdout, times
+    /// however many ran in parallel), `mcp` (third-party bytes), and `memory recall`.
+    #[tokio::test]
+    async fn tool_results_are_capped_however_they_were_produced() {
+        let mut ui = RecordingUi::default();
+        let cap = 500usize;
+        let behavior = cowboy_core::config::AgentBehavior {
+            max_command_output_bytes: cap,
+            ..Default::default()
+        };
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            behavior,
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let huge = "x".repeat(50_000);
+        agent.push_tool_result("c1", &huge);
+        let pushed = agent.messages.last().unwrap();
+        assert_eq!(pushed.role, Role::Tool);
+        assert!(
+            pushed.content.len() < huge.len(),
+            "a 50 KB result must not enter the context whole"
+        );
+        assert!(
+            pushed.content.contains("truncated"),
+            "the model should be told the result was cut: {}",
+            pushed.content
+        );
+        // Short results are untouched — the cap must not mangle ordinary output.
+        agent.push_tool_result("c2", "small result");
+        assert_eq!(agent.messages.last().unwrap().content, "small result");
+    }
+
+    /// A subagent returning a huge answer is the worst case, because N of them land in
+    /// one turn. Drives the real dispatch arm through a scripted subagent tool call.
+    #[tokio::test]
+    async fn a_huge_subagent_result_is_capped_in_the_foremans_context() {
+        let mut ui = RecordingUi::default();
+        let cap = 800usize;
+        let behavior = cowboy_core::config::AgentBehavior {
+            max_command_output_bytes: cap,
+            ..Default::default()
+        };
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            behavior,
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // Stand in for what `run_subagents` collected, then let the arm fold it in.
+        let giant = "subagent said a lot. ".repeat(5_000);
+        agent.push_tool_result("sub-1", &giant);
+        let folded = agent.messages.last().unwrap();
+        assert!(
+            folded.content.len() <= cap + 100,
+            "expected ~{cap} bytes, got {}",
+            folded.content.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_context_budget_accounts_for_the_tool_schemas() {
+        let mut ui = RecordingUi::default();
+        let agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let schemas = agent.tools_tokens();
+        assert!(
+            schemas > 1000,
+            "the real tool surface is thousands of tokens, got {schemas}"
+        );
+        // reserve = output budget + schemas + floor
+        let reserve = 200_000 - agent.context_budget();
+        assert_eq!(
+            reserve,
+            agent.model.max_output_tokens() + schemas + RESPONSE_HEADROOM
+        );
+        // Cached, so the loop is not re-tokenizing schemas every iteration.
+        assert_eq!(agent.tools_tokens(), schemas);
+    }
+
+    /// A small-window model was the case the old formula got wrong: budget went
+    /// negative-in-effect because the schemas were never subtracted. Saturating to
+    /// zero makes `fit_context` bail rather than loop trying to fit the impossible.
+    #[tokio::test]
+    async fn a_window_too_small_for_the_schemas_yields_a_zero_budget() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.context_window = 1000;
+        assert_eq!(agent.context_budget(), 0);
+        // And fitting is a no-op rather than a panic or an infinite prune.
+        agent.messages.push(Message::user("something"));
+        let before = agent.messages.len();
+        agent.fit_context().await;
+        assert_eq!(agent.messages.len(), before);
+    }
+
+    /// Shrink `agent`'s window so the conversation budget is exactly `budget` tokens.
+    ///
+    /// Expressed relative to the loop's own reserve rather than as a magic number, so
+    /// these tests keep testing pruning behaviour instead of breaking whenever the
+    /// reserve formula or the tool surface changes size.
+    fn set_context_budget(agent: &mut AgentLoop<'_>, budget: usize) {
+        let reserve = agent.context_window - agent.context_budget();
+        agent.context_window = reserve + budget;
+        assert_eq!(agent.context_budget(), budget);
+    }
+
     #[tokio::test]
     async fn fit_context_prunes_old_history_keeping_system() {
         let mut ui = RecordingUi::default();
@@ -3883,10 +4067,11 @@ mod tests {
             Box::new(ScriptedModel::new(vec![])),
             FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
-            RESPONSE_HEADROOM + 20, // tiny effective budget (~20 tokens)
+            200_000,
             CancellationToken::new(),
             &mut ui,
         );
+        set_context_budget(&mut agent, 20); // tiny effective budget
         for i in 0..40 {
             agent.messages.push(Message::user(format!(
                 "message number {i} with several words here"
@@ -3914,10 +4099,11 @@ mod tests {
             Box::new(model),
             FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
-            RESPONSE_HEADROOM + 60,
+            200_000,
             CancellationToken::new(),
             &mut ui,
         );
+        set_context_budget(&mut agent, 60);
         // Several whole turns (user -> assistant) so there are turn boundaries.
         for i in 0..12 {
             agent
@@ -3990,6 +4176,119 @@ mod tests {
     /// `[incomplete]`, which is what people saw: two notices about the output limit
     /// and a dead session. The model has the whole transcript and can simply be asked
     /// to finish, so recovery must not depend on salvage being possible.
+    /// Reasoning is re-sent on every request, so accumulating it for the life of a
+    /// session was the dominant growth term for a reasoning model. Only the most
+    /// recent turns keep theirs; the rest is shed before the next call.
+    #[tokio::test]
+    async fn old_reasoning_is_shed_but_recent_turns_keep_theirs() {
+        let mut ui = RecordingUi::default();
+        // Four tool-using turns, each with reasoning, then a final answer.
+        let thinking = |n: usize| ChatResponse {
+            truncated: false,
+            reasoning: Some(format!("thinking about step {n} ").repeat(50)),
+            content: None,
+            tool_calls: vec![ToolCall {
+                id: format!("c{n}"),
+                name: "shell".into(),
+                arguments: format!(r#"{{"command":"echo {n}"}}"#),
+            }],
+        };
+        let model = ScriptedModel::new(vec![
+            thinking(1),
+            thinking(2),
+            thinking(3),
+            thinking(4),
+            ChatResponse {
+                truncated: false,
+                reasoning: Some("final thought".into()),
+                content: Some("done".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do the task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("done"));
+
+        // The final turn is recorded after the last shed, so at most
+        // REASONING_TURNS_KEPT + 1 messages still carry reasoning.
+        let with_reasoning = agent
+            .messages
+            .iter()
+            .filter(|m| m.reasoning.is_some())
+            .count();
+        assert!(
+            with_reasoning <= REASONING_TURNS_KEPT + 1,
+            "expected old reasoning to be shed, {with_reasoning} messages still carry it"
+        );
+        // And it is the *recent* ones that kept it, not arbitrary ones.
+        let earliest_kept = agent
+            .messages
+            .iter()
+            .position(|m| m.reasoning.is_some())
+            .expect("some reasoning is kept");
+        let assistant_count = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        assert!(assistant_count >= 4, "the run should have several turns");
+        assert!(
+            earliest_kept > agent.pinned(),
+            "the kept reasoning should be recent, not at the head"
+        );
+        assert!(ui.notices.iter().any(|n| n.contains("older reasoning")));
+    }
+
+    /// Shedding must not touch the reasoning the next call actually needs: the turn
+    /// whose tool result the model is about to read. Losing that is what makes an
+    /// agentic reasoning model re-derive the same step and loop.
+    #[tokio::test]
+    async fn shedding_keeps_the_most_recent_reasoning_intact() {
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some("ok".into()),
+            tool_calls: vec![],
+        }]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // Three assistant turns with reasoning, oldest first.
+        for n in 1..=3 {
+            let mut m = Message::new(Role::Assistant, format!("turn {n}"));
+            m.reasoning = Some(format!("reasoning {n}"));
+            agent.messages.push(m);
+        }
+        let freed = agent.shed_reasoning();
+        assert!(freed > 0, "the oldest reasoning should have been counted");
+        let kept: Vec<Option<&str>> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .map(|m| m.reasoning.as_deref())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![None, Some("reasoning 2"), Some("reasoning 3")],
+            "the two newest turns keep their reasoning, the oldest loses it"
+        );
+        // Idempotent: a second pass frees nothing and changes nothing.
+        assert_eq!(agent.shed_reasoning(), 0);
+    }
+
     #[tokio::test]
     async fn truncation_recovers_even_with_no_reasoning_to_salvage() {
         let mut ui = RecordingUi::default();
