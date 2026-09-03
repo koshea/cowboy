@@ -154,6 +154,10 @@ pub struct AgentLoop<'a> {
     /// truncation, reset to 0 whenever a turn produces content or a tool call.
     /// Bounds recovery so a model that always truncates can't spin.
     reprime_attempts: u32,
+    /// Set after a truncation recovery: the next model call asks the provider for
+    /// minimal reasoning effort. One turn only — a model that answered is not the
+    /// problem, and permanently dulling its thinking would be a poor trade.
+    minimize_reasoning_next_turn: bool,
     /// One-shot latch so the "output limit may be too low" warning fires once.
     output_limit_warned: bool,
     /// Recursion depth for subagents (0 = top-level).
@@ -525,6 +529,7 @@ impl<'a> AgentLoop<'a> {
             context_window,
             pruned_notified: false,
             reprime_attempts: 0,
+            minimize_reasoning_next_turn: false,
             output_limit_warned: false,
             subagent_depth,
             last_final: None,
@@ -882,6 +887,12 @@ impl<'a> AgentLoop<'a> {
     async fn run_summary(&self, system: &str, body: String) -> Result<String> {
         let msgs = vec![Message::system(system), Message::user(body)];
         let client = self.summarizer.as_deref().unwrap_or(self.model.as_ref());
+        // Minimal reasoning where the backend allows it. Summarizing is mechanical, so
+        // extended thinking here buys nothing — and when this falls back to the main
+        // model it is the very model that just truncated while thinking, which made the
+        // salvage come back empty exactly when it was needed.
+        let low = client.with_minimal_reasoning();
+        let client = low.as_deref().unwrap_or(client);
         let resp = client.chat(&msgs, &[], None).await?;
         Ok(resp.content.unwrap_or_default())
     }
@@ -901,24 +912,42 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// Distill a truncated turn's reasoning into a directive that re-primes the
-    /// model to act. Returns `None` when there's no reasoning to salvage or the
-    /// summary comes back empty — the caller then reports `[incomplete]`.
-    async fn reprime_directive(&self, response: &ChatResponse) -> Option<String> {
-        let reasoning = response
+    /// model to act — or, when there is nothing to distill, still tell it to act.
+    ///
+    /// This used to return `None` in either of those cases and the caller gave up with
+    /// `[incomplete]`, which is the stall people kept reporting. Both cases are common:
+    /// plenty of providers bill reasoning tokens without ever returning the text, and
+    /// the distillation runs on the same model that just proved it will spend its whole
+    /// budget thinking, so the summary comes back empty too. Neither is a reason to
+    /// abandon the turn — the model has a full transcript and can simply be asked to
+    /// finish. Salvaged reasoning makes the retry better, not possible.
+    async fn reprime_directive(&self, response: &ChatResponse) -> String {
+        const ACT_NOW: &str = "Do NOT reason further. Immediately output your final \
+                               answer or the next tool call.";
+        let salvaged = match response
             .reasoning
             .as_deref()
-            .filter(|r| !r.trim().is_empty())?;
-        let summary = self
-            .run_summary(REPRIME_SYSTEM, reasoning.to_string())
-            .await
-            .ok()
-            .filter(|s| !s.trim().is_empty())?;
-        Some(format!(
-            "Your previous attempt ran out of thinking budget before you answered. \
-             Here is what you had already concluded:\n\n{summary}\n\n\
-             Do NOT reason further. Immediately output your final answer or the next \
-             tool call based on the above."
-        ))
+            .filter(|r| !r.trim().is_empty())
+        {
+            Some(reasoning) => self
+                .run_summary(REPRIME_SYSTEM, reasoning.to_string())
+                .await
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            None => None,
+        };
+        match salvaged {
+            Some(summary) => format!(
+                "Your previous attempt ran out of thinking budget before you answered. \
+                 Here is what you had already concluded:\n\n{summary}\n\n{ACT_NOW}"
+            ),
+            None => format!(
+                "Your previous attempt ran out of its output-token budget while thinking \
+                 and produced nothing. Do not start over and do not re-derive your \
+                 reasoning: work from the conversation above. If you cannot finish the \
+                 whole task in one answer, take the single next concrete step. {ACT_NOW}"
+            ),
+        }
     }
 
     /// Ask the model to summarize a span of prior messages into a dense brief.
@@ -1348,37 +1377,43 @@ impl<'a> AgentLoop<'a> {
                 // Truncated mid-generation with nothing usable: a reasoning model
                 // can spend its entire output budget thinking and never emit an
                 // answer or tool call. Warn once that its output limit may be too
-                // low, then try to salvage the wasted reasoning: distill it into
-                // conclusions-so-far and retry the turn with a directive to act
-                // now instead of re-deriving from scratch. Bounded by
-                // MAX_REPRIME_ATTEMPTS so a model that always truncates can't spin.
+                // low, then retry: salvage the wasted reasoning into
+                // conclusions-so-far when the provider returned any, and ask the
+                // provider for minimal reasoning effort so the retry cannot spend
+                // the same budget the same way. Bounded by MAX_REPRIME_ATTEMPTS so a
+                // model that always truncates can't spin.
                 if response.truncated {
                     self.warn_output_limit();
                     if self.reprime_attempts < MAX_REPRIME_ATTEMPTS {
-                        if let Some(directive) = self.reprime_directive(&response).await {
-                            self.reprime_attempts += 1;
-                            // Drop the empty assistant turn we just recorded so the
-                            // giant truncated reasoning isn't re-sent; the compact
-                            // directive replaces it.
-                            self.messages.pop();
-                            self.ui.notice(
-                                "recovering: summarized truncated reasoning, retrying to wrap up",
-                            );
-                            let msg = Message::user(directive);
-                            if let Some(l) = &mut self.logger {
-                                l.log_message(&msg);
-                            }
-                            self.messages.push(msg);
-                            continue;
+                        let directive = self.reprime_directive(&response).await;
+                        self.reprime_attempts += 1;
+                        // Drop the empty assistant turn we just recorded so the
+                        // giant truncated reasoning isn't re-sent; the compact
+                        // directive replaces it.
+                        self.messages.pop();
+                        // Words alone did not work here — "don't think further" is
+                        // advice a reasoning model can ignore, and did. Turn the knob
+                        // the provider honours for the next call as well.
+                        self.minimize_reasoning_next_turn = true;
+                        self.ui.notice(
+                            "recovering: asking the model to answer without further thinking",
+                        );
+                        let msg = Message::user(directive);
+                        if let Some(l) = &mut self.logger {
+                            l.log_message(&msg);
                         }
+                        self.messages.push(msg);
+                        continue;
                     }
-                    // No reasoning to salvage, summary failed, or attempts spent:
-                    // report it explicitly so the caller (a foreman reading a
-                    // subagent's stdout, or the user) sees the cause instead of a
-                    // silent empty result.
-                    let note = "model hit its output-token limit while reasoning \
-                                and produced no answer (no content, no tool call)";
-                    self.ui.notice(note);
+                    // Attempts spent: report it explicitly so the caller (a foreman
+                    // reading a subagent's stdout, or the user) sees the cause
+                    // instead of a silent empty result.
+                    let note = format!(
+                        "model hit its output-token limit while reasoning and produced no \
+                         answer after {MAX_REPRIME_ATTEMPTS} recovery attempts — raise \
+                         max_tokens in models.yaml, or lower reasoning_effort"
+                    );
+                    self.ui.notice(&note);
                     return Ok(Some(format!("[incomplete] {note}")));
                 }
                 self.ui.notice(
@@ -2358,7 +2393,15 @@ impl<'a> AgentLoop<'a> {
     /// Call the model, streaming deltas to the UI, racing cancellation.
     async fn call_model(&mut self) -> Result<ChatResponse> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Delta>();
-        let fut = self.model.chat(&self.messages, &self.tools, Some(tx));
+        // A truncation recovery asks for minimal reasoning for exactly this call.
+        // Taken (not merely read) so it cannot leak into later turns, and resolved
+        // before the borrow below: `with_minimal_reasoning` returns None for backends
+        // with no such control, which just means the retry is the prompt alone.
+        let low_effort = std::mem::take(&mut self.minimize_reasoning_next_turn)
+            .then(|| self.model.with_minimal_reasoning())
+            .flatten();
+        let client = low_effort.as_deref().unwrap_or(self.model.as_ref());
+        let fut = client.chat(&self.messages, &self.tools, Some(tx));
         tokio::pin!(fut);
         loop {
             tokio::select! {
@@ -2399,13 +2442,23 @@ mod tests {
     use std::sync::Mutex;
 
     /// A model that returns a scripted sequence of responses.
+    ///
+    /// `low_effort_calls` counts calls made through the minimal-reasoning variant, so a
+    /// test can assert the loop actually turned the knob rather than only asking nicely
+    /// in the prompt. The queue is shared with the variant: it stands in for one
+    /// endpoint, which is what the real client's clone is.
+    #[derive(Clone)]
     struct ScriptedModel {
-        responses: Mutex<std::collections::VecDeque<ChatResponse>>,
+        responses: Arc<Mutex<std::collections::VecDeque<ChatResponse>>>,
+        low_effort_calls: Arc<Mutex<usize>>,
+        minimal: bool,
     }
     impl ScriptedModel {
         fn new(responses: Vec<ChatResponse>) -> Self {
             Self {
-                responses: Mutex::new(responses.into()),
+                responses: Arc::new(Mutex::new(responses.into())),
+                low_effort_calls: Arc::new(Mutex::new(0)),
+                minimal: false,
             }
         }
     }
@@ -2417,6 +2470,9 @@ mod tests {
             _tools: &[ToolDef],
             deltas: Option<tokio::sync::mpsc::UnboundedSender<Delta>>,
         ) -> Result<ChatResponse, cowboy_core::Error> {
+            if self.minimal {
+                *self.low_effort_calls.lock().unwrap() += 1;
+            }
             let r = self
                 .responses
                 .lock()
@@ -2427,6 +2483,16 @@ mod tests {
                 let _ = tx.send(Delta::Content(c.clone()));
             }
             Ok(r)
+        }
+
+        fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
+            if self.minimal {
+                return None;
+            }
+            Some(Box::new(Self {
+                minimal: true,
+                ..self.clone()
+            }))
         }
     }
 
@@ -3879,16 +3945,25 @@ mod tests {
     #[tokio::test]
     async fn truncated_empty_turn_reports_incomplete_instead_of_silence() {
         // A reasoning model that burns its whole output budget thinking returns
-        // no content and no tool call with finish_reason=length. The loop must
-        // surface that explicitly (so a foreman reading a subagent's stdout sees
-        // the cause) rather than returning an empty/None result.
+        // no content and no tool call with finish_reason=length. Once recovery is
+        // exhausted the loop must surface that explicitly (so a foreman reading a
+        // subagent's stdout sees the cause) rather than returning an empty/None
+        // result.
+        //
+        // Every turn truncates and returns no reasoning, so there is no salvage
+        // summary to script: MAX_REPRIME_ATTEMPTS retries then the verdict.
         let mut ui = RecordingUi::default();
-        let model = ScriptedModel::new(vec![ChatResponse {
+        let trunc = || ChatResponse {
             truncated: true,
-            reasoning: Some("thinking ".repeat(100)),
+            reasoning: None,
             content: None,
             tool_calls: vec![],
-        }]);
+        };
+        let model = ScriptedModel::new(
+            std::iter::repeat_with(trunc)
+                .take(MAX_REPRIME_ATTEMPTS as usize + 1)
+                .collect(),
+        );
         let mut agent = AgentLoop::new(
             Box::new(model),
             FakeSandbox::new(),
@@ -3901,6 +3976,152 @@ mod tests {
         let msg = res.expect("truncation should yield a descriptive result, not None");
         assert!(msg.starts_with("[incomplete]"), "got: {msg}");
         assert_eq!(classify_subagent_result(&msg), "error");
+        // And it names the two levers the user actually has.
+        assert!(
+            msg.contains("max_tokens") && msg.contains("reasoning_effort"),
+            "got: {msg}"
+        );
+    }
+
+    /// The reported stall: a truncated turn with **no reasoning returned**.
+    ///
+    /// Plenty of providers bill reasoning tokens without ever sending the text, so
+    /// there is nothing to distill — and the loop used to give up immediately with
+    /// `[incomplete]`, which is what people saw: two notices about the output limit
+    /// and a dead session. The model has the whole transcript and can simply be asked
+    /// to finish, so recovery must not depend on salvage being possible.
+    #[tokio::test]
+    async fn truncation_recovers_even_with_no_reasoning_to_salvage() {
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: true,
+                reasoning: None, // provider billed the thinking but returned none
+                content: None,
+                tool_calls: vec![],
+            },
+            // No summary call is made (nothing to summarize), so the very next
+            // response is the retry answering.
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("finished after the nudge".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let low_effort = model.low_effort_calls.clone();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do the task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("finished after the nudge"));
+        let nudged = agent.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content.contains("ran out of its output-token budget")
+                && m.content.contains("Do NOT reason further")
+        });
+        assert!(nudged, "a retry directive should have been injected");
+        // And the knob was actually turned: telling a reasoning model not to think is
+        // advice it can ignore, which is how this stalled in the first place.
+        assert_eq!(
+            *low_effort.lock().unwrap(),
+            1,
+            "the retry must go out with minimal reasoning effort"
+        );
+        assert!(ui.notices.iter().any(|n| n.contains("recovering")));
+    }
+
+    /// Salvage that comes back empty must not sink the recovery either. The
+    /// distillation runs on the same model that just spent its whole budget thinking,
+    /// so an empty summary is the expected case, not an exotic one.
+    #[tokio::test]
+    async fn truncation_recovers_when_the_salvage_summary_is_empty() {
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: true,
+                reasoning: Some("thinking at length".into()),
+                content: None,
+                tool_calls: vec![],
+            },
+            // The summary call itself yields nothing usable.
+            ChatResponse {
+                truncated: true,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("wrapped up anyway".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let res = agent.run("do the task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("wrapped up anyway"));
+        assert!(ui.notices.iter().any(|n| n.contains("recovering")));
+    }
+
+    /// The low-effort request is scoped to the retry. A model that answered is not the
+    /// problem, and leaving its reasoning permanently dulled for the rest of the
+    /// session would be a bad trade made invisibly.
+    #[tokio::test]
+    async fn minimal_reasoning_applies_only_to_the_retry_turn() {
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: true,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![],
+            },
+            ChatResponse {
+                truncated: false,
+                reasoning: None,
+                content: Some("recovered".into()),
+                tool_calls: vec![],
+            },
+        ]);
+        let low_effort = model.low_effort_calls.clone();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("first task").await.unwrap();
+        assert_eq!(*low_effort.lock().unwrap(), 1);
+
+        // A second, healthy turn goes out at the configured effort.
+        agent.model = Box::new(ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            reasoning: None,
+            content: Some("second answer".into()),
+            tool_calls: vec![],
+        }]));
+        let res = agent.run("second task").await.unwrap();
+        assert_eq!(res.as_deref(), Some("second answer"));
+        assert_eq!(
+            *low_effort.lock().unwrap(),
+            1,
+            "the override must not persist past the turn that needed it"
+        );
     }
 
     #[tokio::test]

@@ -193,11 +193,15 @@ it accurately keeps requests valid even when the context is nearly full.
 **`summarizer`** (optional): names a model used for Cowboy's internal
 summarization — folding old history into a summary when the context window fills,
 and **truncation recovery**. When a reasoning model spends its whole `max_tokens`
-budget thinking and emits no answer or tool call, Cowboy warns that the output
-limit may be too low, distills the cut-off reasoning into conclusions-so-far, and
-retries the turn with a directive to act on them (bounded, so a model that always
-truncates can't spin). Point `summarizer` at a small/cheap model to make these
-auxiliary calls faster and cheaper; when unset, the session's main model is used.
+budget thinking and emits no answer or tool call, Cowboy warns that the output limit
+may be too low and retries the turn asking it to answer now, with minimal reasoning
+effort requested from the provider; if the cut-off reasoning came back, it is first
+distilled into conclusions-so-far to build on. Bounded, so a model that always
+truncates can't spin — see [the agent loop](../using/agent-and-tools.md). Point
+`summarizer` at a small/cheap model to make these auxiliary calls faster and cheaper;
+when unset, the session's main model is used. These calls always request minimal
+reasoning: summarizing is mechanical, and a model that just truncated while thinking
+would otherwise do the same on the summary and come back empty.
 
 **`anthropic_cache`** (opt-in): when true, Cowboy adds Anthropic `cache_control`
 markers to the static system prompt and the latest message, so a gateway that

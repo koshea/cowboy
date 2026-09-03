@@ -69,9 +69,19 @@ output is additionally byte-capped (`agent.max_command_output_bytes`). Token and
 estimated-cost totals are tracked per session, with optional budgets.
 
 If a reasoning model burns its whole output budget thinking and returns no answer
-or tool call, Cowboy warns that its `max_tokens` may be too low, then tries to
-recover: it summarizes the truncated reasoning and retries the turn with a
-directive to act on those conclusions rather than re-deriving them. Both the
+or tool call, Cowboy warns that its `max_tokens` may be too low and then recovers
+rather than ending the turn. It retries with a directive to answer now, and asks the
+provider for **minimal reasoning effort** on that retry — telling a reasoning model
+not to think is advice it can ignore, so the knob the provider honours is turned as
+well. When the provider returned the cut-off reasoning, it is first distilled into
+conclusions-so-far so the retry builds on them instead of re-deriving them; when it
+did not — many providers bill reasoning tokens without ever sending the text — the
+retry goes ahead anyway, because the model still has the whole transcript.
+
+Recovery is bounded (`2` attempts). Only after those are spent does the turn end,
+with an `[incomplete]` result naming the two levers you have: raise `max_tokens` or
+lower `reasoning_effort`. The low-effort request lasts for the retry only, so a model
+that recovers keeps its normal reasoning for the rest of the session. Both the
 compaction and recovery summaries use the optional
 [`summarizer`](../getting-started/configuration.md) model when configured,
 falling back to the main model otherwise.

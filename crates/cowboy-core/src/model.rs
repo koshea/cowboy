@@ -292,11 +292,24 @@ pub trait ModelClient: Send + Sync {
     fn max_output_tokens(&self) -> usize {
         4096
     }
+
+    /// A variant of this client that spends as little of its output budget on
+    /// reasoning as it can, or `None` when the backend exposes no such control.
+    ///
+    /// Exists for one situation: a reasoning model that burned its entire output
+    /// budget thinking and returned nothing. Asking it again in words ("don't think,
+    /// just answer") is advice a reasoning model is free to ignore, and it did —
+    /// which is how a truncated turn turned into a stalled session. Turning the
+    /// effort knob down is a request the *provider* honours rather than the model.
+    fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
+        None
+    }
 }
 
 /// OpenAI-compatible client. Requests are built with `async-openai`'s typed
 /// args, but streaming is done over a hand-rolled SSE parse so provider
 /// `reasoning_content` (dropped by the typed stream) reaches the UI.
+#[derive(Clone)]
 pub struct OpenAiClient {
     http: reqwest::Client,
     base_url: String,
@@ -644,6 +657,22 @@ fn mark_ephemeral_cache(msg: &mut serde_json::Value) {
 impl ModelClient for OpenAiClient {
     fn max_output_tokens(&self) -> usize {
         self.max_tokens as usize
+    }
+
+    /// Same endpoint and budget, `reasoning_effort: minimal`.
+    ///
+    /// Deliberately unconditional rather than only when an effort is already
+    /// configured: a model that truncated while thinking is *doing* extended
+    /// reasoning, whether or not this config asked it to, so the parameter is worth
+    /// sending. Providers that do not understand it ignore it, which leaves the
+    /// retry no worse off than repeating the same request.
+    fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
+        if self.reasoning_effort == Some(ReasoningEffort::Minimal) {
+            return None; // already as low as it goes
+        }
+        let mut c = self.clone();
+        c.reasoning_effort = Some(ReasoningEffort::Minimal);
+        Some(Box::new(c))
     }
 
     async fn chat(
