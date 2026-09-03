@@ -159,9 +159,34 @@ pub fn remove_in(dir: &Path, root: &Path, path: &Path) -> std::io::Result<bool> 
     Ok(changed)
 }
 
+/// Write the grants file owner-only.
+///
+/// A grant is a host path the sandbox may see. The list of them is a map of which of
+/// the user's directories a sandbox has been let into — worth no more exposure than
+/// the `providers.yaml` it sits beside, and `fs::write` created it at the process
+/// umask, i.e. world-readable on a typical host.
+///
+/// The mode is set on the `open`, so the file is never briefly readable, and re-applied
+/// afterwards because an existing file keeps its inode (and so an older version's
+/// mode). The directory is created `0700` for the same reason: a grants file is only as
+/// private as the directory holding it.
 fn write_file(dir: &Path, file: &Path, grants: &[Grant]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    std::fs::write(file, serde_json::to_string_pretty(grants)?)
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(file)?;
+    f.write_all(serde_json::to_string_pretty(grants)?.as_bytes())?;
+    f.sync_all()?;
+    std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(test)]
@@ -186,6 +211,24 @@ mod tests {
         assert_eq!(load_in(&dir, root), vec![grant("/data", false)]);
         // Adding the same grant again changes nothing.
         assert!(!add_in(&dir, root, &grant("/data", false), Persistence::Project).unwrap());
+    }
+
+    /// A grants file is a list of the user's directories a sandbox has been let into.
+    /// It sits in the same config dir as `providers.yaml` and must be no looser —
+    /// `fs::write` created it at the process umask, world-readable on a typical host.
+    #[test]
+    fn grants_are_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let dir = tmp.path().join("grants");
+        let root = Path::new("/srv/project");
+        add_in(&dir, root, &grant("/data", false), Persistence::Project).unwrap();
+        add_in(&dir, root, &grant("/other", true), Persistence::Global).unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&project_file_in(&dir, root)), 0o600);
+        assert_eq!(mode(&global_file_in(&dir)), 0o600);
+        assert_eq!(mode(&dir), 0o700, "nor may the directory be traversable");
     }
 
     /// Grants are per-project, so one project's grant must not appear in another's.

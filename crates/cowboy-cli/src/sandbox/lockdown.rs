@@ -208,8 +208,21 @@ fn apply_seccomp(req: &ShimRequest) -> Result<()> {
         ));
     }
 
+    // Fail closed. An empty rule set means we were asked to install a filter that
+    // enforces nothing — and the old code returned `Ok(())`, so the shim reported the
+    // sandbox as locked down and exec'd the command with no seccomp filter at all.
+    //
+    // Unreachable today: `SeccompProfile::default()` has a hardcoded, non-empty deny
+    // list, so nothing constructs a request like this. That is exactly why it is worth
+    // closing — a latent fail-open in the code that installs the boundary survives
+    // until some refactor makes it reachable, and then it is silent. Everything else in
+    // this file already refuses to exec rather than run under less confinement than the
+    // plan describes; this was the one exception.
     if rules.is_empty() {
-        return Ok(());
+        bail!(
+            "the sandbox plan denies no syscalls and no raw sockets, so there is nothing to \
+             enforce; refusing to run a command that would have no seccomp filter"
+        );
     }
 
     // EPERM rather than killing the process: a denied syscall should surface as an
@@ -290,6 +303,27 @@ fn syscall_number(name: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty profile must be refused rather than quietly installing nothing.
+    ///
+    /// Latent — the default profile is hardcoded and non-empty, so nothing builds a
+    /// request like this today. But the old code returned `Ok(())`, which meant the
+    /// shim would have reported the sandbox locked down and exec'd the command with no
+    /// filter. A fail-open in the code that installs the boundary is worth closing
+    /// before it becomes reachable, because by then it is silent.
+    #[test]
+    fn an_empty_profile_is_refused_rather_than_enforcing_nothing() {
+        let req = crate::sandbox::shim::ShimRequest {
+            command: "true".into(),
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            scope_ipc: false,
+            deny_syscalls: Vec::new(),
+            deny_raw_sockets: false,
+        };
+        let err = apply_seccomp(&req).expect_err("an empty filter must not be installed");
+        assert!(err.to_string().contains("nothing to enforce"), "{err}");
+    }
 
     /// Every name the plan's default profile denies must resolve to a number.
     /// Otherwise `apply_seccomp` refuses to install the filter and no command runs
