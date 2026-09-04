@@ -1495,12 +1495,12 @@ async fn start_session(
 
     // Wait for the worker to bind its socket. Bail out early — with the worker's
     // own error — if it exits first, rather than blocking for the full timeout.
+    let mut exited = false;
+    let mut bound = false;
     for _ in 0..100 {
         if sock.exists() {
-            return DaemonResp::Started {
-                id,
-                worker_sock: sock,
-            };
+            bound = true;
+            break;
         }
         // The supervisor marks the session terminal (Stale) the moment the child
         // exits; a missing record means it never registered. Either way, stop.
@@ -1513,9 +1513,44 @@ async fn start_session(
                 .unwrap_or(true)
         };
         if gone {
+            exited = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    if bound {
+        return DaemonResp::Started {
+            id,
+            worker_sock: sock,
+        };
+    }
+    // Timed out with the worker still alive. It was spawned before this wait, so
+    // returning an error here used to leave it running: holding the exclusive worktree
+    // lease, unattached, and unknown to the client that was just told it failed. The
+    // user's next attempt on that worktree then hit `LeaseDenied` for a session they
+    // believed had never started, until the staleness sweep eventually noticed.
+    //
+    // So end it deliberately rather than reporting failure and walking away. The
+    // supervisor will observe the exit, but that only marks the record stale — the lease
+    // is released here so the worktree is usable immediately.
+    if !exited {
+        let mut d = daemon.lock().await;
+        if let Some(s) = d.state.sessions.get(&id) {
+            if let Some(pid) = s.pid {
+                // SAFETY: kill() with a signal on a pid we spawned.
+                unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                tracing::warn!(
+                    session = %id, pid,
+                    "worker did not bind its socket in time; terminating it and releasing its lease"
+                );
+            }
+        }
+        if let Some(s) = d.state.sessions.get_mut(&id) {
+            s.status = SessionStatus::Failed;
+            s.worker_sock = None;
+        }
+        d.release_all_for(&id);
+        d.save();
     }
     let message = match worker_log_tail(&id) {
         Some(tail) => format!("worker did not start:\n{tail}"),

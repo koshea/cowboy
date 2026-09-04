@@ -243,23 +243,38 @@ pub fn create(
     Ok((path, branch))
 }
 
-/// Remove a worktree and delete its branch. Best-effort cleanup for a launch that
-/// failed after the worktree was created (so it doesn't leak and a retry reuses
-/// the canonical `cowboy/<ranch>-<ws>` name instead of suffixing `-2`, `-3`, …).
-/// Errors are ignored — there's nothing useful to do if cleanup fails.
-pub fn remove(repo: &Path, path: &Path, branch: &str) {
-    let Ok(repo) = repo_root(repo) else { return };
-    let _ = Command::new("git")
+/// Remove a worktree and delete its branch. Cleanup for a launch that failed after the
+/// worktree was created (so it doesn't leak and a retry reuses the canonical
+/// `cowboy/<ranch>-<ws>` name instead of suffixing `-2`, `-3`, …).
+///
+/// Returns whether both git commands succeeded.
+///
+/// The outcome is reported rather than discarded, because a caller that clears a plan's
+/// reference to a worktree needs to know: recording "no worktree" while the directory and
+/// branch still exist leaves the next `ranch start` colliding with the existing branch,
+/// and nothing left pointing at what to clean up.
+pub fn remove(repo: &Path, path: &Path, branch: &str) -> bool {
+    let Ok(repo) = repo_root(repo) else {
+        return false;
+    };
+    let worktree_gone = Command::new("git")
         .arg("-C")
         .arg(&repo)
         .args(["worktree", "remove", "--force"])
         .arg(path)
-        .output();
-    let _ = Command::new("git")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    // Attempted even when the worktree removal failed: the branch may still be
+    // deletable, and leaving it is what collides with the next launch.
+    let branch_gone = Command::new("git")
         .arg("-C")
         .arg(&repo)
         .args(["branch", "-D", branch])
-        .output();
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    worktree_gone && branch_gone
 }
 
 /// List the repo's worktrees (path + branch). Status is filled in by the daemon

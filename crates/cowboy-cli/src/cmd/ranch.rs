@@ -153,15 +153,27 @@ async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()>
         }
     }
     let old = w.worktree_path.clone().zip(w.branch.clone());
+    // Remove the worktree **before** clearing the plan's reference to it. The other
+    // order meant a failed removal left the plan saying there is no worktree while the
+    // directory and branch were still there, so the next `start` collided with the
+    // existing `cowboy/<ranch>-<ws>` branch and nothing recorded what to clean up.
+    if let Some((path, branch)) = &old {
+        if !crate::net::worktree::remove(root, path, branch) {
+            bail!(
+                "could not remove the worktree for `{workstream}` ({} on branch {branch}). \
+                 The plan has been left untouched, so nothing is lost — clean it up with \
+                 `git worktree remove --force {} && git branch -D {branch}` and re-run retry.",
+                path.display(),
+                path.display(),
+            );
+        }
+    }
     w.status = WorkstreamStatus::Planned; // recompute_readiness re-derives Ready/Blocked
     w.session_id = None;
     w.worktree_path = None;
     w.branch = None;
     ranch.recompute_readiness();
     ranch::save_progress(root, &before, &ranch)?;
-    if let Some((path, branch)) = old {
-        crate::net::worktree::remove(root, &path, &branch);
-    }
     println!(
         "{}",
         crate::style::success(&format!(
@@ -211,6 +223,22 @@ fn lock_ranch(root: &Path, id: &str) -> Result<RanchLock> {
         bail!("acquiring ranch lock {}", path.display());
     }
     Ok(RanchLock { _file: file })
+}
+
+/// Tear down a worktree created for a launch that did not happen, adding a line to the
+/// advance log if the cleanup itself failed.
+///
+/// The failure is worth surfacing rather than swallowing: a worktree left behind makes
+/// the next attempt suffix its branch `-2`, so the plan quietly drifts from the
+/// canonical `cowboy/<ranch>-<ws>` names, and nothing says why.
+fn note_failed_cleanup(log: &mut Vec<String>, root: &Path, path: &Path, branch: &str, ws: &str) {
+    if !crate::net::worktree::remove(root, path, branch) {
+        log.push(format!(
+            "  warning: could not clean up {ws}'s unused worktree {} (branch {branch}); \
+             remove it by hand or the next launch will pick a suffixed branch name",
+            path.display()
+        ));
+    }
 }
 
 /// Shared body for `complete`/`accept`: force a workstream to Complete, promote
@@ -475,7 +503,14 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
     let path = ranch::ranch_path(root, &id);
     std::fs::create_dir_all(path.parent().unwrap())
         .with_context(|| format!("creating {}", path.display()))?;
-    std::fs::write(&path, yaml).with_context(|| format!("writing {}", path.display()))?;
+    // Temp + rename, like `ranch::save`. Not *through* `ranch::save`: this skeleton is
+    // hand-written YAML carrying commented examples, and going through serde would strip
+    // them. A bare `fs::write` left a crash mid-write showing up as a truncated plan that
+    // fails to parse — which blocks every later `cowboy ranch` command for that id, since
+    // they all start by loading it.
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &yaml).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
     // Validate it parses.
     ranch::load(root, &id).context("the new ranch.yaml should parse")?;
     println!("✓ created ranch `{id}` at {}", path.display());
@@ -887,14 +922,22 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
             DaemonResp::LeaseDenied { .. } => {
                 // The worktree we just created went unused — tear it down so it
                 // doesn't leak (and a later attempt reuses the canonical branch).
-                crate::net::worktree::remove(root, &path, &branch);
-                log.push(format!("skip {}: worktree already in use", ws.id))
+                log.push(format!("skip {}: worktree already in use", ws.id));
+                note_failed_cleanup(&mut log, root, &path, &branch, &ws.id);
             }
             DaemonResp::Err { message } => {
-                crate::net::worktree::remove(root, &path, &branch);
-                log.push(format!("skip {}: {message}", ws.id))
+                log.push(format!("skip {}: {message}", ws.id));
+                note_failed_cleanup(&mut log, root, &path, &branch, &ws.id);
             }
-            other => bail!("unexpected daemon response: {other:?}"),
+            // Not `bail!`: an unexpected response would otherwise leak the worktree and
+            // branch we just created, and a later attempt would then suffix `-2`.
+            other => {
+                log.push(format!(
+                    "skip {}: unexpected daemon response: {other:?}",
+                    ws.id
+                ));
+                note_failed_cleanup(&mut log, root, &path, &branch, &ws.id);
+            }
         }
     }
 

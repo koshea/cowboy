@@ -25,6 +25,15 @@ pub struct SessionLogger {
     commands: File,
     command_seq: u32,
     message_seq: u32,
+    /// The first write that failed, kept so it can be reported once.
+    ///
+    /// The transcript and command log are the record of what the agent actually did —
+    /// the audit trail the whole session exists to produce. Writes here used to be
+    /// `let _ = writeln!(…)`, so a full disk or a revoked permission truncated that
+    /// record with no indication at all: the session carried on looking healthy and the
+    /// evidence simply stopped. Held rather than logged immediately so a failing disk
+    /// produces one notice, not one per message.
+    write_failure: Option<String>,
 }
 
 /// A logged command record (`commands.jsonl`).
@@ -79,6 +88,7 @@ impl SessionLogger {
             commands,
             command_seq: 0,
             message_seq: 0,
+            write_failure: None,
         })
     }
 
@@ -95,7 +105,8 @@ impl SessionLogger {
     pub fn log_message(&mut self, msg: &Message) {
         self.message_seq += 1;
         if let Ok(line) = serde_json::to_string(msg) {
-            let _ = writeln!(self.transcript, "{line}");
+            let r = writeln!(self.transcript, "{line}");
+            self.note_failure("transcript.jsonl", r);
         }
     }
 
@@ -107,7 +118,8 @@ impl SessionLogger {
             .dir
             .join("commands")
             .join(format!("{:04}.out", self.command_seq));
-        let _ = std::fs::write(&out_path, output);
+        let r = std::fs::write(&out_path, output);
+        self.note_failure("a command output file", r);
         let rec = CommandRecord {
             seq: self.command_seq,
             ts_ms: now_ms(),
@@ -117,8 +129,33 @@ impl SessionLogger {
             output_bytes: output.len(),
         };
         if let Ok(line) = serde_json::to_string(&rec) {
-            let _ = writeln!(self.commands, "{line}");
+            let r = writeln!(self.commands, "{line}");
+            self.note_failure("commands.jsonl", r);
         }
+    }
+
+    /// Remember the first write failure, naming what could not be written.
+    fn note_failure(&mut self, what: &str, r: std::io::Result<()>) {
+        if let Err(e) = r {
+            if self.write_failure.is_none() {
+                self.write_failure = Some(format!("could not write {what}: {e}"));
+                // Also logged immediately: the caller may never ask, and a silently
+                // truncated audit trail is the thing being prevented.
+                tracing::error!(
+                    error = %e, what,
+                    "the session log could not be written; this session's record is incomplete"
+                );
+            }
+        }
+    }
+
+    /// The first write failure, if the session's record is incomplete.
+    ///
+    /// Reported to the user by the agent loop rather than returned from every `log_*`
+    /// call: a logging failure should not change control flow mid-turn, but the user
+    /// must not be left believing they have a complete transcript.
+    pub fn write_failure(&self) -> Option<&str> {
+        self.write_failure.as_deref()
     }
 
     /// Write the final summary.
@@ -288,6 +325,44 @@ fn create_file(path: &Path) -> Result<File> {
 mod tests {
     use super::*;
     use cowboy_core::model::Message;
+
+    /// A failed transcript write must be recorded, not swallowed.
+    ///
+    /// These files are the record of what the agent did. Writes used to be
+    /// `let _ = writeln!(…)`, so a full disk or a revoked permission truncated the audit
+    /// trail while the session carried on looking perfectly healthy — the evidence just
+    /// stopped. `/dev/full` accepts an open and fails every write with `ENOSPC`, which is
+    /// literally the case being guarded.
+    #[test]
+    fn a_failed_transcript_write_is_recorded_and_reported_once() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let mut log = SessionLogger::create_with_id(tmp.path(), "s1").unwrap();
+
+        // Healthy to begin with.
+        log.log_message(&Message::user("hello"));
+        assert!(log.write_failure().is_none());
+
+        let Ok(full) = std::fs::OpenOptions::new().write(true).open("/dev/full") else {
+            eprintln!("skipping: no /dev/full on this host");
+            return;
+        };
+        log.transcript = full;
+
+        log.log_message(&Message::user("this cannot be written"));
+        let first = log
+            .write_failure()
+            .expect("a failed write must be recorded, not discarded")
+            .to_string();
+        assert!(first.contains("transcript.jsonl"), "{first}");
+
+        // Kept, not replaced: a failing disk must not produce a notice per message.
+        log.log_message(&Message::user("nor this"));
+        assert_eq!(
+            log.write_failure().unwrap(),
+            first,
+            "the first failure is kept, not overwritten on every later write"
+        );
+    }
 
     #[test]
     fn writes_session_artifacts() {

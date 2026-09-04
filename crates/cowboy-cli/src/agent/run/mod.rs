@@ -1613,7 +1613,7 @@ impl<'a> AgentLoop<'a> {
 
     /// Finalize the session log (diff + summary). Call once when the
     /// conversation ends.
-    pub fn finalize_session(&self) {
+    pub fn finalize_session(&mut self) {
         let status = if self.last_final.is_some() {
             "complete"
         } else {
@@ -1622,6 +1622,19 @@ impl<'a> AgentLoop<'a> {
         self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SessionCompleted {
             status: status.to_string(),
         });
+        // Say so if the record of this session is incomplete. The user is about to walk
+        // away believing the transcript is what happened, and a full disk is the usual
+        // cause — silent truncation of the audit trail is worse than a noisy session.
+        let failure = self
+            .logger
+            .as_ref()
+            .and_then(|l| l.write_failure().map(str::to_string));
+        if let Some(why) = failure {
+            self.ui.notice(&format!(
+                "this session's log is incomplete — {why}. The transcript and command \
+                 records under .cowboy/sessions/ are missing entries."
+            ));
+        }
         if let Some(l) = &self.logger {
             l.finalize(self.last_final.as_deref());
         }
