@@ -229,3 +229,19 @@ surface, review the `insta` diff. If you changed the CLI, regenerate `cli.md`
 (above). If you added/changed a feature, update its docs chapter. If you changed
 model-dependent behavior, run the relevant `#[ignore]` E2E and report whether it
 passed.
+
+**If you touched `cowboy-proto` (or anything else the web UI consumes), build the web
+UI too** — it is wasm32-only and **not a workspace member**, so `--workspace` never
+compiles it and a break is invisible to every command above:
+
+```sh
+cd crates/cowboy-web-ui && cargo test && trunk build --release
+```
+
+This has bitten once already: adding `UiEventMsg::ContextUsage` for the TUI's
+`/context` view left the web UI's `match` non-exhaustive, and nothing local failed —
+`dist/` kept embedding a stale bundle, so even `COWBOY_WEB_UI_TESTS=required` passed
+(it asserts a bundle *is* embedded, not that one *builds*). CI has a dedicated job that
+would have caught it; that is no help before you push. Note also that
+`cargo install --path` re-resolves dependencies and ignores `Cargo.lock` — always
+`--locked`.

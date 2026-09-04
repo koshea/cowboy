@@ -385,6 +385,14 @@ fn session(props: &SessionProps) -> Html {
                 </span>
                 <span class="muted stats">
                     { format!("{} in · {} out", model.tokens_in, model.tokens_out) }
+                    if let Some((used, budget)) = model.context {
+                        // How full the conversation is, which is what you actually want
+                        // to know on a small screen — the absolute counts above keep
+                        // growing all session and never say how close a compaction is.
+                        if budget > 0 {
+                            { format!(" · ctx {}%", used.saturating_mul(100) / budget) }
+                        }
+                    }
                     if model.cost_usd > 0.0 { { format!(" · ${:.3}", model.cost_usd) } }
                 </span>
             </header>

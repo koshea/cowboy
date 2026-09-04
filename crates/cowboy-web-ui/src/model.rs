@@ -70,6 +70,13 @@ pub struct Model {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
+    /// Conversation tokens against the conversation budget, from the loop's own
+    /// accounting — the same numbers `/context` shows in the TUI. `None` until the
+    /// first turn reports them.
+    ///
+    /// Only the two figures the header needs: the window/reserve split and the list of
+    /// top consumers are a diagnostic view the phone-sized header has no room for.
+    pub context: Option<(u64, u64)>,
     pub diffstat: String,
     pub plan: Vec<(String, String)>,
     pub blocked: Option<String>,
@@ -230,6 +237,9 @@ impl Model {
                 self.tokens_out = output;
             }
             UiEventMsg::Cost(c) => self.cost_usd = c,
+            UiEventMsg::ContextUsage { used, budget, .. } => {
+                self.context = Some((used, budget));
+            }
             UiEventMsg::Blocked(r) => self.blocked = r,
             UiEventMsg::Plan(p) => self.plan = p,
             UiEventMsg::Title(t) => self.title = t,
@@ -273,6 +283,28 @@ mod tests {
         }
     }
 
+    /// Context utilisation reaches the header.
+    ///
+    /// This variant was added to the wire protocol for the TUI's `/context` view and
+    /// the web UI's match was not updated — which failed no build, because
+    /// `cowboy-web-ui` is wasm32-only and not a workspace member, so `cargo build
+    /// --workspace` never compiles it, and the stale bundle in `dist/` kept embedding
+    /// happily. Matching every variant explicitly (no `_ =>` arm) is what makes the
+    /// compiler catch the next one; this keeps that honest.
+    #[test]
+    fn context_usage_lands_in_the_header_stats() {
+        let mut m = Model::default();
+        assert_eq!(m.context, None, "nothing to show before the first turn");
+        m.apply_event(UiEventMsg::ContextUsage {
+            used: 84_500,
+            budget: 160_000,
+            window: 200_000,
+            reserve: 40_000,
+            top: vec![("shell".into(), 30_000)],
+        });
+        assert_eq!(m.context, Some((84_500, 160_000)));
+    }
+
     #[test]
     fn tracks_subagents_and_freezes_on_end() {
         let mut m = Model::default();
@@ -285,12 +317,18 @@ mod tests {
             ok: true,
             id: "b".into(),
         });
-        assert_eq!(m.subagents.iter().find(|s| s.id == "b").unwrap().done, Some(true));
+        assert_eq!(
+            m.subagents.iter().find(|s| s.id == "b").unwrap().done,
+            Some(true)
+        );
         assert_eq!(m.subagents.iter().find(|s| s.id == "a").unwrap().done, None);
 
         // Session end freezes any still-running subagent (no forever "running").
         m.apply(ServerMsg::Ended { reason: "x".into() });
-        assert_eq!(m.subagents.iter().find(|s| s.id == "a").unwrap().done, Some(false));
+        assert_eq!(
+            m.subagents.iter().find(|s| s.id == "a").unwrap().done,
+            Some(false)
+        );
     }
 
     #[test]

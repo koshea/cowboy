@@ -44,6 +44,30 @@ The `#[ignore]` end-to-end tests are the **manually-run suite** for model-depend
 behavior (run with `cargo test -p cowboy-cli --test daemon_e2e -- --ignored`).
 Always clean up the worktrees they create.
 
+## The web UI is invisible to `--workspace`
+
+`cowboy-web-ui` is wasm32-only and deliberately **not a workspace member**, so
+`cargo build --workspace`, `clippy --workspace` and `nextest run` never compile it. If
+you change `cowboy-proto` — or anything else it consumes — build it yourself:
+
+```sh
+cd crates/cowboy-web-ui && cargo test && trunk build --release
+```
+
+This is not hypothetical. Adding a `UiEventMsg` variant for the TUI's `/context` view
+left the web UI's `match` non-exhaustive and **nothing local failed**: `dist/` still
+held a bundle from before the change, so `cowboy-cli` embedded it happily and even
+`COWBOY_WEB_UI_TESTS=required` passed — it asserts a bundle *is* embedded, not that one
+still *builds*. CI has a dedicated job with `trunk` that catches this, which is no help
+until you push.
+
+Two habits follow from it: keep `apply_event`'s match exhaustive (no `_ =>` arm, so the
+compiler is the guard), and rebuild `dist/` before installing, or you ship a binary
+whose embedded UI predates the protocol it speaks.
+
+Also: `cargo install --path` **re-resolves dependencies and ignores `Cargo.lock`**. Use
+`--locked`, as the install docs do, or you build against versions nobody has tested.
+
 ## Keeping these docs up to date
 
 This site is part of the change, not an afterthought. **When you add or change a
