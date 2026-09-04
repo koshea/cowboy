@@ -217,10 +217,54 @@ fn read_list(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Whether this host can enforce limits at all, for `cowboy doctor` to report
-/// without creating anything.
+/// Whether this host can enforce limits at all, for `cowboy doctor` to report and for
+/// tests to skip on.
+///
+/// Verified by **doing it**: create a real cgroup, confirm a limit landed, remove it.
+/// It used to just ask whether any ancestor delegated the controllers, which is a
+/// weaker claim than it looks — a directory can advertise `memory cpu pids` in its
+/// `cgroup.subtree_control` and still refuse `mkdir` to the current user. A GitHub
+/// Actions runner is exactly that shape, and the results were:
+///
+/// - `cowboy doctor` printed `resource limits: cgroup v2 subtree delegated` on a host
+///   where no ceiling would ever apply, and `cowboy sandbox plan` omitted its
+///   `NOT ENFORCED` warning — the module's own rule about never claiming a limit that
+///   is not in force, broken by the check meant to report it;
+/// - every test guarded on this ran instead of skipping, then failed inside
+///   `Cgroup::create`. The guard said yes and the thing it guarded said no.
+///
+/// Implemented by calling `Cgroup::create` rather than re-deriving its conditions, so
+/// the answer cannot drift from what actually happens. All three controllers are
+/// requested because `create` succeeds if *any* limit applied, and a host that
+/// delegates only `cpu` can still enforce something worth reporting.
 pub fn available() -> bool {
-    !candidate_parents().is_empty()
+    let probe = ResourceLimits {
+        memory_mib: Some(64),
+        cpus: Some(1.0),
+        pids: Some(16),
+        jobs: None,
+    };
+    // Unique per call: concurrent probes (the test suite runs in parallel) must not
+    // race on one name and conclude the host cannot do this — the bug this module
+    // already fixed once inside `create`.
+    match Cgroup::create(&probe_name(), &probe) {
+        Ok(Some(cg)) => {
+            cg.remove();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// A cgroup name no other probe or session will pick.
+fn probe_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "probe-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// Remove leftover cowboy cgroup directories that no longer hold any process.
@@ -263,6 +307,29 @@ pub fn reap_empty() -> usize {
 mod tests {
     use super::*;
 
+    /// Whether to skip a test that needs a real cgroup.
+    ///
+    /// Deliberately **not** gated on `COWBOY_SANDBOX_TESTS=required`. That switch means
+    /// "the security boundary must work here", and resource limits are explicitly not
+    /// part of it — they protect the machine from a runaway build, and the sandbox
+    /// confines correctly without them. A CI runner has no delegated subtree and should
+    /// still be able to demand a working boundary.
+    ///
+    /// `COWBOY_CGROUP_TESTS=required` is the narrower switch, for a host that does have
+    /// delegation (a systemd user session) and wants to know if it silently loses it.
+    fn skip_no_cgroups() -> bool {
+        if available() {
+            return false;
+        }
+        assert!(
+            std::env::var("COWBOY_CGROUP_TESTS").as_deref() != Ok("required"),
+            "COWBOY_CGROUP_TESTS=required but no usable cgroup v2 subtree here — the \
+             delegated parent may advertise controllers while refusing mkdir to this user"
+        );
+        eprintln!("skipping: no usable cgroup v2 subtree here");
+        true
+    }
+
     #[test]
     fn the_v2_cgroup_line_is_parsed() {
         let text = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n";
@@ -303,8 +370,7 @@ mod tests {
     /// files the kernel reads, which is the only evidence that a limit is in force.
     #[test]
     fn limits_are_written_where_the_kernel_reads_them() {
-        if !available() {
-            eprintln!("skipping: no delegated cgroup v2 subtree here");
+        if skip_no_cgroups() {
             return;
         }
         let limits = ResourceLimits {
@@ -333,8 +399,7 @@ mod tests {
     /// A fractional CPU quota must not round to zero, which the kernel rejects.
     #[test]
     fn a_tiny_cpu_quota_stays_valid() {
-        if !available() {
-            eprintln!("skipping: no delegated cgroup v2 subtree here");
+        if skip_no_cgroups() {
             return;
         }
         let limits = ResourceLimits {
@@ -362,8 +427,7 @@ mod tests {
     /// an intermittently failing end-to-end test.
     #[test]
     fn concurrent_sessions_each_get_enforced_limits() {
-        if !available() {
-            eprintln!("skipping: no delegated cgroup v2 subtree here");
+        if skip_no_cgroups() {
             return;
         }
         let limits = ResourceLimits {
@@ -399,6 +463,31 @@ mod tests {
                 (256 * 1024 * 1024).to_string(),
                 "and each must actually be configured"
             );
+            cg.remove();
+        }
+    }
+
+    /// The skip guard must agree with the thing it guards.
+    ///
+    /// `available()` used to answer "does an ancestor delegate the controllers?", which
+    /// is a weaker claim than "can a cgroup be created here" — a directory can advertise
+    /// `memory cpu pids` and still refuse `mkdir` to this user. On such a host (a
+    /// GitHub Actions runner) every guarded test ran instead of skipping and then failed
+    /// inside `create`, and `doctor` reported limits as available on a machine where
+    /// none would apply. Whatever this host is, the two must not disagree.
+    #[test]
+    fn the_availability_check_agrees_with_actually_creating_one() {
+        let limits = ResourceLimits {
+            memory_mib: Some(128),
+            ..Default::default()
+        };
+        let created = Cgroup::create(&format!("agree-{}", std::process::id()), &limits).unwrap();
+        assert_eq!(
+            available(),
+            created.is_some(),
+            "the guard and the operation must reach the same conclusion on this host"
+        );
+        if let Some(cg) = created {
             cg.remove();
         }
     }

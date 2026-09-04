@@ -73,6 +73,16 @@ impl Requirement {
     }
 }
 
+/// Whether the caller has declared that the sandbox **must** work here.
+///
+/// `COWBOY_SANDBOX_TESTS=required` is the repo-wide switch: the sandbox integration
+/// tests use it to turn a self-skip into a failure, so a suite cannot pass by quietly
+/// doing nothing precisely where it matters. The host-capability unit tests honour the
+/// same variable, so there is one thing to set rather than one per test file.
+pub fn tests_required() -> bool {
+    std::env::var("COWBOY_SANDBOX_TESTS").as_deref() == Ok("required")
+}
+
 /// Run every check. Ordered so that the most fundamental failure is reported first:
 /// if user namespaces are unavailable nothing else matters, and a reader should not
 /// have to work out which of six failures is the cause of the others.
@@ -357,6 +367,12 @@ mod tests {
     /// The suite runs on the target host, so these must all pass here. If one does
     /// not, the sandbox tests would be skipping and the failure belongs in `doctor`
     /// rather than being discovered later.
+    ///
+    /// Except where the sandbox genuinely cannot run — a CI runner without bubblewrap,
+    /// or Ubuntu 24.04's AppArmor gate on unprivileged user namespaces. There these
+    /// findings are correct, and failing on them tests the host rather than the code.
+    /// `COWBOY_SANDBOX_TESTS=required` makes the skip a failure, matching the
+    /// integration tests, so CI that means to cover the sandbox says so once.
     #[test]
     fn the_host_meets_every_requirement() {
         let checks = check_all();
@@ -373,6 +389,10 @@ mod tests {
                 )
             })
             .collect();
+        if !broken.is_empty() && !super::tests_required() {
+            eprintln!("skipping: this host cannot run the sandbox: {broken:#?}");
+            return;
+        }
         assert!(
             broken.is_empty(),
             "this host cannot run the sandbox: {broken:#?}"

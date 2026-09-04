@@ -31,6 +31,17 @@ COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
 is obvious once you know it: a few seconds when they run, a few milliseconds when
 they skip.
 
+The same switch governs the host-capability *unit* tests (`cowboy doctor`'s own
+check, and the preflight's). Those used to assert unconditionally, so they failed on
+any machine that cannot sandbox — a CI runner without bubblewrap, or Ubuntu 24.04,
+which gates unprivileged user namespaces behind AppArmor
+(`kernel.apparmor_restrict_unprivileged_userns=1`; installing bwrap is not enough).
+
+**Cgroup tests use a separate switch,** `COWBOY_CGROUP_TESTS=required`. Resource
+limits are deliberately not part of the security boundary, so `COWBOY_SANDBOX_TESTS`
+does not demand them — a runner with no delegated cgroup subtree should still be able
+to require a working sandbox. On a systemd user session, set both.
+
 Two traps worth knowing before you write a test here:
 
 - **A successful `connect()` is not evidence of egress.** Under transparent

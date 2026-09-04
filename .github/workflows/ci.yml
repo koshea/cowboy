@@ -30,17 +30,38 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The sandbox is the security boundary, so CI runs its tests for real rather
+      # than letting them self-skip. Two prerequisites, and installing only the first
+      # is the trap: Ubuntu 23.10+ gates unprivileged user namespaces behind AppArmor
+      # (`kernel.apparmor_restrict_unprivileged_userns=1`), so bwrap is present and
+      # every sandbox operation still fails with
+      # `write failed /proc/self/uid_map: Operation not permitted`.
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Tolerant: the knob only exists on AppArmor kernels that restrict userns.
+          # Its absence is fine; what matters is the smoke test below, which is the
+          # same "check by doing" the sandbox preflight uses.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --unshare-user --unshare-net --ro-bind /usr /usr \
+                --symlink usr/lib /lib --symlink usr/lib64 /lib64 -- /usr/bin/true
+          echo "bubblewrap works unprivileged here"
+
       - name: Formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # The default suite is host-only: every test that needs a real model provider
-      # is `#[ignore]` and self-skips, and the sandbox tests skip themselves when the
-      # kernel prerequisites are absent — so this is safe on a vanilla runner. (Run
-      # the `#[ignore]` suites manually; see AGENTS.md.)
+      # `COWBOY_SANDBOX_TESTS=required` turns every sandbox self-skip into a failure.
+      # Without it this suite passes on a runner that cannot sandbox at all, which is
+      # the one place the coverage matters most — a green tick for tests that did
+      # nothing. Tests needing a real model provider are `#[ignore]`; run those
+      # manually (see AGENTS.md).
       - name: Tests
+        env:
+          COWBOY_SANDBOX_TESTS: required
         run: cargo test --workspace
 
       - name: Doctests

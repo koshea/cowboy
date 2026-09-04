@@ -111,6 +111,25 @@ fn which(bin: &str) -> Option<PathBuf> {
     })
 }
 
+/// Whether to skip a test needing a real cgroup.
+///
+/// Not gated on `COWBOY_SANDBOX_TESTS=required`: that switch means the security
+/// boundary must work here, and resource limits are explicitly not part of it. A CI
+/// runner has no delegated subtree and should still be able to demand a boundary.
+/// `COWBOY_CGROUP_TESTS=required` is the narrower switch, for a host that has
+/// delegation and wants to notice if it silently loses it.
+fn skip_no_cgroups() -> bool {
+    if cowboy_cli::sandbox::cgroup::available() {
+        return false;
+    }
+    assert!(
+        std::env::var("COWBOY_CGROUP_TESTS").as_deref() != Ok("required"),
+        "COWBOY_CGROUP_TESTS=required but no usable cgroup v2 subtree on this host"
+    );
+    eprintln!("skipping: no usable cgroup v2 subtree on this host");
+    true
+}
+
 macro_rules! skip_if_unsupported {
     () => {
         if let Some(why) = unsupported() {
@@ -559,8 +578,7 @@ async fn a_saved_grant_for_credentials_is_refused_by_a_real_sandbox() {
 #[tokio::test]
 async fn a_memory_ceiling_kills_a_runaway_command_and_not_the_machine() {
     skip_if_unsupported!();
-    if !cowboy_cli::sandbox::cgroup::available() {
-        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+    if skip_no_cgroups() {
         return;
     }
     let p = Project::new();
@@ -610,8 +628,7 @@ async fn a_memory_ceiling_kills_a_runaway_command_and_not_the_machine() {
 #[tokio::test]
 async fn a_fork_bomb_is_bounded_by_the_process_ceiling() {
     skip_if_unsupported!();
-    if !cowboy_cli::sandbox::cgroup::available() {
-        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+    if skip_no_cgroups() {
         return;
     }
     let p = Project::new();
@@ -648,8 +665,7 @@ else:
 #[tokio::test]
 async fn the_session_cgroup_is_reaped_on_teardown() {
     skip_if_unsupported!();
-    if !cowboy_cli::sandbox::cgroup::available() {
-        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+    if skip_no_cgroups() {
         return;
     }
     let p = Project::new();
@@ -705,8 +721,7 @@ async fn the_session_cgroup_is_reaped_on_teardown() {
 #[tokio::test]
 async fn a_sibling_teardown_leaves_a_live_session_working() {
     skip_if_unsupported!();
-    if !cowboy_cli::sandbox::cgroup::available() {
-        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+    if skip_no_cgroups() {
         return;
     }
     let p = Project::new();
@@ -737,8 +752,7 @@ async fn a_sibling_teardown_leaves_a_live_session_working() {
 #[tokio::test]
 async fn concurrent_sessions_get_independent_cgroups() {
     skip_if_unsupported!();
-    if !cowboy_cli::sandbox::cgroup::available() {
-        eprintln!("skipping: no delegated cgroup v2 subtree on this host");
+    if skip_no_cgroups() {
         return;
     }
     let p = Project::new();

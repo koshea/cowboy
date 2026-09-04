@@ -54,6 +54,14 @@ over a unix socket.
   not evidence of egress** (under transparent interception every connect succeeds —
   attempt a data transfer), and **denial tests pass vacuously offline** (hence a
   separate `skip_if_offline!()`).
+
+  Host-capability *unit* tests (`doctor::this_host_reports_no_sandbox_failures`,
+  `preflight::the_host_meets_every_requirement`) honour the same switch. They used to
+  assert unconditionally, which failed on any host that cannot sandbox — including CI.
+- **Cgroup tests** have their own switch, `COWBOY_CGROUP_TESTS=required`. Resource
+  limits are deliberately **not** part of the boundary, so `COWBOY_SANDBOX_TESTS`
+  must not demand them: a CI runner has no delegated subtree and should still be able
+  to require a working sandbox. On a systemd user session, set both.
 - **`#[ignore]` end-to-end tests** are the **manually-run suite** — they spawn real
   worker processes and need a real model provider. They self-skip when
   prerequisites are absent, so `--ignored` is safe to run anywhere:
