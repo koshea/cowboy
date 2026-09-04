@@ -104,6 +104,12 @@ struct Daemon {
     /// The running web server (`cowboy web on`); `None` when not serving. Runtime-only
     /// — the setting itself lives in `web.yaml`.
     web: Option<WebServer>,
+    /// The newest serialized state waiting to be written, staged by [`Daemon::save`]
+    /// and consumed by [`flush_state`] once the lock is released.
+    ///
+    /// Its own mutex so `save` can take `&self`: it is called from ~27 places that hold
+    /// the outer daemon lock, and none of them should have to care how the write happens.
+    pending: std::sync::Mutex<Option<String>>,
 }
 
 /// A spawned web server, and whether it is actually still up.
@@ -188,10 +194,12 @@ fn load_state(path: &Path) -> State {
 }
 
 impl Daemon {
+    /// Load the registry from disk.
     fn load(state_path: PathBuf) -> Self {
         Self {
             state: load_state(&state_path),
             state_path,
+            pending: std::sync::Mutex::new(None),
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
             web: None,
@@ -537,29 +545,90 @@ impl Daemon {
     /// small but the payload is not: a truncated `state.json` is a *parse* failure,
     /// which used to reset the registry — leases included — without a word. So the
     /// two halves of this fix belong together.
+    /// Persist the registry.
+    ///
+    /// Serializes under the caller's lock — cheap — and stages the bytes. The actual
+    /// temp-file, fsync, rename and directory fsync happen in [`flush_state`], called
+    /// once the lock is released and **before** the RPC is answered.
+    ///
+    /// Every one of the ~27 call sites holds the daemon mutex, so writing here blocked
+    /// every other RPC behind a disk, on a tokio worker thread. Adding the fsyncs that
+    /// durability needed made it materially worse: heartbeats arrive every 5s and a
+    /// session goes stale after 30s, so a slow disk could queue heartbeats behind saves
+    /// and report live sessions as dead.
+    ///
+    /// Deliberately still synchronous *with respect to the reply*. An earlier attempt at
+    /// this handed writes to a background task, which was faster but lost the newest
+    /// change when the daemon was `SIGKILL`ed — and the newest change can be the only
+    /// record of a live worker's worktree lease. Losing that reintroduces exactly the
+    /// "two sessions in one worktree" bug the durability fix was for. What moves off the
+    /// lock is the *waiting*, not the guarantee.
     fn save(&self) {
-        if let Some(parent) = self.state_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        if let Ok(json) = serde_json::to_string_pretty(&self.state) {
+            *self
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(json);
         }
-        let Ok(json) = serde_json::to_string_pretty(&self.state) else {
-            return;
-        };
-        let tmp = self.state_path.with_extension("json.tmp");
-        if let Err(e) = write_durable(&tmp, json.as_bytes()) {
-            tracing::warn!(path = %tmp.display(), error = %e, "could not stage the daemon registry");
-            return;
+    }
+
+    /// Persist synchronously and immediately, for shutdown paths where no flush will
+    /// follow.
+    fn save_now(&self) {
+        self.save();
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(json) = pending {
+            write_state(&self.state_path, &json);
         }
-        if let Err(e) = std::fs::rename(&tmp, &self.state_path) {
-            tracing::warn!(path = %self.state_path.display(), error = %e, "could not save the daemon registry");
-            let _ = std::fs::remove_file(&tmp);
-            return;
-        }
-        // The rename itself is a directory operation, so the directory needs its own
-        // flush or the entry can be lost even though the file's contents are safe.
-        if let Some(parent) = self.state_path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+    }
+}
+
+/// Write any staged registry snapshot to disk, off the daemon lock.
+///
+/// The lock is taken only to *take* the snapshot, then released before the fsyncs. Two
+/// concurrent callers are safe: the state is a whole-file snapshot, so the one that takes
+/// it writes the newest version and the other finds nothing to do.
+async fn flush_state(daemon: &Arc<Mutex<Daemon>>) {
+    let staged = {
+        let d = daemon.lock().await;
+        let json = d
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        json.map(|j| (d.state_path.clone(), j))
+    };
+    if let Some((path, json)) = staged {
+        // `spawn_blocking` because `write_state` fsyncs: doing that on a runtime worker
+        // is the other half of what this change fixes.
+        let _ = tokio::task::spawn_blocking(move || write_state(&path, &json)).await;
+    }
+}
+
+/// Atomically and durably replace the registry file with `json`.
+fn write_state(state_path: &Path, json: &str) {
+    if let Some(parent) = state_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp = state_path.with_extension("json.tmp");
+    if let Err(e) = write_durable(&tmp, json.as_bytes()) {
+        tracing::warn!(path = %tmp.display(), error = %e, "could not stage the daemon registry");
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, state_path) {
+        tracing::warn!(path = %state_path.display(), error = %e, "could not save the daemon registry");
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    // The rename itself is a directory operation, so the directory needs its own
+    // flush or the entry can be lost even though the file's contents are safe.
+    if let Some(parent) = state_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
         }
     }
 }
@@ -656,6 +725,8 @@ pub async fn serve() -> Result<()> {
         // Serve the web UI now if it's enabled in web.yaml (always-on setting).
         d.apply_web();
     }
+    // Startup reconciliation happens before any request, so nothing else would flush it.
+    flush_state(&daemon).await;
 
     // Periodic staleness sweep so crashed/abandoned workers are noticed even
     // without a client poking the daemon.
@@ -701,6 +772,9 @@ pub async fn serve() -> Result<()> {
                     );
                 }
             }
+            // The sweeper mutates outside any request, so nothing else will flush what it
+            // staged. Off the lock, which the block above has just released.
+            flush_state(&sweeper).await;
             // Nothing to tear down for a crashed session: its namespaces, ruleset and
             // cgroup were owned by a holder process tied to the worker's lifetime, so
             // they went when the worker did. Only the empty cgroup *directory* can
@@ -727,6 +801,9 @@ pub async fn serve() -> Result<()> {
                             "no sessions left; cowboyd exiting (it restarts on the next command)"
                         );
                         idle_shutdown.cancel();
+                        // Writes are normally handed to a background task; on the way
+                        // out there is nobody left to run one, so flush here.
+                        sweeper.lock().await.save_now();
                         return;
                     }
                 }
@@ -749,6 +826,9 @@ pub async fn serve() -> Result<()> {
                 // but does not happen is worse than no shutdown at all, because
                 // everything downstream now believes the daemon is gone.
                 force_exit_after(std::time::Duration::from_secs(10));
+                // Flush synchronously: the writer task will not outlive this loop, and a
+                // clean shutdown should not be the one that loses the last change.
+                daemon.lock().await.save_now();
                 break;
             }
         };
@@ -864,6 +944,11 @@ async fn handle_conn(
                 },
             },
         };
+        // Any registry change this request made reaches the disk **before** the reply,
+        // so an acknowledged `LeaseGranted` (say) survives a `SIGKILL` — that record can
+        // be the only evidence a worker holds a worktree. `dispatch` has released the
+        // daemon lock by now, so the fsync no longer blocks every other RPC behind it.
+        flush_state(&daemon).await;
         w.write_all(encode_line(&out).as_bytes()).await?;
         w.flush().await?;
     }
@@ -1486,6 +1571,8 @@ async fn start_session(
             d.save();
             staled
         };
+        // Outside any request: the supervisor is the only thing that will flush this.
+        flush_state(&sup).await;
         // A crashed ranch workstream should still advance the plan (so it's
         // reflected as failed and the user is prompted), mirroring clean exits.
         if went_stale {
@@ -1670,6 +1757,7 @@ mod tests {
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
             web: None,
+            pending: std::sync::Mutex::new(None),
         }
     }
 
@@ -1691,9 +1779,10 @@ mod tests {
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
             web: None,
+            pending: std::sync::Mutex::new(None),
         };
         put_session(&mut d, "s1", SessionStatus::Running);
-        d.save();
+        d.save_now();
         assert!(load_state(&path).sessions.contains_key("s1"));
 
         // Truncated, as an un-fsynced write followed by a crash leaves it.
@@ -1725,6 +1814,81 @@ mod tests {
             std::fs::read_dir(tmp.path()).unwrap().flatten().count() == 0,
             "nothing is written for a daemon that has never saved"
         );
+    }
+
+    /// Saving must not do the fsync while the caller holds the daemon lock — but the
+    /// bytes must still reach the disk before the request is answered.
+    ///
+    /// Every `save()` call site holds the daemon mutex, so writing inline blocked every
+    /// other RPC behind a disk, and adding fsyncs for durability made that worse:
+    /// heartbeats arrive every 5s and a session goes stale after 30s.
+    ///
+    /// The first attempt at this wrote in a background task. Faster, and wrong — it lost
+    /// the newest change when the daemon was `SIGKILL`ed, and that change can be the only
+    /// record of a live worker's worktree lease, which is the "two sessions in one
+    /// worktree" bug the durability fix existed to prevent. So `save` stages and
+    /// `flush_state` writes: the *waiting* moves off the lock, not the guarantee.
+    #[tokio::test]
+    async fn saving_stages_under_the_lock_and_flushes_outside_it() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let daemon = Arc::new(Mutex::new(Daemon::load(path.clone())));
+
+        {
+            let mut d = daemon.lock().await;
+            put_session(&mut d, "s1", SessionStatus::Running);
+            let before = std::time::Instant::now();
+            d.save();
+            assert!(
+                before.elapsed() < std::time::Duration::from_millis(20),
+                "save() must not fsync while the lock is held"
+            );
+            assert!(!path.exists(), "nothing is written until the flush");
+        }
+
+        flush_state(&daemon).await;
+        assert!(
+            load_state(&path).sessions.contains_key("s1"),
+            "the flush must persist what was staged"
+        );
+
+        // A second flush with nothing staged is a no-op, not a rewrite.
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        flush_state(&daemon).await;
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+    }
+
+    /// A burst of mutations collapses to one write of the newest state. A snapshot is
+    /// whole-file, so last-writer-wins is not a compromise — it is correct.
+    #[tokio::test]
+    async fn a_burst_of_saves_collapses_to_the_latest_state() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let daemon = Arc::new(Mutex::new(Daemon::load(path.clone())));
+        {
+            let mut d = daemon.lock().await;
+            for i in 0..50 {
+                put_session(&mut d, &format!("s{i}"), SessionStatus::Running);
+                d.save();
+            }
+        }
+        flush_state(&daemon).await;
+        assert_eq!(
+            load_state(&path).sessions.len(),
+            50,
+            "the newest state must be written, not an earlier snapshot"
+        );
+    }
+
+    /// Shutdown has no flush after it, so it writes synchronously.
+    #[tokio::test]
+    async fn save_now_persists_without_a_flush() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let path = tmp.path().join("state.json");
+        let mut d = Daemon::load(path.clone());
+        put_session(&mut d, "s1", SessionStatus::Running);
+        d.save_now();
+        assert!(load_state(&path).sessions.contains_key("s1"));
     }
 
     /// Register a session with a given status so its lease holder has known

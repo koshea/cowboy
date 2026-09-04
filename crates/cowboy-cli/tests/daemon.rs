@@ -269,9 +269,18 @@ fn registry_register_attach_complete() {
         other => panic!("expected Replay attach, got {other:?}"),
     }
 
-    // State persisted to disk.
+    // State persisted to disk — and by the time a request is answered, not eventually.
+    // Registry writes are staged under the daemon lock and fsynced after it is released
+    // but *before* the reply, so an acknowledged request is durable without every other
+    // RPC queueing behind the disk (see `Daemon::save`).
     let state_file = state.path().join("cowboy/daemon/state.json");
     assert!(state_file.exists(), "state.json should be written");
+    assert!(
+        std::fs::read_to_string(&state_file)
+            .unwrap()
+            .contains("sess-1"),
+        "and contain the session that was registered"
+    );
 }
 
 fn git(repo: &std::path::Path, args: &[&str]) {
