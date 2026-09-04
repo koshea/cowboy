@@ -395,19 +395,52 @@ async fn cancel_reaps_a_descendant_that_escaped_its_process_group() {
     let p = Project::new();
     // A marker unlikely to collide with anything else on the machine.
     let marker = format!("cowboy-reap-probe-{}", std::process::id());
+
+    // Cancel once the probe is actually running, and record that we saw it.
+    //
+    // This test used to sleep a fixed 800ms and then assert only that nothing carrying
+    // the marker *survived*. That passes vacuously whenever the probe never started —
+    // and it never started on any host where `/bin/sh` is not bash, because the old
+    // command used `exec -a`, a bash extension. A reaping test that proves nothing on
+    // Debian/Ubuntu is worse than no test, so the probe is now POSIX (`tail -f` on a
+    // path carrying the marker) and its existence is asserted.
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel = tokio_util::sync::CancellationToken::new();
-    let c = cancel.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(800)).await;
-        c.cancel();
-    });
-    let command = format!("setsid sh -c 'exec -a {marker} sleep 120' & sleep 120");
+    {
+        let c = cancel.clone();
+        let seen = seen.clone();
+        let marker = marker.clone();
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                if processes_matching(&marker) > 0 {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            c.cancel();
+        });
+    }
+    // `setsid` puts the descendant in its own session and process group, which is the
+    // escape this test is about; `exec` (no `-a`) is POSIX.
+    let command = format!(
+        "setsid sh -c 'touch /workspace/{marker} && exec tail -f /workspace/{marker}' \
+         & sleep 120"
+    );
     let (code, _out) = run_cancellable(&p.path(), &command, 0, cancel).await;
     assert_eq!(code, 130);
+    assert!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        "the escaped descendant never started, so this test would prove nothing about \
+         reaping it"
+    );
 
-    // Give the kernel a moment to tear the namespace down, then confirm nothing
-    // carrying our marker survives anywhere on the host.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Then confirm nothing carrying our marker survives anywhere on the host.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while processes_matching(&marker) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
         processes_matching(&marker),
         0,

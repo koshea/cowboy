@@ -432,19 +432,36 @@ async fn stopping_the_session_reaps_background_processes() {
     let marker = format!("cowboy-session-probe-{}", std::process::id());
 
     let def = ProcessDef {
-        command: format!("exec -a {marker} sleep 120"),
+        // `tail -f` on a path containing the marker, so the marker is in the
+        // process's argv without needing `exec -a` — that is a bash extension, and
+        // the shim runs `/bin/sh -c`, which is dash on Debian/Ubuntu. There it failed
+        // outright, the probe never started, and this assertion fired in CI.
+        command: format!("touch /workspace/{marker} && exec tail -f /workspace/{marker}"),
         cwd: "/workspace".to_string(),
         auto_start: false,
     };
     s.start_process("web", &def).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Poll rather than sleep a fixed 800ms. Bringing a session up (holder,
+    // namespaces, Landlock, seccomp, ruleset) and then starting a process can outlast
+    // any constant small enough to keep the suite quick — the same flakiness the
+    // sibling loopback test above already had to fix.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while processes_matching(&marker) == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
         processes_matching(&marker) > 0,
         "the background process should be running"
     );
 
     s.stop().await;
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Poll for the teardown too: an assertion that the process is gone must not pass
+    // merely because the kernel had not got round to it yet.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while processes_matching(&marker) > 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert_eq!(
         processes_matching(&marker),
         0,

@@ -57,6 +57,19 @@ Two traps worth knowing before you write a test here:
   connection reset on the first read.
 - **Denial tests pass vacuously when the network is down.** `skip_if_offline!()` is
   separate from `skip_if_unsupported!()` for exactly that reason.
+- **A cleanup test must first prove the thing existed.** A test that asserts only
+  "nothing carrying my marker survives" passes trivially when the marker process never
+  started. That is not hypothetical: the reaping test for a `setsid`'d descendant
+  launched its probe with `exec -a`, which is a bash/ksh extension
+  ([SC3038](https://github.com/koalaman/shellcheck/wiki/SC3038)) — so on every
+  Debian/Ubuntu host it never started and the test verified nothing, silently, while
+  passing. Assert the process is there, *then* assert it is gone.
+
+**Agent commands run under `/bin/sh`, which is dash on Debian and Ubuntu.** The
+lockdown shim execs `/bin/sh -c <command>`, and `/usr` is bind-mounted from the host, so
+the shell inside the sandbox is the host's. Keep test commands (and any shell snippet
+cowboy generates) POSIX: no `exec -a`, no `[[`, no `<(…)`. It works on a Gentoo box where
+`/bin/sh` is bash and fails, or silently does nothing, everywhere else.
 
 The `#[ignore]` end-to-end tests are the **manually-run suite** for model-dependent
 behavior (run with `cargo test -p cowboy-cli --test daemon_e2e -- --ignored`).

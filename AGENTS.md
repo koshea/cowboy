@@ -50,10 +50,18 @@ over a unix socket.
   COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
       --test sandbox_exec --test sandbox_session --test sandbox_egress
   ```
-  `required` turns a skip into a failure. Two traps: **a successful `connect()` is
+  `required` turns a skip into a failure. Three traps: **a successful `connect()` is
   not evidence of egress** (under transparent interception every connect succeeds —
-  attempt a data transfer), and **denial tests pass vacuously offline** (hence a
-  separate `skip_if_offline!()`).
+  attempt a data transfer); **denial tests pass vacuously offline** (hence a
+  separate `skip_if_offline!()`); and **a cleanup test must first assert the thing
+  existed** — one that only checks "nothing survives" passes trivially when the probe
+  never started.
+
+  **Commands run under `/bin/sh`, which is dash on Debian/Ubuntu**, since the shim execs
+  `/bin/sh -c` and `/usr` is bind-mounted from the host. Keep test commands POSIX: no
+  `exec -a` (a bash/ksh extension), no `[[`, no `<(…)`. `exec -a` in two sandbox tests
+  worked only because this dev box links `/bin/sh` to bash — in CI one failed and the
+  other passed while verifying nothing.
 
   Host-capability *unit* tests (`doctor::this_host_reports_no_sandbox_failures`,
   `preflight::the_host_meets_every_requirement`) honour the same switch. They used to
