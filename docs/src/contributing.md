@@ -31,6 +31,13 @@ COWBOY_SANDBOX_TESTS=required cargo nextest run -p cowboy-cli \
 is obvious once you know it: a few seconds when they run, a few milliseconds when
 they skip.
 
+**Run both `cargo nextest run` and `cargo test`.** They are not interchangeable here.
+nextest gives each test its own process, so anything keyed on the pid — the sandbox
+scratch directory is — is unshared, and a race between two tests cannot occur.
+`cargo test` runs a binary's tests as threads in one process, which is what CI does. A
+TOCTOU in the config-mask creation survived every nextest sweep for exactly that reason
+and failed on the first CI run that got far enough to execute the tests.
+
 The same switch governs the host-capability *unit* tests (`cowboy doctor`'s own
 check, and the preflight's). Those used to assert unconditionally, so they failed on
 any machine that cannot sandbox — a CI runner without bubblewrap, or Ubuntu 24.04,

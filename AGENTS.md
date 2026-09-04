@@ -232,11 +232,17 @@ Two guards keep it honest (both run under `cargo test`):
 ## Before you commit
 
 `cargo fmt --all` · `cargo clippy --workspace --all-targets` (clean) ·
-`cargo nextest run` (or `cargo test --workspace`). If you touched a snapshotted
-surface, review the `insta` diff. If you changed the CLI, regenerate `cli.md`
-(above). If you added/changed a feature, update its docs chapter. If you changed
-model-dependent behavior, run the relevant `#[ignore]` E2E and report whether it
-passed.
+`cargo nextest run` **and** `cargo test --workspace`. Both, not either: nextest runs
+each test in its own **process**, so anything keyed on the pid (the sandbox scratch dir,
+via `project::scratch_key`) is unshared and races between tests simply cannot happen.
+`cargo test` runs a binary's tests as threads in one process, which is what CI does —
+and how a TOCTOU in `ensure_mask_file` survived every local nextest sweep and failed on
+the first CI run that reached it.
+
+If you touched a snapshotted surface, review the `insta` diff. If you changed the CLI,
+regenerate `cli.md` (above). If you added/changed a feature, update its docs chapter. If
+you changed model-dependent behavior, run the relevant `#[ignore]` E2E and report
+whether it passed.
 
 **If you touched `cowboy-proto` (or anything else the web UI consumes), build the web
 UI too** — it is wasm32-only and **not a workspace member**, so `--workspace` never

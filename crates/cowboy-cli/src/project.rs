@@ -156,18 +156,32 @@ pub fn ensure_scratch_dir(key: &str) -> Result<PathBuf> {
 /// and never a boundary hole.
 fn ensure_mask_file(dir: &Path) -> Result<PathBuf> {
     let path = dir.join("mask-empty");
-    // Create only when absent: a bind of this file may be live in another command of
-    // the same session, and replacing it under them is the very thing being fixed.
-    if !path.exists() {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o400);
+    // `create_new`, not `exists()` then `create`. The old form was a TOCTOU: two
+    // commands in one session bringing a sandbox up at the same time both saw the file
+    // absent, the first created it `0o400`, and the second's `write(true)` open then
+    // failed with `EACCES` — on a file that was already exactly what it wanted. It only
+    // showed up where tests run in parallel on a slow machine, which is to say in CI
+    // and never on a dev box.
+    //
+    // O_EXCL closes the window, and "someone else created it" is success: the file is
+    // empty by construction and never written, so any winner produces the same result.
+    // Still created only-if-absent, for the original reason — a bind of it may be live
+    // in another command of this session, and replacing it under them is the bug this
+    // whole function exists to fix.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o400);
+    }
+    match opts.open(&path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("creating the config mask {}", path.display()))
         }
-        opts.open(&path)
-            .with_context(|| format!("creating the config mask {}", path.display()))?;
     }
     Ok(path)
 }
@@ -400,6 +414,48 @@ mod tests {
 #[cfg(test)]
 mod exe_tests {
     use super::*;
+
+    /// Concurrent sandbox bring-ups must not fight over the config mask.
+    ///
+    /// `ensure_mask_file` used to check `exists()` and then open with `write(true)`. The
+    /// file is created `0o400`, so the loser of that race opened an existing read-only
+    /// file for writing and got `EACCES` — while the file was already exactly what it
+    /// wanted. Two commands in one session, or a parallel test suite, is all it takes.
+    /// It never fired on a fast dev box and failed two tests on the first CI run that
+    /// got far enough to execute them.
+    #[test]
+    fn concurrent_sandbox_startups_share_one_config_mask() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let dir = tmp.path().to_path_buf();
+
+        let results: Vec<_> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| s.spawn(|| ensure_mask_file(&dir)))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "every concurrent caller must get the mask, not EACCES: {:?}",
+                r.as_ref().err()
+            );
+        }
+
+        // And it really is the empty, read-only file the plan binds.
+        let mask = mask_file_in(&dir);
+        assert!(mask.is_file());
+        assert_eq!(std::fs::metadata(&mask).unwrap().len(), 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&mask).unwrap().permissions().mode() & 0o777,
+                0o400,
+                "the mask must stay read-only — it is bound over host-owned config"
+            );
+        }
+    }
 
     #[test]
     fn resolve_exe_handles_a_replaced_binary() {
