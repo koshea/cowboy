@@ -66,8 +66,59 @@ impl Persistence {
 /// that read the real `global.json` would behave differently on every machine.
 pub fn dir() -> PathBuf {
     cowboy_core::config::global_config_dir()
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(|| {
+            // A predictable name in world-writable `/tmp` was the old fallback, for a
+            // file that lists **host paths mounted into the sandbox**. Anyone able to
+            // pre-create it could hand the agent a directory nobody granted. uid-scoped
+            // now, and verified owner-only at every read and write below.
+            // SAFETY: getuid() takes no arguments and cannot fail.
+            let uid = unsafe { libc::getuid() };
+            std::env::temp_dir().join(format!("cowboy-{uid}"))
+        })
         .join("grants")
+}
+
+/// Verify the store directory is a real directory owned by us with no access for anyone
+/// else, creating it if needed.
+///
+/// Refusing beats falling back: a grants file another user can write is a list of paths
+/// they choose to expose to the agent.
+fn store_dir(dir: &Path) -> std::io::Result<()> {
+    crate::localsock::ensure_private_dir(dir)
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+/// Whether persisted grants under `dir` may be trusted.
+///
+/// Stricter than the write path deliberately. `store_dir` *tightens* a loose directory we
+/// own, which is right when we are about to write — from that moment it is private. But
+/// for reading, a directory that is currently group- or world-**writable** means someone
+/// else could already have planted entries, and tightening the mode does not un-plant
+/// them. The contents are suspect, so they are ignored rather than trusted and fixed.
+fn readable(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !dir.exists() {
+        return true; // nothing persisted yet
+    }
+    let Ok(md) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    let refuse = |why: &str| {
+        tracing::warn!(path = %dir.display(), why, "ignoring persisted grants");
+        false
+    };
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return refuse("not a real directory");
+    }
+    // SAFETY: getuid() takes no arguments and cannot fail.
+    if md.uid() != unsafe { libc::getuid() } {
+        return refuse("owned by another user");
+    }
+    if md.permissions().mode() & 0o022 != 0 {
+        return refuse("writable by others, so its entries may not be ours");
+    }
+    true
 }
 
 /// Grants file for one project, keyed by the root's hash.
@@ -82,6 +133,9 @@ fn global_file_in(dir: &Path) -> PathBuf {
 
 /// Persisted grants with the scope each came from, for `cowboy grant --list`.
 pub fn listing(dir: &Path, root: &Path) -> Vec<(Grant, Persistence)> {
+    if !readable(dir) {
+        return Vec::new();
+    }
     read_file(&project_file_in(dir, root))
         .into_iter()
         .map(|g| (g, Persistence::Project))
@@ -100,6 +154,9 @@ pub fn listing(dir: &Path, root: &Path) -> Vec<(Grant, Persistence)> {
 /// it is the more specific statement, and a global read-only grant must not silently
 /// downgrade a project's read-write one.
 pub fn load_in(dir: &Path, root: &Path) -> Vec<Grant> {
+    if !readable(dir) {
+        return Vec::new();
+    }
     let mut out = read_file(&project_file_in(dir, root));
     for g in read_file(&global_file_in(dir)) {
         if !out.iter().any(|existing| existing.path == g.path) {
@@ -172,12 +229,9 @@ pub fn remove_in(dir: &Path, root: &Path, path: &Path) -> std::io::Result<bool> 
 /// private as the directory holding it.
 fn write_file(dir: &Path, file: &Path, grants: &[Grant]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Creates it 0700 and refuses a directory owned by anyone else.
+    store_dir(dir)?;
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -198,6 +252,45 @@ mod tests {
             path: PathBuf::from(path),
             read_only,
         }
+    }
+
+    /// A grants store we cannot verify as our own must yield nothing, and refuse writes.
+    ///
+    /// The path used to fall back to bare `env::temp_dir()`, i.e. a predictable name in a
+    /// world-writable directory — for a file listing host paths mounted into the sandbox.
+    /// Anyone able to pre-create it could hand the agent a directory nobody granted.
+    /// Verified at use rather than only by choosing a better path, which also protects
+    /// the ordinary `~/.config` location against a mis-permissioned home.
+    #[test]
+    fn a_grants_directory_that_is_not_ours_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let dir = tmp.path().join("grants");
+        let root = Path::new("/srv/project");
+
+        // Seed a legitimate grant, then loosen the directory as a hostile /tmp would be.
+        add_in(&dir, root, &grant("/data", false), Persistence::Project).unwrap();
+        assert_eq!(load_in(&dir, root), vec![grant("/data", false)]);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(
+            load_in(&dir, root).is_empty(),
+            "grants from a world-writable directory must not be honoured"
+        );
+        assert!(
+            listing(&dir, root).is_empty(),
+            "nor listed as though they applied"
+        );
+        // A write still succeeds and tightens the directory: we own it, and from that
+        // moment it is private. Only *trusting existing entries* is refused, because
+        // fixing the mode cannot un-plant what was already there.
+        add_in(&dir, root, &grant("/other", true), Persistence::Project).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // Tightened, so the store is trusted again.
+        assert!(!load_in(&dir, root).is_empty());
     }
 
     #[test]

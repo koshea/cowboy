@@ -208,9 +208,37 @@ pub fn save_in(
     );
     let path = dir.join(format!("{name}.md"));
     let tmp = dir.join(format!(".{name}.md.tmp"));
-    std::fs::write(&tmp, doc)?;
+    // Owner-only, like every other host-side store. A memory holds whatever the agent
+    // decided was worth remembering about the project, and `fs::write` creates at the
+    // process umask — world-readable on a typical host, even though `restrict_dir` above
+    // has already made the directory `0700`.
+    write_owner_only(&tmp, &doc)?;
     std::fs::rename(&tmp, &path)?;
     Ok(name)
+}
+
+/// Write `contents` to `path` readable only by its owner.
+///
+/// The mode is set on the `open` so the file is never briefly world-readable, and
+/// re-applied afterwards because an existing file keeps its inode — and so an older
+/// version's permissions.
+fn write_owner_only(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// Full body of a memory by name (project store wins over global).
@@ -296,6 +324,32 @@ pub fn delete(project_key: &str, name: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A memory holds whatever the agent decided was worth remembering about the
+    /// project, next to `providers.yaml` in the same host config tree. `fs::write`
+    /// created it at the process umask — world-readable on a typical host — even though
+    /// the directory was already `0700`.
+    #[test]
+    fn a_saved_memory_is_not_readable_by_other_users() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tmp();
+        let name = save_in(&base, "proj", "A Note", "body", Scope::Project, None).unwrap();
+        let path = scope_dir(&base, "proj", Scope::Project).join(format!("{name}.md"));
+        assert!(path.is_file(), "{}", path.display());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Overwriting keeps it owner-only: the file keeps its inode, so the mode has to
+        // be re-applied rather than assumed from the `open`.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        save_in(&base, "proj", "A Note", "new body", Scope::Project, None).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     fn tmp() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

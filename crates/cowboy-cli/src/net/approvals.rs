@@ -24,12 +24,37 @@ use cowboy_core::netproto::NetworkAttempt;
 pub type Approval = cowboy_core::config::ApprovedEndpoint;
 
 /// The host-only directory holding per-project approvals
-/// (`~/.config/cowboy/approvals/`); falls back to the host temp dir if there is
+/// (`~/.config/cowboy/approvals/`); falls back to a uid-scoped temp path when there is
 /// no home config dir. Never inside the (agent-writable) workspace.
+///
+/// The fallback used to be bare `env::temp_dir()`, i.e. a predictable name in a
+/// world-writable directory — holding the project's **egress allow-list**. A local user
+/// could pre-create it and grant the agent destinations nobody approved. The path is now
+/// uid-scoped, and every read and write verifies the directory is a real directory owned
+/// by us with no access for anyone else (see [`store_dir`]), which also protects the
+/// ordinary `~/.config` path against a mis-permissioned home.
 fn approvals_dir() -> PathBuf {
     cowboy_core::config::global_config_dir()
-        .unwrap_or_else(std::env::temp_dir)
+        .unwrap_or_else(private_tmp)
         .join("approvals")
+}
+
+/// A uid-scoped temp directory, for hosts with no resolvable config dir.
+fn private_tmp() -> PathBuf {
+    // SAFETY: getuid() takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::env::temp_dir().join(format!("cowboy-{uid}"))
+}
+
+/// Verify `dir` is ours and owner-only, creating it if needed.
+///
+/// Refusing is the right outcome rather than falling back to writing anyway: the file
+/// decides what the agent may reach, so a directory someone else can write to must not
+/// be used at all.
+fn store_dir(dir: &Path) -> std::io::Result<()> {
+    crate::localsock::ensure_private_dir(dir)
+        .map(|_| ())
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 /// Approvals file for a project root within `dir` (keyed by the root's hash).
@@ -41,8 +66,47 @@ fn file_in(dir: &Path, root: &Path) -> PathBuf {
 }
 
 /// Load persisted approvals (empty if none).
+///
+/// A store directory we cannot verify as our own yields **no** approvals rather than
+/// whatever it happens to contain: this list decides what the agent may reach.
 pub fn load(root: &Path) -> Vec<Approval> {
-    load_in(&approvals_dir(), root)
+    let dir = approvals_dir();
+    if !readable(&dir) {
+        return Vec::new();
+    }
+    load_in(&dir, root)
+}
+
+/// Whether persisted approvals under `dir` may be trusted.
+///
+/// Stricter than the write path on purpose. `store_dir` tightens a loose directory we
+/// own, which is right when we are about to write. For reading, a directory currently
+/// group- or world-**writable** means someone else could already have added entries, and
+/// fixing the mode does not remove them — so the contents are ignored. This list decides
+/// what the agent may reach.
+fn readable(dir: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    if !dir.exists() {
+        return true; // nothing persisted yet
+    }
+    let Ok(md) = std::fs::symlink_metadata(dir) else {
+        return false;
+    };
+    let refuse = |why: &str| {
+        tracing::warn!(path = %dir.display(), why, "ignoring persisted network approvals");
+        false
+    };
+    if md.file_type().is_symlink() || !md.is_dir() {
+        return refuse("not a real directory");
+    }
+    // SAFETY: getuid() takes no arguments and cannot fail.
+    if md.uid() != unsafe { libc::getuid() } {
+        return refuse("owned by another user");
+    }
+    if md.permissions().mode() & 0o022 != 0 {
+        return refuse("writable by others, so its entries may not be ours");
+    }
+    true
 }
 
 /// Append an approval derived from an attempt, de-duplicating.
@@ -58,7 +122,9 @@ fn load_in(dir: &Path, root: &Path) -> Vec<Approval> {
 }
 
 fn append_in(dir: &Path, root: &Path, attempt: &NetworkAttempt) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    // Creates it 0700 and refuses one owned by anyone else, rather than writing the
+    // egress allow-list into a directory another user can rewrite.
+    store_dir(dir)?;
     // Serialise the whole read-modify-write. Two approvals racing — two parallel
     // commands in one session, or two sessions on one project — each loaded the same
     // baseline, appended their own entry, and the second write clobbered the first.
