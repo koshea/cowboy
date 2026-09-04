@@ -944,15 +944,22 @@ fn mount_targets_host_secret(source: &str) -> bool {
     let resolved = expand_path(source).unwrap_or_else(|_| PathBuf::from(source));
     let resolved = std::fs::canonicalize(&resolved).unwrap_or(resolved);
 
-    // The secret files by basename, or any `.cowboy` component in the path.
+    // The secret files by basename.
     let name = resolved.file_name().and_then(|n| n.to_str());
-    if matches!(
-        name,
-        Some(SECURITY_FILE) | Some(PROVIDERS_FILE) | Some(COWBOY_DIR)
-    ) {
+    if matches!(name, Some(SECURITY_FILE) | Some(PROVIDERS_FILE)) {
         return true;
     }
-    if resolved.components().any(|c| c.as_os_str() == COWBOY_DIR) {
+
+    // A `.cowboy` component names a *project* config dir. Scan for it, but only
+    // *below* the user's home directory: a `.cowboy` that appears merely because
+    // `$HOME` itself sits under one (e.g. `HOME=/…/.cowboy/home`, as in a sandboxed
+    // dev container) is not a project config dir, and refusing it would reject every
+    // ordinary `~/…` grant. The home cowboy config dir is covered separately below.
+    let below_home = home_dir()
+        .and_then(|h| std::fs::canonicalize(&h).ok().or(Some(h)))
+        .and_then(|h| resolved.strip_prefix(&h).ok().map(Path::to_path_buf));
+    let scan = below_home.as_deref().unwrap_or(&resolved);
+    if scan.components().any(|c| c.as_os_str() == COWBOY_DIR) {
         return true;
     }
 
@@ -965,6 +972,15 @@ fn mount_targets_host_secret(source: &str) -> bool {
         }
     }
     false
+}
+
+/// The user's home directory, if resolvable — for distinguishing a `.cowboy`
+/// component that is a project config dir from one that is merely part of `$HOME`.
+fn home_dir() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+        return Some(PathBuf::from(v));
+    }
+    directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
 }
 
 impl AgentConfig {

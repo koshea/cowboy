@@ -45,6 +45,9 @@ impl HostProbe for Host {
         let exe = dir.join("cowboy");
         exe.exists().then_some(exe)
     }
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
 }
 
 fn which(bin: &str) -> Option<PathBuf> {

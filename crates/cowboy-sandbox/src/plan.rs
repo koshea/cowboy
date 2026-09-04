@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use cowboy_core::config::{self, SecurityConfig};
 use cowboy_core::error::{Error, Result};
 
-use crate::denylist::Denylist;
+use crate::denylist::{DenyReason, Denylist};
 use crate::probe::HostProbe;
 
 /// How a path is exposed inside the sandbox.
@@ -411,8 +411,10 @@ impl SandboxPlan {
             let source = resolve_source(inputs.root, &m.source);
             // The same invariant `SecurityConfig::validate` enforces, re-checked
             // here because a mount can also arrive via the user's personal
-            // overlay, which is merged after that validation runs.
-            if let Some(reason) = denylist.check(&source) {
+            // overlay, which is merged after that validation runs. Resolves symlinks
+            // first, so a benign-looking source that links into a credential store is
+            // caught rather than bound.
+            if let Some(reason) = denied_source(&denylist, probe, &source) {
                 return Err(Error::SecurityInvariant(format!(
                     "mount {} is refused: {}",
                     source.display(),
@@ -753,6 +755,28 @@ fn build_env(
     }
     env.sort();
     env
+}
+
+/// Run the credential denylist against a bind source, resolving symlinks first.
+///
+/// The denylist's own matching is purely lexical, so a symlink whose name looks
+/// innocent but points at `~/.aws` or `~/.config/cowboy` would pass. Canonicalizing
+/// through the probe makes the check see the real destination. Both the literal and
+/// (when it differs) the resolved path are checked: the literal catches a denied path
+/// that does not yet exist (so cannot be canonicalized), the resolved one catches the
+/// symlink redirection. Returns the refusal reason if either is denied.
+fn denied_source(denylist: &Denylist, probe: &dyn HostProbe, source: &Path) -> Option<DenyReason> {
+    if let Some(reason) = denylist.check(source) {
+        return Some(reason);
+    }
+    if let Some(real) = probe.canonicalize(source) {
+        if real != source {
+            if let Some(reason) = denylist.check(&real) {
+                return Some(reason);
+            }
+        }
+    }
+    None
 }
 
 /// Resolve a configured mount source: `.` means the project root, a relative path
@@ -1266,6 +1290,24 @@ mod tests {
                 "{source}: {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_mount_source_that_symlinks_into_a_credential_store_is_refused() {
+        // A benign-looking source inside the project that is actually a symlink to
+        // the user's AWS credentials. The denylist's own matching is lexical, so
+        // this is caught only because the plan canonicalizes the source first
+        // (finding 2). Without that, `/srv/proj/innocent` sails through.
+        let host = host().with_symlink("/srv/proj/innocent", "/home/dev/.aws");
+        let mut sec = SecurityConfig::default();
+        sec.sandbox.mounts.push(Mount {
+            source: "/srv/proj/innocent".into(),
+            target: "/workspace/innocent".into(),
+            mode: "ro".into(),
+        });
+        let err = plan_with(&sec, &[], &host)
+            .expect_err("a mount source symlinked to a credential store must be refused");
+        assert!(matches!(err, Error::SecurityInvariant(_)), "{err:?}");
     }
 
     #[test]

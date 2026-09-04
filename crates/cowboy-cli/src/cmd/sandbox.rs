@@ -136,6 +136,10 @@ impl HostProbe for RealHost {
     fn self_exe(&self) -> Option<PathBuf> {
         crate::project::self_exe().ok()
     }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
 }
 
 fn plan() -> Result<()> {

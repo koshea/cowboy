@@ -41,6 +41,9 @@ impl HostProbe for Host {
         let exe = dir.join("cowboy");
         exe.exists().then_some(exe)
     }
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        std::fs::canonicalize(path).ok()
+    }
 }
 
 /// Whether the sandbox can run here at all. Returns the reason it cannot, so a
@@ -733,6 +736,9 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
         }
         fn self_exe(&self) -> Option<PathBuf> {
             Some(self.0.clone())
+        }
+        fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+            std::fs::canonicalize(path).ok()
         }
     }
 

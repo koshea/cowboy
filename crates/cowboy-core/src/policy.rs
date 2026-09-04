@@ -201,17 +201,38 @@ enum DestClass {
 }
 
 fn classify(ip: Option<IpAddr>) -> DestClass {
+    let ip = match ip {
+        None => return DestClass::External, // hostname-only: treat as external
+        Some(ip) => ip,
+    };
+    // An IPv4-mapped address (`::ffff:a.b.c.d`, i.e. `::ffff:0:0/96`) is really the v4
+    // address it wraps. Unwrap it *before* classifying, or `::ffff:10.0.0.1`,
+    // `::ffff:127.0.0.1` and `::ffff:169.254.169.254` all slip through the v6 arm as
+    // External and defeat both the SSRF domain guard and the private-CIDR defaults.
+    // Only the v4-*mapped* range is unwrapped, never the deprecated v4-*compatible*
+    // one, so `::1` is not misprojected to `0.0.0.1`.
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        v4 => v4,
+    };
+    // Loopback (`127.0.0.0/8`, `::1`) and the unspecified address (`0.0.0.0`, `::`)
+    // are not routable off-host and must never be treated as public. Checked after
+    // unwrapping, so `::ffff:127.0.0.1` is caught too.
+    if ip.is_loopback() || ip.is_unspecified() {
+        return DestClass::Host;
+    }
     match ip {
-        None => DestClass::External, // hostname-only: treat as external
-        Some(ip) if ip.is_loopback() => DestClass::Host,
-        Some(IpAddr::V4(v4)) => {
+        IpAddr::V4(v4) => {
             if v4.is_private() || v4.is_link_local() {
                 DestClass::PrivateLan
             } else {
                 DestClass::External
             }
         }
-        Some(IpAddr::V6(v6)) => {
+        IpAddr::V6(v6) => {
             // Unique-local (fc00::/7) or link-local (fe80::/10) -> private LAN.
             let seg = v6.segments();
             if (seg[0] & 0xfe00) == 0xfc00 || (seg[0] & 0xffc0) == 0xfe80 {
@@ -516,6 +537,75 @@ mod tests {
         assert_eq!(
             evaluate(&policy, &attempt(Some("evil.example"), None, 443)).0,
             Verdict::Ask
+        );
+    }
+
+    /// An IPv4-mapped v6 address must classify as the v4 address it wraps, so it can
+    /// never be laundered past the private/loopback/link-local checks as External.
+    #[test]
+    fn ipv4_mapped_v6_classifies_as_its_v4_address() {
+        assert_eq!(
+            classify(Some("::ffff:10.0.0.1".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        assert_eq!(
+            classify(Some("::ffff:192.168.1.1".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        assert_eq!(
+            classify(Some("::ffff:169.254.169.254".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        assert_eq!(
+            classify(Some("::ffff:127.0.0.1".parse().unwrap())),
+            DestClass::Host
+        );
+        assert_eq!(
+            classify(Some("::ffff:8.8.8.8".parse().unwrap())),
+            DestClass::External
+        );
+    }
+
+    /// The unspecified address (`0.0.0.0`, `::`) is not routable off-host and must
+    /// never be treated as a public destination.
+    #[test]
+    fn unspecified_addresses_are_not_external() {
+        assert_eq!(classify(Some("0.0.0.0".parse().unwrap())), DestClass::Host);
+        assert_eq!(classify(Some("::".parse().unwrap())), DestClass::Host);
+    }
+
+    /// A domain allow must not become a path to an internal IP when the name resolves
+    /// (or is rebound) to a v4-mapped private address — the SSRF guard has to see it,
+    /// exactly as it does for the plain-v4 answer.
+    #[test]
+    fn domain_allow_does_not_leak_to_v4_mapped_private_ip() {
+        use crate::config::DefaultVerdict;
+        let policy = NetworkPolicy {
+            allow: crate::config::RuleSet {
+                domains: vec!["cdn.example".into()],
+                ports: vec![443],
+                ..Default::default()
+            },
+            default_private_lan: DefaultVerdict::Deny,
+            ..Default::default()
+        };
+        // Plain v4 private answer falls through the domain grant to the class default.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &attempt(Some("cdn.example"), Some("169.254.169.254"), 443)
+            )
+            .0,
+            Verdict::Deny,
+        );
+        // The v4-mapped form must be treated identically, not slip through as External.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &attempt(Some("cdn.example"), Some("::ffff:169.254.169.254"), 443)
+            )
+            .0,
+            Verdict::Deny,
         );
     }
 

@@ -579,6 +579,13 @@ struct ToolCallAccumulator {
     slots: Vec<(String, String, String)>, // (id, name, arguments)
 }
 
+/// Upper bound on the tool-call index a provider may address. The index is
+/// provider-controlled and is used to `resize` the slot vec, so an unbounded value
+/// (`u32::MAX` ≈ 4 billion × 3 `String`s ≈ 100 GB) would abort the host worker. No
+/// real turn emits anywhere near this many parallel calls; a chunk past the cap is
+/// dropped rather than trusted.
+const MAX_TOOL_CALL_INDEX: usize = 1024;
+
 impl ToolCallAccumulator {
     fn apply(
         &mut self,
@@ -587,6 +594,10 @@ impl ToolCallAccumulator {
         name: Option<String>,
         args: Option<String>,
     ) {
+        // Reject an out-of-range (or malicious) index before it drives an allocation.
+        if index > MAX_TOOL_CALL_INDEX {
+            return;
+        }
         if self.slots.len() <= index {
             self.slots
                 .resize(index + 1, (String::new(), String::new(), String::new()));
@@ -1139,6 +1150,34 @@ mod tests {
         let mut acc = ToolCallAccumulator::default();
         acc.apply(0, None, None, Some("orphan".into()));
         assert!(acc.finish().is_empty());
+    }
+
+    /// A provider-controlled index past the cap must not drive a giant allocation:
+    /// the chunk is dropped, so `u32::MAX` costs nothing instead of ~100 GB.
+    #[test]
+    fn accumulator_ignores_out_of_range_index() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.apply(
+            u32::MAX as usize,
+            Some("call_evil".into()),
+            Some("shell".into()),
+            Some("{}".into()),
+        );
+        // Nothing was allocated and no call materialised.
+        assert!(acc.slots.len() <= MAX_TOOL_CALL_INDEX + 1);
+        assert!(acc.finish().is_empty());
+
+        // A legitimate index right at the cap still works.
+        let mut acc = ToolCallAccumulator::default();
+        acc.apply(
+            MAX_TOOL_CALL_INDEX,
+            Some("call_ok".into()),
+            Some("shell".into()),
+            Some("{}".into()),
+        );
+        let calls = acc.finish();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "shell");
     }
 
     #[test]

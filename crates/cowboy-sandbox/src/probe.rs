@@ -35,6 +35,17 @@ pub trait HostProbe {
 
     /// The running `cowboy` binary, which the agent must not be able to overwrite.
     fn self_exe(&self) -> Option<PathBuf>;
+
+    /// Resolve a path to its canonical form, following symlinks.
+    ///
+    /// The denylist's own normalization is purely lexical (it runs against paths that
+    /// may not exist and a fakeable probe), so it cannot catch a *symlink* that points
+    /// a benign-looking source at `~/.aws` or `~/.config/cowboy`. A caller that binds a
+    /// real path — a mount source, a credential grant — must resolve it here first, so
+    /// the denylist sees the true destination. Returns `None` when the path cannot be
+    /// resolved (it does not exist, or a component is not traversable); a caller binding
+    /// a *required* source must treat that as an error rather than trusting the literal.
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf>;
 }
 
 /// A [`HostProbe`] describing a filesystem instead of touching one.
@@ -44,6 +55,10 @@ pub struct FakeHost {
     pub git_common: Option<PathBuf>,
     pub home: Option<PathBuf>,
     pub self_exe: Option<PathBuf>,
+    /// Symlink redirections: a source path here canonicalizes to its target, so a
+    /// test can point a benign-looking mount source at a denied destination without
+    /// touching a real filesystem.
+    pub symlinks: Vec<(PathBuf, PathBuf)>,
 }
 
 impl FakeHost {
@@ -54,6 +69,7 @@ impl FakeHost {
             git_common: None,
             home: Some(PathBuf::from("/home/dev")),
             self_exe: Some(PathBuf::from("/usr/bin/cowboy")),
+            symlinks: Vec::new(),
         }
     }
 
@@ -77,6 +93,16 @@ impl FakeHost {
     /// Present `root` as a linked worktree whose shared git dir is `common`.
     pub fn as_linked_worktree(mut self, common: impl Into<PathBuf>) -> Self {
         self.git_common = Some(common.into());
+        self
+    }
+
+    /// Add a symlink: `source` canonicalizes to `target`. Also marks `source` as
+    /// existing, so a test need only state the redirection.
+    pub fn with_symlink(mut self, source: impl Into<PathBuf>, target: impl Into<PathBuf>) -> Self {
+        let source = source.into();
+        let target = target.into();
+        self.existing.push(source.clone());
+        self.symlinks.push((source, target));
         self
     }
 }
@@ -104,5 +130,23 @@ impl HostProbe for FakeHost {
 
     fn self_exe(&self) -> Option<PathBuf> {
         self.self_exe.clone()
+    }
+
+    fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
+        // A symlink on the path (or an ancestor of it) redirects the whole subtree:
+        // `/home/dev/link` -> `/secret` makes `/home/dev/link/x` resolve to `/secret/x`.
+        if let Some(redirected) = self
+            .symlinks
+            .iter()
+            .find_map(|(src, dst)| path.strip_prefix(src).ok().map(|rest| dst.join(rest)))
+        {
+            return Some(redirected);
+        }
+        // No symlink: a real `canonicalize` only succeeds for paths that exist.
+        if self.exists(path) {
+            Some(path.to_path_buf())
+        } else {
+            None
+        }
     }
 }
