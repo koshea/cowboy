@@ -14,6 +14,8 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `~/.config/cowboy/mcp.yaml` | [MCP](../how-to.md) server definitions (host-owned; the agent can call but not edit). |
 | `~/.config/cowboy/web.yaml` | [Web UI](../using/web.md) setting + bearer token (`0600`). |
 | `~/.config/cowboy/skills/` | User-level [skills](../using/skills-and-subagents.md). |
+| `~/.config/cowboy/approvals/<project>.json` | Persisted [network approvals](../security/network.md), per project (`0600`). Host-side **on purpose**: in the workspace the agent could widen its own egress by writing the file. |
+| `~/.config/cowboy/grants/` | Persisted path [grants](../security/model.md), per project + global (`0600`, dir `0700`). Host-side for the same reason. |
 
 ## Per-project (`.cowboy/`)
 
@@ -23,7 +25,6 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `.cowboy/agent.yaml` | yes | Non-security agent behavior, processes, command aliases. |
 | `.cowboy/models.yaml` | **masked** | Project model definitions (no credentials). |
 | `.mcp.json` | — | Project-declared [MCP](../how-to.md) servers (trust-gated; the format other MCP clients use). |
-| `.cowboy/approvals.json` | — | Persisted project/global network approvals. |
 | `.cowboy/skills/` | yes | Project skills. |
 | `.cowboy/sessions/<id>/` | — | Per-session logs (gitignored). |
 | `.cowboy/ranches/<id>/` | — | Ranch plans + promoted artifacts + proposals (committed). |

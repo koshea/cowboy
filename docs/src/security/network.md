@@ -89,11 +89,12 @@ The relay does peek at the first bytes, and forwards them, but only to *classify
 saw. The agent writes those bytes, so a request could claim any SNI it liked. There
 is no TLS interception and no decryption.
 
-Policy order: deny-list wins; then the allow-list (a domain matched against the
-resolved name for that IP, or a CIDR against the real destination IP, with optional
-port restriction); otherwise the default for the destination's class. A domain allow
-only ever grants a **public** address, so it cannot become a path to an internal
-one. `ask` goes to you; with no approver it fails closed.
+Policy order: deny-list wins; then **approvals** you granted (each scoped to the one
+host-or-address and the one port you were asked about); then the allow-list (a domain
+matched against the resolved name for that IP, or a CIDR against the real destination
+IP, with optional port restriction); otherwise the default for the destination's class.
+A domain allow only ever grants a **public** address, so it cannot become a path to an
+internal one. `ask` goes to you; with no approver it fails closed.
 
 ## DNS
 
@@ -149,6 +150,19 @@ global, or deny. Project and global approvals persist host-side (never in the
 workspace) and merge into the policy on the next run. Non-interactive runs fail
 closed and log the decision. When several commands run at once, the prompt names
 the one that is asking.
+
+**An approval grants exactly what the prompt showed**: that host (or that address) on
+that port. Not other ports on the same host, not other hosts on that port, and not
+subdomains — the prompt named one host, so that is what is granted. If you want a
+broader rule, write it in `security.yaml`'s `allow:`, where it is visible and
+reviewable; that is also where a domain rule deliberately covers subdomains.
+
+This used not to hold. A persisted approval was decomposed into the policy-wide
+`allow` rule set, which is a *cross product* of its domains, CIDRs and ports — so
+approving one host on port 22 opened port 22 for every allowed domain, and (with no
+`ports:` list configured) approving a host on a non-web port silently did nothing at
+all. Approvals are now stored and evaluated as scoped endpoints, matching what the
+in-session approval cache already did.
 
 ## Honest scope
 

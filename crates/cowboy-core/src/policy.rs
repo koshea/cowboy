@@ -4,17 +4,19 @@
 //! and an observed [`NetworkAttempt`], decide allow/deny/ask. This is the
 //! security core, so it is exhaustively unit- and property-tested.
 //!
-//! Precedence (deny wins, then allow, then the default):
+//! Precedence (deny wins, then approvals, then allow, then the default):
 //! 1. An explicit **deny** match (domain or CIDR) → [`Verdict::Deny`].
-//! 2. An explicit **allow** match (domain or CIDR), with the port allowed if a
+//! 2. An **approved endpoint** — a host or CIDR the user allowed, on the exact port
+//!    they were asked about → [`Verdict::Allow`].
+//! 3. An explicit **allow** match (domain or CIDR), with the port allowed if a
 //!    port allow-list is configured → [`Verdict::Allow`].
-//! 3. Otherwise the `default_external` verdict.
+//! 4. Otherwise the `default_external` verdict.
 
 use std::net::IpAddr;
 
 use ipnet::IpNet;
 
-use crate::config::{DefaultVerdict, NetworkPolicy, RuleSet};
+use crate::config::{ApprovedEndpoint, DefaultVerdict, NetworkPolicy, RuleSet};
 use crate::netproto::{NetworkAttempt, Verdict};
 
 impl From<DefaultVerdict> for Verdict {
@@ -41,6 +43,44 @@ fn allow_port_ok(rules: &RuleSet, port: u16) -> bool {
     }
 }
 
+/// Whether an approved endpoint covers this attempt.
+///
+/// The port must match **exactly** — the whole point of the type is that an approval
+/// carries its own port instead of contributing to a shared list.
+///
+/// Host matching is **exact**, not parent matching. An `allow` rule for `github.com`
+/// deliberately covers `api.github.com`, because the user wrote that rule meaning a
+/// domain. An approval is the answer to a prompt naming one host, so extending it to
+/// every subdomain would grant something that was never shown. A user who wants the
+/// broader grant writes it in `security.yaml`, where it is visible and reviewable.
+///
+/// A CIDR approval *is* honoured for private addresses, matching `allow.cidrs`: the
+/// prompt showed the literal address, so approving it is an explicit IP grant. A host
+/// approval is not, for the same reason a domain allow is not — a public name that
+/// resolves to an internal address would otherwise become an SSRF pivot.
+fn approval_matches(e: &ApprovedEndpoint, attempt: &NetworkAttempt) -> Option<String> {
+    if e.port != attempt.port {
+        return None;
+    }
+    if let (Some(cidr), Some(ip)) = (&e.cidr, attempt.ip) {
+        if cidr_matches(cidr, ip) {
+            return Some(format!("approved {cidr}:{}", e.port));
+        }
+    }
+    if let (Some(host), Some(attempted)) = (&e.host, &attempt.host) {
+        let same = host
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case(attempted.trim_end_matches('.'));
+        let ip_is_public = attempt
+            .ip
+            .is_none_or(|ip| classify(Some(ip)) == DestClass::External);
+        if same && ip_is_public {
+            return Some(format!("approved {host}:{}", e.port));
+        }
+    }
+    None
+}
+
 /// Evaluate an attempt against the policy, returning a verdict and a short
 /// human-readable reason.
 pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, String) {
@@ -49,16 +89,27 @@ pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, S
         return (Verdict::Deny, format!("denied by policy ({reason})"));
     }
 
-    // 2. Allow list (port must be permitted).
+    // 2. Endpoints the user approved individually, each on its own port. Before the
+    //    allow list because they are narrower, and after deny so an approval can never
+    //    override an explicit denial.
+    if let Some(reason) = policy
+        .approved
+        .iter()
+        .find_map(|e| approval_matches(e, attempt))
+    {
+        return (Verdict::Allow, format!("allowed by policy ({reason})"));
+    }
+
+    // 3. Allow list (port must be permitted).
     if allow_port_ok(&policy.allow, attempt.port) {
-        // 2a. A CIDR allow is an explicit IP grant — it wins for any address class
+        // 3a. A CIDR allow is an explicit IP grant — it wins for any address class
         //     (allow-listing 10.0.0.0/8 means it).
         if let Some(ip) = attempt.ip {
             if let Some(rule) = policy.allow.cidrs.iter().find(|c| cidr_matches(c, ip)) {
                 return (Verdict::Allow, format!("allowed by policy (cidr {rule})"));
             }
         }
-        // 2b. A domain allow grants by name, but must NOT become a path to a
+        // 3b. A domain allow grants by name, but must NOT become a path to a
         //     private/loopback/link-local address — a public name that resolves
         //     (or is DNS-rebound) to an internal IP. If the destination IP is not
         //     public, fall through to the destination-class default instead.
@@ -79,7 +130,7 @@ pub fn evaluate(policy: &NetworkPolicy, attempt: &NetworkAttempt) -> (Verdict, S
         }
     }
 
-    // 3. No rule matched — fall back to the default for the destination's class.
+    // 4. No rule matched — fall back to the default for the destination's class.
     let (default, class) = match classify(attempt.ip) {
         DestClass::Host => (policy.default_host, "default_host"),
         DestClass::PrivateLan => (policy.default_private_lan, "default_private_lan"),
@@ -98,11 +149,31 @@ pub fn is_public(ip: IpAddr) -> bool {
 
 /// Evaluate a bare DNS **name** against the policy (no port/CIDR/IP logic — a
 /// resolution isn't a connection). Precedence mirrors [`evaluate`]: a deny-domain
-/// match wins, then an allow-domain match, else `default_external`. Used by the
-/// gateway's resolver to gate which names it will resolve.
+/// match wins, then an approved host, then an allow-domain match, else
+/// `default_external`. Used by the gateway's resolver to gate which names it will
+/// resolve.
+///
+/// Approved hosts have to be included or an approval would be useless: with
+/// `dns.enforce` on, the connection would be permitted while the lookup that finds its
+/// address was refused. Port is ignored here for the reason above — the name is the
+/// same name whichever port follows.
 pub fn evaluate_name(policy: &NetworkPolicy, name: &str) -> (Verdict, String) {
     if let Some(rule) = policy.deny.domains.iter().find(|d| domain_matches(d, name)) {
         return (Verdict::Deny, format!("denied by policy (domain {rule})"));
+    }
+    if let Some(host) = policy
+        .approved
+        .iter()
+        .filter_map(|e| e.host.as_deref())
+        .find(|h| {
+            h.trim_end_matches('.')
+                .eq_ignore_ascii_case(name.trim_end_matches('.'))
+        })
+    {
+        return (
+            Verdict::Allow,
+            format!("allowed by policy (approved {host})"),
+        );
     }
     if let Some(rule) = policy
         .allow
@@ -215,8 +286,190 @@ pub fn cidr_matches(rule: &str, ip: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DefaultVerdict;
+    use crate::config::{ApprovedEndpoint, DefaultVerdict};
     use crate::netproto::Protocol;
+
+    /// An approval must grant exactly what was asked about — no more, no less.
+    ///
+    /// Approvals used to be folded into the `allow` rule set, which is a **cross
+    /// product** of its domains, CIDRs and ports. That was wrong in both directions:
+    ///
+    /// - it *widened*: approving `evil.example:22` pushed 22 into the shared
+    ///   `allow.ports`, so `github.com:22` became allowed too;
+    /// - it *silently did nothing*: with the default empty `allow.ports` the port was
+    ///   never recorded, so an approval on any port outside the built-in 80/443 had no
+    ///   effect and the user was asked again next time.
+    #[test]
+    fn an_approval_grants_one_host_and_port_and_nothing_else() {
+        let mut policy = NetworkPolicy::default();
+        policy.allow.domains = vec!["github.com".into()];
+        policy.allow.ports = vec![443];
+        policy.approved = vec![ApprovedEndpoint {
+            host: Some("evil.example".into()),
+            cidr: None,
+            port: 22,
+        }];
+
+        // The approval itself works, on its own port.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("evil.example"), None, 22)).0,
+            Verdict::Allow
+        );
+        // It does not leak that port to anything else — the widening.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("github.com"), None, 22)).0,
+            Verdict::Ask,
+            "approving one host on port 22 must not open port 22 for every allowed domain"
+        );
+        // Nor does it grant the approved host on other ports.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("evil.example"), None, 443)).0,
+            Verdict::Ask
+        );
+        // And the pre-existing allow rule is untouched.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("github.com"), None, 443)).0,
+            Verdict::Allow
+        );
+    }
+
+    /// The other half: an approval on a non-web port works even when the policy's own
+    /// port list does not mention it — where the old merge either widened that shared
+    /// list or, if it was empty, recorded nothing at all.
+    #[test]
+    fn an_approval_works_on_a_port_outside_the_default_web_ports() {
+        for ports in [vec![], vec![80, 443]] {
+            let mut policy = NetworkPolicy::default();
+            policy.allow.ports = ports.clone();
+            policy.approved = vec![ApprovedEndpoint {
+                host: Some("registry.internal".into()),
+                cidr: None,
+                port: 8443,
+            }];
+            assert_eq!(
+                evaluate(&policy, &attempt(Some("registry.internal"), None, 8443)).0,
+                Verdict::Allow,
+                "an approval must take effect whatever allow.ports says (ports={ports:?})"
+            );
+            // And it did not add 8443 to whatever the allow list covers.
+            policy.allow.domains.push("other.example".into());
+            assert_eq!(
+                evaluate(&policy, &attempt(Some("other.example"), None, 8443)).0,
+                Verdict::Ask,
+                "the approved port must not leak to the allow list (ports={ports:?})"
+            );
+        }
+    }
+
+    /// An approval is the answer to a prompt naming one host, so it does **not** extend
+    /// to subdomains. An `allow` rule deliberately does — the user wrote it meaning a
+    /// domain. This is a narrowing versus the old behaviour, and the point of the fix.
+    #[test]
+    fn an_approved_host_does_not_cover_its_subdomains() {
+        let policy = NetworkPolicy {
+            approved: vec![ApprovedEndpoint {
+                host: Some("example.com".into()),
+                cidr: None,
+                port: 443,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("example.com"), None, 443)).0,
+            Verdict::Allow
+        );
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("evil.example.com"), None, 443)).0,
+            Verdict::Ask,
+            "a subdomain was never shown to the user, so it was never approved"
+        );
+        // Case and a trailing dot are the same name, though.
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("EXAMPLE.com."), None, 443)).0,
+            Verdict::Allow
+        );
+    }
+
+    /// A deny rule still beats an approval: the user cannot be prompted into
+    /// overriding an explicit denial.
+    #[test]
+    fn deny_beats_an_approval() {
+        let mut policy = NetworkPolicy::default();
+        policy.deny.domains.push("metadata.internal".into());
+        policy.approved = vec![ApprovedEndpoint {
+            host: Some("metadata.internal".into()),
+            cidr: None,
+            port: 443,
+        }];
+        assert_eq!(
+            evaluate(&policy, &attempt(Some("metadata.internal"), None, 443)).0,
+            Verdict::Deny
+        );
+    }
+
+    /// A host approval must not become an SSRF pivot, matching the domain-allow rule;
+    /// a CIDR approval *is* honoured for a private address, matching `allow.cidrs`,
+    /// because the prompt showed that literal address.
+    #[test]
+    fn approval_ssrf_semantics_match_the_allow_list() {
+        let mut policy = NetworkPolicy {
+            default_private_lan: DefaultVerdict::Deny,
+            ..Default::default()
+        };
+        policy.approved = vec![
+            ApprovedEndpoint {
+                host: Some("rebound.example".into()),
+                cidr: None,
+                port: 443,
+            },
+            ApprovedEndpoint {
+                host: None,
+                cidr: Some("10.1.2.3/32".into()),
+                port: 5432,
+            },
+        ];
+        // A name that resolves to an internal address is not granted by a host approval.
+        assert_eq!(
+            evaluate(
+                &policy,
+                &attempt(Some("rebound.example"), Some("10.9.9.9"), 443)
+            )
+            .0,
+            Verdict::Deny
+        );
+        // An explicitly approved address is granted, private or not.
+        assert_eq!(
+            evaluate(&policy, &attempt(None, Some("10.1.2.3"), 5432)).0,
+            Verdict::Allow
+        );
+    }
+
+    /// With `dns.enforce` on, an approved host must also be resolvable — otherwise the
+    /// connection is permitted while the lookup that finds its address is refused, and
+    /// the approval is useless in a new way.
+    #[test]
+    fn an_approved_host_can_be_resolved() {
+        let policy = NetworkPolicy {
+            default_external: DefaultVerdict::Ask,
+            approved: vec![ApprovedEndpoint {
+                host: Some("approved.example".into()),
+                cidr: None,
+                port: 8443,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_name(&policy, "approved.example").0,
+            Verdict::Allow,
+            "an approved host must resolve, or its approval cannot be acted on"
+        );
+        // Still not its subdomains, and still not an unrelated name.
+        assert_eq!(
+            evaluate_name(&policy, "evil.approved.example").0,
+            Verdict::Ask
+        );
+        assert_eq!(evaluate_name(&policy, "unknown.test").0, Verdict::Ask);
+    }
 
     #[test]
     fn evaluate_name_gates_by_domain_only() {
@@ -276,6 +529,7 @@ mod tests {
             default_host: DefaultVerdict::Allow,
             allow: Default::default(),
             deny: Default::default(),
+            approved: Default::default(),
             dns: Default::default(),
         };
         // loopback -> host

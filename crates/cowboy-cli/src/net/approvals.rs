@@ -15,17 +15,13 @@ use std::path::{Path, PathBuf};
 
 use cowboy_core::config::NetworkPolicy;
 use cowboy_core::netproto::NetworkAttempt;
-use serde::{Deserialize, Serialize};
 
-/// One persisted allow entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Approval {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cidr: Option<String>,
-    pub port: u16,
-}
+/// One persisted approval: a host or CIDR, and the port it was approved for.
+///
+/// The same type the policy evaluates ([`cowboy_core::config::ApprovedEndpoint`]), so
+/// there is one definition of "an approved destination" and the stored JSON and the
+/// in-memory policy cannot drift apart. The file format is unchanged.
+pub type Approval = cowboy_core::config::ApprovedEndpoint;
 
 /// The host-only directory holding per-project approvals
 /// (`~/.config/cowboy/approvals/`); falls back to the host temp dir if there is
@@ -132,20 +128,26 @@ fn lock(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Merge persisted approvals into a policy's allow-list (used when generating
 /// the gateway policy file).
+/// Merge persisted approvals into a policy for this session.
+///
+/// Each approval becomes an [`ApprovedEndpoint`] carrying **its own port**, rather than
+/// being decomposed into the policy-wide `allow` rule set. That decomposition was wrong
+/// in both directions, because `allow` is a cross product of its domains, CIDRs and
+/// ports:
+///
+/// - **It widened.** Approving `evil.example:22` pushed `22` into `allow.ports`, and
+///   since [`cowboy_core::policy`] checks the port against that shared list, port 22
+///   then opened for *every* allowed domain — `github.com:22` included.
+/// - **It silently did nothing.** With the default empty `allow.ports`, the push was
+///   skipped entirely and the port fell back to the built-in web ports (80/443). So
+///   approving `host:8443` had no effect at all, and the next attempt asked again.
+///
+/// An approval is the answer to one question about one destination, and is now stored
+/// as exactly that.
 pub fn merge_into(policy: &mut NetworkPolicy, approvals: &[Approval]) {
     for a in approvals {
-        if let Some(h) = &a.host {
-            if !policy.allow.domains.contains(h) {
-                policy.allow.domains.push(h.clone());
-            }
-        }
-        if let Some(c) = &a.cidr {
-            if !policy.allow.cidrs.contains(c) {
-                policy.allow.cidrs.push(c.clone());
-            }
-        }
-        if !policy.allow.ports.is_empty() && !policy.allow.ports.contains(&a.port) {
-            policy.allow.ports.push(a.port);
+        if !policy.approved.contains(a) {
+            policy.approved.push(a.clone());
         }
     }
 }
@@ -153,7 +155,7 @@ pub fn merge_into(policy: &mut NetworkPolicy, approvals: &[Approval]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cowboy_core::netproto::Protocol;
+    use cowboy_core::netproto::{Protocol, Verdict};
 
     #[test]
     fn append_and_load_roundtrip() {
@@ -228,27 +230,76 @@ mod tests {
         }
     }
 
+    /// Approvals reach the policy as scoped endpoints, and leave the hand-written
+    /// `allow` rule set alone.
+    ///
+    /// This test used to assert the opposite — that `a.test` landed in `allow.domains`
+    /// and `53` in `allow.ports`. That last assertion was the bug written down as
+    /// intent: `allow.ports` is shared by every domain and CIDR in the rule set, so
+    /// approving one host on port 53 opened port 53 for all of them.
     #[test]
-    fn merge_adds_domains_and_cidrs() {
+    fn approvals_merge_as_scoped_endpoints_not_into_the_allow_rules() {
         let mut policy = NetworkPolicy::default();
+        policy.allow.domains = vec!["github.com".into()];
         policy.allow.ports = vec![443];
-        merge_into(
-            &mut policy,
-            &[
-                Approval {
-                    host: Some("a.test".into()),
-                    cidr: None,
-                    port: 443,
-                },
-                Approval {
-                    host: None,
-                    cidr: Some("9.9.9.9/32".into()),
-                    port: 53,
-                },
-            ],
+        let before_allow = policy.allow.clone();
+
+        let approvals = [
+            Approval {
+                host: Some("a.test".into()),
+                cidr: None,
+                port: 443,
+            },
+            Approval {
+                host: None,
+                cidr: Some("9.9.9.9/32".into()),
+                port: 53,
+            },
+        ];
+        merge_into(&mut policy, &approvals);
+
+        assert_eq!(
+            policy.allow, before_allow,
+            "merging approvals must not rewrite the policy's own allow rules"
         );
-        assert!(policy.allow.domains.contains(&"a.test".to_string()));
-        assert!(policy.allow.cidrs.contains(&"9.9.9.9/32".to_string()));
-        assert!(policy.allow.ports.contains(&53));
+        assert_eq!(policy.approved, approvals);
+
+        // Each is honoured on its own port…
+        let (v, _) = cowboy_core::policy::evaluate(&policy, &attempt_on("a.test", None, 443));
+        assert_eq!(v, Verdict::Allow);
+        let (v, _) = cowboy_core::policy::evaluate(&policy, &attempt_on("x", Some("9.9.9.9"), 53));
+        assert_eq!(v, Verdict::Allow);
+        // …and port 53 did not leak to the allow-listed domain.
+        let (v, _) = cowboy_core::policy::evaluate(&policy, &attempt_on("github.com", None, 53));
+        assert_eq!(
+            v,
+            Verdict::Ask,
+            "approving one host on port 53 must not open port 53 for github.com"
+        );
+    }
+
+    /// Merging twice must not accumulate duplicates — `merge_into` runs at every
+    /// session start against the same stored file.
+    #[test]
+    fn merging_the_same_approvals_twice_is_idempotent() {
+        let mut policy = NetworkPolicy::default();
+        let approvals = [Approval {
+            host: Some("a.test".into()),
+            cidr: None,
+            port: 443,
+        }];
+        merge_into(&mut policy, &approvals);
+        merge_into(&mut policy, &approvals);
+        assert_eq!(policy.approved.len(), 1);
+    }
+
+    fn attempt_on(host: &str, ip: Option<&str>, port: u16) -> NetworkAttempt {
+        NetworkAttempt {
+            protocol: Protocol::Tls,
+            host: Some(host.to_string()),
+            ip: ip.map(|s| s.parse().unwrap()),
+            port,
+            command_pid: None,
+        }
     }
 }

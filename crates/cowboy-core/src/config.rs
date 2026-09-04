@@ -164,6 +164,25 @@ pub enum DefaultVerdict {
     Ask,
 }
 
+/// One destination the user has explicitly approved: a host **or** a CIDR, together
+/// with the single port they approved it for.
+///
+/// Kept separate from [`RuleSet`] because the two mean different things. A rule set is
+/// a deliberate, reviewable policy written by hand, and its `ports` list applies to
+/// every domain and CIDR in it — a cross product, which is a convenience when you are
+/// writing the policy yourself. An approval is a specific answer to a specific
+/// question ("allow evil.example on port 22?"), and folding it into that cross product
+/// answered a broader question than the one that was asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedEndpoint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
+    pub port: u16,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
@@ -177,6 +196,13 @@ pub struct NetworkPolicy {
     pub allow: RuleSet,
     #[serde(default = "default_deny_rules")]
     pub deny: RuleSet,
+    /// Destinations the user approved one at a time, each scoped to its own port.
+    ///
+    /// Populated from the persisted approvals store at session start, never written by
+    /// hand — `allow` is the place to express policy deliberately. Evaluated after
+    /// `deny` and before `allow`, so an approval can never override an explicit denial.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approved: Vec<ApprovedEndpoint>,
     /// DNS resolution policy (strict allowlist gating + tunnel detection). Serde
     /// default keeps older configs/policy.json parsing.
     #[serde(default)]
@@ -699,6 +725,7 @@ impl Default for NetworkPolicy {
             default_host: DefaultVerdict::Ask,
             allow: default_allow_rules(),
             deny: default_deny_rules(),
+            approved: Vec::new(),
             dns: DnsPolicy::default(),
         }
     }
