@@ -101,9 +101,24 @@ struct Daemon {
     /// flag: set when another workstream finishes while an advance is running, so
     /// the coordinator re-runs once to pick up the late completion. Runtime-only.
     coordinating: std::collections::HashMap<String, bool>,
-    /// Cancel handle for the running web server (`cowboy web on`); `None` when not
-    /// serving. Runtime-only — the setting itself lives in `web.yaml`.
-    web: Option<tokio_util::sync::CancellationToken>,
+    /// The running web server (`cowboy web on`); `None` when not serving. Runtime-only
+    /// — the setting itself lives in `web.yaml`.
+    web: Option<WebServer>,
+}
+
+/// A spawned web server, and whether it is actually still up.
+///
+/// The liveness flag is the point. This used to be a bare cancellation token, set
+/// *before* the server task was spawned and never cleared if that task failed — so a
+/// bind that did not succeed (Tailscale down at daemon start, or the port already
+/// taken) left the daemon believing it was serving. Two things then lied: `cowboy web
+/// status` said "serving", and the idle-linger check kept the daemon alive forever for
+/// a web UI that was not there. A `cowboyd` that outlives every session and serves
+/// nothing is exactly the thing the linger exists to prevent.
+struct WebServer {
+    cancel: tokio_util::sync::CancellationToken,
+    /// Cleared by the server task when it stops, however it stops.
+    alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 use cowboy_core::time::now_ms;
@@ -187,8 +202,8 @@ impl Daemon {
     /// startup and on `DaemonReq::ReloadWeb`. Best-effort: a bad bind / missing
     /// token logs and leaves the server stopped rather than failing the daemon.
     fn apply_web(&mut self) {
-        if let Some(tok) = self.web.take() {
-            tok.cancel(); // stop the previous server (config changed / disabled)
+        if let Some(w) = self.web.take() {
+            w.cancel.cancel(); // stop the previous server (config changed / disabled)
         }
         let cfg = cowboy_core::config::WebConfig::load_global();
         if !cfg.enabled {
@@ -206,14 +221,31 @@ impl Daemon {
             return;
         }
         let cancel = tokio_util::sync::CancellationToken::new();
-        self.web = Some(cancel.clone());
+        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.web = Some(WebServer {
+            cancel: cancel.clone(),
+            alive: alive.clone(),
+        });
         let token = cfg.token.clone();
         tokio::spawn(async move {
-            if let Err(e) = crate::cmd::web::serve_with(addr, token, cancel).await {
-                tracing::warn!(error = %e, "web server exited");
+            let outcome = crate::cmd::web::serve_with(addr, token, cancel).await;
+            // However it ended, it is no longer serving. Clearing this is what lets the
+            // daemon exit when idle instead of lingering for a UI that is not there,
+            // and what stops `cowboy web status` claiming it is up.
+            alive.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = outcome {
+                tracing::warn!(
+                    error = %e, bind = %addr,
+                    "web server exited; not serving the web UI (the daemon will now exit when \
+                     idle). Fix the bind in web.yaml and run `cowboy web on` again."
+                );
             }
         });
-        tracing::info!(bind = %addr, "serving web UI");
+        tracing::info!(
+            bind = %addr,
+            "serving web UI; this daemon will stay up with no sessions (`cowboy web off` to \
+             let it exit when idle)"
+        );
     }
 
     /// Whether any session is still live. A *detached* session counts as live — the
@@ -226,10 +258,13 @@ impl Daemon {
             .any(|s| !s.status.is_terminal())
     }
 
-    /// Whether the daemon is serving the web UI, in which case it is useful with no
-    /// sessions at all and must not exit on idleness.
+    /// Whether the daemon is *actually* serving the web UI, in which case it is useful
+    /// with no sessions at all and must not exit on idleness. Checks the server's
+    /// liveness rather than the intent to start one — see [`WebServer`].
     fn serving_web(&self) -> bool {
-        self.web.is_some()
+        self.web
+            .as_ref()
+            .is_some_and(|w| w.alive.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     /// Canonical lease key for a worktree root (matches the container/network
@@ -863,7 +898,7 @@ async fn dispatch(
         DaemonReq::WebStatus => {
             let d = daemon.lock().await;
             DaemonResp::Web {
-                serving: d.web.is_some(),
+                serving: d.serving_web(),
             }
         }
         DaemonReq::Ping => {

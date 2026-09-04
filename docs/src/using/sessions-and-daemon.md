@@ -50,6 +50,11 @@ The linger exists so that starting a session does not race the daemon shutting
 down. `COWBOY_DAEMON_LINGER` sets it in seconds (default `20`); `0` disables
 idle exit entirely and the daemon stays up until asked to stop.
 
+If you find a long-lived `cowboyd` with nothing running, the usual reason is
+[`cowboy web`](web.md) being on — a served web UI is useful with no sessions, so it
+holds the daemon up deliberately. "Serving" means the server is actually up, not
+merely configured: a web UI whose bind failed does not keep the daemon alive.
+
 Ending a session is unconditional rather than merely bounded. The worker unlinks
 its socket and stops accepting *before* it tears anything down, so an ended session
 cannot be attached to while it winds up, and both worker and daemon arm a watchdog

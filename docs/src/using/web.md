@@ -21,6 +21,18 @@ cowboy web off                       # stop serving (the daemon keeps running)
 
 The setting (enabled, bind, token, allow-lan) persists in `~/.config/cowboy/web.yaml`.
 
+**It keeps `cowboyd` running.** Normally the daemon exits a few seconds after the last
+session ends — there is nothing to supervise, and it restarts on the next command. A
+served web UI is useful with no sessions at all (that is how you start one from your
+phone), so while it is serving, the daemon stays up. If you find a `cowboyd` in `ps`
+long after you closed everything, that is usually why; `cowboy web status` will say
+`enabled · serving`, and `cowboy web off` lets it exit when idle again.
+
+If the bind fails — a Tailscale IP that is not up when the daemon starts, or a port
+already taken — the daemon says so in its log, reports `enabled · not serving`, and
+exits when idle like any other idle daemon rather than lingering for a UI that never
+came up. Fix the bind and run `cowboy web on` again.
+
 ## What you can do
 
 Open the URL and you get a list of your sessions; tap one to:

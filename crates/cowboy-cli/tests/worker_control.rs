@@ -60,6 +60,17 @@ fn setup() -> Fixture {
 /// for teardown: a worker that never started a sandbox has no holder process, no
 /// namespaces and no broker threads to release, so it cannot exhibit a teardown leak.
 fn setup_with_setup_command(eager: bool) -> Fixture {
+    setup_inner(eager, None)
+}
+
+/// As [`setup`], but with the web UI enabled at `bind`. Used by the idle-linger tests,
+/// since serving the web UI is the one thing that legitimately keeps an idle daemon up
+/// — and so the one thing that must not do so when it is not actually serving.
+fn setup_with_web(bind: &str) -> Fixture {
+    setup_inner(false, Some(bind))
+}
+
+fn setup_inner(eager: bool, web_bind: Option<&str>) -> Fixture {
     let port = blackhole();
     let runtime = assert_fs::TempDir::new().unwrap();
     let state = assert_fs::TempDir::new().unwrap();
@@ -77,6 +88,13 @@ fn setup_with_setup_command(eager: bool) -> Fixture {
     proj.child(".cowboy/security.yaml")
         .write_str("version: 1\n")
         .unwrap();
+    if let Some(bind) = web_bind {
+        cfg.child("cowboy/web.yaml")
+            .write_str(&format!(
+                "enabled: true\nbind: {bind}\ntoken: testtoken\nallow_lan: false\n"
+            ))
+            .unwrap();
+    }
     proj.child(".cowboy/agent.yaml")
         .write_str(if eager {
             "version: 1\nagent:\n  setup:\n    - true\n"
@@ -768,6 +786,70 @@ fn the_daemon_stays_up_while_a_session_is_detached() {
     assert!(
         pid_alive(pid),
         "cowboyd must not exit while a detached session is live"
+    );
+}
+
+/// A web UI that is enabled but **cannot bind** must not make the daemon immortal.
+///
+/// `apply_web` recorded the server before spawning it and never cleared that on
+/// failure, so a bind that did not succeed — Tailscale down at daemon start, or the
+/// port already taken — left the daemon believing it was serving. It then refused to
+/// exit on idleness forever, for a web UI that was not there, and `cowboy web status`
+/// agreed with it. A `cowboyd` outliving every session while serving nothing is exactly
+/// what the idle linger exists to prevent.
+#[test]
+fn a_web_ui_that_cannot_bind_does_not_keep_the_daemon_alive() {
+    // A port already held, so `guard_bind_str` passes (loopback) and the real bind
+    // fails — the failure mode being tested, not a rejected address.
+    let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+
+    let fx = setup_with_web(&format!("127.0.0.1:{port}"));
+    let pid = daemon_pid(&fx.sock).expect("the daemon should be reachable");
+
+    // It must also not *claim* to be serving.
+    assert!(
+        matches!(
+            dreq(&fx.sock, DaemonReq::WebStatus),
+            Some(DaemonResp::Web { serving: false })
+        ),
+        "the daemon must not report a web UI it failed to bind as serving"
+    );
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(60) {
+        if !pid_alive(pid) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!("cowboyd ({pid}) is still alive, held up by a web UI that never started");
+}
+
+/// And the other direction: a web UI that *is* serving must keep the daemon up, since
+/// remote control is useful with no sessions at all. A fix for the above that simply
+/// stopped honouring `serving_web` would pass that test and break the feature.
+#[test]
+fn a_serving_web_ui_keeps_the_daemon_alive() {
+    let free = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = free.local_addr().unwrap().port();
+    drop(free); // hand the port back so the daemon can take it
+
+    let fx = setup_with_web(&format!("127.0.0.1:{port}"));
+    let pid = daemon_pid(&fx.sock).expect("the daemon should be reachable");
+    assert!(
+        matches!(
+            dreq(&fx.sock, DaemonReq::WebStatus),
+            Some(DaemonResp::Web { serving: true })
+        ),
+        "the daemon should be serving the web UI on a free port"
+    );
+
+    // Well past the linger window this fixture sets.
+    std::thread::sleep(Duration::from_secs(12));
+    assert!(
+        pid_alive(pid),
+        "cowboyd must stay up while it is serving the web UI"
     );
 }
 
