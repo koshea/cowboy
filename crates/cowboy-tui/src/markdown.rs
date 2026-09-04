@@ -73,6 +73,34 @@ pub fn link_urls(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `url` is safe to hand a terminal as an OSC 8 hyperlink destination.
+///
+/// Two separate hazards, both because this string comes from **model output**:
+///
+/// 1. **Escape-sequence injection.** The destination is interpolated into
+///    `\x1b]8;;{url}\x07`. A `\x07` in the URL terminates the sequence early and
+///    everything after it is written to the terminal as-is — so a link destination
+///    becomes arbitrary terminal control: cursor movement, screen clears, changing the
+///    window title, or on terminals with such features, worse. Any ASCII control
+///    character is refused, not just BEL and ESC.
+/// 2. **Dangerous schemes.** What a terminal does with a hyperlink is its business, and
+///    `file:` opens local files, `javascript:` runs script in some GUI handlers, and
+///    `data:` can carry a payload. Only the three schemes that mean "somewhere else on
+///    the network, or an email" are allowed.
+///
+/// A refused URL is not a rendering error: the label still renders, styled as a link,
+/// just without a clickable destination. Degrading is the right trade against writing
+/// model-chosen bytes into the user's terminal.
+pub fn is_safe_url(url: &str) -> bool {
+    if url.chars().any(|c| c.is_ascii_control()) {
+        return false;
+    }
+    let scheme = url.split_once(':').map(|(s, _)| s).unwrap_or_default();
+    scheme.eq_ignore_ascii_case("http")
+        || scheme.eq_ignore_ascii_case("https")
+        || scheme.eq_ignore_ascii_case("mailto")
+}
+
 /// Render `text` as Markdown into styled lines, using `base` as the body style.
 pub fn render(text: &str, base: Style) -> Vec<Line<'static>> {
     let mut opts = Options::empty();
@@ -531,6 +559,66 @@ mod tests {
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    /// A link destination is model output that gets interpolated into an OSC 8 escape
+    /// sequence, so it must not be able to carry escape sequences of its own.
+    ///
+    /// A `\x07` closes `\x1b]8;;{url}\x07` early and everything after it reaches the
+    /// terminal directly — a link destination becomes arbitrary terminal control. The
+    /// scheme allowlist is the second half: what a terminal does with a hyperlink is its
+    /// own business, and `file:`/`javascript:`/`data:` are not destinations we should be
+    /// handing it on a model's say-so.
+    #[test]
+    fn a_link_destination_cannot_smuggle_escape_sequences_or_schemes() {
+        assert!(is_safe_url("https://example.com/a?b=c#d"));
+        assert!(is_safe_url("http://example.com"));
+        assert!(is_safe_url("HTTPS://EXAMPLE.COM"));
+        assert!(is_safe_url("mailto:someone@example.com"));
+
+        // Control characters, which is the injection.
+        assert!(!is_safe_url("http://x\u{07}\u{1b}[2J"));
+        assert!(!is_safe_url("https://x\u{1b}]0;pwned\u{07}"));
+        assert!(!is_safe_url("https://x\n"));
+        assert!(!is_safe_url("https://x\r\nSet-Cookie: y"));
+        assert!(!is_safe_url("https://x\u{7f}"));
+
+        // Schemes a terminal should not be asked to open.
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("file:///etc/passwd"));
+        assert!(!is_safe_url("data:text/html,<script>x</script>"));
+        assert!(!is_safe_url("/relative/path"));
+        assert!(!is_safe_url(""));
+    }
+
+    /// Can the parser actually be made to hand through a destination with a control
+    /// character? Worth knowing precisely, because it decides whether `is_safe_url` is
+    /// closing a live hole or hardening a latent one.
+    #[test]
+    fn what_the_parser_does_with_control_characters_in_a_destination() {
+        let cases = [
+            ("bare parens", "[c](http://x\u{07}evil)"),
+            ("angle brackets", "[c](<http://x\u{07}evil>)"),
+            ("reference link", "[c][r]\n\n[r]: http://x\u{07}evil"),
+            ("autolink", "<http://x\u{07}evil>"),
+            ("escape char", "[c](http://x\u{1b}evil)"),
+            ("title after", "[c](http://x\u{07}evil \"t\")"),
+        ];
+        let mut got_through = Vec::new();
+        for (name, md) in cases {
+            for u in link_urls(md) {
+                if u.chars().any(|c| c.is_ascii_control()) {
+                    got_through.push((name, u));
+                }
+            }
+        }
+        // Whatever the answer, `is_safe_url` refuses every one of them. Recorded as a
+        // list rather than an assertion on the parser's behaviour, which is not ours and
+        // can change under us — which is exactly why the check is at the render site.
+        for (_, u) in &got_through {
+            assert!(!is_safe_url(u), "{u:?} must be refused");
+        }
+        eprintln!("destinations reaching the renderer with control chars: {got_through:?}");
     }
 
     #[test]

@@ -647,6 +647,13 @@ pub(super) fn overlay_hyperlinks(buf: &mut Buffer, app: &App, text_rect: Rect, o
     let top = offset_top;
     let bottom = offset_top + text_rect.height as usize;
     for h in hits.iter().filter(|h| h.row >= top && h.row < bottom) {
+        // The destination is model output being written into an escape sequence, so it
+        // is checked before it goes anywhere near the terminal. Skipping leaves the
+        // label rendered and styled, minus the clickable destination — see
+        // `markdown::is_safe_url`.
+        if !markdown::is_safe_url(&h.url) {
+            continue;
+        }
         let sy = (h.row - top) as u16;
         let y = text_rect.y + sy;
         // Reconstruct the label from the already-rendered cells.

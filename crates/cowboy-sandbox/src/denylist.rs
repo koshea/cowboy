@@ -196,10 +196,22 @@ impl Denylist {
     ///
     /// Matches a denied path **and everything under it**, and also refuses any
     /// *ancestor* of a denied path: granting `~` must not become a way to reach
-    /// `~/.aws` one level down. Callers must pass an absolute, symlink-resolved
-    /// path — `..` and symlink games are the caller's job to eliminate first,
-    /// since no string comparison can survive them.
+    /// `~/.aws` one level down.
+    ///
+    /// `.` and `..` are normalized away first. They used to be the caller's problem,
+    /// and the callers did not all agree: grant paths are canonicalized by both
+    /// entry points (`cowboy grant` and the agent's `request_path`), but mount sources
+    /// arrive from `plan::resolve_source`, which only joins. `/home/dev/.config/../.aws`
+    /// therefore did not match the denied `/home/dev/.aws` and was bound into the
+    /// sandbox. Normalizing here rather than asking every caller to remember is the
+    /// difference between an invariant and a convention.
+    ///
+    /// Note what this still does **not** do: resolve symlinks. That needs the
+    /// filesystem, and this runs against a fakeable `HostProbe` in tests and on paths
+    /// that may not exist yet. Callers that can canonicalize should — both grant paths
+    /// do — and this is the backstop for the ones that cannot.
     pub fn check(&self, path: &Path) -> Option<DenyReason> {
+        let path = &normalize(path);
         // Specific entries first: "this is your AWS credentials, use cowboy
         // secrets" is more actionable than "this is host-owned config", and both
         // match for e.g. `~/.config/cowboy/providers.yaml`.
@@ -236,6 +248,42 @@ impl Denylist {
 
 /// Whether a path is, or is inside, cowboy's host-owned config directory, or is
 /// one of the host-owned files themselves.
+/// Collapse `.` and `..` lexically, without touching the filesystem.
+///
+/// `Path::components()` already drops `.`, so only `..` needs work: each one pops the
+/// previous normal component. A `..` that would escape the root is dropped, matching
+/// how the kernel treats `/..` — and meaning the result can never be shorter than the
+/// root, so this cannot turn a denied absolute path into a relative one.
+///
+/// Purely lexical on purpose: this runs in the plan builder against a fakeable
+/// `HostProbe`, and on mount sources that need not exist yet, so `canonicalize` is not
+/// available. It is strictly better than nothing — the bug it fixes was a `..` walking
+/// sideways out of a denied prefix — and callers that *can* canonicalize still should.
+fn normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                // Only pop a real directory name; keep the root and any leading `..`
+                // of a relative path, which have nothing above them to discard.
+                if out
+                    .components()
+                    .next_back()
+                    .is_some_and(|c| matches!(c, Component::Normal(_)))
+                {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn names_host_owned_config(path: &Path) -> bool {
     use cowboy_core::config::{COWBOY_DIR, MODELS_FILE, PROVIDERS_FILE, SECURITY_FILE};
     path.components().any(|c| c.as_os_str() == COWBOY_DIR)
@@ -248,6 +296,48 @@ fn names_host_owned_config(path: &Path) -> bool {
 mod tests {
     use super::*;
     use crate::probe::FakeHost;
+
+    /// `..` and `.` are collapsed before any prefix test, and nothing can escape the
+    /// root — otherwise normalization itself could turn a denied absolute path into
+    /// something that no longer matches.
+    #[test]
+    fn normalize_collapses_traversal_without_escaping_the_root() {
+        let n = |s: &str| normalize(Path::new(s));
+        assert_eq!(
+            n("/home/dev/.config/../.aws"),
+            PathBuf::from("/home/dev/.aws")
+        );
+        assert_eq!(n("/home/dev/./.aws"), PathBuf::from("/home/dev/.aws"));
+        assert_eq!(n("/home/dev/.aws/"), PathBuf::from("/home/dev/.aws"));
+        assert_eq!(
+            n("/home/dev/a/b/../../.aws"),
+            PathBuf::from("/home/dev/.aws")
+        );
+        // `..` past the root is dropped, as the kernel treats `/..`.
+        assert_eq!(n("/../../.aws"), PathBuf::from("/.aws"));
+        assert_eq!(n("/.."), PathBuf::from("/"));
+        // A relative path keeps its leading `..`: there is nothing above it to pop,
+        // and silently dropping them would change which directory it names.
+        assert_eq!(n("../../x"), PathBuf::from("../../x"));
+        assert_eq!(n("a/../b"), PathBuf::from("b"));
+        // Already-clean paths are unchanged.
+        assert_eq!(n("/home/dev/.aws"), PathBuf::from("/home/dev/.aws"));
+    }
+
+    /// The traversal that motivated normalizing here: a sideways `..` out of a
+    /// non-denied sibling into a denied directory. `/home/dev/.aws/../.aws` was always
+    /// caught (it literally starts with the denied prefix); this form was not.
+    #[test]
+    fn a_sideways_traversal_into_a_denied_path_is_refused() {
+        let l = list();
+        assert!(l.check(Path::new("/home/dev/.config/../.aws")).is_some());
+        assert!(l
+            .check(Path::new("/home/dev/x/y/../../.aws/credentials"))
+            .is_some());
+        // And a path that merely mentions `..` without reaching anything denied is
+        // still allowed — normalization must not become its own denial.
+        assert!(l.check(Path::new("/srv/proj/sub/../src")).is_none());
+    }
 
     /// A denylist for a project unrelated to the user's home, which is the
     /// ordinary case.

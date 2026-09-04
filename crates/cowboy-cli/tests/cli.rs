@@ -68,17 +68,29 @@ fn doctor_runs_after_init() {
         .arg("init")
         .assert()
         .success();
-    // Doctor should succeed on this host (Linux with the kernel prerequisites present), though
-    // it may warn about a missing provider.
+
+    // What this test is really about: after `init`, `doctor` runs and reports on the
+    // platform and the project's config. Both are asserted unconditionally.
+    //
+    // The **exit code** is a property of the host, not of the code. `doctor` exits 1
+    // when it finds a failure, which is correct on a machine that cannot sandbox — a CI
+    // runner without bubblewrap, or one where unprivileged user namespaces are blocked.
+    // Asserting `.success()` there tests the host. `COWBOY_SANDBOX_TESTS=required` is
+    // the repo-wide switch for "the sandbox must work here", so it governs this too;
+    // the two other host-capability tests (`doctor::this_host_reports_no_sandbox_failures`
+    // and `preflight::the_host_meets_every_requirement`) already honour it.
     let home = assert_fs::TempDir::new().unwrap();
-    cowboy()
+    let assertion = cowboy()
         .current_dir(tmp.path())
         .env("XDG_CONFIG_HOME", home.path())
         .arg("doctor")
         .assert()
-        .success()
         .stdout(predicate::str::contains("platform"))
         .stdout(predicate::str::contains("security.yaml"));
+
+    if cowboy_cli::sandbox::preflight::tests_required() {
+        assertion.success();
+    }
 }
 
 #[test]

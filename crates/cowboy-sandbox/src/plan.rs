@@ -1233,6 +1233,41 @@ mod tests {
         assert!(matches!(err, Error::SecurityInvariant(_)));
     }
 
+    /// A `..` in a mount source must not walk past the credential denylist.
+    ///
+    /// `Denylist::check` is a component-wise prefix test and says so — it requires an
+    /// absolute, normalized path. Grant paths get canonicalized by both callers
+    /// (`cowboy grant` and the agent's `request_path`), but mount sources go through
+    /// `resolve_source`, which only joins. So `/home/dev/.aws/../.aws` did not match the
+    /// denied entry `/home/dev/.aws` and was bound into the sandbox.
+    ///
+    /// Only reachable from host-owned `security.yaml` (or the user's personal overlay),
+    /// so this is a footgun rather than an agent-exploitable hole — but the whole point
+    /// of the check is to catch a user mounting their credentials by accident, and it
+    /// silently failed to.
+    #[test]
+    fn a_mount_source_cannot_walk_past_the_denylist_with_dotdot() {
+        for source in [
+            "/home/dev/.aws/../.aws",
+            "/home/dev/./.aws",
+            "/home/dev/.config/../.aws",
+            "/home/dev/.aws/",
+        ] {
+            let mut sec = SecurityConfig::default();
+            sec.sandbox.mounts.push(Mount {
+                source: source.into(),
+                target: "/workspace/aws".into(),
+                mode: "ro".into(),
+            });
+            let err = plan_with(&sec, &[], &host())
+                .expect_err(&format!("mount source {source} must be refused"));
+            assert!(
+                matches!(err, Error::SecurityInvariant(_)),
+                "{source}: {err:?}"
+            );
+        }
+    }
+
     #[test]
     fn optional_missing_credential_is_skipped_and_required_one_fails() {
         let mut sec = SecurityConfig::default();
