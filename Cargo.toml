@@ -73,10 +73,6 @@ crossterm = "0.29"
 ratatui-textarea = "0.9"
 ansi-to-tui = "8"
 throbber-widgets-tui = "0.11"
-# Direct OS clipboard (X11 + Wayland). `default-features = false` drops the
-# heavy `image` crate — we only copy text. OSC 52 stays as the SSH/remote
-# fallback. x11rb is always compiled on Linux; `wayland` adds wl-clipboard-rs.
-clipboard-rs = { version = "0.3", default-features = false, features = ["wayland"] }
 # Rich transcript rendering: markdown → styled ratatui lines, with syntect for
 # fenced code-block syntax highlighting. `default-fancy` uses the pure-Rust
 # fancy-regex engine (no oniguruma C build dep).

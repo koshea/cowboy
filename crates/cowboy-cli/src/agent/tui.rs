@@ -13,7 +13,6 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
-use clipboard_rs::{Clipboard, ClipboardContext};
 use cowboy_core::daemonproto::UiEventMsg;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 use cowboy_tui::{draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, REASONING_OPTS};
@@ -337,10 +336,11 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-/// Copy `text` to the clipboard via OSC 52 — the *fallback* path, used when the
-/// direct OS clipboard (clipboard-rs) is unavailable, e.g. running the TUI over
-/// SSH with no local display. Works in Ghostty, kitty, iTerm2, and over
-/// SSH/tmux (with passthrough), though some terminal/multiplexer stacks drop it.
+/// Copy `text` to the clipboard via OSC 52 — the terminal-native mechanism, and
+/// the *only* clipboard path (a blocking native X11/Wayland backend used to sit in
+/// front of this and froze the event loop; see the copy site). Works in Ghostty,
+/// kitty, iTerm2, and over SSH/tmux (with passthrough), though some
+/// terminal/multiplexer stacks drop it — the terminal must allow clipboard writes.
 ///
 /// `out` MUST be ratatui's own terminal backend (`terminal.backend_mut()`), not
 /// a fresh `io::stdout()`: crossterm buffers each frame and flushes it at the
@@ -477,11 +477,10 @@ fn event_loop(
         _ => app.mode = Mode::Idle,
     }
 
-    // Direct OS clipboard handle (X11/Wayland), created once and kept alive for
-    // the whole session: on X11 the copied selection is only served while this
-    // context lives. `None` when there's no local display (headless / SSH), in
-    // which case copies fall back to OSC 52 through the terminal.
-    let clipboard = ClipboardContext::new().ok();
+    // Clipboard is OSC 52 only: copies are written to the terminal as an escape
+    // sequence (see `clipboard_copy`), which works locally and over SSH and — unlike
+    // a native X11/Wayland backend — cannot block the event loop. No handle to keep
+    // alive, so nothing is created here.
 
     // Byte offset consumed from the watched subagent's journal, reset when the
     // watch target changes, so the nested view tails the file across ticks.
@@ -581,24 +580,20 @@ fn event_loop(
         // crossterm's buffered frame — when there's no local display (SSH).
         // Outcome is reported both in the status line and the per-run log
         // ($TMPDIR/cowboy-<pid>.log) so copy failures are diagnosable.
+        // OSC 52 only: ask the terminal to set the clipboard by writing an escape
+        // sequence through ratatui's own backend (never a fresh stdout — see
+        // `clipboard_copy`). This runs on the event loop, so it must never block:
+        // writing a few bytes to the tty cannot. The previous native path
+        // (`clipboard_rs::set_text`) *could* block on the X server / clipboard
+        // manager, and did — freezing input while the last frame kept rendering,
+        // with Ctrl+C dead because raw mode delivers it as a key event to the very
+        // loop that was stuck. OSC 52 removes that failure mode entirely and works
+        // identically over SSH. Outcome is logged to $TMPDIR/cowboy-<pid>.log.
         if let Some(text) = app.take_pending_copy() {
             let n = text.chars().count();
-            app.status = match clipboard.as_ref().map(|c| c.set_text(text.clone())) {
-                Some(Ok(())) => {
-                    eprintln!("[copy] {n} chars -> OS clipboard ok");
-                    format!("copied {n} chars")
-                }
-                Some(Err(e)) => {
-                    eprintln!("[copy] OS clipboard failed ({e}); OSC 52 fallback");
-                    clipboard_copy(terminal.backend_mut(), &text);
-                    format!("copied {n} chars (osc52 fallback)")
-                }
-                None => {
-                    eprintln!("[copy] no OS clipboard (headless/SSH?); OSC 52");
-                    clipboard_copy(terminal.backend_mut(), &text);
-                    format!("copied {n} chars (osc52)")
-                }
-            };
+            clipboard_copy(terminal.backend_mut(), &text);
+            eprintln!("[copy] {n} chars -> clipboard (osc52)");
+            app.status = format!("copied {n} chars");
         }
 
         if event::poll(Duration::from_millis(120))? {
