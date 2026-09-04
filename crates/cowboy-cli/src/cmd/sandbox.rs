@@ -125,8 +125,16 @@ impl HostProbe for RealHost {
         expand_path("~").ok()
     }
 
+    /// The running cowboy binary — the plan bind-mounts it as the lockdown shim.
+    ///
+    /// Goes through [`crate::project::self_exe`] rather than `current_exe()` directly,
+    /// because `current_exe()` on a **replaced** binary (`cargo install` during a live
+    /// session) yields `".../cowboy (deleted)"`. The shim bind is rendered
+    /// `--ro-bind-try`, so that missing source is silently skipped and every command in
+    /// the session then dies with `bwrap: execvp /.cowboy-shim: No such file or
+    /// directory` — a session alive but unable to run anything.
     fn self_exe(&self) -> Option<PathBuf> {
-        std::env::current_exe().ok()
+        crate::project::self_exe().ok()
     }
 }
 

@@ -14,6 +14,55 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use cowboy_core::config;
 
+/// Path to *this* cowboy binary, robust to the binary having been **replaced** since
+/// the process started — `cargo install`, or a package upgrade, while a session runs.
+///
+/// On Linux `current_exe()` reads `/proc/self/exe`, which for a replaced executable
+/// resolves to the literal string `".../cowboy (deleted)"`. That path does not exist, so
+/// anything using it fails with `ENOENT`. The replacement almost always sits at the
+/// same path, so strip the marker; failing that, look the bare name up on `PATH`.
+///
+/// This matters in two places that both looked unrelated to each other, which is why it
+/// lives here rather than next to either of them:
+///
+/// - spawning a subagent, which fails to exec;
+/// - **the sandbox's lockdown shim**, which the plan bind-mounts at
+///   `cowboy_sandbox::SHIM_PATH`. That bind is rendered `--ro-bind-try`, so a missing
+///   source is *silently skipped* — leaving nothing at the shim path and every command
+///   in the session failing with `bwrap: execvp /.cowboy-shim: No such file or
+///   directory`. The session stays alive and cannot run a single command.
+pub fn self_exe() -> std::result::Result<PathBuf, String> {
+    let raw = std::env::current_exe().map_err(|e| format!("cannot locate cowboy binary: {e}"))?;
+    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    resolve_exe(raw, &|p| p.exists(), &path_dirs)
+        .ok_or_else(|| "cowboy binary not found (moved or upgraded mid-session?)".to_string())
+}
+
+/// Inner resolver, parameterized over existence + `PATH` for testing.
+fn resolve_exe(
+    raw: PathBuf,
+    exists: &dyn Fn(&Path) -> bool,
+    path_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    if exists(&raw) {
+        return Some(raw);
+    }
+    // A replaced executable's `/proc/self/exe` reads as `<path> (deleted)`.
+    let s = raw.to_string_lossy();
+    if let Some(stripped) = s.strip_suffix(" (deleted)") {
+        let p = PathBuf::from(stripped);
+        if exists(&p) {
+            return Some(p);
+        }
+    }
+    // Last resort: look up the bare binary name on PATH.
+    let name = raw.file_name().map(|n| n.to_string_lossy().into_owned())?;
+    let name = name.strip_suffix(" (deleted)").unwrap_or(&name).to_string();
+    path_dirs.iter().map(|d| d.join(&name)).find(|c| exists(c))
+}
+
 /// A stable 32-bit hash of the project path, used to derive per-project network
 /// names and subnets.
 pub fn project_hash(root: &Path) -> u32 {
@@ -345,5 +394,35 @@ mod tests {
             );
             assert!(k.contains(&format!(".{}.", std::process::id())), "{k}");
         }
+    }
+}
+
+#[cfg(test)]
+mod exe_tests {
+    use super::*;
+
+    #[test]
+    fn resolve_exe_handles_a_replaced_binary() {
+        let bin = PathBuf::from("/cargo/bin/cowboy");
+        let deleted = PathBuf::from("/cargo/bin/cowboy (deleted)");
+
+        // A live path is returned as-is.
+        let exists_real = |p: &Path| p == bin;
+        assert_eq!(
+            resolve_exe(bin.clone(), &exists_real, &[]),
+            Some(bin.clone())
+        );
+
+        // A `(deleted)` path resolves to the replacement at the same location.
+        assert_eq!(resolve_exe(deleted.clone(), &exists_real, &[]), Some(bin));
+
+        // If the same path is gone, fall back to the name on PATH.
+        let path_dir = PathBuf::from("/usr/local/bin");
+        let on_path = path_dir.join("cowboy");
+        let exists_path = |p: &Path| p == on_path;
+        assert_eq!(
+            resolve_exe(deleted, &exists_path, &[path_dir]),
+            Some(on_path)
+        );
     }
 }

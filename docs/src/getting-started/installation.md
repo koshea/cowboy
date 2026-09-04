@@ -74,6 +74,22 @@ reports a couple of transitive crates as behind their latest release — `matchi
 `generic-array`, both pinned to an exact version by `axum`, so there is nothing to
 update and nothing wrong.
 
+## Upgrading
+
+Re-run the install command. One thing to know: **end your sessions first.**
+
+Installing replaces the binary on disk, and a running session bind-mounts that same
+binary into its sandbox as the lockdown shim. Once it is replaced, the worker's own
+`/proc/self/exe` reads `".../cowboy (deleted)"`. Cowboy resolves that — the replacement
+is at the same path — so the session keeps working. But if the binary moved somewhere
+else entirely, the session cannot confine anything and refuses to run commands rather
+than running them unconfined, telling you to restart it. The daemon is unaffected:
+`cowboy down` and starting again picks up the new version.
+
+The web UI is embedded in the binary, so a running `cowboyd` keeps serving the version
+it started with. `cowboy web off && cowboy web on` after an upgrade, or let the daemon
+idle out.
+
 ## The toolchain the agent gets
 
 Yours. `/usr` and `/opt` are exposed read-only inside the sandbox, so the agent

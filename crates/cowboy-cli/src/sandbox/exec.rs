@@ -63,6 +63,19 @@ fn build_command(
     let bwrap_path = bwrap::resolve_bwrap()?;
     // The shim runs from inside the sandbox at a fixed path; the plan binds the
     // cowboy binary there (see `cowboy_sandbox::SHIM_PATH`).
+    //
+    // Checked rather than assumed, because the failure is otherwise unreadable. Binds
+    // are rendered `--ro-bind-try` (an optional path that vanished between planning and
+    // now should not abort the command), so a shim whose source is missing is *silently
+    // skipped* — and bwrap then reports `execvp /.cowboy-shim: No such file or
+    // directory`, which points at the target inside the sandbox and says nothing about
+    // the host path that actually went away. Every command in the session fails that
+    // way, so the agent stays alive with no ability to run anything.
+    //
+    // The way this happens in practice is upgrading cowboy (`cargo install`) while a
+    // session is running: `current_exe()` then reads `".../cowboy (deleted)"`.
+    // `project::self_exe` resolves that, so this is the backstop, not the fix.
+    ensure_shim_is_bound(plan)?;
     let shim_argv: Vec<OsString> = vec![cowboy_sandbox::SHIM_PATH.into(), "x-sandbox-shim".into()];
     let argv = bwrap::build_argv(&bwrap_path, plan, net, &shim_argv);
 
@@ -84,6 +97,31 @@ fn build_command(
         deny_raw_sockets: plan.seccomp.deny_raw_sockets,
     };
     Ok((cmd, request))
+}
+
+/// Refuse to run when the lockdown shim would not be present inside the sandbox.
+///
+/// Fails closed either way — without the shim nothing execs — so this exists purely to
+/// replace an error that names the wrong thing with one that names the right thing and
+/// says what to do.
+fn ensure_shim_is_bound(plan: &SandboxPlan) -> Result<()> {
+    let bound = plan
+        .binds
+        .iter()
+        .find(|b| b.target == cowboy_sandbox::SHIM_PATH);
+    match bound {
+        Some(b) if b.source.exists() => Ok(()),
+        Some(b) => anyhow::bail!(
+            "the cowboy binary is no longer at {}, so the sandbox lockdown shim cannot be \
+             mounted. This usually means cowboy was upgraded or moved while this session was \
+             running. End the session and start a new one (`cowboy down`, then re-run).",
+            b.source.display()
+        ),
+        None => anyhow::bail!(
+            "the sandbox plan has no lockdown shim, so no command can be confined; refusing to \
+             run. Check `cowboy doctor` and that the cowboy binary is on disk."
+        ),
+    }
 }
 
 /// Send the shim its request, then any payload for the command itself.
@@ -340,7 +378,7 @@ mod tests {
     use cowboy_core::config::SecurityConfig;
     use cowboy_sandbox::plan::PlanInputs;
     use cowboy_sandbox::probe::FakeHost;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     fn dummy_plan() -> SandboxPlan {
         let probe = FakeHost::new().with_existing(["/usr", "/srv/proj"]);
@@ -357,6 +395,75 @@ mod tests {
             &probe,
         )
         .unwrap()
+    }
+
+    /// Upgrading cowboy mid-session must say so, not fail as a missing file inside the
+    /// sandbox.
+    ///
+    /// `cargo install` while a session runs replaces the binary, after which
+    /// `current_exe()` reads `".../cowboy (deleted)"`. The plan bind-mounts that as the
+    /// lockdown shim, binds render as `--ro-bind-try`, and a missing source is silently
+    /// skipped — so bwrap reported `execvp /.cowboy-shim: No such file or directory`,
+    /// naming the path *inside* the sandbox and saying nothing about the host binary
+    /// that moved. Every command in the session failed that way: an agent alive and
+    /// unable to run anything.
+    ///
+    /// `project::self_exe` resolves the `(deleted)` marker so this should not arise;
+    /// this is the backstop that makes it legible if it ever does.
+    #[test]
+    fn a_missing_lockdown_shim_names_the_host_binary_not_the_sandbox_path() {
+        // A plan whose shim source does not exist, exactly as a replaced binary leaves it.
+        let probe = FakeHost {
+            self_exe: Some(PathBuf::from("/cargo/bin/cowboy (deleted)")),
+            ..FakeHost::new().with_existing(["/usr", "/srv/proj"])
+        };
+        let sec = SecurityConfig::default();
+        let plan = SandboxPlan::build(
+            &PlanInputs {
+                root: Path::new("/srv/proj"),
+                security: &sec,
+                grants: &[],
+                mask_file: Path::new("/run/mask"),
+                relay_port: 8443,
+                scratch: Path::new("/scratch"),
+            },
+            &probe,
+        )
+        .unwrap();
+
+        let err = ensure_shim_is_bound(&plan).expect_err("a missing shim must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/cargo/bin/cowboy (deleted)"),
+            "the error must name the host path that went away: {msg}"
+        );
+        assert!(
+            msg.contains("upgraded or moved"),
+            "and say why that happens: {msg}"
+        );
+        assert!(
+            !msg.contains(cowboy_sandbox::SHIM_PATH),
+            "and not point at the path inside the sandbox, which is not the problem: {msg}"
+        );
+
+        // And a plan whose shim really is on disk passes.
+        let live = FakeHost {
+            self_exe: std::env::current_exe().ok(),
+            ..FakeHost::new().with_existing(["/usr", "/srv/proj"])
+        };
+        let ok_plan = SandboxPlan::build(
+            &PlanInputs {
+                root: Path::new("/srv/proj"),
+                security: &sec,
+                grants: &[],
+                mask_file: Path::new("/run/mask"),
+                relay_port: 8443,
+                scratch: Path::new("/scratch"),
+            },
+            &live,
+        )
+        .unwrap();
+        assert!(ensure_shim_is_bound(&ok_plan).is_ok());
     }
 
     fn req<'a>(plan: &'a SandboxPlan, command: &'a str, cwd: Option<&'a str>) -> ExecRequest<'a> {

@@ -3,44 +3,15 @@
 //! keep the loop itself focused on orchestration.
 
 use super::*;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Path to *this* cowboy binary, for spawning subagents — robust to the binary
-/// being replaced mid-session (e.g. `cargo install` / a package upgrade while a
-/// session runs). On Linux `current_exe()` then resolves to `".../cowboy
-/// (deleted)"`, which fails to spawn with ENOENT; strip that marker (the
-/// replacement usually sits at the same path) and, failing that, fall back to
-/// the binary's name on `PATH`.
+/// Path to *this* cowboy binary, for spawning subagents.
+///
+/// Delegates to [`crate::project::self_exe`], which is robust to the binary being
+/// replaced mid-session. Shared with the sandbox's shim bind, which hits the same
+/// problem far less visibly — see that function.
 pub(super) fn self_exe() -> std::result::Result<PathBuf, String> {
-    let raw = std::env::current_exe().map_err(|e| format!("cannot locate cowboy binary: {e}"))?;
-    let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    resolve_exe(raw, &|p| p.exists(), &path_dirs)
-        .ok_or_else(|| "cowboy binary not found (moved or upgraded mid-session?)".to_string())
-}
-
-/// Inner resolver, parameterized over existence + `PATH` for testing.
-fn resolve_exe(
-    raw: PathBuf,
-    exists: &dyn Fn(&Path) -> bool,
-    path_dirs: &[PathBuf],
-) -> Option<PathBuf> {
-    if exists(&raw) {
-        return Some(raw);
-    }
-    // A replaced executable's `/proc/self/exe` reads as `<path> (deleted)`.
-    let s = raw.to_string_lossy();
-    if let Some(stripped) = s.strip_suffix(" (deleted)") {
-        let p = PathBuf::from(stripped);
-        if exists(&p) {
-            return Some(p);
-        }
-    }
-    // Last resort: look up the bare binary name on PATH.
-    let name = raw.file_name().map(|n| n.to_string_lossy().into_owned())?;
-    let name = name.strip_suffix(" (deleted)").unwrap_or(&name).to_string();
-    path_dirs.iter().map(|d| d.join(&name)).find(|c| exists(c))
+    crate::project::self_exe()
 }
 
 /// Forward a streamed [`Delta`] to the UI. A free function so it borrows only
@@ -188,34 +159,4 @@ pub(super) fn truncate(output: &str, max_bytes: usize) -> String {
         &output[..end],
         max_bytes
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_exe_handles_a_replaced_binary() {
-        let bin = PathBuf::from("/cargo/bin/cowboy");
-        let deleted = PathBuf::from("/cargo/bin/cowboy (deleted)");
-
-        // A live path is returned as-is.
-        let exists_real = |p: &Path| p == bin;
-        assert_eq!(
-            resolve_exe(bin.clone(), &exists_real, &[]),
-            Some(bin.clone())
-        );
-
-        // A `(deleted)` path resolves to the replacement at the same location.
-        assert_eq!(resolve_exe(deleted.clone(), &exists_real, &[]), Some(bin));
-
-        // If the same path is gone, fall back to the name on PATH.
-        let path_dir = PathBuf::from("/usr/local/bin");
-        let on_path = path_dir.join("cowboy");
-        let exists_path = |p: &Path| p == on_path;
-        assert_eq!(
-            resolve_exe(deleted, &exists_path, &[path_dir]),
-            Some(on_path)
-        );
-    }
 }

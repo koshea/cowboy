@@ -659,3 +659,111 @@ async fn the_shim_refuses_to_run_with_capabilities() {
         "the command must not have run"
     );
 }
+
+/// Upgrading cowboy while a session is live must produce a legible error, not an
+/// unrunnable sandbox.
+///
+/// `cargo install` replaces the binary, after which the running worker's
+/// `current_exe()` reads `".../cowboy (deleted)"`. That path is what the plan
+/// bind-mounts as the lockdown shim, binds are rendered `--ro-bind-try`, and bwrap
+/// *silently skips a missing source* — so nothing landed at the shim path and every
+/// command failed with `bwrap: execvp /.cowboy-shim: No such file or directory`. That
+/// names the path inside the sandbox and says nothing about the host binary that moved,
+/// and it happens for the rest of the session: an agent alive, answering, and unable to
+/// run a single command.
+///
+/// Simulated by pointing the probe at a copy of the binary and then deleting it, so the
+/// test never touches the installed one.
+#[tokio::test]
+async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_sandbox() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let real = Host.self_exe().unwrap();
+    let tmp = assert_fs::TempDir::new().unwrap();
+    let copy = tmp.path().join("cowboy");
+    std::fs::copy(&real, &copy).unwrap();
+
+    /// A host whose cowboy binary is the copy above.
+    struct MovableHost(PathBuf);
+    impl HostProbe for MovableHost {
+        fn exists(&self, path: &Path) -> bool {
+            path.exists()
+        }
+        fn git_common_dir(&self, _root: &Path) -> Option<PathBuf> {
+            None
+        }
+        fn expand(&self, raw: &str) -> Option<PathBuf> {
+            cowboy_core::config::expand_path(raw).ok()
+        }
+        fn home(&self) -> Option<PathBuf> {
+            cowboy_core::config::expand_path("~").ok()
+        }
+        fn self_exe(&self) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+    }
+
+    let sec = SecurityConfig::default();
+    let mask = mask_file();
+    let scratch = cowboy_cli::project::ensure_scratch_dir(&cowboy_cli::project::scratch_key(
+        "sandbox-exec-replaced",
+    ))
+    .unwrap();
+    let build = |probe: &dyn HostProbe| {
+        SandboxPlan::build(
+            &PlanInputs {
+                root: &p.path(),
+                security: &sec,
+                grants: &[],
+                mask_file: &mask,
+                relay_port: 8443,
+                scratch: &scratch,
+            },
+            probe,
+        )
+        .unwrap()
+    };
+
+    let exec = |plan: SandboxPlan| async move {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        run_streaming(
+            ExecRequest {
+                plan: &plan,
+                command: "echo alive",
+                cwd: None,
+                timeout_secs: 30,
+                net: NetMode::Isolated,
+                session: None,
+            },
+            tokio_util::sync::CancellationToken::new(),
+            tx,
+        )
+        .await
+    };
+
+    // With the copy in place, the sandbox works.
+    let plan = build(&MovableHost(copy.clone()));
+    let (res, out) = exec(plan).await.expect("the sandbox should run");
+    assert_eq!(res.exit_code, 0, "{out}");
+    assert!(out.contains("alive"), "{out}");
+
+    // Now the binary is replaced/removed, exactly as `cargo install` leaves it.
+    std::fs::remove_file(&copy).unwrap();
+    let plan = build(&MovableHost(copy.clone()));
+    let err = exec(plan)
+        .await
+        .expect_err("a sandbox with no shim must refuse rather than run")
+        .to_string();
+    assert!(
+        err.contains(&copy.display().to_string()),
+        "the error must name the host binary that went away: {err}"
+    );
+    assert!(
+        err.contains("upgraded or moved"),
+        "and explain how that happens: {err}"
+    );
+    assert!(
+        !err.contains("execvp"),
+        "and not surface as bwrap failing to exec a path inside the sandbox: {err}"
+    );
+}
