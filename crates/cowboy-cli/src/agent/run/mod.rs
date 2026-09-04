@@ -131,11 +131,27 @@ you go, then `publish` it as an artifact by `path` and keep your final answer to
 short summary that points at the file. Save progress incrementally so partial work \
 survives even if you don't finish.";
 
+/// USD-per-1M-token pricing for the cost estimate. `cached_input` defaults to
+/// `input` when the model config names no cache discount.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ModelPricing {
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cached_input: Option<f64>,
+}
+
+impl ModelPricing {
+    /// The effective price of a cached input token: the configured cache
+    /// price, else the full input price (no assumed discount).
+    fn cached_input_or_input(&self) -> Option<f64> {
+        self.cached_input.or(self.input)
+    }
+}
+
 /// Builds a model client by name (host-owned credentials in, built client out),
-/// yielding the client, its context window, and its (input, output) per-1M-token
-/// USD pricing. Used to reroute when a model turns out to be unavailable.
-pub type ModelBuilder =
-    Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, (Option<f64>, Option<f64>))>>;
+/// yielding the client, its context window, and its USD pricing. Used to
+/// reroute when a model turns out to be unavailable.
+pub type ModelBuilder = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, ModelPricing)>>;
 
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
@@ -195,6 +211,18 @@ pub struct AgentLoop<'a> {
     /// USD per 1M input/output tokens (None when the model's pricing is unknown).
     price_in: Option<f64>,
     price_out: Option<f64>,
+    /// USD per 1M *cached* input tokens; falls back to `price_in` (no discount).
+    price_cached_in: Option<f64>,
+    /// Provider-reported token totals, preferred over the local estimate when
+    /// the stream carries `usage` (billing ground truth; sees cache hits).
+    usage_in: u64,
+    usage_out: u64,
+    usage_cached_in: u64,
+    /// True once any response carried provider usage: from then on the estimate
+    /// is abandoned entirely (mixing counted and estimated tokens would corrupt
+    /// both), and a response *without* usage contributes zero rather than an
+    /// estimate.
+    usage_reported: bool,
     /// Running estimated session spend in USD (0.0 when pricing is unknown).
     /// This is the agent's OWN spend; subagent spend is tracked separately in
     /// [`Self::subagent_cost_usd`] and added in when reporting to the UI.
@@ -576,6 +604,11 @@ impl<'a> AgentLoop<'a> {
             tokens_out: 0,
             price_in: None,
             price_out: None,
+            price_cached_in: None,
+            usage_in: 0,
+            usage_out: 0,
+            usage_cached_in: 0,
+            usage_reported: false,
             cost_usd: 0.0,
             subagent_cost_usd: 0.0,
             subagent_tokens_in: 0,
@@ -627,22 +660,39 @@ impl<'a> AgentLoop<'a> {
         self.mcp = Some(manager);
     }
 
-    /// Accumulate per-call token estimates (prompt sent + completion received)
-    /// and report the running session total to the UI. Estimates use the local
-    /// tokenizer, so they are provider-independent and roughly track billing.
+    /// Accumulate per-call token usage (prompt sent + completion received)
+    /// and report the running session total to the UI. Provider-reported usage
+    /// is the billing ground truth — it sees prompt-cache hits — so once any
+    /// response carries it we account on it exclusively; until then we fall
+    /// back to the local tokenizer estimate (provider-independent, roughly
+    /// tracks billing, but blind to caching).
     fn account_tokens(&mut self, prompt_est: u64, response: &ChatResponse) {
-        self.tokens_in += prompt_est;
-        let mut out =
-            cowboy_core::tokens::count(response.content.as_deref().unwrap_or_default()) as u64;
-        // Reasoning is billed as output and can dwarf the visible answer on the
-        // reasoning models this targets; omitting it made spend/budget read far
-        // below the truth.
-        out += cowboy_core::tokens::count(response.reasoning.as_deref().unwrap_or_default()) as u64;
-        for tc in &response.tool_calls {
-            out += (cowboy_core::tokens::count(&tc.arguments)
-                + cowboy_core::tokens::count(&tc.name)) as u64;
+        if let Some(u) = response.usage {
+            self.usage_reported = true;
+            self.usage_in += u.prompt_tokens;
+            self.usage_out += u.completion_tokens;
+            self.usage_cached_in += u.cached_prompt_tokens.min(u.prompt_tokens);
+            self.tokens_in += u.prompt_tokens;
+            self.tokens_out += u.completion_tokens;
+        } else if self.usage_reported {
+            // Earlier calls reported usage, so the totals are counted, not
+            // estimated — adding an estimate now would corrupt both. A missing
+            // usage chunk contributes zero (slight undercount) instead.
+        } else {
+            self.tokens_in += prompt_est;
+            let mut out =
+                cowboy_core::tokens::count(response.content.as_deref().unwrap_or_default()) as u64;
+            // Reasoning is billed as output and can dwarf the visible answer on the
+            // reasoning models this targets; omitting it made spend/budget read far
+            // below the truth.
+            out += cowboy_core::tokens::count(response.reasoning.as_deref().unwrap_or_default())
+                as u64;
+            for tc in &response.tool_calls {
+                out += (cowboy_core::tokens::count(&tc.arguments)
+                    + cowboy_core::tokens::count(&tc.name)) as u64;
+            }
+            self.tokens_out += out;
         }
-        self.tokens_out += out;
         self.report_usage();
     }
 
@@ -655,8 +705,17 @@ impl<'a> AgentLoop<'a> {
     /// subagent cost (a subagent may be priced even when this agent isn't).
     fn report_usage(&mut self) {
         if let (Some(pi), Some(po)) = (self.price_in, self.price_out) {
-            self.cost_usd =
-                (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po;
+            self.cost_usd = if self.usage_reported {
+                // Counted tokens: bill cache hits at the cache price (default:
+                // full input price), the rest of the prompt at the input price.
+                let pc = self.price_cached_in.unwrap_or(pi);
+                let uncached = self.usage_in.saturating_sub(self.usage_cached_in);
+                (uncached as f64 / 1e6) * pi
+                    + (self.usage_cached_in as f64 / 1e6) * pc
+                    + (self.usage_out as f64 / 1e6) * po
+            } else {
+                (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po
+            };
         }
         self.ui.tokens(
             self.tokens_in + self.subagent_tokens_in,
@@ -1435,6 +1494,14 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
+    /// Set the full pricing triple (including the cached-input rate).
+    pub fn with_model_pricing(mut self, pricing: ModelPricing) -> Self {
+        self.price_in = pricing.input;
+        self.price_out = pricing.output;
+        self.price_cached_in = pricing.cached_input;
+        self
+    }
+
     /// Register the model to reroute to when the configured one turns out to be
     /// **permanently unavailable** at the provider (a 404 `model_not_found` — e.g.
     /// a roster entry naming a model id the provider has since retired). Without
@@ -1452,13 +1519,13 @@ impl<'a> AgentLoop<'a> {
         &mut self,
         model: Box<dyn ModelClient>,
         context_window: usize,
-        price_in: Option<f64>,
-        price_out: Option<f64>,
+        pricing: ModelPricing,
     ) {
         self.model = model;
         self.context_window = context_window;
-        self.price_in = price_in;
-        self.price_out = price_out;
+        self.price_in = pricing.input;
+        self.price_out = pricing.output;
+        self.price_cached_in = pricing.cached_input_or_input();
     }
 
     /// Toggle plan mode. While on, `edit`/`write` are refused (the agent must
@@ -1997,9 +2064,9 @@ impl<'a> AgentLoop<'a> {
         };
         let name = name.clone();
         match build(&name) {
-            Ok((client, cw, (price_in, price_out))) => {
+            Ok((client, cw, pricing)) => {
                 self.fallback_used = true;
-                self.set_model(client, cw, price_in, price_out);
+                self.set_model(client, cw, pricing);
                 self.ui.notice(&format!(
                     "the configured model is not available at the provider — \
                      falling back to `{name}` and retrying (fix the model id in \
@@ -3131,12 +3198,14 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("inspecting".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done; tests pass"}"#)],
@@ -3227,17 +3296,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_usage_drives_cost_with_cache_discount() {
+        // The provider reports 1000 prompt tokens (800 cached) + 100 completions;
+        // pricing is $3/Mtok in, $0.30/Mtok cached, $15/Mtok out. Expected:
+        // 200*3/1e6 + 800*0.30/1e6 + 100*15/1e6 = 0.0006 + 0.00024 + 0.0015.
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            usage: Some(cowboy_core::model::Usage {
+                prompt_tokens: 1000,
+                completion_tokens: 100,
+                cached_prompt_tokens: 800,
+            }),
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("1", "final", r#"{"message":"done"}"#)],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_model_pricing(ModelPricing {
+            input: Some(3.0),
+            output: Some(15.0),
+            cached_input: Some(0.30),
+        });
+        agent.run("go").await.unwrap();
+
+        let expected = 200.0 * 3.0 / 1e6 + 800.0 * 0.30 / 1e6 + 100.0 * 15.0 / 1e6;
+        let got = *ui.costs.last().expect("priced model reports cost");
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "cache-aware cost: got {got}, want {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_usage_without_a_cache_price_bills_full_input_rate() {
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            usage: Some(cowboy_core::model::Usage {
+                prompt_tokens: 1000,
+                completion_tokens: 0,
+                cached_prompt_tokens: 800,
+            }),
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("1", "final", r#"{"message":"done"}"#)],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_pricing(Some(3.0), Some(15.0)); // no cached rate → full input price
+        agent.run("go").await.unwrap();
+
+        let got = *ui.costs.last().expect("priced model reports cost");
+        let expected = 1000.0 * 3.0 / 1e6;
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "no cache discount configured: got {got}, want {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn estimate_is_abandoned_once_provider_usage_arrives() {
+        // First response carries no usage (estimated); the second does. The
+        // estimated tokens from turn one must not linger in the cost basis —
+        // once the provider reports, only counted tokens are billed.
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: Some("a long estimated answer that the local tokenizer counts".into()),
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: Some(cowboy_core::model::Usage {
+                    prompt_tokens: 500,
+                    completion_tokens: 10,
+                    cached_prompt_tokens: 0,
+                }),
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::printing("file1\n"),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_pricing(Some(3.0), Some(15.0));
+        agent.run("go").await.unwrap();
+
+        let got = *ui.costs.last().expect("priced model reports cost");
+        let expected = 500.0 * 3.0 / 1e6 + 10.0 * 15.0 / 1e6;
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "only the provider-counted turn is billed: got {got}, want {expected}"
+        );
+    }
+
+    #[tokio::test]
     async fn stops_when_token_budget_reached_and_reports_cost() {
         // The model keeps asking for shell (never finals); only the budget stops it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("working".into()),
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("still working".into()),
                 tool_calls: vec![tool_call("2", "shell", r#"{"command":"ls"}"#)],
@@ -3351,6 +3540,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3363,6 +3553,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -3426,6 +3617,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3437,6 +3629,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -3473,6 +3666,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3483,6 +3677,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -3529,6 +3724,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3539,12 +3735,14 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "unblock", "{}")],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
@@ -3588,6 +3786,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3598,6 +3797,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3608,6 +3808,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("3", "final", r#"{"message":"done"}"#)],
@@ -3650,6 +3851,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -3661,6 +3863,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -3703,6 +3906,7 @@ mod tests {
             for i in 0..12 {
                 q.push_back(ChatResponse {
                     truncated: false,
+                    usage: None,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
@@ -3751,6 +3955,7 @@ mod tests {
             for i in 0..10 {
                 q.push_back(ChatResponse {
                     truncated: false,
+                    usage: None,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
@@ -3763,6 +3968,7 @@ mod tests {
             // Then it finishes normally.
             q.push_back(ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("f", "final", r#"{"message":"server is up"}"#)],
@@ -3798,6 +4004,7 @@ mod tests {
     async fn final_answers_its_own_call_and_any_batched_after_it() {
         let m = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: None,
             tool_calls: vec![
@@ -3838,6 +4045,7 @@ mod tests {
         // The gate must stop the command before it ever reaches the container.
         let m = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: None,
             tool_calls: vec![
@@ -3944,11 +4152,16 @@ mod tests {
                 // The healthy fallback answers immediately.
                 let m = ScriptedModel::new(vec![ChatResponse {
                     truncated: false,
+                    usage: None,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call("f", "final", r#"{"message":"rescued"}"#)],
                 }]);
-                Ok((Box::new(m) as Box<dyn ModelClient>, 200_000, (None, None)))
+                Ok((
+                    Box::new(m) as Box<dyn ModelClient>,
+                    200_000,
+                    ModelPricing::default(),
+                ))
             }),
         );
         let res = agent.run("do the work").await.unwrap();
@@ -4013,6 +4226,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -4023,6 +4237,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
@@ -4058,6 +4273,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call(
@@ -4068,6 +4284,7 @@ mod tests {
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"here is the plan"}"#)],
@@ -4106,6 +4323,7 @@ mod tests {
             for i in 0..10 {
                 q.push_back(ChatResponse {
                     truncated: false,
+                    usage: None,
                     reasoning: None,
                     content: None,
                     tool_calls: vec![tool_call(
@@ -4141,12 +4359,14 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("1", "final", r#"{"message":"done 1"}"#)],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![tool_call("2", "final", r#"{"message":"done 2"}"#)],
@@ -4348,6 +4568,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("SUMMARY: earlier work".into()),
             tool_calls: vec![],
@@ -4543,6 +4764,7 @@ mod tests {
         let essay = "and then a great many further details followed. ".repeat(4_000);
         let model = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some(essay.clone()),
             tool_calls: vec![],
@@ -4905,6 +5127,7 @@ mod tests {
         // The model serves the compaction summary.
         let model = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("SUMMARY: earlier turns did X and Y".into()),
             tool_calls: vec![],
@@ -4955,6 +5178,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let trunc = || ChatResponse {
             truncated: true,
+            usage: None,
             reasoning: None,
             content: None,
             tool_calls: vec![],
@@ -4999,6 +5223,7 @@ mod tests {
         // Four tool-using turns, each with reasoning, then a final answer.
         let thinking = |n: usize| ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: Some(format!("thinking about step {n} ").repeat(50)),
             content: None,
             tool_calls: vec![ToolCall {
@@ -5014,6 +5239,7 @@ mod tests {
             thinking(4),
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: Some("final thought".into()),
                 content: Some("done".into()),
                 tool_calls: vec![],
@@ -5068,6 +5294,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("ok".into()),
             tool_calls: vec![],
@@ -5109,6 +5336,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: None, // provider billed the thinking but returned none
                 content: None,
                 tool_calls: vec![],
@@ -5117,6 +5345,7 @@ mod tests {
             // response is the retry answering.
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("finished after the nudge".into()),
                 tool_calls: vec![],
@@ -5158,6 +5387,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: Some("thinking at length".into()),
                 content: None,
                 tool_calls: vec![],
@@ -5165,12 +5395,14 @@ mod tests {
             // The summary call itself yields nothing usable.
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("wrapped up anyway".into()),
                 tool_calls: vec![],
@@ -5198,12 +5430,14 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: None,
                 content: None,
                 tool_calls: vec![],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("recovered".into()),
                 tool_calls: vec![],
@@ -5224,6 +5458,7 @@ mod tests {
         // A second, healthy turn goes out at the configured effort.
         agent.model = Box::new(ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("second answer".into()),
             tool_calls: vec![],
@@ -5247,18 +5482,21 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: Some("I should edit foo.rs and run the tests".into()),
                 content: None,
                 tool_calls: vec![],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("conclusion: edit foo.rs, then test".into()),
                 tool_calls: vec![],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("all done".into()),
                 tool_calls: vec![],
@@ -5295,12 +5533,14 @@ mod tests {
         let mut ui = RecordingUi::default();
         let trunc = || ChatResponse {
             truncated: true,
+            usage: None,
             reasoning: Some("still thinking hard".into()),
             content: None,
             tool_calls: vec![],
         };
         let summ = || ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("concluded: keep going".into()),
             tool_calls: vec![],
@@ -5341,12 +5581,14 @@ mod tests {
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: true,
+                usage: None,
                 reasoning: Some("raw thinking".into()),
                 content: None,
                 tool_calls: vec![],
             },
             ChatResponse {
                 truncated: false,
+                usage: None,
                 reasoning: None,
                 content: Some("wrapped up".into()),
                 tool_calls: vec![],
@@ -5354,6 +5596,7 @@ mod tests {
         ]);
         let summarizer = ScriptedModel::new(vec![ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: Some("SUMMARIZER_SAYS: edit foo.rs".into()),
             tool_calls: vec![],
@@ -5529,6 +5772,7 @@ mod tests {
     fn request_path_response(path: &std::path::Path, read_only: bool) -> ChatResponse {
         ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: None,
             tool_calls: vec![tool_call(
@@ -5547,6 +5791,7 @@ mod tests {
     fn finished(message: &str) -> ChatResponse {
         ChatResponse {
             truncated: false,
+            usage: None,
             reasoning: None,
             content: None,
             tool_calls: vec![tool_call(

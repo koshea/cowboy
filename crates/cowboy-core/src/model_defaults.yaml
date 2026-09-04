@@ -5,7 +5,9 @@
 # (longest match wins). Fields: name, context_window, max_tokens, temperature,
 # reasoning_effort (minimal|low|medium|high), chat (default true),
 # input_cost_per_mtok / output_cost_per_mtok (USD per 1M tokens, for the
-# running cost estimate; omit when unknown).
+# running cost estimate; omit when unknown), cached_input_cost_per_mtok
+# (USD per 1M *cached* input tokens; omit when the provider has no cache
+# discount — the full input price is then assumed).
 #
 # Values are best-effort baselines you can tweak per-model when adding one; the
 # point is sensible prefills, not perfection. Prices in particular drift — treat
@@ -93,6 +95,7 @@ models:
     temperature: 0.6
     input_cost_per_mtok: 0.6
     output_cost_per_mtok: 2.5
+    cached_input_cost_per_mtok: 0.15
   - id: fireworks/accounts/fireworks/models/kimi-k2p6
     name: "Fireworks: Kimi K2.6"
     context_window: 262144
@@ -100,6 +103,7 @@ models:
     temperature: 0.6
     input_cost_per_mtok: 0.6
     output_cost_per_mtok: 2.5
+    cached_input_cost_per_mtok: 0.15
   - id: fireworks/accounts/fireworks/models/deepseek-v4-pro
     name: "Fireworks: DeepSeek V4 Pro"
     context_window: 163840

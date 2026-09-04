@@ -180,6 +180,7 @@ models:
     context_window: 1000000    # total input+output window the model supports
     input_cost_per_mtok: 3.0   # optional, for usage/cost display
     output_cost_per_mtok: 15.0
+    cached_input_cost_per_mtok: 0.30  # optional: prompt-cache hit price (see below)
     anthropic_cache: true      # optional: see below
 ```
 
@@ -210,6 +211,15 @@ truncates can't spin — see [the agent loop](../using/agent-and-tools.md). Poin
 when unset, the session's main model is used. These calls always request minimal
 reasoning: summarizing is mechanical, and a model that just truncated while thinking
 would otherwise do the same on the summary and come back empty.
+
+**Cost display.** Cowboy asks the provider for per-request token usage
+(`stream_options.include_usage`) and, when the stream carries it, bills the
+session from those counts — the billing ground truth — rather than its local
+tokenizer estimate. Providers that support prompt caching report cache hits
+(`cached_tokens`), which are priced at `cached_input_cost_per_mtok` when set,
+else at the full input price. When a provider reports no usage, Cowboy falls
+back to the local estimate at the full input/output rates, so the display can
+drift from the dashboard — most visibly when the provider caches aggressively.
 
 **`anthropic_cache`** (opt-in): when true, Cowboy adds Anthropic `cache_control`
 markers to the static system prompt and the latest message, so a gateway that

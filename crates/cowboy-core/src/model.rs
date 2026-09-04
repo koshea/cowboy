@@ -261,6 +261,23 @@ pub struct ChatResponse {
     /// agent loop report a truncation instead of silently treating it as "no
     /// action" (a reasoning model can burn the whole budget on thinking).
     pub truncated: bool,
+    /// Provider-reported token usage for this call, when the stream carried it
+    /// (we request `stream_options.include_usage`). Preferred over the local
+    /// tokenizer estimate for cost accounting: it is the billing ground truth,
+    /// including prompt-cache hits the estimate cannot see.
+    pub usage: Option<Usage>,
+}
+
+/// Provider-reported token usage for one call (the `usage` object of an
+/// OpenAI-compatible response / final stream chunk).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// Prompt tokens served from the provider's prompt cache
+    /// (`usage.prompt_tokens_details.cached_tokens`). Billed at a discount (or
+    /// free) by providers that cache; a subset of `prompt_tokens`.
+    pub cached_prompt_tokens: u64,
 }
 
 /// A streamed piece of a model response: visible answer text, or the model's
@@ -625,6 +642,24 @@ impl ToolCallAccumulator {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Present only on the final chunk, and only because we send
+    /// `stream_options.include_usage` — a usage-only chunk has empty `choices`.
+    #[serde(default)]
+    usage: Option<UsageWire>,
+}
+#[derive(Deserialize)]
+struct UsageWire {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 #[derive(Deserialize)]
 struct StreamChoice {
@@ -724,6 +759,11 @@ impl ModelClient for OpenAiClient {
         let request = builder.build().map_err(oa_err)?;
         let mut body = serde_json::to_value(&request).map_err(|e| Error::Model(e.to_string()))?;
         body["stream"] = serde_json::Value::Bool(true);
+        // Ask for a final usage-only chunk: provider-reported token counts are
+        // the billing ground truth (and the only place prompt-cache hits show
+        // up), so cost accounting prefers them over the local estimate.
+        // Providers that don't support `stream_options` ignore it.
+        body["stream_options"] = serde_json::json!({"include_usage": true});
         // Reasoning models ignore the legacy `max_tokens` for the thinking phase
         // (it bounds only the visible answer), so a model can spend an unbounded
         // number of tokens reasoning and never produce an answer — observed:
@@ -827,6 +867,7 @@ impl ModelClient for OpenAiClient {
         let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
         let mut truncated = false;
+        let mut usage: Option<Usage> = None;
         let mut buf = String::new();
         let mut stream = resp.bytes_stream();
         // Set once the stream has ended, so the final (unterminated) frame still gets
@@ -887,11 +928,22 @@ impl ModelClient for OpenAiClient {
                         tool_calls: acc.finish(),
                         reasoning: (!reasoning.is_empty()).then_some(reasoning),
                         truncated,
+                        usage,
                     });
                 }
                 let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
                     continue; // skip keep-alives / unparseable frames
                 };
+                if let Some(u) = chunk.usage {
+                    usage = Some(Usage {
+                        prompt_tokens: u.prompt_tokens,
+                        completion_tokens: u.completion_tokens,
+                        cached_prompt_tokens: u
+                            .prompt_tokens_details
+                            .map(|d| d.cached_tokens)
+                            .unwrap_or(0),
+                    });
+                }
                 let Some(choice) = chunk.choices.into_iter().next() else {
                     continue;
                 };
@@ -927,6 +979,7 @@ impl ModelClient for OpenAiClient {
             tool_calls: acc.finish(),
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
             truncated,
+            usage,
         })
     }
 }

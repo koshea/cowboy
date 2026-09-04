@@ -26,6 +26,7 @@ fn profile(base_url: String) -> ResolvedModel {
         headers: BTreeMap::new(),
         input_cost_per_mtok: None,
         output_cost_per_mtok: None,
+        cached_input_cost_per_mtok: None,
         anthropic_cache: false,
         stream_idle_timeout_seconds: None,
     }
@@ -569,4 +570,59 @@ async fn a_tool_result_with_no_id_is_refused_before_sending() {
         .await
         .expect_err("an unanswerable conversation must not be sent");
     assert!(err.to_string().contains("tool_call_id"), "{err}");
+}
+
+#[tokio::test]
+async fn captures_provider_usage_from_the_final_chunk() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(&[
+                content_chunk("ok"),
+                // The usage-only final chunk: empty choices, billing ground truth.
+                serde_json::json!({
+                    "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "test-model",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 1000,
+                        "completion_tokens": 50,
+                        "prompt_tokens_details": {"cached_tokens": 800}
+                    }
+                }),
+            ]),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    let u = resp.usage.expect("usage chunk parsed");
+    assert_eq!(u.prompt_tokens, 1000);
+    assert_eq!(u.completion_tokens, 50);
+    assert_eq!(u.cached_prompt_tokens, 800);
+}
+
+#[tokio::test]
+async fn usage_is_none_when_the_stream_omits_it() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+        )
+        .mount(&server)
+        .await;
+
+    let client = OpenAiClient::from_resolved(&profile(format!("{}/v1", server.uri()))).unwrap();
+    let resp = client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    assert_eq!(resp.usage, None, "no usage chunk → estimate fallback");
 }

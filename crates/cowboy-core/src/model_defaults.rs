@@ -54,6 +54,8 @@ struct Entry {
     input_cost_per_mtok: Option<f64>,
     #[serde(default)]
     output_cost_per_mtok: Option<f64>,
+    #[serde(default)]
+    cached_input_cost_per_mtok: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -72,6 +74,8 @@ pub struct ModelDefault {
     /// USD per 1M input/output tokens, for cost estimation (None when unknown).
     pub input_cost_per_mtok: Option<f64>,
     pub output_cost_per_mtok: Option<f64>,
+    /// USD per 1M *cached* input tokens (None → no assumed cache discount).
+    pub cached_input_cost_per_mtok: Option<f64>,
 }
 
 /// The merged registry: override entries first (they win ties), then embedded.
@@ -136,6 +140,7 @@ impl Registry {
             chat: self.is_chat(id),
             input_cost_per_mtok: e.and_then(|e| e.input_cost_per_mtok),
             output_cost_per_mtok: e.and_then(|e| e.output_cost_per_mtok),
+            cached_input_cost_per_mtok: e.and_then(|e| e.cached_input_cost_per_mtok),
         }
     }
 

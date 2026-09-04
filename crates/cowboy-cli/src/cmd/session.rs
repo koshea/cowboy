@@ -18,7 +18,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::tui::SessionCtx;
-use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi};
+use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi, ModelPricing};
 use crate::cli::StartFlags;
 use crate::cmd::daemon;
 use crate::project::{project_hash, session_name_for};
@@ -233,7 +233,11 @@ pub async fn run(
         .with_logger(logger)
         .with_memory_context(memory_ctx)
         .with_history(history)
-        .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
+        .with_model_pricing(ModelPricing {
+            input: resolved.input_cost_per_mtok,
+            output: resolved.output_cost_per_mtok,
+            cached_input: resolved.cached_input_cost_per_mtok,
+        });
         let result = agent.run(&task).await;
         agent.shutdown().await; // stop managed processes
 

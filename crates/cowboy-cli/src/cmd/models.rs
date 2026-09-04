@@ -114,6 +114,7 @@ fn setup() -> Result<()> {
                 extra: BTreeMap::new(),
                 input_cost_per_mtok: None,
                 output_cost_per_mtok: None,
+                cached_input_cost_per_mtok: None,
                 headers: BTreeMap::new(),
                 anthropic_cache: false,
                 stream_idle_timeout_seconds: None,
@@ -376,6 +377,7 @@ fn add(a: AddArgs) -> Result<()> {
         headers: BTreeMap::new(),
         input_cost_per_mtok: d.input_cost_per_mtok,
         output_cost_per_mtok: d.output_cost_per_mtok,
+        cached_input_cost_per_mtok: d.cached_input_cost_per_mtok,
         anthropic_cache: false,
         stream_idle_timeout_seconds: None,
     };
@@ -462,6 +464,7 @@ pub fn save_user_model(
         headers: BTreeMap::new(),
         input_cost_per_mtok: d.input_cost_per_mtok,
         output_cost_per_mtok: d.output_cost_per_mtok,
+        cached_input_cost_per_mtok: d.cached_input_cost_per_mtok,
         anthropic_cache: false,
         stream_idle_timeout_seconds: None,
     };

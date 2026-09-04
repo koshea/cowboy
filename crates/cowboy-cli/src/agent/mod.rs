@@ -8,5 +8,5 @@ pub mod tui;
 pub mod ui;
 
 pub use journal_ui::JournalUi;
-pub use run::AgentLoop;
+pub use run::{AgentLoop, ModelPricing};
 pub use ui::ConsoleUi;

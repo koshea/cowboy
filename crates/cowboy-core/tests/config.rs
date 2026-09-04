@@ -334,6 +334,7 @@ fn model_def(provider: &str, model: &str) -> ModelDef {
         headers: BTreeMap::new(),
         input_cost_per_mtok: None,
         output_cost_per_mtok: None,
+        cached_input_cost_per_mtok: None,
         anthropic_cache: false,
         stream_idle_timeout_seconds: None,
     }

@@ -19,7 +19,7 @@ use cowboy_core::model::{ModelClient, OpenAiClient};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::socket_ui::SocketUi;
-use crate::agent::AgentLoop;
+use crate::agent::{AgentLoop, ModelPricing};
 use crate::cmd::daemon;
 use crate::cmd::session::{
     context_title, git_branch, log_approval, log_network, post_turn_indicators, verdict_str,
@@ -322,7 +322,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     .with_summarizer(summarizer)
     .with_memory_context(memory_ctx)
     .with_history(history)
-    .with_pricing(resolved.input_cost_per_mtok, resolved.output_cost_per_mtok);
+    .with_model_pricing(pricing_of(&resolved));
 
     if let Some(name) = fallback_name {
         let providers = providers.clone();
@@ -333,7 +333,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             Box::new(move |n: &str| {
                 let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(n))?;
                 let cw = r.context_window as usize;
-                let pricing = (r.input_cost_per_mtok, r.output_cost_per_mtok);
+                let pricing = pricing_of(&r);
                 let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
                 Ok((client, cw, pricing))
             }),
@@ -396,7 +396,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         Box::new(move |name: &str| {
             let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
             let cw = r.context_window as usize;
-            let pricing = (r.input_cost_per_mtok, r.output_cost_per_mtok);
+            let pricing = pricing_of(&r);
             let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
             Ok((client, cw, pricing))
         })
@@ -994,17 +994,25 @@ fn control_approver(
     std::sync::Arc::new(ChannelApprover::new(approvals_tx, events_tx))
 }
 
+/// The pricing triple for a resolved model (cached-input rate included).
+fn pricing_of(r: &cowboy_core::config::ResolvedModel) -> ModelPricing {
+    ModelPricing {
+        input: r.input_cost_per_mtok,
+        output: r.output_cost_per_mtok,
+        cached_input: r.cached_input_cost_per_mtok,
+    }
+}
+
 /// Rebuilds a model client by name (host-owned creds in, built client out).
-/// Yields the client, its context window, and its (input, output) per-1M-token
-/// USD pricing for the cost estimate.
-type Resolver =
-    Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, (Option<f64>, Option<f64>))>>;
+/// Yields the client, its context window, and its USD pricing for the cost
+/// estimate.
+type Resolver = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, ModelPricing)>>;
 
 /// Apply a `/model` switch: re-resolve and swap the client, or report why not.
 fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
     match resolve(name) {
-        Ok((client, cw, (price_in, price_out))) => {
-            agent.set_model(client, cw, price_in, price_out);
+        Ok((client, cw, pricing)) => {
+            agent.set_model(client, cw, pricing);
             ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
         }
         Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),
