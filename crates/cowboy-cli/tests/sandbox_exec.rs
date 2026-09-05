@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cowboy_cli::sandbox::bwrap::NetMode;
-use cowboy_cli::sandbox::exec::{run_streaming, ExecRequest};
+use cowboy_cli::sandbox::exec::{run_streaming, run_with_stdin, ExecRequest};
 use cowboy_core::config::SecurityConfig;
 use cowboy_sandbox::plan::{PlanInputs, SandboxPlan};
 use cowboy_sandbox::HostProbe;
@@ -194,6 +194,39 @@ async fn the_project_is_writable_and_is_the_working_directory() {
             .unwrap()
             .trim(),
         "written"
+    );
+}
+
+/// The structured file tools (`read`/`edit`/`write`) send their JSON request as a
+/// payload on the command's stdin, *after* the shim's own newline-terminated
+/// request line on the same pipe. This asserts that payload actually survives the
+/// bwrap → shim → `sh -c` → `x-fileop` chain and reaches `x-fileop`'s stdin — a
+/// regression guard for the "read/write tool broken: EOF while parsing a value"
+/// failure, where `x-fileop` got empty stdin and every structured edit fell back
+/// to shell.
+#[tokio::test]
+async fn the_fileop_payload_reaches_x_fileop_stdin() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    std::fs::write(p.path().join("hello.txt"), "line one\nline two\n").unwrap();
+    let plan = plan_for(&p.path());
+    let command = format!("{} x-fileop", cowboy_sandbox::SHIM_PATH);
+    let payload = serde_json::json!({
+        "op": "read", "path": "hello.txt", "offset": null, "limit": null,
+    })
+    .to_string();
+    let (res, out) = run_with_stdin(&plan, &command, &payload, NetMode::Isolated, None)
+        .await
+        .expect("run_with_stdin");
+    assert_eq!(res.exit_code, 0, "x-fileop should succeed, got: {out}");
+    assert!(
+        !out.contains("parsing fileop request") && !out.contains("EOF while parsing"),
+        "x-fileop received empty stdin — the payload did not survive the pipe: {out}"
+    );
+    // The file's content came back with line numbers, proving the payload arrived.
+    assert!(
+        out.contains("line one") && out.contains("line two"),
+        "{out}"
     );
 }
 

@@ -59,28 +59,37 @@ pub fn run() -> Result<()> {
     Err(anyhow::Error::new(err).context("exec of the sandboxed command failed"))
 }
 
-/// Read exactly one newline-terminated JSON object from stdin.
+/// Read exactly one newline-terminated JSON object from **fd 0 directly**.
 ///
-/// Deliberately unbuffered, one byte at a time. A `BufReader` would read past the
-/// newline into its buffer and silently swallow the start of whatever follows —
-/// which matters because anything after the request line belongs to the *command*'s
-/// stdin (the structured file tools send their payload that way, so that multi-line
-/// content never has to survive shell quoting). Reading no further than the newline
-/// leaves fd 0 positioned exactly at the payload for the exec'd command to inherit.
+/// Byte-at-a-time, and crucially **not** through `std::io::stdin()`: `Stdin` wraps
+/// an 8 KiB `BufReader`, so the first read slurps everything available on the pipe
+/// — including the *payload* that follows the request line — into a userspace
+/// buffer that is then thrown away when we `exec`. The exec'd command would inherit
+/// fd 0 positioned at EOF and see empty stdin (observed as the structured file
+/// tools failing with "parsing fileop request: EOF while parsing a value").
 ///
-/// A few hundred single-byte reads is nothing next to the process spawn around it.
+/// Reading the raw fd leaves the payload in the kernel pipe buffer, exactly where
+/// the exec'd command's own stdin read will find it. A few hundred single-byte
+/// `read(2)` syscalls is nothing next to the process spawn around it.
 fn read_request() -> Result<ShimRequest> {
-    use std::io::Read;
-    let mut stdin = std::io::stdin().lock();
     let mut line = Vec::with_capacity(4096);
     let mut byte = [0u8; 1];
     loop {
-        match stdin.read(&mut byte) {
-            Ok(0) => break, // EOF without a newline: parse what we have
-            Ok(_) if byte[0] == b'\n' => break,
-            Ok(_) => line.push(byte[0]),
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into()),
+        // SAFETY: reading one byte from fd 0 (stdin) into a stack buffer. fd 0 is
+        // this process's stdin for the whole call. Going through libc rather than
+        // `std::io::stdin()` is the whole point — see the doc comment.
+        let n = unsafe { libc::read(0, byte.as_mut_ptr() as *mut libc::c_void, 1) };
+        match n {
+            0 => break, // EOF without a newline: parse what we have
+            1 if byte[0] == b'\n' => break,
+            1 => line.push(byte[0]),
+            _ => {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e).context("reading the shim request from stdin");
+            }
         }
     }
     serde_json::from_slice(&line).with_context(|| {
