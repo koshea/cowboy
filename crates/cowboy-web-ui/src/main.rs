@@ -456,10 +456,14 @@ fn session(props: &SessionProps) -> Html {
 fn render_subagent_chip(s: &model::SubagentStatus, on_watch: Callback<String>) -> Html {
     let id = s.id.clone();
     let onclick = Callback::from(move |_| on_watch.emit(id.clone()));
-    let (mark, cls) = match s.done {
-        None => ("●", "running"),
-        Some(true) => ("✓", "done"),
-        Some(false) => ("✗", "failed"),
+    let (mark, cls) = if s.pending {
+        ("⋯", "pending")
+    } else {
+        match s.done {
+            None => ("●", "running"),
+            Some(true) => ("✓", "done"),
+            Some(false) => ("✗", "failed"),
+        }
     };
     html! {
         <button class={classes!("subagent-chip", cls)} {onclick}

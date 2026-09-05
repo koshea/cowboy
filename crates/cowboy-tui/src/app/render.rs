@@ -857,9 +857,18 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
     // Crew subagents first (most active background work).
     for m in &app.crew {
         let (mark, color) = match m.status {
+            CrewStatus::Pending => ("⋯", Color::DarkGray),
             CrewStatus::Running => ("⟳", Color::Yellow),
             CrewStatus::Done => ("✓", Color::Green),
             CrewStatus::Failed => ("✗", Color::Red),
+        };
+        // Pending members are queued behind the per-provider concurrency cap and
+        // aren't consuming a model connection yet, so show "queued" rather than a
+        // ticking timer that would imply work is happening.
+        let trailing = if m.status == CrewStatus::Pending {
+            " queued".to_string()
+        } else {
+            format!(" {}s", m.elapsed_secs)
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{mark} "), Style::default().fg(color)),
@@ -868,10 +877,7 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(Color::White),
             ),
             Span::styled(short(&m.model), Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!(" {}s", m.elapsed_secs),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(trailing, Style::default().fg(Color::DarkGray)),
         ]));
     }
     // Then managed processes.

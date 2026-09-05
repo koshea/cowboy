@@ -435,6 +435,59 @@ fn load_model_defs(
     defs
 }
 
+/// A user-facing notice describing the *true* concurrency of a subagent batch:
+/// how many start running now vs. how many queue behind the per-provider cap.
+/// Grouping by provider matters because the cap is per provider — three subagents
+/// split across three providers all run at once, but three on one provider run
+/// `per_provider` at a time.
+fn concurrency_notice(
+    plans: &[(String, SubagentPlan)],
+    per_provider: usize,
+    max_parallel: usize,
+    defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
+    foreman: Option<&str>,
+) -> String {
+    let keys: Vec<String> = plans
+        .iter()
+        .map(|(_, plan)| provider_key(plan.model.as_deref(), defs, foreman))
+        .collect();
+    concurrency_notice_from_keys(&keys, per_provider, max_parallel)
+}
+
+/// The concurrency-notice math, over already-resolved provider keys (one per
+/// planned subagent). Split out so it can be unit-tested without building plans.
+fn concurrency_notice_from_keys(
+    provider_keys: &[String],
+    per_provider: usize,
+    max_parallel: usize,
+) -> String {
+    let total = provider_keys.len();
+    let mut per_provider_counts: std::collections::HashMap<&str, usize> =
+        std::collections::HashMap::new();
+    for k in provider_keys {
+        *per_provider_counts.entry(k.as_str()).or_insert(0) += 1;
+    }
+    let cap = if per_provider == 0 {
+        usize::MAX
+    } else {
+        per_provider
+    };
+    let runnable: usize = per_provider_counts
+        .values()
+        .map(|&n| n.min(cap))
+        .sum::<usize>()
+        .min(max_parallel.max(1));
+    let queued = total.saturating_sub(runnable);
+    if queued == 0 {
+        format!("↳ running {total} subagents in parallel")
+    } else {
+        format!(
+            "↳ {total} subagents: {runnable} running, {queued} queued \
+             (max {per_provider}/provider)"
+        )
+    }
+}
+
 /// The provider a subagent will hit, used to group the per-provider concurrency
 /// throttle. A routed model resolves to its `provider`; an unknown model keys on
 /// its own name (still groups identical models); a roster-less worker (`None`)
@@ -2572,10 +2625,6 @@ impl<'a> AgentLoop<'a> {
         if plans.is_empty() {
             return results;
         }
-        if plans.len() > 1 {
-            self.ui
-                .notice(&format!("↳ running {} subagents in parallel", plans.len()));
-        }
         // Per-provider throttle: cap concurrent workers hitting the same provider
         // so a batch of same-model subagents can't trip its rate limit (429),
         // while different providers still run fully in parallel. Bounded further by
@@ -2586,6 +2635,18 @@ impl<'a> AgentLoop<'a> {
             .unwrap_or(2) as usize;
         let model_defs = load_model_defs(self.root());
         let foreman = crate::cmd::crew::foreman_model();
+        // Announce true concurrency, not just the batch size: with a per-provider
+        // cap, a batch of same-provider subagents runs a few at a time and the rest
+        // queue. Saying "running N in parallel" when only 2 can run is misleading.
+        if plans.len() > 1 {
+            self.ui.notice(&concurrency_notice(
+                &plans,
+                per_provider,
+                max_parallel,
+                &model_defs,
+                foreman.as_deref(),
+            ));
+        }
         let mut provider_sems: std::collections::HashMap<
             String,
             std::sync::Arc<tokio::sync::Semaphore>,
@@ -2618,6 +2679,11 @@ impl<'a> AgentLoop<'a> {
         // capturing a coarse outcome for the crew history. Process completions as
         // they arrive so the background pane flips each subagent to done/failed
         // with its own elapsed time (rather than all at once at the end).
+        // Signals a subagent flipping from pending → running the moment it acquires
+        // its provider permit, so the UI (which owns `&mut self`) can update the pane
+        // from the completion loop rather than from inside these owned tasks.
+        let (started_tx, mut started_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
         let mut stream = futures::stream::iter(plans.into_iter().map(|(id, plan)| {
             let routed = plan.routed.clone();
             let label = plan
@@ -2627,8 +2693,13 @@ impl<'a> AgentLoop<'a> {
                 .unwrap_or(&plan.label)
                 .to_string();
             let sub_id = plan.id.clone();
+            let model_disp = plan
+                .model
+                .clone()
+                .unwrap_or_else(|| "<default>".to_string());
             let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
             let sem = provider_sems.get(&key).cloned();
+            let started_tx = started_tx.clone();
             async move {
                 // Hold a provider permit for the worker's whole lifetime; `None`
                 // means the throttle is disabled (unlimited).
@@ -2636,6 +2707,9 @@ impl<'a> AgentLoop<'a> {
                     Some(s) => s.acquire_owned().await.ok(),
                     None => None,
                 };
+                // Permit in hand → actually running now; tell the UI to flip this
+                // subagent from pending to running.
+                let _ = started_tx.send((sub_id.clone(), label.clone(), model_disp.clone()));
                 let started = std::time::Instant::now();
                 let result = exec_subagent(plan).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -2655,6 +2729,9 @@ impl<'a> AgentLoop<'a> {
             }
         }))
         .buffer_unordered(max_parallel);
+        // Note: `started_tx` stays captured by the stream's per-item closures for as
+        // long as the stream lives; the completion loop exits on stream exhaustion
+        // (not on the started-channel closing), so no explicit drop is needed.
 
         let root = self.root().to_path_buf();
         let cancel = self.cancel.clone();
@@ -2692,6 +2769,13 @@ impl<'a> AgentLoop<'a> {
                         dispatched.len() - stopped
                     ));
                     break;
+                }
+                // A subagent just acquired its permit and started running: flip it
+                // from pending → running in the pane. Drained before `stream.next()`
+                // so the transition shows promptly.
+                Some((sub_id, label, model)) = started_rx.recv() => {
+                    self.ui.subagent_started(&label, &model, &sub_id);
+                    continue;
                 }
                 item = stream.next() => item,
             };
@@ -2833,7 +2917,10 @@ impl<'a> AgentLoop<'a> {
         ));
         // Pane label is the category/effort part (the model is shown separately).
         let label = plan.label.split(" → ").next().unwrap_or(&plan.label);
-        self.ui.subagent_started(
+        // Announce as *pending*: the per-provider throttle means a dispatched
+        // subagent may wait for a permit before it actually runs. It flips to
+        // running when it acquires one (emitted from the execution stream).
+        self.ui.subagent_pending(
             label,
             plan.model.as_deref().unwrap_or("<default>"),
             &plan.id,
@@ -4394,6 +4481,30 @@ mod tests {
             .count();
         assert_eq!(users, 2);
         assert_eq!(agent.last_final.as_deref(), Some("done 2"));
+    }
+
+    #[test]
+    fn concurrency_notice_reflects_the_per_provider_cap() {
+        // Five subagents all on the same provider, cap 2 → 2 run, 3 queue.
+        let keys = vec!["fireworks".to_string(); 5];
+        let n = concurrency_notice_from_keys(&keys, 2, 4);
+        assert_eq!(n, "↳ 5 subagents: 2 running, 3 queued (max 2/provider)");
+
+        // Spread across three providers, cap 2 → all run, none queued.
+        let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let n = concurrency_notice_from_keys(&keys, 2, 4);
+        assert_eq!(n, "↳ running 3 subagents in parallel");
+
+        // The global max_parallel still bounds it: 3 providers each under the cap,
+        // but max_parallel=2 means only 2 run at once.
+        let keys = vec!["a".into(), "b".into(), "c".into()];
+        let n = concurrency_notice_from_keys(&keys, 2, 2);
+        assert_eq!(n, "↳ 3 subagents: 2 running, 1 queued (max 2/provider)");
+
+        // Throttle disabled (0) → all run.
+        let keys = vec!["fireworks".to_string(); 5];
+        let n = concurrency_notice_from_keys(&keys, 0, 8);
+        assert_eq!(n, "↳ running 5 subagents in parallel");
     }
 
     #[tokio::test]

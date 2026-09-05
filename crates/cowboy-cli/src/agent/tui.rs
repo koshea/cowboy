@@ -228,6 +228,9 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
         UiEventMsg::Blocked(reason) => app.set_blocked(reason),
         UiEventMsg::Title(t) => app.title = t,
         UiEventMsg::Processes(procs) => app.processes = procs,
+        UiEventMsg::SubagentPending { label, model, id } => {
+            app.subagent_pending(label, model, id, now_ms())
+        }
         UiEventMsg::SubagentStarted { label, model, id } => {
             app.subagent_started(label, model, id, now_ms())
         }

@@ -444,6 +444,16 @@ pub enum UiEventMsg {
     Title(String),
     Processes(Vec<(String, String)>),
     /// A crew subagent was dispatched (routing label + resolved model). `id` is
+    /// A crew subagent was planned but is waiting for a concurrency permit (the
+    /// per-provider cap means not all dispatched subagents run at once). It shows
+    /// as *pending* until a matching `SubagentStarted` arrives. `id` correlates the
+    /// three lifecycle events (pending → started → done).
+    SubagentPending {
+        label: String,
+        model: String,
+        #[serde(default)]
+        id: String,
+    },
     /// the subagent's session id — its live journal is at
     /// `<root>/.cowboy/sessions/<id>/events.jsonl`, which the UI can watch.
     /// `#[serde(default)]` keeps older journals (no id) replayable.

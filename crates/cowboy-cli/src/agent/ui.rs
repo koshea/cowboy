@@ -54,6 +54,10 @@ pub trait AgentUi {
     /// (`None`). Default: ignored.
     fn blocked(&mut self, _reason: Option<&str>) {}
     /// A crew subagent was dispatched (`label` = routing label, `model` =
+    /// A crew subagent was planned but is waiting for a concurrency permit (the
+    /// per-provider cap gates how many run at once). Shows as *pending* until the
+    /// matching `subagent_started`. Default: ignored.
+    fn subagent_pending(&mut self, _label: &str, _model: &str, _id: &str) {}
     /// resolved model, `id` = the subagent's session id, whose live journal the
     /// UI can watch). Default: ignored.
     fn subagent_started(&mut self, _label: &str, _model: &str, _id: &str) {}

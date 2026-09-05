@@ -55,6 +55,9 @@ pub struct SubagentStatus {
     pub id: String,
     pub label: String,
     pub model: String,
+    /// `true` = planned but waiting for a concurrency permit (per-provider cap);
+    /// not yet running. Flips to `false` on the matching `SubagentStarted`.
+    pub pending: bool,
     /// `None` = running, `Some(true)` = finished ok, `Some(false)` = failed.
     pub done: Option<bool>,
 }
@@ -244,8 +247,8 @@ impl Model {
             UiEventMsg::Plan(p) => self.plan = p,
             UiEventMsg::Title(t) => self.title = t,
             UiEventMsg::TurnDone => self.running = false,
-            UiEventMsg::SubagentStarted { label, model, id } => {
-                // A fresh fan-out (none still running) replaces the previous batch.
+            UiEventMsg::SubagentPending { label, model, id } => {
+                // A fresh fan-out (none still pending or running) replaces the batch.
                 if !self.subagents.iter().any(|s| s.done.is_none()) {
                     self.subagents.clear();
                 }
@@ -253,8 +256,31 @@ impl Model {
                     id,
                     label,
                     model,
+                    pending: true,
                     done: None,
                 });
+            }
+            UiEventMsg::SubagentStarted { label, model, id } => {
+                // Flip an existing pending entry to running; otherwise it's a fresh
+                // start (throttle disabled, or an older worker with no pending event).
+                if let Some(s) = self
+                    .subagents
+                    .iter_mut()
+                    .find(|s| s.id == id && s.pending && s.done.is_none())
+                {
+                    s.pending = false;
+                } else {
+                    if !self.subagents.iter().any(|s| s.done.is_none()) {
+                        self.subagents.clear();
+                    }
+                    self.subagents.push(SubagentStatus {
+                        id,
+                        label,
+                        model,
+                        pending: false,
+                        done: None,
+                    });
+                }
             }
             UiEventMsg::SubagentDone { ok, id, .. } => {
                 if let Some(s) = self

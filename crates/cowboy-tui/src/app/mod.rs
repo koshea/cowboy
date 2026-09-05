@@ -239,6 +239,9 @@ pub struct RunningCmd {
 /// Status of a spawned subagent (crew member).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrewStatus {
+    /// Planned but waiting for a concurrency permit (per-provider cap) — not yet
+    /// consuming a model connection.
+    Pending,
     Running,
     Done,
     Failed,
@@ -771,8 +774,37 @@ impl App {
         self.last_output_transient = false;
     }
 
-    /// A subagent was dispatched. Starting a fresh fan-out (no member still
-    /// running) replaces the previous batch so the pane shows the current crew.
+    /// A subagent was planned but is waiting for a concurrency permit. Shows as
+    /// *pending* in the pane until `subagent_started` flips it to running. A fresh
+    /// fan-out (no member still pending or running) replaces the previous batch.
+    pub fn subagent_pending(
+        &mut self,
+        label: impl Into<String>,
+        model: impl Into<String>,
+        id: impl Into<String>,
+        now_ms: u64,
+    ) {
+        if !self
+            .crew
+            .iter()
+            .any(|m| matches!(m.status, CrewStatus::Running | CrewStatus::Pending))
+        {
+            self.crew.clear();
+        }
+        self.crew.push(CrewMember {
+            id: id.into(),
+            label: label.into(),
+            model: model.into(),
+            status: CrewStatus::Pending,
+            started_ms: now_ms,
+            elapsed_secs: 0,
+        });
+    }
+
+    /// A subagent acquired its permit and is now running. Flips its existing
+    /// pending entry (matched by id) to running and (re)starts its clock; falls
+    /// back to inserting one if no pending entry exists (e.g. throttle disabled,
+    /// or an older worker that never emitted `SubagentPending`).
     pub fn subagent_started(
         &mut self,
         label: impl Into<String>,
@@ -780,11 +812,25 @@ impl App {
         id: impl Into<String>,
         now_ms: u64,
     ) {
-        if !self.crew.iter().any(|m| m.status == CrewStatus::Running) {
+        let id = id.into();
+        if let Some(m) = self
+            .crew
+            .iter_mut()
+            .find(|m| m.id == id && m.status == CrewStatus::Pending)
+        {
+            m.status = CrewStatus::Running;
+            m.started_ms = now_ms; // clock the run, not the queue wait
+            return;
+        }
+        if !self
+            .crew
+            .iter()
+            .any(|m| matches!(m.status, CrewStatus::Running | CrewStatus::Pending))
+        {
             self.crew.clear();
         }
         self.crew.push(CrewMember {
-            id: id.into(),
+            id,
             label: label.into(),
             model: model.into(),
             status: CrewStatus::Running,
@@ -798,7 +844,7 @@ impl App {
         if let Some(m) = self
             .crew
             .iter_mut()
-            .find(|m| m.id == id && m.status == CrewStatus::Running)
+            .find(|m| m.id == id && matches!(m.status, CrewStatus::Running | CrewStatus::Pending))
         {
             m.status = if ok {
                 CrewStatus::Done
@@ -823,7 +869,7 @@ impl App {
     /// (now dead) background pane.
     pub fn freeze_crew(&mut self) {
         for m in &mut self.crew {
-            if m.status == CrewStatus::Running {
+            if matches!(m.status, CrewStatus::Running | CrewStatus::Pending) {
                 m.status = CrewStatus::Failed;
             }
         }
@@ -1662,6 +1708,45 @@ mod tests {
         app.tick_crew(60_000);
         assert_eq!(app.crew[0].status, CrewStatus::Failed);
         assert_eq!(app.crew[0].elapsed_secs, 4, "frozen, not still ticking");
+    }
+
+    #[test]
+    fn pending_subagents_are_distinct_from_running() {
+        let mut app = App::new("t");
+        // A batch is announced as pending (queued behind the per-provider cap).
+        app.subagent_pending("core", "glm", "c1", 1000);
+        app.subagent_pending("gw", "glm", "g1", 1000);
+        assert_eq!(app.crew.len(), 2);
+        assert!(app.crew.iter().all(|m| m.status == CrewStatus::Pending));
+
+        // Pending members don't tick — the timer only runs once they start.
+        app.tick_crew(5000);
+        assert_eq!(app.crew[0].elapsed_secs, 0, "pending must not tick");
+
+        // One acquires a permit and starts; it flips in place (no new entry),
+        // and its clock starts from the start time, not the queue time.
+        app.subagent_started("core", "glm", "c1", 6000);
+        assert_eq!(
+            app.crew.len(),
+            2,
+            "started flips the pending entry, not appends"
+        );
+        assert_eq!(app.crew[0].status, CrewStatus::Running);
+        assert_eq!(app.crew[1].status, CrewStatus::Pending);
+        app.tick_crew(9000);
+        assert_eq!(
+            app.crew[0].elapsed_secs, 3,
+            "running clock from start, not queue"
+        );
+        assert_eq!(
+            app.crew[1].elapsed_secs, 0,
+            "still-pending member stays at 0"
+        );
+
+        // Freeze marks both running and pending as failed (session ended).
+        app.freeze_crew();
+        assert_eq!(app.crew[0].status, CrewStatus::Failed);
+        assert_eq!(app.crew[1].status, CrewStatus::Failed);
     }
 
     #[test]

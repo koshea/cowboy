@@ -351,6 +351,13 @@ impl AgentUi for SocketUi {
     fn plan(&mut self, steps: &[(String, String)]) {
         self.emit(UiEventMsg::Plan(steps.to_vec()));
     }
+    fn subagent_pending(&mut self, label: &str, model: &str, id: &str) {
+        self.emit(UiEventMsg::SubagentPending {
+            label: label.to_string(),
+            model: model.to_string(),
+            id: id.to_string(),
+        });
+    }
     fn subagent_started(&mut self, label: &str, model: &str, id: &str) {
         self.emit(UiEventMsg::SubagentStarted {
             label: label.to_string(),
