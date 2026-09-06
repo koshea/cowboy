@@ -145,11 +145,16 @@ pub fn build_argv(
 
     for b in &plan.binds {
         // `try` variants: an optional path that vanished between planning and now
-        // should not abort the command. Required paths are validated while building
-        // the plan, where the error can say something useful.
-        match b.mode {
-            BindMode::ReadOnly => push!("--ro-bind-try"),
-            BindMode::ReadWrite => push!("--bind-try"),
+        // should not abort the command. But a bind marked `required` (the config
+        // mask) is the opposite case — its *absence* would widen the boundary (an
+        // unmasked `security.yaml`), so use the non-`try` bind, which aborts the
+        // spawn if the source is missing. Fail closed on the one bind where a silent
+        // skip is dangerous.
+        match (b.mode, b.required) {
+            (BindMode::ReadOnly, true) => push!("--ro-bind"),
+            (BindMode::ReadOnly, false) => push!("--ro-bind-try"),
+            (BindMode::ReadWrite, true) => push!("--bind"),
+            (BindMode::ReadWrite, false) => push!("--bind-try"),
         }
         a.push(b.source.clone().into_os_string());
         a.push(b.target.clone().into());

@@ -143,6 +143,7 @@ impl Project {
 struct FixedApprover {
     answer: Verdict,
     asked: std::sync::Mutex<Vec<NetworkAttempt>>,
+    events: std::sync::Mutex<Vec<(NetworkAttempt, Verdict)>>,
 }
 
 impl FixedApprover {
@@ -150,10 +151,16 @@ impl FixedApprover {
         Arc::new(Self {
             answer,
             asked: std::sync::Mutex::new(Vec::new()),
+            events: std::sync::Mutex::new(Vec::new()),
         })
     }
     fn questions(&self) -> Vec<NetworkAttempt> {
         self.asked.lock().unwrap().clone()
+    }
+    /// Allow/deny decisions the engine made on its own (no question) and reported.
+    /// Proof that a connection actually traversed the policy engine.
+    fn events(&self) -> Vec<(NetworkAttempt, Verdict)> {
+        self.events.lock().unwrap().clone()
     }
 }
 
@@ -163,7 +170,9 @@ impl Approver for FixedApprover {
         self.asked.lock().unwrap().push(attempt.clone());
         self.answer
     }
-    async fn event(&self, _a: &NetworkAttempt, _v: Verdict, _r: String) {}
+    async fn event(&self, a: &NetworkAttempt, v: Verdict, _r: String) {
+        self.events.lock().unwrap().push((a.clone(), v));
+    }
 }
 
 fn sandbox_with(root: &Path, policy: NetworkPolicy, approver: Arc<dyn Approver>) -> NativeSandbox {
@@ -299,8 +308,20 @@ async fn with_interception_traffic_is_policed_not_direct() {
         out.contains("CONNECTED"),
         "an allowed destination should be reachable through the relay: {out}"
     );
-    // Prove it went through the engine rather than straight out: the engine recorded
-    // the attempt as an event even though it needed no question.
+    // A bare CONNECTED is NOT enough: a transport that bypassed interception entirely
+    // would also connect. Prove it went through the *engine* — the engine reports
+    // every allow/deny it decides as an event, so a recorded Allow for 1.1.1.1:443 is
+    // evidence the connection was policed via the relay rather than dialed directly.
+    let events = approver.events();
+    assert!(
+        events.iter().any(
+            |(a, v)| a.ip.map(|ip| ip.to_string()).as_deref() == Some("1.1.1.1")
+                && a.port == 443
+                && *v == Verdict::Allow
+        ),
+        "the engine must have recorded the connection as an allowed event \
+         (proving it was policed, not direct); got {events:?}"
+    );
     s.stop().await;
 }
 
@@ -309,25 +330,53 @@ async fn with_interception_traffic_is_policed_not_direct() {
 #[tokio::test]
 async fn an_agent_command_cannot_touch_the_ruleset() {
     skip_if_unsupported!();
+    skip_if_offline!();
     let p = Project::new();
-    let s = sandbox_with(
-        &p.path(),
-        NetworkPolicy::default(),
-        Arc::new(cowboy_gateway::DenyAll),
-    );
-    let (_, out) = run(
-        &s,
-        "nft list ruleset 2>&1 | head -3; nft flush ruleset 2>&1 | head -2; \
-         ip link add evil type veth peer name evil2 2>&1 | head -2",
-    )
-    .await;
+    // Allow-all default so egress works when policed — the post-check below relies on
+    // a reachable destination to prove interception SURVIVED the tamper attempt.
+    let approver = FixedApprover::new(Verdict::Allow);
+    let policy = NetworkPolicy {
+        default_external: DefaultVerdict::Allow,
+        ..Default::default()
+    };
+    let s = sandbox_with(&p.path(), policy, approver.clone());
+
+    // Reading the ruleset must not reveal cowboy's table.
+    let (_, read_out) = run(&s, "nft list ruleset 2>&1 | head -5").await;
     assert!(
-        !out.contains("table ip cowboy"),
-        "the agent should not be able to read the ruleset: {out}"
+        !read_out.contains("table ip cowboy"),
+        "the agent should not be able to read the ruleset: {read_out}"
+    );
+
+    // Each destructive op must FAIL individually — the old test OR'd three commands
+    // and accepted any one "denied", so `nft list` failing satisfied it even if
+    // `nft flush` had succeeded. Run them separately with a per-command success
+    // marker and assert the marker never appears.
+    for cmd in [
+        "nft flush ruleset",
+        "nft delete table ip cowboy",
+        "ip link add evil type veth peer name evil2",
+        "ip link delete evil",
+    ] {
+        let (_, out) = run(&s, &format!("{cmd} 2>&1 && echo COMMAND_SUCCEEDED")).await;
+        assert!(
+            !out.contains("COMMAND_SUCCEEDED"),
+            "`{cmd}` must be refused (empty caps), but it succeeded: {out}"
+        );
+    }
+
+    // The decisive check: interception still WORKS after the tamper attempts. If
+    // `nft flush` had actually gone through, egress would now be unpoliced. A policed
+    // connection still reaching the destination proves the ruleset survived.
+    let events_before = approver.events().len();
+    let (_, out) = run(&s, &connect_probe("1.1.1.1", 443)).await;
+    assert!(
+        out.contains("CONNECTED"),
+        "egress should still be policed-and-reachable after the tamper attempts: {out}"
     );
     assert!(
-        out.to_lowercase().contains("permitted") || out.to_lowercase().contains("denied"),
-        "modifying the network must be refused: {out}"
+        approver.events().len() > events_before,
+        "the post-tamper connection must still traverse the engine (ruleset intact)"
     );
     s.stop().await;
 }

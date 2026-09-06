@@ -24,14 +24,27 @@ pub fn count(text: &str) -> usize {
 }
 
 /// Truncate `text` to at most `max_tokens` tokens (decoding the kept prefix).
+///
+/// `decode` can fail when the cut falls in the middle of a multi-token character
+/// (the byte sequence for the kept prefix isn't valid UTF-8 on its own). When it
+/// does, we retry with one fewer token until a prefix decodes — every such prefix
+/// is ≤ `max_tokens` tokens, so the result never exceeds the budget. The old
+/// fallback (`chars().take(max_tokens * 4)`) could return up to ~4× the budget in
+/// tokens, defeating the point of a token-exact truncation.
 pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     let toks = bpe().encode_ordinary(text);
     if toks.len() <= max_tokens {
         return text.to_string();
     }
-    bpe()
-        .decode(&toks[..max_tokens])
-        .unwrap_or_else(|_| text.chars().take(max_tokens * 4).collect())
+    // Back off from `max_tokens` until a prefix decodes cleanly. Bounded (at most a
+    // few iterations in practice — a character spans very few tokens) and always
+    // ≤ max_tokens, so it can never overshoot the budget.
+    for end in (0..=max_tokens).rev() {
+        if let Ok(s) = bpe().decode(&toks[..end]) {
+            return s;
+        }
+    }
+    String::new()
 }
 
 #[cfg(test)]
@@ -57,5 +70,27 @@ mod tests {
         let t = truncate_to_tokens(&big, 10);
         assert!(count(&t) <= 10);
         assert!(t.len() < big.len());
+    }
+
+    /// Multibyte text (emoji, CJK) is where a token boundary can split a character
+    /// and make `decode` fail. The result must still be within budget — never the
+    /// old `chars().take(max*4)` overshoot. (M13)
+    #[test]
+    fn truncate_never_exceeds_budget_on_multibyte_text() {
+        for text in [
+            "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀".to_string(),
+            "日本語のテキストをたくさん".repeat(20),
+            "café résumé naïve ".repeat(50),
+            "🇺🇸🇬🇧🇯🇵".repeat(30), // flag emoji are multi-codepoint
+        ] {
+            for budget in [0usize, 1, 3, 7, 20] {
+                let t = truncate_to_tokens(&text, budget);
+                assert!(
+                    count(&t) <= budget,
+                    "budget {budget}: got {} tokens for {t:?}",
+                    count(&t)
+                );
+            }
+        }
     }
 }

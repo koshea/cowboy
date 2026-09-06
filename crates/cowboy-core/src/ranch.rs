@@ -231,6 +231,25 @@ impl Ranch {
     /// (`deps_satisfied` is never true) with no error — a confusing deadlock.
     /// Call before starting a ranch.
     pub fn validate(&self) -> std::result::Result<(), String> {
+        // Ids become path components host-side (`ranch_path`, `ranch_artifact_dir`)
+        // and reach `remove_dir_all`/copy in the coordinator, so a traversing id is
+        // a host-filesystem escape, not just a bad label. Reject before anything is
+        // written.
+        if !is_safe_id(&self.id) {
+            return Err(format!(
+                "unsafe ranch id {:?}: must be a single path component (no `/`, `..`, or empty)",
+                self.id
+            ));
+        }
+        for w in &self.workstreams {
+            if !is_safe_id(&w.id) {
+                return Err(format!(
+                    "unsafe workstream id {:?}: must be a single path component \
+                     (no `/`, `..`, or empty)",
+                    w.id
+                ));
+            }
+        }
         let ids: HashSet<&str> = self.workstreams.iter().map(|w| w.id.as_str()).collect();
         if ids.len() != self.workstreams.len() {
             return Err("duplicate workstream ids".into());
@@ -282,6 +301,20 @@ impl Ranch {
 // Storage  (.cowboy/ranches/<id>/ranch.yaml — committed source of truth)
 // ---------------------------------------------------------------------------
 
+/// Whether `id` is safe to use as a single path component in the ranch store.
+///
+/// Ranch and workstream ids come from the **committed, agent-writable**
+/// `ranch.yaml`, yet they are `join`ed into host-side paths that reach
+/// `remove_dir_all` and file copies in the auto-advancing coordinator. A raw
+/// `Path::join` treats `..` as a real parent-dir hop and an absolute component as
+/// a full replacement, so an id like `../../..` or `/etc` would escape the store
+/// and let a hostile repo delete or clobber arbitrary host directories. An id must
+/// therefore be exactly one normal filename component — no separators, no `.`/`..`,
+/// not absolute. (Same guard as [`crate::memory`]'s `is_safe_name`.)
+pub fn is_safe_id(id: &str) -> bool {
+    !id.is_empty() && Path::new(id).file_name() == Some(std::ffi::OsStr::new(id))
+}
+
 /// The ranches directory for a project root.
 pub fn ranches_dir(root: &Path) -> PathBuf {
     root.join(".cowboy").join("ranches")
@@ -303,25 +336,56 @@ pub fn ranch_artifact_dir(root: &Path, ranch_id: &str, workstream_id: &str) -> P
 
 /// Load a ranch plan by id.
 pub fn load(root: &Path, id: &str) -> Result<Ranch> {
+    // Reject a traversing ranch id before it is `join`ed into a host path (the id
+    // may come from a directory listing of the agent-writable store).
+    if !is_safe_id(id) {
+        return Err(Error::Invalid(format!(
+            "unsafe ranch id {id:?}: must be a single path component"
+        )));
+    }
     let path = ranch_path(root, id);
     let text = std::fs::read_to_string(&path)
         .map_err(|_| Error::Invalid(format!("no ranch `{id}` ({})", path.display())))?;
-    serde_yaml_ng::from_str(&text).map_err(|e| Error::Invalid(format!("parsing {id}: {e}")))
+    let ranch: Ranch =
+        serde_yaml_ng::from_str(&text).map_err(|e| Error::Invalid(format!("parsing {id}: {e}")))?;
+    // The committed file is agent-writable, so its ids are untrusted. Reject any
+    // that would traverse when `join`ed into an artifact/store path host-side
+    // (`promote_artifacts` reaches `remove_dir_all`), and reject an id/file mismatch
+    // that would make the loaded ranch write back to a different directory.
+    if ranch.id != id {
+        return Err(Error::Invalid(format!(
+            "ranch id mismatch: directory `{id}` holds a plan with id {:?}",
+            ranch.id
+        )));
+    }
+    for w in &ranch.workstreams {
+        if !is_safe_id(&w.id) {
+            return Err(Error::Invalid(format!(
+                "unsafe workstream id {:?} in ranch `{id}`: must be a single path component",
+                w.id
+            )));
+        }
+    }
+    Ok(ranch)
 }
 
 /// Write a ranch plan (creates its dir; atomic temp+rename).
 ///
 /// Use [`save_progress`] for any write that is *not* meant to change the plan's scope.
 pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
-    let path = ranch_path(root, &ranch.id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(e.to_string()))?;
+    // Never let a traversing id reach the filesystem, even on a write path that
+    // didn't go through `load`/`validate` (e.g. a freshly constructed ranch).
+    if !is_safe_id(&ranch.id) {
+        return Err(Error::Invalid(format!(
+            "unsafe ranch id {:?}: must be a single path component",
+            ranch.id
+        )));
     }
+    let path = ranch_path(root, &ranch.id);
     let yaml = serde_yaml_ng::to_string(ranch).map_err(|e| Error::Invalid(e.to_string()))?;
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, yaml).map_err(|e| Error::Invalid(e.to_string()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::Invalid(e.to_string()))?;
-    Ok(())
+    // Symlink-safe atomic write: the tmp path lives in the agent-writable workspace,
+    // so a plain `fs::write` there would follow a planted symlink (host-side TOCTOU).
+    crate::fs::write_atomic(&path, yaml.as_bytes())
 }
 
 /// Write a plan whose **scope has not changed**, refusing the write if it has.
@@ -339,12 +403,31 @@ pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
 /// so ordinary bookkeeping passes and an accidental (or agent-driven) scope edit on a
 /// progress path fails loudly instead of landing in a committed file.
 pub fn save_progress(root: &Path, before: &Ranch, after: &Ranch) -> Result<()> {
+    // 1. The caller did not itself change scope between its own load and this save.
     if before.scope_fingerprint() != after.scope_fingerprint() {
         return Err(Error::Invalid(format!(
             "refusing to write ranch `{}`: this is a progress update, but the plan's scope \
              changed. Scope changes go through a proposal and `cowboy ranch approve`",
             after.id
         )));
+    }
+    // 2. And the on-disk scope has not changed since the caller loaded it. `before`
+    //    is a stale in-memory snapshot; a user-gated `cowboy ranch approve` may have
+    //    landed a new scope on disk while this progress write was in flight. Writing
+    //    `after` (built on the stale scope) would silently clobber that approval — a
+    //    lost update. Re-read and compare against the committed file; refuse on drift.
+    //    Callers should hold the ranch lock around load→…→save so this window is
+    //    closed entirely (see `lock_ranch`); the re-read is the backstop that makes
+    //    the invariant hold even for a caller that does not.
+    if let Ok(on_disk) = load(root, &after.id) {
+        if on_disk.scope_fingerprint() != after.scope_fingerprint() {
+            return Err(Error::Invalid(format!(
+                "refusing to write ranch `{}`: its scope changed on disk since it was loaded \
+                 (a proposal was approved concurrently). Re-run so the update applies to the \
+                 current plan.",
+                after.id
+            )));
+        }
     }
     save(root, after)
 }
@@ -473,6 +556,54 @@ mod tests {
         .is_err());
     }
 
+    /// Ids from the committed (agent-writable) ranch.yaml become path components
+    /// host-side and reach `remove_dir_all`/copy in the coordinator, so a traversing
+    /// id must be refused before it can escape the store.
+    #[test]
+    fn is_safe_id_rejects_traversal() {
+        assert!(is_safe_id("api"));
+        assert!(is_safe_id("api-v2_3"));
+        for bad in ["", ".", "..", "../..", "a/b", "/etc", "/", "a/../b", "."] {
+            assert!(!is_safe_id(bad), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_traversing_ranch_and_workstream_ids() {
+        // A traversing workstream id is refused (this id would flow into
+        // ranch_artifact_dir -> remove_dir_all).
+        let r = ranch(vec![ws("../../etc", &[], WorkstreamStatus::Planned)]);
+        assert!(
+            r.validate().is_err(),
+            "traversing workstream id must fail validate"
+        );
+
+        // A traversing ranch id is refused too.
+        let mut r = ranch(vec![ws("a", &[], WorkstreamStatus::Planned)]);
+        r.id = "../../..".into();
+        assert!(
+            r.validate().is_err(),
+            "traversing ranch id must fail validate"
+        );
+
+        // And `save` refuses it even without going through validate.
+        let tmp = std::env::temp_dir().join(format!("cowboy-ranch-test-{}", std::process::id()));
+        assert!(
+            save(&tmp, &r).is_err(),
+            "save must refuse a traversing ranch id"
+        );
+    }
+
+    /// The artifact dir for any *validated* ranch stays inside the store — a
+    /// traversing id can never reach this helper because load/validate reject it.
+    #[test]
+    fn artifact_dir_of_a_safe_id_stays_in_the_store() {
+        let root = Path::new("/srv/proj");
+        let dir = ranch_artifact_dir(root, "myranch", "api");
+        assert!(dir.starts_with(ranches_dir(root)));
+        assert_eq!(dir, root.join(".cowboy/ranches/myranch/artifacts/api"),);
+    }
+
     /// Progress writes go through; scope writes on a progress path do not.
     ///
     /// This is the AGENTS.md rule made mechanical: the daemon coordinator and
@@ -533,6 +664,55 @@ mod tests {
         }
         // And nothing leaked to disk: the committed plan still has one workstream.
         assert_eq!(load(&dir, "r").unwrap().workstreams.len(), 1);
+    }
+
+    /// M7: a progress write must also see a scope change that landed *on disk* since
+    /// the caller loaded — otherwise a progress update built on the stale scope
+    /// silently clobbers a concurrently-approved scope change (lost update).
+    #[test]
+    fn a_progress_write_refuses_a_scope_change_that_landed_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "cowboy-ranch-m7-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = ranch(vec![ws("schema", &[], WorkstreamStatus::Planned)]);
+        save(&dir, &before).unwrap();
+
+        // A user-gated approval lands a NEW scope on disk (adds a workstream).
+        let mut approved = before.clone();
+        approved
+            .workstreams
+            .push(ws("api", &["schema"], WorkstreamStatus::Planned));
+        save(&dir, &approved).unwrap();
+
+        // Meanwhile a progress writer that loaded the OLD scope tries to record
+        // bookkeeping. Its own before→after scope is unchanged (so check 1 passes),
+        // but the on-disk scope has moved on — check 2 must refuse it.
+        let mut progress = before.clone();
+        progress.status = RanchStatus::Running;
+        let err = save_progress(&dir, &before, &progress)
+            .expect_err("a progress write over a landed scope change must be refused");
+        assert!(
+            err.to_string().contains("changed on disk"),
+            "expected an on-disk-drift refusal: {err}"
+        );
+
+        // The approved scope survives untouched — the lost update did not happen.
+        let on_disk = load(&dir, "r").unwrap();
+        assert_eq!(
+            on_disk.workstreams.len(),
+            2,
+            "the approval must not be clobbered"
+        );
+
+        // And a progress write built on the CURRENT on-disk scope still works.
+        let mut ok = approved.clone();
+        ok.status = RanchStatus::Running;
+        save_progress(&dir, &approved, &ok).expect("progress on the current scope is fine");
+        assert_eq!(load(&dir, "r").unwrap().status, RanchStatus::Running);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

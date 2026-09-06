@@ -23,7 +23,7 @@
 
 use anyhow::{bail, Context, Result};
 use landlock::{
-    path_beneath_rules, Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr,
+    Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 
@@ -138,18 +138,35 @@ fn apply_landlock(req: &ShimRequest) -> Result<()> {
 
     let mut created = ruleset.create().context("creating the Landlock ruleset")?;
 
-    // A missing path here is a bug, not an expected condition: these are
-    // sandbox-internal targets that bwrap has just created, and the plan already
-    // skipped optional host paths that were absent. Silently dropping failures is
-    // how the "Landlock rules used host paths" bug stayed hidden — every rule failed
-    // to resolve inside the sandbox and the domain ended up allowing nothing, which
-    // looked like working confinement.
-    created = created
-        .add_rules(path_beneath_rules(&req.read_only, ro))
-        .context("adding read-only Landlock rules (paths are sandbox-internal)")?;
-    created = created
-        .add_rules(path_beneath_rules(&req.read_write, rw))
-        .context("adding read-write Landlock rules (paths are sandbox-internal)")?;
+    // Add one rule per path, opening each with `PathFd::new` so an unopenable path
+    // is a hard error. We deliberately do NOT use `path_beneath_rules`: it
+    // `filter_map`s away any path it cannot open (yielding `None`, so `add_rules`
+    // never sees an error), and `HardRequirement` only rejects incompatible access
+    // *rights*, not a missing path — so a dropped rule would otherwise leave the
+    // domain `FullyEnforced` with fewer rules than intended. Opening each path here
+    // makes that a propagated `Err` instead. (This is the "Landlock rules used host
+    // paths" failure mode; the plan already skips optional host paths that are
+    // absent, so anything reaching here must resolve.)
+    //
+    // We must also replicate `path_beneath_rules`' access narrowing: directory-only
+    // rights (e.g. `ReadDir`) are rejected under `HardRequirement` when applied to a
+    // regular *file* (like the `/.cowboy-shim` bind). For a non-directory, mask the
+    // requested access down to the file-applicable subset.
+    let file_access = AccessFs::from_file(REQUIRED_ABI);
+    for (paths, access) in [(&req.read_only, ro), (&req.read_write, rw)] {
+        for p in paths {
+            let fd = PathFd::new(p).with_context(|| {
+                format!("opening Landlock rule path {p:?} (sandbox-internal target)")
+            })?;
+            // A regular file cannot carry directory-only rights; narrow to the file
+            // subset. On a stat failure, keep the requested access (as the crate does).
+            let is_dir = std::fs::metadata(p).map(|m| m.is_dir()).unwrap_or(true);
+            let effective = if is_dir { access } else { access & file_access };
+            created = created
+                .add_rule(PathBeneath::new(fd, effective))
+                .with_context(|| format!("adding Landlock rule for {p:?}"))?;
+        }
+    }
 
     let status = created.restrict_self().context("restrict_self")?;
     // With HardRequirement a partial application should already have errored, but

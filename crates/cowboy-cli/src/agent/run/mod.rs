@@ -179,6 +179,11 @@ pub struct AgentLoop<'a> {
     /// One-shot notice that the window cannot fit the reserve — a config problem, so
     /// repeating it every iteration would just bury the turn.
     zero_budget_warned: bool,
+    /// One-shot notice that the *irreducible* pinned head (system + task + memory
+    /// index) alone exceeds the budget, so no fold or drop can get under it. Without
+    /// this latch, `compact_within_turn` would re-summarize the middle every turn —
+    /// ~100 wasted model calls — never shrinking the head that is the actual problem.
+    compaction_stuck_warned: bool,
     /// Cached token cost of `tools`, which is fixed once MCP tools are merged in.
     tools_tokens_cache: std::sync::OnceLock<usize>,
     /// Memoized per-message token counts, keyed by a hash of the fields that affect
@@ -647,6 +652,7 @@ impl<'a> AgentLoop<'a> {
             minimize_reasoning_next_turn: false,
             reasoning_shed_notified: false,
             zero_budget_warned: false,
+            compaction_stuck_warned: false,
             tools_tokens_cache: std::sync::OnceLock::new(),
             token_memo: std::cell::RefCell::new(std::collections::HashMap::new()),
             task: None,
@@ -1195,6 +1201,26 @@ impl<'a> AgentLoop<'a> {
     /// separated from their answers (which providers reject).
     async fn compact_within_turn(&mut self, budget: usize, tail_budget: usize) {
         let pin = self.pinned();
+        // If the pinned head alone (system + task + any carried memory index) already
+        // meets or exceeds the budget, no fold or drop can get the conversation under
+        // it — the irreducible head IS the overflow. Summarizing the middle would burn
+        // a model call and change nothing, and `fit_context` runs every turn, so
+        // without stopping here that is ~100 wasted summarizations. Warn once and bail;
+        // the request goes out over budget and the provider decides (a turn that can't
+        // fit its own head is a config problem — context_window too small — not
+        // something compaction can solve).
+        let head_tokens: usize = self.messages[..pin].iter().map(|m| self.tokens_of(m)).sum();
+        if head_tokens >= budget {
+            if !self.compaction_stuck_warned {
+                self.compaction_stuck_warned = true;
+                self.ui.notice(&format!(
+                    "the pinned context (system prompt + task) is {head_tokens} tokens, at or \
+                     over the {budget}-token budget — cannot compact further; raise \
+                     context_window or shorten the task/system prompt"
+                ));
+            }
+            return;
+        }
         // The earliest safe cut whose tail fits — keeps as much recent context as
         // the budget allows.
         let mut suffix = vec![0usize; self.messages.len() + 1];
@@ -4942,6 +4968,67 @@ mod tests {
             hits[0].contains("models.yaml"),
             "points at the fix: {}",
             hits[0]
+        );
+    }
+
+    /// When the pinned head (system prompt + task) alone exceeds the budget, no fold
+    /// or drop can get under it. `fit_context` runs every turn, so it must NOT
+    /// re-summarize the middle each time — that was ~100 wasted model calls. It warns
+    /// once and leaves the history alone. (M4)
+    #[tokio::test]
+    async fn an_irreducible_pinned_head_does_not_spin_on_compaction() {
+        let mut ui = RecordingUi::default();
+        // A summarizer whose calls we can count: `summarize` uses the minimal-
+        // reasoning client, which bumps `low_effort_calls`. If compaction tried to
+        // fold, this would be > 0.
+        let model = ScriptedModel::new(vec![]);
+        let summary_calls = model.low_effort_calls.clone();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // A huge system prompt + task so the pinned head alone blows a tiny budget.
+        agent.messages = vec![
+            Message::system("SYSTEM ".repeat(2000)),
+            Message::user("TASK ".repeat(2000)),
+        ];
+        agent.task = Some(agent.messages[1].content.clone());
+        // Some middle history that a naive fold would keep re-summarizing.
+        for i in 0..6 {
+            agent.push_tool_result(&format!("c{i}"), &"data ".repeat(50));
+        }
+        set_context_budget(&mut agent, 50); // far smaller than the pinned head
+
+        let before = agent.messages.clone();
+        agent.fit_context().await;
+        agent.fit_context().await;
+        agent.fit_context().await;
+
+        assert_eq!(
+            *summary_calls.lock().unwrap(),
+            0,
+            "an irreducible head must not trigger any summarization calls"
+        );
+        // Capture agent-derived facts before borrowing `ui` (agent holds `&mut ui`).
+        let messages_unchanged = agent.messages == before;
+        assert!(
+            messages_unchanged,
+            "nothing foldable/droppable, so the history is left intact"
+        );
+        let hits: Vec<&String> = ui
+            .notices
+            .iter()
+            .filter(|n| n.contains("cannot compact further"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "warned exactly once, not every turn: {:?}",
+            ui.notices
         );
     }
 

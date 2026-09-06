@@ -143,13 +143,21 @@ async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()>
     }
     // Refuse if the parked session is actually still live (e.g. a `Stale` parked
     // workstream whose worker has since recovered) — `worktree::remove --force`
-    // would otherwise destroy in-flight work and orphan the session's lease.
+    // would otherwise destroy in-flight work and orphan the session's lease. Fail
+    // CLOSED: if liveness can't be determined (daemon unreachable), do not destroy —
+    // a transient socket blip must not be a licence to wipe a possibly-live worktree.
     if let Some(sid) = w.session_id.clone() {
-        if session_is_live(&sid).await {
-            bail!(
+        match session_liveness(&sid).await {
+            SessionLiveness::Live => bail!(
                 "workstream `{workstream}` still has a live session ({sid}); end it first \
                  (e.g. `cowboy down`) before retrying"
-            );
+            ),
+            SessionLiveness::Unknown => bail!(
+                "can't confirm session ({sid}) for `{workstream}` is stopped: the daemon is \
+                 unreachable. Refusing to destroy a possibly-live worktree. Start the daemon \
+                 (or run `cowboy down` to be sure it's stopped) and retry."
+            ),
+            SessionLiveness::Dead => {}
         }
     }
     let old = w.worktree_path.clone().zip(w.branch.clone());
@@ -183,16 +191,38 @@ async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()>
     Ok(())
 }
 
-/// Whether the daemon currently reports session `sid` as actively live (not a
-/// terminal/stale record). Used by `retry` to avoid wiping a worktree whose
-/// worker is still running. Treats "daemon unreachable" as not-live (the worker
-/// can't be running without a daemon).
-async fn session_is_live(sid: &str) -> bool {
-    matches!(
-        daemon::request(DaemonReq::ListSessions { root: None }).await,
-        Ok(DaemonResp::Sessions { sessions })
-            if sessions.iter().any(|s| s.id == sid && !s.status.is_terminal())
-    )
+/// Whether a session is definitely running, definitely stopped, or indeterminate.
+#[derive(Debug, PartialEq, Eq)]
+enum SessionLiveness {
+    /// The daemon reports a session with this id in a non-terminal state.
+    Live,
+    /// The daemon responded and this id is absent or terminal.
+    Dead,
+    /// The daemon could not be reached (or answered unexpectedly), so liveness is
+    /// unknown. Callers that would destroy state on "dead" must treat this as a
+    /// refusal, not a green light — a transient socket failure is not proof the
+    /// worker is gone.
+    Unknown,
+}
+
+/// Query the daemon for a session's liveness. Used by `retry` to avoid wiping a
+/// worktree whose worker is still running.
+async fn session_liveness(sid: &str) -> SessionLiveness {
+    match daemon::request(DaemonReq::ListSessions { root: None }).await {
+        Ok(DaemonResp::Sessions { sessions }) => {
+            if sessions
+                .iter()
+                .any(|s| s.id == sid && !s.status.is_terminal())
+            {
+                SessionLiveness::Live
+            } else {
+                SessionLiveness::Dead
+            }
+        }
+        // Daemon unreachable or an unexpected reply: cannot conclude the session is
+        // stopped. Fail closed.
+        _ => SessionLiveness::Unknown,
+    }
 }
 
 /// A held exclusive lock on a ranch's directory. `ranch.yaml` is the committed
@@ -376,6 +406,12 @@ fn list_proposals(root: &std::path::Path, id: &str, all: bool) -> Result<()> {
 /// `cowboy ranch approve <id> <proposal>` — apply a pending proposal's change to
 /// the plan and mark it approved.
 fn approve(root: &std::path::Path, id: &str, pid: &str) -> Result<()> {
+    // Serialize against the coordinator's `advance` and other scope writers: this is
+    // a scope-mutating path (`ranch::save`, not `save_progress`), and without the
+    // lock an in-flight `advance` that loaded the pre-approval plan would write its
+    // stale scope back over this approval (lost update). Every ranch.yaml writer must
+    // hold this lock — retry/mark_done/advance already do.
+    let _lock = lock_ranch(root, id)?;
     let mut p = scope::load(root, id, pid)?;
     if p.status != ProposalStatus::Pending {
         bail!(
@@ -654,6 +690,9 @@ fn add_workstream(
     acceptance: Vec<String>,
     expects: Vec<String>,
 ) -> Result<()> {
+    // Scope-mutating path: hold the ranch lock so a concurrent `advance` can't write
+    // a stale plan back over this addition (same rationale as `approve`).
+    let _lock = lock_ranch(root, ranch_id)?;
     let mut ranch = ranch::load(root, ranch_id)?;
     if ranch.workstreams.iter().any(|w| w.id == ws_id) {
         bail!("workstream `{ws_id}` already exists in ranch `{ranch_id}`");

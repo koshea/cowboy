@@ -123,7 +123,17 @@ pub fn add_in(
     summary: Option<String>,
     now_ms: u64,
 ) -> Result<ArtifactRef> {
-    let seq = list_in(session_dir).len() + 1;
+    // Next id from the max existing id + 1, NOT from the count. `list_in` silently
+    // drops unparseable jsonl lines, so a single corrupt line would shrink the count
+    // and hand out an id that already exists — overwriting a prior artifact's file
+    // and shadowing its index entry (and ranch promotion could then feed downstream
+    // workstreams the wrong bytes). Max-id+1 is monotonic regardless of gaps or a
+    // bad line.
+    let seq = list_in(session_dir)
+        .iter()
+        .filter_map(|a| a.id.strip_prefix('a').and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .map_or(1, |m| m + 1);
     let id = format!("a{seq:04}");
     let stem = crate::memory::slugify(title);
     let rel = PathBuf::from("artifacts").join(format!("{id}-{stem}.{}", kind.ext()));
@@ -223,5 +233,38 @@ mod tests {
     #[test]
     fn missing_index_is_empty() {
         assert!(list_in(&tmp()).is_empty());
+    }
+
+    /// A corrupt (unparseable) index line must not cause the next id to collide with
+    /// an existing one. `list_in` drops the bad line, so a count-based id would reuse
+    /// a live id and overwrite it; max-id+1 stays monotonic. (M8)
+    #[test]
+    fn a_corrupt_index_line_does_not_cause_a_duplicate_id() {
+        let dir = tmp();
+        let a = add_in(&dir, "s", ArtifactKind::Other, "one", "1", None, 1).unwrap();
+        let b = add_in(&dir, "s", ArtifactKind::Other, "two", "2", None, 2).unwrap();
+        assert_eq!(a.id, "a0001");
+        assert_eq!(b.id, "a0002");
+
+        // Corrupt the index: append a garbage line that won't parse.
+        let index = dir.join("artifacts.jsonl");
+        let mut text = std::fs::read_to_string(&index).unwrap();
+        text.push_str("{ this is not valid json\n");
+        std::fs::write(&index, &text).unwrap();
+        assert_eq!(
+            list_in(&dir).len(),
+            2,
+            "the bad line is dropped, so count is now short"
+        );
+
+        // The next id must still be a0003, not a0002 (which count+1 would produce).
+        let c = add_in(&dir, "s", ArtifactKind::Other, "three", "3", None, 3).unwrap();
+        assert_eq!(
+            c.id, "a0003",
+            "next id must not collide with an existing one"
+        );
+        // And the earlier artifact's file/body is intact (not overwritten).
+        let (_, body) = get_in(&dir, "a0002").unwrap();
+        assert_eq!(body, "2");
     }
 }

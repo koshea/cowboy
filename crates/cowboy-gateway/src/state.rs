@@ -128,9 +128,18 @@ impl GatewayState {
         // (approving `evil.com:443` must not also open `evil.com:22`). DNS
         // resolution is keyed separately (port 53) and gated by name, not cached
         // here, so this doesn't reintroduce a double prompt for the 53→443 step.
+        //
+        // The destination *address class* is also part of the key: an `Allow`
+        // approved while a name resolved to a public IP must NOT be reused after the
+        // name rebinds to a private/loopback address (a DNS-rebinding SSRF). Public→
+        // public IP rotation stays a cache hit (same class), so a CDN changing IPs
+        // does not re-prompt; only a cross-class rebind (External→PrivateLan/Host)
+        // misses the cache and is re-evaluated (and, being non-public, no longer
+        // qualifies for the public-only allow paths).
+        let class = policy::classify(attempt.ip);
         match &attempt.host {
             Some(h) => format!(
-                "host:{}:{}",
+                "host:{}:{}:{class:?}",
                 h.trim_end_matches('.').to_ascii_lowercase(),
                 attempt.port
             ),
@@ -445,6 +454,53 @@ mod tests {
         let events = approver.events.lock().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].1, Verdict::Allow);
+    }
+
+    /// A cached `Allow` approved for a public IP must NOT be reused after the name
+    /// rebinds to a private address (DNS-rebinding SSRF). The address class is part
+    /// of the cache key, so the rebind misses the cache and is re-evaluated; a
+    /// benign public→public IP rotation stays a cache hit and does not re-prompt.
+    #[tokio::test]
+    async fn a_cached_public_allow_does_not_ride_a_private_rebind() {
+        // default_private_lan defaults to Ask, so a private IP reaches the cache
+        // branch rather than being denied outright by the policy — this is exactly
+        // the window the class-keyed cache has to close.
+        let (s, approver) = state_with(NetworkPolicy::default(), Verdict::Allow);
+
+        // 1. Name resolves to a public IP: prompted, approved, cached under External.
+        assert_eq!(
+            s.decide(&attempt(Some("evil.test"), Some("93.184.216.34"), 443))
+                .await,
+            Verdict::Allow
+        );
+        // 2. Same name, another public IP (CDN rotation): SAME class → cache hit, no
+        //    second prompt.
+        assert_eq!(
+            s.decide(&attempt(Some("evil.test"), Some("93.184.216.35"), 443))
+                .await,
+            Verdict::Allow
+        );
+        assert_eq!(
+            approver.asked.lock().unwrap().len(),
+            1,
+            "a public→public rotation must reuse the approval (one prompt)"
+        );
+
+        // 3. Name rebinds to a private IP: DIFFERENT class → the public approval must
+        //    not be reused; it is re-evaluated (and re-asked here).
+        s.decide(&attempt(Some("evil.test"), Some("10.1.2.3"), 443))
+            .await;
+        assert_eq!(
+            approver.asked.lock().unwrap().len(),
+            2,
+            "a rebind to a private IP must NOT reuse the public approval"
+        );
+        // And the re-ask concerned the private IP, not the original.
+        let asked = approver.asked.lock().unwrap();
+        assert_eq!(
+            asked[1].0.ip.map(|ip| ip.to_string()).as_deref(),
+            Some("10.1.2.3")
+        );
     }
 
     #[tokio::test]

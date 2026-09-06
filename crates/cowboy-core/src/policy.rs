@@ -190,8 +190,13 @@ pub fn evaluate_name(policy: &NetworkPolicy, name: &str) -> (Verdict, String) {
 }
 
 /// Destination class for choosing which default verdict applies.
+///
+/// Also used by the gateway's approval cache: a cached `Allow` for a name must not
+/// be reused when that name later resolves to a *different* class of address (a DNS
+/// rebind from a public IP to a private/loopback one), so the class is part of the
+/// cache key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DestClass {
+pub enum DestClass {
     /// Loopback / the host itself.
     Host,
     /// RFC1918 / link-local / unique-local — i.e. the private LAN.
@@ -200,7 +205,9 @@ enum DestClass {
     External,
 }
 
-fn classify(ip: Option<IpAddr>) -> DestClass {
+/// Classify a destination IP into a [`DestClass`]. `None` (hostname-only, no
+/// resolved address) is treated as `External`.
+pub fn classify(ip: Option<IpAddr>) -> DestClass {
     let ip = match ip {
         None => return DestClass::External, // hostname-only: treat as external
         Some(ip) => ip,
@@ -226,7 +233,11 @@ fn classify(ip: Option<IpAddr>) -> DestClass {
     }
     match ip {
         IpAddr::V4(v4) => {
-            if v4.is_private() || v4.is_link_local() {
+            // Shared/CGNAT space (100.64.0.0/10, RFC 6598) is used by carrier NAT and
+            // by Tailscale for its `100.x` addresses — not the public internet, so
+            // classify it as private LAN. `std::net` has no predicate for it.
+            let is_cgnat = v4.octets()[0] == 100 && (64..=127).contains(&v4.octets()[1]);
+            if v4.is_private() || v4.is_link_local() || is_cgnat {
                 DestClass::PrivateLan
             } else {
                 DestClass::External
@@ -572,6 +583,33 @@ mod tests {
     fn unspecified_addresses_are_not_external() {
         assert_eq!(classify(Some("0.0.0.0".parse().unwrap())), DestClass::Host);
         assert_eq!(classify(Some("::".parse().unwrap())), DestClass::Host);
+    }
+
+    /// CGNAT / shared space (100.64.0.0/10, RFC 6598 — also Tailscale's `100.x`) is
+    /// not the public internet; it must classify as PrivateLan, not External.
+    #[test]
+    fn cgnat_shared_space_is_private_not_external() {
+        assert_eq!(
+            classify(Some("100.64.0.1".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        assert_eq!(
+            classify(Some("100.100.100.200".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        assert_eq!(
+            classify(Some("100.127.255.255".parse().unwrap())),
+            DestClass::PrivateLan
+        );
+        // Boundaries: 100.63.x and 100.128.x are NOT in 100.64.0.0/10 → External.
+        assert_eq!(
+            classify(Some("100.63.0.1".parse().unwrap())),
+            DestClass::External
+        );
+        assert_eq!(
+            classify(Some("100.128.0.1".parse().unwrap())),
+            DestClass::External
+        );
     }
 
     /// A domain allow must not become a path to an internal IP when the name resolves

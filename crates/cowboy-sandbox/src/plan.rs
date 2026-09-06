@@ -30,6 +30,13 @@ pub struct Bind {
     /// Why this bind exists, for `cowboy sandbox plan` and for reviewing a diff of
     /// the boundary rather than a list of paths.
     pub why: String,
+    /// If `true`, the executor MUST abort when the source is missing at spawn time
+    /// rather than skip it (`--ro-bind` not `--ro-bind-try`). Used for the config
+    /// **mask**: it is the one bind whose *absence widens* the boundary (a skipped
+    /// mask leaves `security.yaml` exposed), so a missing source must fail closed.
+    /// Every other bind is optional — a source that vanished between planning and
+    /// spawn should not abort the command.
+    pub required: bool,
 }
 
 impl Bind {
@@ -39,6 +46,19 @@ impl Bind {
             target: target.into(),
             mode: BindMode::ReadOnly,
             why: why.into(),
+            required: false,
+        }
+    }
+    /// A read-only bind whose source must exist at spawn (fail-closed): the executor
+    /// aborts rather than silently skipping it. For the config mask.
+    fn ro_required(
+        source: impl Into<PathBuf>,
+        target: impl Into<String>,
+        why: impl Into<String>,
+    ) -> Self {
+        Self {
+            required: true,
+            ..Self::ro(source, target, why)
         }
     }
     fn rw(source: impl Into<PathBuf>, target: impl Into<String>, why: impl Into<String>) -> Self {
@@ -47,6 +67,7 @@ impl Bind {
             target: target.into(),
             mode: BindMode::ReadWrite,
             why: why.into(),
+            required: false,
         }
     }
 }
@@ -439,6 +460,7 @@ impl SandboxPlan {
                 target: m.target.clone(),
                 mode,
                 why: why.into(),
+                required: false,
             });
         }
         // An agent with no project is never what anyone meant; say so rather than
@@ -483,14 +505,19 @@ impl SandboxPlan {
                     BindMode::ReadWrite
                 },
                 why: "credential grant (security.yaml)".into(),
+                required: false,
             });
         }
 
         // 6. Runtime grants. Re-checked against the denylist here as well as at
         //    approval time: this is the load-bearing check, since it is the one a
-        //    persisted or hand-edited grant must also pass.
+        //    persisted or hand-edited grant must also pass. Uses the same
+        //    canonicalizing `denied_source` as configured mounts, so a grant for a
+        //    path under an agent-writable dir that is later swapped for a symlink to
+        //    a credential store (`~/.aws`, `~/.config/cowboy`) is resolved and caught
+        //    rather than followed by `bwrap --bind`.
         for g in inputs.grants {
-            if let Some(reason) = denylist.check(&g.path) {
+            if let Some(reason) = denied_source(&denylist, probe, &g.path) {
                 return Err(Error::SecurityInvariant(format!(
                     "granted path {} is refused: {}",
                     g.path.display(),
@@ -507,16 +534,39 @@ impl SandboxPlan {
                     BindMode::ReadWrite
                 },
                 why: "runtime grant (approved by the user)".into(),
+                required: false,
             });
         }
 
-        // 7. Mask host-owned config LAST. It lives under the project directory, so
+        // 7. The Ranch store is the committed *source of truth* for multi-workstream
+        //    plans, and its scope (which workstreams exist, their deps, acceptance)
+        //    is user-gated: only the coordinator and `ranch approve` — both host-side
+        //    — ever write it. It lives inside the read-write workspace, though, so a
+        //    sandboxed command could otherwise rewrite `ranch.yaml` out-of-band and
+        //    have the next auto-advance ratify the tampered scope (the in-run
+        //    fingerprint gate can't see an edit made between runs). Bind it read-only
+        //    over itself so the agent can still *read* its own brief but the kernel
+        //    refuses writes. Read-only rather than masked because the workstream agent
+        //    legitimately reads the plan; the host writers are unaffected (they run
+        //    outside the sandbox). Placed before the config mask so the mask stays the
+        //    last bind (see `mask_binds_come_last`).
+        let ranches = inputs.root.join(config::COWBOY_DIR).join("ranches");
+        if probe.exists(&ranches) {
+            let target = format!("{workdir}/{}/ranches", config::COWBOY_DIR);
+            binds.push(Bind::ro(
+                ranches,
+                target,
+                "ranch store (user-gated, read-only)",
+            ));
+        }
+
+        // 8. Mask host-owned config LAST. It lives under the project directory, so
         //    it is inside a bind the agent can otherwise read; an empty read-only
         //    file over it means the agent cannot learn its own boundary.
         for file in [config::SECURITY_FILE, config::MODELS_FILE] {
             let host_path = inputs.root.join(config::COWBOY_DIR).join(file);
             if probe.exists(&host_path) {
-                binds.push(Bind::ro(
+                binds.push(Bind::ro_required(
                     inputs.mask_file.to_path_buf(),
                     format!("{workdir}/{}/{file}", config::COWBOY_DIR),
                     "mask host-owned config",
@@ -1040,7 +1090,51 @@ mod tests {
                 .unwrap_or_else(|| panic!("no mask bind for {f}"));
             assert_eq!(bind.source, Path::new("/run/cowboy/mask"));
             assert_eq!(bind.mode, BindMode::ReadOnly);
+            assert!(
+                bind.required,
+                "the mask must be a required (non-try) bind: a skipped mask leaves {f} exposed"
+            );
         }
+    }
+
+    /// The Ranch store (committed, user-gated scope) is bound read-only into the
+    /// sandbox when present, so a sandboxed command can read its brief but cannot
+    /// rewrite `ranch.yaml` to smuggle a scope change past the propose→approve gate.
+    #[test]
+    fn the_ranch_store_is_bound_read_only() {
+        let probe = host().with_existing(["/srv/proj/.cowboy/ranches"]);
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &probe).unwrap();
+        let target = format!("{}/.cowboy/ranches", sec.sandbox.workdir);
+        let bind = plan
+            .binds
+            .iter()
+            .find(|b| b.target == target)
+            .expect("the ranch store must be bound when it exists");
+        assert_eq!(bind.source, Path::new("/srv/proj/.cowboy/ranches"));
+        assert_eq!(
+            bind.mode,
+            BindMode::ReadOnly,
+            "the ranch store must be read-only"
+        );
+        // It appears in Landlock's read-only set, so the confinement holds even if
+        // the bind were wrong (defence in depth).
+        assert!(
+            plan.landlock.read_only.contains(&PathBuf::from(&target)),
+            "the ranch store must be Landlock read-only too"
+        );
+        // And it does not appear as writable.
+        assert!(!plan.landlock.read_write.contains(&PathBuf::from(&target)));
+    }
+
+    /// Absent ranch store → no bind (nothing to protect, and bwrap would refuse a
+    /// missing source).
+    #[test]
+    fn no_ranch_bind_when_the_store_is_absent() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host()).unwrap();
+        let target = format!("{}/.cowboy/ranches", sec.sandbox.workdir);
+        assert!(!plan.binds.iter().any(|b| b.target == target));
     }
 
     /// The mask must be applied after everything else, or a later bind could
@@ -1224,6 +1318,23 @@ mod tests {
                 "refusal for {src} should point at cowboy secrets: {msg}"
             );
         }
+    }
+
+    /// A runtime grant whose path is (or passes through) a symlink to a credential
+    /// store must be refused: the denylist match is lexical, so like configured
+    /// mounts, grants are canonicalized first (`denied_source`) — otherwise a grant
+    /// for a benign dir could be swapped for a symlink to `~/.aws` and `bwrap --bind`
+    /// would follow it (M1).
+    #[test]
+    fn refuses_a_grant_that_symlinks_into_a_credential_store() {
+        let host = host().with_symlink("/srv/other/looks-fine", "/home/dev/.aws");
+        let grants = [Grant {
+            path: PathBuf::from("/srv/other/looks-fine"),
+            read_only: true,
+        }];
+        let err = plan_with(&SecurityConfig::default(), &grants, &host)
+            .expect_err("a grant symlinked to a credential store must be refused");
+        assert!(matches!(err, Error::SecurityInvariant(_)), "{err:?}");
     }
 
     #[test]

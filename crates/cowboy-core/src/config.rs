@@ -124,7 +124,13 @@ impl<'de> Deserialize<'de> for CpuLimit {
             Str(String),
         }
         match Repr::deserialize(d)? {
-            Repr::Num(n) => Ok(CpuLimit::Cores(n)),
+            // A CPU quota drives the cgroup limit and build parallelism (`jobs`), so a
+            // NaN, infinite, zero, or negative value is meaningless — reject it at
+            // parse time rather than letting it flow into a cgroup write or a `-j0`.
+            Repr::Num(n) if n.is_finite() && n > 0.0 => Ok(CpuLimit::Cores(n)),
+            Repr::Num(n) => Err(serde::de::Error::custom(format!(
+                "cpus must be a positive, finite number of cores, got {n}"
+            ))),
             Repr::Str(s) if s.eq_ignore_ascii_case("auto") => Ok(CpuLimit::Auto),
             Repr::Str(s) => Err(serde::de::Error::custom(format!(
                 "cpus must be a number or \"auto\", got {s:?}"

@@ -459,6 +459,12 @@ fn cpus_accepts_number_or_auto() {
     assert_eq!(c.cpus, None);
     // Garbage is rejected.
     assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: lots\n").is_err());
+    // Nonsensical numbers are rejected: zero, negative, and non-finite would each
+    // corrupt the cgroup quota / build parallelism.
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: 0\n").is_err());
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: -4\n").is_err());
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: .nan\n").is_err());
+    assert!(serde_yaml_ng::from_str::<SandboxConfig>("cpus: .inf\n").is_err());
     // So is a key from the Docker era. This test itself used to carry `image: x`,
     // ignored by serde and meaningless since the container went.
     assert!(serde_yaml_ng::from_str::<SandboxConfig>("image: x\ncpus: 2\n").is_err());

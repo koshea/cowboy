@@ -834,7 +834,13 @@ impl ModelClient for OpenAiClient {
             {
                 Ok(r) if r.status().is_success() => break r,
                 Ok(r) if is_retryable_status(r.status()) && attempt < MAX_RETRIES => {
-                    let delay = retry_after(&r).unwrap_or_else(|| backoff(attempt));
+                    // A provider signal of 0 (`Retry-After: 0`, or a reset header that
+                    // already elapsed) is not a licence to retry instantly and re-hammer
+                    // the endpoint — treat a zero/absent signal as "use our jittered
+                    // backoff", which also de-synchronizes parallel retriers.
+                    let delay = retry_after(&r)
+                        .filter(|d| !d.is_zero())
+                        .unwrap_or_else(|| backoff(attempt));
                     tracing::warn!(
                         status = %r.status(),
                         attempt = attempt + 1,

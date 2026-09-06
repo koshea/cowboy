@@ -57,7 +57,14 @@ pub fn record_in(
     rationale: Option<String>,
     now_ms: u64,
 ) -> Decision {
-    let seq = list_in(session_dir).len() + 1;
+    // Next id from max existing id + 1, not the count: `list_in` drops unparseable
+    // lines, so a count would collide on a corrupt line and overwrite a prior
+    // decision. (Same fix as artifact ids.)
+    let seq = list_in(session_dir)
+        .iter()
+        .filter_map(|d| d.id.strip_prefix('d').and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .map_or(1, |m| m + 1);
     let d = Decision {
         id: format!("d{seq:04}"),
         session_id: session_id.to_string(),
@@ -110,5 +117,30 @@ mod tests {
             Some("uuid")
         );
         assert!(get_in(&dir, "nope").is_none());
+    }
+
+    /// A corrupt index line must not make the next decision id collide with an
+    /// existing one (M8, same fix as artifacts).
+    #[test]
+    fn a_corrupt_line_does_not_duplicate_a_decision_id() {
+        let dir = std::env::temp_dir().join(format!(
+            "cowboy-decision-m8-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(path(&dir));
+
+        record_in(&dir, "s", "q1", vec![], None, None, 1);
+        record_in(&dir, "s", "q2", vec![], None, None, 2);
+        // Append a garbage line.
+        let mut text = std::fs::read_to_string(path(&dir)).unwrap();
+        text.push_str("not json at all\n");
+        std::fs::write(path(&dir), &text).unwrap();
+        assert_eq!(list_in(&dir).len(), 2, "bad line dropped");
+
+        let d3 = record_in(&dir, "s", "q3", vec![], None, None, 3);
+        assert_eq!(d3.id, "d0003", "next id must not collide");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

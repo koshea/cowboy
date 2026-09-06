@@ -61,6 +61,15 @@ pub(crate) fn load(root: &Path) -> Result<cowboy_core::config::SecurityConfig> {
     // Merge the personal overlay so this matches what a session would actually
     // get; without it the boundary shown here would be narrower than the real one.
     cowboy_core::usersecrets::merge_into(&mut security, &crate::project::repo_key(root));
+    // Re-validate AFTER merging, exactly as the session/worker paths do:
+    // `SecurityConfig::load` validated the raw project file, but the overlay adds
+    // credential grants (`secrets.files`), and `validate()` is the only place that
+    // enforces `mount_targets_host_secret` on grant sources. Skipping it here (this
+    // backs `cowboy sandbox exec` and `plan`) would let an overlay grant sourced at
+    // `providers.yaml`/`.cowboy` config be bound into the sandbox with no check.
+    security
+        .validate()
+        .context("validating security config with the personal overlay merged")?;
     Ok(security)
 }
 

@@ -93,15 +93,18 @@ pub fn proposal_path(root: &Path, ranch_id: &str, pid: &str) -> PathBuf {
 
 /// Write a proposal (creates its dir; atomic temp+rename).
 pub fn save(root: &Path, p: &ScopeProposal) -> Result<()> {
-    let path = proposal_path(root, &p.ranch_id, &p.id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(e.to_string()))?;
+    // `ranch_id`/`id` become path components; refuse traversal (same guard as the
+    // ranch store — these ids reach host-side paths).
+    if !ranch::is_safe_id(&p.ranch_id) || !ranch::is_safe_id(&p.id) {
+        return Err(Error::Invalid(format!(
+            "unsafe proposal id (ranch {:?}, proposal {:?}): each must be a single path component",
+            p.ranch_id, p.id
+        )));
     }
+    let path = proposal_path(root, &p.ranch_id, &p.id);
     let yaml = serde_yaml_ng::to_string(p).map_err(|e| Error::Invalid(e.to_string()))?;
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, yaml).map_err(|e| Error::Invalid(e.to_string()))?;
-    std::fs::rename(&tmp, &path).map_err(|e| Error::Invalid(e.to_string()))?;
-    Ok(())
+    // Symlink-safe atomic write (agent-writable workspace; see ranch::save).
+    crate::fs::write_atomic(&path, yaml.as_bytes())
 }
 
 /// Load one proposal by id.

@@ -250,6 +250,52 @@ async fn host_owned_security_config_is_masked() {
     assert!(out.contains("[end]"), "{out}");
 }
 
+/// H2: the Ranch store is bound read-only into the sandbox, so a sandboxed command
+/// can read a workstream brief but cannot rewrite `ranch.yaml` to smuggle a scope
+/// change past the propose→approve gate. This is the end-to-end kernel check behind
+/// the plan-level `the_ranch_store_is_bound_read_only` unit test.
+#[tokio::test]
+async fn the_ranch_store_is_read_only_inside_the_sandbox() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    // Seed a committed ranch plan on the host so the read-only bind applies.
+    std::fs::create_dir_all(p.path().join(".cowboy/ranches/r1")).unwrap();
+    std::fs::write(
+        p.path().join(".cowboy/ranches/r1/ranch.yaml"),
+        "version: 1\nid: r1\ntitle: R\ngoal: g\n",
+    )
+    .unwrap();
+
+    // Reading the plan is allowed (the workstream agent needs its brief)...
+    let (code, out) = run(
+        &p.path(),
+        "cat /workspace/.cowboy/ranches/r1/ranch.yaml; echo '[read-ok]'",
+        60,
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("id: r1") && out.contains("[read-ok]"), "{out}");
+
+    // ...but writing it (or adding a new file) is refused by the kernel.
+    let (_code, out) = run(
+        &p.path(),
+        "echo tampered >> /workspace/.cowboy/ranches/r1/ranch.yaml \
+         && echo '[WROTE]' || echo '[write-denied]'",
+        60,
+    )
+    .await;
+    assert!(
+        out.contains("[write-denied]") && !out.contains("[WROTE]"),
+        "the agent was able to write the ranch store: {out}"
+    );
+    // The host-side file is unchanged — no tampering landed.
+    let on_host = std::fs::read_to_string(p.path().join(".cowboy/ranches/r1/ranch.yaml")).unwrap();
+    assert!(
+        !on_host.contains("tampered"),
+        "host ranch.yaml was modified: {on_host}"
+    );
+}
+
 #[tokio::test]
 async fn the_host_toolchain_is_usable() {
     skip_if_unsupported!();
