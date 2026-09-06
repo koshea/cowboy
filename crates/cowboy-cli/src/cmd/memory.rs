@@ -8,13 +8,13 @@ use anyhow::Result;
 use cowboy_core::memory;
 
 use crate::cli::{MemoryCmdArgs, MemoryCommand};
-use crate::project::project_hash;
+use crate::project::project_key_hex;
 
 /// The memory key for the current worktree (matches the agent's).
 fn project_key() -> Result<String> {
     let root = crate::cmd::project_root()?;
     let canon = std::fs::canonicalize(&root).unwrap_or(root);
-    Ok(format!("{:08x}", project_hash(&canon)))
+    Ok(project_key_hex(&canon))
 }
 
 pub fn run(args: MemoryCmdArgs) -> Result<()> {

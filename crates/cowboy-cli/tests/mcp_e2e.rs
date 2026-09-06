@@ -39,7 +39,9 @@ fn everything_config() -> McpConfig {
                 ],
                 env: BTreeMap::new(),
             },
-            tools: vec![],
+            // Expose all tools: with fail-closed semantics, `*` is the explicit
+            // opt-in (an empty list would now expose nothing).
+            tools: vec!["*".into()],
         },
     );
     McpConfig {

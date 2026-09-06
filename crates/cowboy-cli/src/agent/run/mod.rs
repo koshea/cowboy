@@ -55,9 +55,9 @@ AGENTS.md with `edit`/`write` so it persists for everyone.
 You also have a private cross-session `memory` (stored on the host, not the \
 repo). The index of what you've saved is shown below when present; `recall` a \
 full entry by name when it's relevant, and `save` concise facts or user \
-preferences worth remembering next time (default scope \"project\"; use \
-\"global\" for things true across projects). Keep project conventions in \
-AGENTS.md, not memory.
+preferences worth remembering next time (default scope \"project\"; \"global\" \
+applies across all projects and requires the user to approve the save). Keep \
+project conventions in AGENTS.md, not memory.
 
 The runtime enforces network, host, and secret permissions outside your control. \
 Outbound network access goes through a gateway that allows, denies, or prompts \
@@ -4840,10 +4840,11 @@ mod tests {
         assert_eq!(kept.len(), history.len());
     }
 
-    /// tiktoken is slow enough that repeated full passes dominate the loop's own cost:
-    /// measured ~570ms for one pass over a 300-message / 110k-token conversation, and
-    /// the loop makes several passes per iteration. This asserts the memo actually
-    /// bites, rather than trusting that it does.
+    /// tiktoken is slow enough that repeated full passes dominate the loop's own cost,
+    /// so message token counts are memoized. This asserts the memo actually *bites* —
+    /// by inspecting the memo directly rather than timing two passes, which flaked
+    /// under concurrent test load (a wall-clock `warm < cold/5` ratio is not stable
+    /// when the CPU is contended).
     #[tokio::test]
     async fn repeated_token_counts_are_memoized() {
         let mut ui = RecordingUi::default();
@@ -4859,21 +4860,31 @@ mod tests {
         for _ in 0..120 {
             agent.messages.push(Message::user(body.clone()));
         }
-        let t = std::time::Instant::now();
-        let cold_total = agent.total_tokens();
-        let cold = t.elapsed();
-        let t = std::time::Instant::now();
-        let warm_total = agent.total_tokens();
-        let warm = t.elapsed();
+        assert!(agent.token_memo.borrow().is_empty(), "memo starts empty");
 
+        let cold_total = agent.total_tokens();
+        // The conversation is the seeded system message plus 120 identical user
+        // messages. The 120 identical ones share one memo key, so the memo holds
+        // exactly two entries (system + the shared user body): proof of both
+        // memoization and cross-message dedup. A non-memoizing implementation would
+        // still return the right total, so the memo state is the only faithful witness
+        // that it bit.
+        assert_eq!(
+            agent.token_memo.borrow().len(),
+            2,
+            "system + 120 identical user messages must collapse to two memo entries"
+        );
+
+        let warm_total = agent.total_tokens();
         assert_eq!(
             cold_total, warm_total,
             "the memo must not change the answer"
         );
         assert!(cold_total > 1000, "the fixture should be substantial");
-        assert!(
-            warm * 5 < cold,
-            "the second pass should be far cheaper: cold {cold:?} vs warm {warm:?}"
+        assert_eq!(
+            agent.token_memo.borrow().len(),
+            2,
+            "a second pass adds no new entries — every message was a memo hit"
         );
 
         // Changing a message changes its key, so the count follows the content rather

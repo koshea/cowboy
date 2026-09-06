@@ -59,7 +59,7 @@ fn trust_dir() -> PathBuf {
 
 /// Trust record file for a project root within `dir` (keyed by the root's hash).
 fn file_in(dir: &Path, root: &Path) -> PathBuf {
-    dir.join(format!("{:08x}.json", crate::project::project_hash(root)))
+    dir.join(format!("{}.json", crate::project::project_key_hex(root)))
 }
 
 fn load_record_in(dir: &Path, root: &Path) -> Option<TrustRecord> {

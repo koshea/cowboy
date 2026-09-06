@@ -315,9 +315,10 @@ When it needs a server it uses the built-in `mcp` tool to **discover** that
 server's tools (full schemas, on demand) and **call** them. Type `/mcp` in the
 TUI to see the connected servers yourself.
 
-Use `--tool <name>` (repeatable) on `add` to expose only specific tools from a
-chatty server. `${VAR}` in `--env`/`--header` values is expanded from your host
-environment at connect time, so secrets never live in the config file.
+Use `--tool <name>` (repeatable) on `add` to expose specific tools from a server.
+The allowlist is **fail-closed**: omitting `--tool` exposes *no* tools, and
+`--tool '*'` exposes all of them. `${VAR}` in `--env`/`--header` values is expanded
+from your host environment at connect time, so secrets never live in the config file.
 
 ### Project servers from `.mcp.json`
 

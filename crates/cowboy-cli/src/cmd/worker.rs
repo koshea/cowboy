@@ -25,7 +25,7 @@ use crate::cmd::session::{
     context_title, git_branch, log_approval, log_network, post_turn_indicators, verdict_str,
 };
 use crate::net::approvals;
-use crate::project::{project_hash, session_name_for};
+use crate::project::session_name_for;
 use crate::sandbox::policy::ChannelApprover;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
 
@@ -254,7 +254,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // torn down on clean shutdown below.
     let session_name = crate::sandbox::Sandbox::session_name(&runtime).to_string();
 
-    let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
+    let memory_ctx = cowboy_core::memory::index(&crate::project::project_key_hex(&root));
     // Continue a prior session if asked (load its transcript as history).
     let history = match &args.resume {
         Some(id) => match crate::session::load_history(&root, id) {

@@ -60,8 +60,8 @@ fn store_dir(dir: &Path) -> std::io::Result<()> {
 /// Approvals file for a project root within `dir` (keyed by the root's hash).
 fn file_in(dir: &Path, root: &Path) -> PathBuf {
     dir.join(format!(
-        "{:08x}.json",
-        super::super::project::project_hash(root)
+        "{}.json",
+        super::super::project::project_key_hex(root)
     ))
 }
 

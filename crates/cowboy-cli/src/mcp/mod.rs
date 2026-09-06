@@ -148,7 +148,7 @@ impl McpManager {
 
     /// Full tool list + JSON schemas for one server (filtered by its allowlist).
     async fn list_one(&self, name: &str) -> Result<String> {
-        let allow = self.server(name)?.tools.clone();
+        let server = self.server(name)?.clone();
         let client = self.connect(name).await?;
         let tools = client
             .list_all_tools()
@@ -157,7 +157,7 @@ impl McpManager {
         let mut out = format!("# MCP server `{name}` tools\n");
         let mut shown = 0;
         for t in &tools {
-            if !allow.is_empty() && !allow.iter().any(|a| a == t.name.as_ref()) {
+            if !server.tool_allowed(t.name.as_ref()) {
                 continue;
             }
             shown += 1;
@@ -181,7 +181,7 @@ impl McpManager {
 
     /// One-line-per-tool summary for a server (no schemas) — the cheap overview.
     async fn list_one_compact(&self, name: &str) -> Result<String> {
-        let allow = self.server(name)?.tools.clone();
+        let server = self.server(name)?.clone();
         let client = self.connect(name).await?;
         let tools = client
             .list_all_tools()
@@ -189,7 +189,7 @@ impl McpManager {
             .map_err(|e| anyhow!("listing tools on `{name}`: {e}"))?;
         let mut out = format!("## {name}\n");
         for t in &tools {
-            if !allow.is_empty() && !allow.iter().any(|a| a == t.name.as_ref()) {
+            if !server.tool_allowed(t.name.as_ref()) {
                 continue;
             }
             let desc = t
@@ -209,12 +209,17 @@ impl McpManager {
         tool: &str,
         arguments: Option<serde_json::Value>,
     ) -> Result<String> {
-        // Enforce the per-server allowlist (if any).
-        let allow = self.server(server)?.tools.clone();
-        if !allow.is_empty() && !allow.iter().any(|a| a == tool) {
+        // Enforce the per-server allowlist (fail-closed: empty = none, `*` = all).
+        let cfg = self.server(server)?.clone();
+        if !cfg.tool_allowed(tool) {
             return Err(anyhow!(
-                "tool `{tool}` is not in `{server}`'s allowlist ({})",
-                allow.join(", ")
+                "tool `{tool}` is not in `{server}`'s allowlist ({}). Add it to the server's \
+                 `tools` list (or `\"*\"` for all) in mcp config.",
+                if cfg.tools.is_empty() {
+                    "empty — no tools exposed".to_string()
+                } else {
+                    cfg.tools.join(", ")
+                }
             ));
         }
         let arguments = match arguments {

@@ -227,7 +227,7 @@ Add or replace an MCP server in ~/.config/cowboy/mcp.yaml
 | `--env` | stdio: an environment variable, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE to reference host env; never inline secret literals |
 | `--url` | http: the server URL |
 | `--header` | http: a request header, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE |
-| `--tool` | Restrict to these tool names (repeatable). Omit to expose all tools |
+| `--tool` | Tool names to expose (repeatable), fail-closed: omit to expose NONE, or pass `--tool '*'` to expose all of the server's tools |
 
 
 ### `cowboy mcp disable`

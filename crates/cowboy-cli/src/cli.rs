@@ -546,7 +546,8 @@ pub struct McpAddArgs {
     /// http: a request header, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE.
     #[arg(long = "header", value_name = "KEY=VALUE")]
     pub header: Vec<String>,
-    /// Restrict to these tool names (repeatable). Omit to expose all tools.
+    /// Tool names to expose (repeatable), fail-closed: omit to expose NONE, or pass
+    /// `--tool '*'` to expose all of the server's tools.
     #[arg(long = "tool", value_name = "NAME")]
     pub tools: Vec<String>,
 }

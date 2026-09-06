@@ -58,8 +58,11 @@ pub struct McpServer {
     pub enabled: bool,
     /// How to reach the server.
     pub transport: McpTransport,
-    /// Optional allowlist of tool names to expose. Empty = expose all the server's
-    /// tools. Use it to keep a chatty server's surface focused.
+    /// Allowlist of tool names to expose. **Fail-closed: an empty list exposes
+    /// NOTHING** — you must name the tools you want, or use a single `"*"` entry to
+    /// expose all of the server's tools. An MCP server is host-connected and
+    /// model-invokable, so silently exposing every tool of a newly-added server (the
+    /// old "empty = all" behavior) is the wrong default for a security-first tool.
     #[serde(default)]
     pub tools: Vec<String>,
 }
@@ -92,6 +95,15 @@ impl McpServer {
     /// Is this server a local stdio subprocess?
     pub fn is_stdio(&self) -> bool {
         matches!(self.transport, McpTransport::Stdio { .. })
+    }
+
+    /// Whether tool `name` may be exposed/called, per this server's allowlist.
+    ///
+    /// Fail-closed: an empty `tools` list allows NOTHING. A single `"*"` entry is
+    /// the explicit opt-in to all tools; otherwise a tool must be named. Centralized
+    /// here so the list/list-compact/call paths cannot drift on the rule.
+    pub fn tool_allowed(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| t == "*" || t == name)
     }
 
     /// A short human label for the transport (for `cowboy mcp list`).
@@ -281,7 +293,11 @@ pub fn parse_mcp_json(text: &str) -> Result<BTreeMap<String, McpServer>> {
                 description: raw.description.unwrap_or_else(|| "(from .mcp.json)".into()),
                 enabled: true,
                 transport,
-                tools: vec![],
+                // `.mcp.json` (the Claude-compatible import format) has no per-tool
+                // allowlist, so importing a server there means "use it" — expose all
+                // its tools via the explicit `*`. Cowboy's own mcp config still
+                // fail-closes on an empty list.
+                tools: vec!["*".into()],
             },
         );
     }
@@ -301,6 +317,30 @@ pub fn load_project_mcp(root: &Path) -> Result<Option<BTreeMap<String, McpServer
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fail-closed allowlist: empty exposes nothing, `*` exposes all, otherwise a
+    /// tool must be named. (M5)
+    #[test]
+    fn tool_allowed_is_fail_closed() {
+        let mk = |tools: Vec<&str>| McpServer {
+            description: String::new(),
+            enabled: true,
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: BTreeMap::new(),
+            },
+            tools: tools.into_iter().map(String::from).collect(),
+        };
+        // Empty = nothing exposed.
+        assert!(!mk(vec![]).tool_allowed("echo"));
+        // `*` = everything.
+        assert!(mk(vec!["*"]).tool_allowed("echo"));
+        assert!(mk(vec!["*"]).tool_allowed("anything"));
+        // Named list = exactly those.
+        assert!(mk(vec!["echo", "add"]).tool_allowed("echo"));
+        assert!(!mk(vec!["echo", "add"]).tool_allowed("delete"));
+    }
 
     #[test]
     fn config_roundtrips_through_yaml() {

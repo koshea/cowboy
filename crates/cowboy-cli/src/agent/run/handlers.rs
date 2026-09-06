@@ -11,9 +11,9 @@ impl AgentLoop<'_> {
     /// Handle a `memory` tool call host-side (the agent can't reach the home
     /// dir; the loop runs on the host, so it reads/writes it directly). Returns
     /// the observation text.
-    pub(super) fn run_memory(&self, args: &MemoryArgs) -> String {
+    pub(super) fn run_memory(&mut self, args: &MemoryArgs) -> String {
         use cowboy_core::memory::{self, Scope};
-        let key = format!("{:08x}", crate::project::project_hash(self.runtime.root()));
+        let key = crate::project::project_key_hex(self.runtime.root());
         match args.action.as_str() {
             "save" => {
                 let (Some(title), Some(content)) = (&args.title, &args.content) else {
@@ -23,6 +23,31 @@ impl AgentLoop<'_> {
                     Some("global") => Scope::Global,
                     _ => Scope::Project,
                 };
+                // A GLOBAL memory is injected into the system prompt of every future
+                // session on this host, across all projects — a durable, cross-project
+                // channel a prompt-injected agent in a hostile repo could use to shape
+                // future work. Gate it behind explicit user approval (project-scoped
+                // saves stay ungated: they only affect this project's own sessions).
+                if scope == Scope::Global {
+                    let question = format!(
+                        "The agent wants to save a GLOBAL memory (visible in every future \
+                         session, across all projects):\n  title: {}\n  {}",
+                        memory::sanitize_meta(title, 200),
+                        memory::sanitize_meta(content, 300),
+                    );
+                    let options = vec![
+                        "allow this global save".to_string(),
+                        "deny (save project-scoped instead? no — just deny)".to_string(),
+                    ];
+                    let answer = self.ui.ask_user(&question, &options).trim().to_lowercase();
+                    // Fail closed: only an explicit allow proceeds (an empty answer means
+                    // no one could be asked).
+                    if !answer.starts_with("allow") {
+                        return "global memory save denied by the user; not saved. \
+                                Use scope \"project\" for project-local notes."
+                            .into();
+                    }
+                }
                 match memory::save(&key, title, content, scope, args.kind.as_deref()) {
                     Ok(name) => format!("saved memory `{name}` [{}]", scope.as_str()),
                     Err(e) => format!("error: {e}"),

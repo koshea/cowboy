@@ -63,12 +63,28 @@ fn resolve_exe(
     path_dirs.iter().map(|d| d.join(&name)).find(|c| exists(c))
 }
 
-/// A stable 32-bit hash of the project path, used to derive per-project network
-/// names and subnets.
-pub fn project_hash(root: &Path) -> u32 {
+/// A stable 64-bit hash of the project path, used to derive per-project network
+/// names/subnets and to key the per-project stores (memory, approvals, MCP trust).
+///
+/// 64-bit, not the old truncated 32-bit: the hash is keyless and deterministic, so a
+/// 32-bit space was both birthday-collidable (~65k projects) and cheap to *target* —
+/// an attacker who knew a victim project's path could brute-force a colliding path to
+/// inherit its credential overlay and egress approvals. 64 bits puts a targeted
+/// second-preimage out of reach for the same-user, cross-project confusion this
+/// guards against. Prefer [`project_key_hex`] for anything that becomes a path/name.
+pub fn project_hash(root: &Path) -> u64 {
     let mut hasher = DefaultHasher::new();
     root.hash(&mut hasher);
-    hasher.finish() as u32
+    hasher.finish()
+}
+
+/// The canonical hex form of [`project_hash`] — a fixed-width, filesystem-safe key.
+///
+/// The single source of truth for how the hash is rendered into a store filename or
+/// network name, so the width can't drift between call sites (it did: some used
+/// `{:08x}`, which would have silently truncated a widened hash back to 32 bits).
+pub fn project_key_hex(root: &Path) -> String {
+    format!("{:016x}", project_hash(root))
 }
 
 /// The name of the scratch directory belonging to *this process's* sandbox for
@@ -236,7 +252,7 @@ pub fn remove_scratch_dir(key: &str) {
 /// One definition, used by the sandbox itself and by the daemon registry, so a
 /// session can be identified without asking a running worker.
 pub fn session_name_for(root: &Path) -> String {
-    format!("cowboy-{:08x}", project_hash(root))
+    format!("cowboy-{}", project_key_hex(root))
 }
 
 /// Run a host command and return its trimmed stdout as a secret value, or
@@ -301,7 +317,7 @@ pub fn repo_root(root: &Path) -> PathBuf {
 /// The per-repository overlay key (stable across all of a repo's worktrees).
 /// Used for the personal credential overlay so a grant applies to every worktree.
 pub fn repo_key(root: &Path) -> String {
-    format!("{:08x}", project_hash(&repo_root(root)))
+    project_key_hex(&repo_root(root))
 }
 
 /// The shared git directory to mount when `root` is a *linked worktree* — i.e.

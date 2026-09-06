@@ -21,7 +21,7 @@ use crate::agent::tui::SessionCtx;
 use crate::agent::{ui::AgentUi, AgentLoop, ConsoleUi, JournalUi, ModelPricing};
 use crate::cli::StartFlags;
 use crate::cmd::daemon;
-use crate::project::{project_hash, session_name_for};
+use crate::project::session_name_for;
 use crate::sandbox::policy::ChannelApprover;
 use crate::style;
 
@@ -190,7 +190,7 @@ pub async fn run(
             coordinate_oneshot(&root, &id, &task).await?
         };
 
-        let memory_ctx = cowboy_core::memory::index(&format!("{:08x}", project_hash(&root)));
+        let memory_ctx = cowboy_core::memory::index(&crate::project::project_key_hex(&root));
         // Continue a prior session if asked (load its transcript as history).
         let history = match &resume_id {
             Some(id) => crate::session::load_history(&root, id).unwrap_or_else(|e| {
