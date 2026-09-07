@@ -354,12 +354,40 @@ pub async fn run_interactive(
     net: NetMode,
     session: Option<&SessionSandbox>,
 ) -> Result<ExecResult> {
+    use tokio::io::AsyncWriteExt;
     let (mut cmd, request) = build_command(plan, command, net, session)?;
     cmd.stdin(Stdio::piped());
     // stdout/stderr inherited so the shell is usable.
     let mut child = cmd.spawn().context("spawning the interactive sandbox")?;
-    send_request(&mut child, &request, None).await?;
+
+    // The shim reads its one request line off fd 0, then execs the command, which
+    // inherits fd 0. So we must send the request line and then keep feeding the
+    // command's stdin — NOT shut it down as the one-shot paths do. Closing it here
+    // (the old bug) handed `bash -l` an immediate EOF, so `cowboy shell` exited at
+    // once instead of giving an interactive shell. Write the request, then pump the
+    // process's own stdin (the user's terminal) into the child for its lifetime.
+    let mut child_stdin = child.stdin.take().context("sandbox stdin unavailable")?;
+    let mut line = serde_json::to_vec(&request)?;
+    debug_assert!(!line.contains(&b'\n'), "the request must be a single line");
+    line.push(b'\n');
+    child_stdin
+        .write_all(&line)
+        .await
+        .context("sending the shim request")?;
+
+    // Copy terminal stdin -> child stdin until either side ends; then the child's
+    // stdin closes (EOF), which is the normal way an interactive shell exits on
+    // Ctrl-D. Runs as a detached task so we can still await the child.
+    let pump = tokio::spawn(async move {
+        let mut term_stdin = tokio::io::stdin();
+        let _ = tokio::io::copy(&mut term_stdin, &mut child_stdin).await;
+        let _ = child_stdin.shutdown().await;
+    });
+
     let status = child.wait().await.context("waiting for the shell")?;
+    // The shell exited; stop pumping (the copy task may still be blocked on a
+    // terminal read). Aborting drops `child_stdin`, closing the pipe.
+    pump.abort();
     Ok(ExecResult {
         exit_code: status.code().unwrap_or(-1),
     })

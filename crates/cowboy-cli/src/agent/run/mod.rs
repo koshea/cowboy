@@ -328,7 +328,11 @@ fn setup_hash(cmds: &[String]) -> String {
 async fn exec_subagent(plan: SubagentPlan) -> String {
     use std::os::unix::process::ExitStatusExt;
     let mut cmd = tokio::process::Command::new(&plan.exe);
-    cmd.arg(&plan.task)
+    // `--` before the task so a task that happens to start with `-` (e.g.
+    // "-v refactoring" or "--wip") is parsed as the positional TASK, not mistaken
+    // for a flag by the child's clap parser — which would fail the subagent to start.
+    cmd.arg("--")
+        .arg(&plan.task)
         .current_dir(&plan.root)
         .env("COWBOY_SUBAGENT_DEPTH", plan.child_depth.to_string())
         // Assign the child its session id so its journal lands at a path the parent

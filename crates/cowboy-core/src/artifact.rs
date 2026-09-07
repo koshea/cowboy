@@ -90,11 +90,33 @@ pub struct ArtifactRef {
     pub created_ms: u64,
 }
 
+impl ArtifactRef {
+    /// Whether `path` is a safe session-relative path (no absolute root, no `..`
+    /// component). `add_in` always produces `artifacts/<name>`, so this only ever
+    /// rejects a hand-crafted or tampered index entry — before it can `join` out of
+    /// the session dir on read/promotion.
+    fn has_safe_path(&self) -> bool {
+        use std::path::Component;
+        !self.path.as_os_str().is_empty()
+            && self
+                .path
+                .components()
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    }
+}
+
 fn index_path(session_dir: &Path) -> PathBuf {
     session_dir.join("artifacts.jsonl")
 }
 
 /// All artifacts recorded for a session, in publish order (absent/empty → []).
+///
+/// Entries whose `path` is not a safe session-relative path are dropped: the index
+/// is a jsonl file inside the (agent-writable) session dir, and both `get_in` and
+/// ranch `promote_artifacts` `join` `path` onto the session dir and read it. A ref
+/// with `../…` or an absolute path would otherwise read/copy a host file outside the
+/// session — an exfiltration primitive when a workstream's artifacts are promoted
+/// into the committed ranch store. Filtering here protects every consumer at once.
 pub fn list_in(session_dir: &Path) -> Vec<ArtifactRef> {
     let Ok(text) = std::fs::read_to_string(index_path(session_dir)) else {
         return Vec::new();
@@ -102,6 +124,7 @@ pub fn list_in(session_dir: &Path) -> Vec<ArtifactRef> {
     text.lines()
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<ArtifactRef>(l).ok())
+        .filter(|a| a.has_safe_path())
         .collect()
 }
 
@@ -233,6 +256,38 @@ mod tests {
     #[test]
     fn missing_index_is_empty() {
         assert!(list_in(&tmp()).is_empty());
+    }
+
+    /// A tampered/hand-crafted index entry whose `path` escapes the session dir
+    /// (`../…` or absolute) is dropped by `list_in`, so neither `get_in` nor ranch
+    /// promotion can read/copy a host file outside the session. (low finding)
+    #[test]
+    fn an_index_entry_with_a_traversing_path_is_dropped() {
+        let dir = tmp();
+        // A legitimate artifact, plus two hand-written malicious index lines.
+        add_in(&dir, "s", ArtifactKind::Other, "ok", "hi", None, 1).unwrap();
+        let index = dir.join("artifacts.jsonl");
+        let mut text = std::fs::read_to_string(&index).unwrap();
+        text.push_str(
+            "{\"id\":\"a9998\",\"session_id\":\"s\",\"kind\":\"other\",\"title\":\"evil\",\
+             \"path\":\"../../../../etc/passwd\",\"created_ms\":2}\n",
+        );
+        text.push_str(
+            "{\"id\":\"a9999\",\"session_id\":\"s\",\"kind\":\"other\",\"title\":\"evil2\",\
+             \"path\":\"/etc/hostname\",\"created_ms\":3}\n",
+        );
+        std::fs::write(&index, &text).unwrap();
+
+        let listed = list_in(&dir);
+        assert_eq!(
+            listed.len(),
+            1,
+            "traversing/absolute entries must be filtered out"
+        );
+        assert_eq!(listed[0].title, "ok");
+        // And they can't be fetched by id either.
+        assert!(get_in(&dir, "a9998").is_none());
+        assert!(get_in(&dir, "a9999").is_none());
     }
 
     /// A corrupt (unparseable) index line must not cause the next id to collide with

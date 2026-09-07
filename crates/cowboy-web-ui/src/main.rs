@@ -596,11 +596,24 @@ fn markdown(src: &str) -> Html {
 }
 
 /// Allow only obviously-safe link schemes (block `javascript:`, `data:`, etc.).
+/// Allow only obviously-safe link schemes (block `javascript:`, `data:`, etc.),
+/// and reject any control character.
+///
+/// The URL is model-controlled and flows into raw HTML (`push_html` →
+/// `from_html_unchecked`), so this must be at least as strict as the TUI's
+/// `markdown::is_safe_url`: an embedded control character (newline, etc.) could
+/// break out of the `href` attribute context. Relative (`/`) and anchor (`#`)
+/// targets are allowed here — unlike the TUI — because they are legitimate in a
+/// browser `href` and cannot carry a scheme.
 fn is_safe_url(url: &str) -> bool {
+    if url.chars().any(|c| c.is_control()) {
+        return false;
+    }
     let u = url.trim_start();
-    u.starts_with("http://")
-        || u.starts_with("https://")
-        || u.starts_with("mailto:")
+    let scheme_ok = |p: &str| u.get(..p.len()).is_some_and(|h| h.eq_ignore_ascii_case(p));
+    scheme_ok("http://")
+        || scheme_ok("https://")
+        || scheme_ok("mailto:")
         || u.starts_with('/')
         || u.starts_with('#')
 }
@@ -706,4 +719,32 @@ fn plan_mark(status: &str) -> &'static str {
 
 fn main() {
     yew::Renderer::<App>::new().render();
+}
+
+
+#[cfg(test)]
+mod url_tests {
+    use super::is_safe_url;
+
+    #[test]
+    fn is_safe_url_matches_the_tui_hardening() {
+        // Allowed schemes (case-insensitive) + relative/anchor targets.
+        assert!(is_safe_url("https://example.com/a?b=c#d"));
+        assert!(is_safe_url("HTTP://EXAMPLE.COM"));
+        assert!(is_safe_url("mailto:someone@example.com"));
+        assert!(is_safe_url("/relative/path"));
+        assert!(is_safe_url("#anchor"));
+
+        // Dangerous schemes are blocked.
+        assert!(!is_safe_url("javascript:alert(1)"));
+        assert!(!is_safe_url("JavaScript:alert(1)"));
+        assert!(!is_safe_url("data:text/html,<script>"));
+        assert!(!is_safe_url("vbscript:msgbox"));
+
+        // Control characters are rejected — the parity gap with the TUI. An href
+        // built into raw HTML must not carry a newline that could break the context.
+        assert!(!is_safe_url("https://example.com/\n"));
+        assert!(!is_safe_url("/path\twith\ttabs"));
+        assert!(!is_safe_url("https://exa\u{0}mple.com"));
+    }
 }

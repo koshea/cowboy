@@ -882,3 +882,26 @@ pub enum ProcCommand {
     /// Stream logs for a process.
     Logs { name: String },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A subagent task that starts with `-` must survive the child's clap parse. The
+    /// parent spawns `cowboy -- <task>` (see `exec_subagent`); the `--` makes clap
+    /// treat the hyphen-leading string as the positional TASK, not a flag — otherwise
+    /// a task like "-v refactor" or "--wip" fails the subagent to start.
+    #[test]
+    fn a_hyphen_leading_task_parses_as_the_positional_after_dashdash() {
+        let cli = Cli::try_parse_from(["cowboy", "--", "-v refactor the parser"])
+            .expect("`cowboy -- <task>` should parse");
+        assert_eq!(cli.task.as_deref(), Some("-v refactor the parser"));
+
+        let cli = Cli::try_parse_from(["cowboy", "--", "--wip"]).expect("parse");
+        assert_eq!(cli.task.as_deref(), Some("--wip"));
+
+        // An ordinary task still parses with or without the separator.
+        let cli = Cli::try_parse_from(["cowboy", "fix the tests"]).unwrap();
+        assert_eq!(cli.task.as_deref(), Some("fix the tests"));
+    }
+}
