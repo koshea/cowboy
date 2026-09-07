@@ -23,8 +23,8 @@ static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 mod handlers;
 mod support;
 use support::{
-    emit_delta, fileop_summary, parse_args, render_plan, render_transcript, self_exe,
-    tool_signature, truncate, unified_diff,
+    emit_delta, fileop_summary, parse_args, raw_tool_signature, render_plan, render_transcript,
+    self_exe, tool_signature, truncate, unified_diff,
 };
 
 /// Default agent system prompt (see plan §10.3).
@@ -261,6 +261,21 @@ pub struct AgentLoop<'a> {
     last_obs_sig: Option<String>,
     last_obs_changed: bool,
     tool_repeat: u32,
+    /// Companion to `tool_repeat` that counts consecutive turns with the same
+    /// *normalized* call **regardless of whether the result changed**. The strict
+    /// guard (`tool_repeat`) intentionally exempts a repeated call whose output
+    /// keeps changing, because that is legitimate polling. But a *fixating* model
+    /// re-runs one inspection with cosmetic churn (which `tool_signature` now folds
+    /// away) and gets trivially-different output each time — polling-shaped, yet no
+    /// progress. This counter gives that pattern a separate, higher-threshold
+    /// backstop so a churner stops well before `max_iterations` without shortening
+    /// the rope for genuine polling.
+    same_call_repeat: u32,
+    /// The previous turn's *raw* (un-normalized) call signature. Distinguishes
+    /// byte-identical repetition (polling — the same command re-run for fresh
+    /// output) from cosmetic churn (the command edited each turn but folding to the
+    /// same normalized signature). Only the latter feeds `same_call_repeat`.
+    last_raw_tool_sig: Option<String>,
     /// Plan mode: while on, file-mutating tools (`edit`/`write`) are refused so
     /// the agent proposes a plan and waits for the user to approve (`/go`). Host-
     /// enforced — the agent can't edit during planning even if it tries.
@@ -684,6 +699,8 @@ impl<'a> AgentLoop<'a> {
             last_obs_sig: None,
             last_obs_changed: false,
             tool_repeat: 0,
+            same_call_repeat: 0,
+            last_raw_tool_sig: None,
             planning: false,
             mcp: None,
             fallback_model: None,
@@ -2028,15 +2045,106 @@ impl<'a> AgentLoop<'a> {
             // iteration's tool results, so comparing it with the one before tells us
             // whether repeating the call actually changed anything.
             let sig = tool_signature(&response.tool_calls);
+            let raw_sig = raw_tool_signature(&response.tool_calls);
             let same_call = self.last_tool_sig.as_deref() == Some(sig.as_str());
+            let same_raw = self.last_raw_tool_sig.as_deref() == Some(raw_sig.as_str());
             if same_call && !self.last_obs_changed {
                 self.tool_repeat += 1;
             } else {
                 self.tool_repeat = 0;
             }
+            // Separately, count *cosmetic churn*: the normalized call is unchanged
+            // but the raw command was edited each turn (a different counter, an
+            // added `echo`, reflowed whitespace). That is the pattern the strict
+            // guard exempts as "polling" because the output changes — yet it is no
+            // progress. Byte-identical repetition (`same_raw`) is real polling and
+            // must NOT count here; it is the strict guard's job.
+            if same_call && !same_raw {
+                self.same_call_repeat += 1;
+            } else {
+                self.same_call_repeat = 0;
+            }
             self.last_tool_sig = Some(sig);
+            self.last_raw_tool_sig = Some(raw_sig);
             const LOOP_NUDGE_AT: u32 = 3;
             const LOOP_ABORT_AT: u32 = 6;
+            // Cosmetic churn escalates in three stages, each stronger than the last,
+            // because the goal is to change the model's behavior — not just to stop.
+            // A model editing one inspection each turn (a different counter, an added
+            // `echo`, reflowed whitespace) gets a nudge, then a forceful directive it
+            // must act on, and only a model that ignores even that is hard-stopped —
+            // still an order of magnitude below max_iterations. `same_call_repeat`
+            // counts only churn (same normalized call, edited raw command).
+            const CHURN_NUDGE_AT: u32 = 8;
+            const CHURN_INTERVENE_AT: u32 = 12;
+            const CHURN_ABORT_AT: u32 = 15;
+            if self.same_call_repeat >= CHURN_ABORT_AT {
+                // It ignored the forceful directive and kept churning. Stop for real.
+                let reps = self.same_call_repeat + 1;
+                self.ui.notice(&format!(
+                    "loop detected: same inspection re-run {reps}× with only cosmetic changes and \
+                     no real progress, despite an explicit instruction to stop — ending the turn"
+                ));
+                for c in &response.tool_calls {
+                    self.push_tool_result(
+                        &c.id,
+                        "[loop guard] aborted: you repeated the same inspection after being told to \
+                         stop. The turn is over. No further tool calls will run.",
+                    );
+                }
+                return Ok(None);
+            }
+            if self.same_call_repeat >= CHURN_INTERVENE_AT {
+                // Strong intervention: a forceful, specific directive injected as the
+                // tool result, then `continue` so the model actually gets to act on
+                // it. This is the "do something different" message — it forbids the
+                // repeat, spells out the only acceptable next moves, and warns that
+                // ignoring it ends the turn.
+                let reps = self.same_call_repeat + 1;
+                self.ui.notice(
+                    "loop guard: STRONG intervention — same inspection churned; ordering a \
+                     different action",
+                );
+                for c in &response.tool_calls {
+                    self.push_tool_result(
+                        &c.id,
+                        &format!(
+                        "[loop guard — STOP] You have now run essentially this SAME inspection \
+                         {reps} times, changing only cosmetic details (a counter, an `echo`, \
+                         whitespace, `2>&1`). This is producing NO new information and NO progress \
+                         on the task.\n\n\
+                         Do NOT run this command — or a variation of it — again. That request will \
+                         be refused.\n\n\
+                         You have enough information. Take ONE of these actions now:\n\
+                         1. State the conclusion you can already draw from the output you have, \
+                         then move to the NEXT distinct step of the task.\n\
+                         2. If you are blocked, investigate a DIFFERENT file, command, or angle — \
+                         not this one.\n\
+                         3. If the task is complete, call `final` with your answer.\n\n\
+                         If your very next action is another variant of this same inspection, the \
+                         turn will be ended immediately."
+                    ),
+                    );
+                }
+                continue;
+            }
+            if self.same_call_repeat >= CHURN_NUDGE_AT {
+                // First warning: gentle course-correction before the strong directive.
+                let reps = self.same_call_repeat + 1;
+                self.ui.notice(
+                    "loop guard: same inspection re-run with cosmetic tweaks — nudging a change of \
+                     approach",
+                );
+                for c in &response.tool_calls {
+                    self.push_tool_result(&c.id, &format!(
+                        "[loop guard] You have re-run essentially this same inspection {reps}× with \
+                         only cosmetic changes (a different counter, an added `echo`, reflowed \
+                         whitespace). This is not progress. Draw a conclusion from what you already \
+                         have and move on, or call `final` if the task is complete."
+                    ));
+                }
+                continue;
+            }
             if self.tool_repeat >= LOOP_ABORT_AT {
                 let reps = self.tool_repeat + 1;
                 self.ui.notice(&format!(
@@ -3342,6 +3450,112 @@ mod tests {
         // And the sandbox really was asked to run it — the UI showing a command is
         // not the same as the command reaching the sandbox.
         assert_eq!(*ran.lock().unwrap(), vec!["ls".to_string()]);
+    }
+
+    /// A model that re-runs one inspection with only cosmetic changes (a different
+    /// counter, an added `echo`, reflowed whitespace) — and gets trivially
+    /// different output each time — is escalated through the churn ladder (nudge →
+    /// strong intervention → abort) well before `max_iterations`, even though the
+    /// strict same-call/same-result guard exempts it as "polling". Regression test
+    /// for a real session that burned all 100 iterations this way.
+    #[tokio::test]
+    async fn cosmetic_churn_escalates_then_aborts_before_max_iterations() {
+        // `counting()` returns a *different* output per call, so `last_obs_changed`
+        // is true every turn — the polling exemption that used to let this run.
+        let sandbox = FakeSandbox::counting();
+        let ran = sandbox.log();
+
+        // The same core inspection, each turn with a distinct cosmetic tweak the old
+        // guard treated as a different command. Generate well past CHURN_ABORT_AT so
+        // the whole ladder is exercised; every variant folds to the same normalized
+        // signature but has a different raw command.
+        let core = r#"git show HEAD -- ranch.rs | grep -E \"test|dead-sid\""#;
+        let responses: Vec<ChatResponse> = (0..25)
+            .map(|i| {
+                // A unique cosmetic tail per turn: a trailing echo carrying the turn
+                // number (narration the normalizer strips) plus alternating counters.
+                let tail = if i % 2 == 0 {
+                    format!(" | wc -l; echo \\\"step {i}\\\"")
+                } else {
+                    format!(" ; echo \\\"probe {i}\\\" 2>&1")
+                };
+                ChatResponse {
+                    truncated: false,
+                    usage: None,
+                    reasoning: None,
+                    content: None,
+                    tool_calls: vec![tool_call(
+                        &format!("c{i}"),
+                        "shell",
+                        &format!(r#"{{"command":"cd /workspace && {core}{tail}"}}"#),
+                    )],
+                }
+            })
+            .collect();
+        let total = responses.len();
+
+        let behavior = cowboy_core::config::AgentBehavior::default(); // max_iterations 100
+        let cancel = CancellationToken::new();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            sandbox,
+            behavior,
+            200_000,
+            cancel,
+            &mut ui,
+        );
+        let out = agent.run("review the ranch commit").await.unwrap();
+
+        // The intervention must actually reach the model as a forceful directive to
+        // do something different — not merely a UI notice. It is pushed as a tool
+        // result, so it lands in the conversation the model sees on its next turn.
+        // Capture this before dropping `agent` (which holds the &mut borrow of `ui`).
+        let strong_in_history = agent.messages.iter().any(|m| {
+            m.role == Role::Tool
+                && m.content.contains("[loop guard — STOP]")
+                && m.content.contains("Do NOT run this command")
+        });
+        let ran_count = ran.lock().unwrap().len();
+        drop(agent);
+
+        // Stopped without a final answer …
+        assert_eq!(out, None);
+        // … having climbed the full escalation ladder, in order: a gentle nudge, a
+        // STRONG intervention that orders a different action, then the hard abort.
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("nudging a change of approach")),
+            "expected the nudge stage, got: {:?}",
+            ui.notices
+        );
+        assert!(
+            ui.notices.iter().any(|n| n.contains("STRONG intervention")),
+            "expected the strong-intervention stage, got: {:?}",
+            ui.notices
+        );
+        assert!(
+            ui.notices.iter().any(|n| n.contains("ending the turn")),
+            "expected the hard-abort stage, got: {:?}",
+            ui.notices
+        );
+        assert!(
+            strong_in_history,
+            "the strong 'do something different' directive must be delivered to the model"
+        );
+        // Never the iteration cap.
+        assert!(
+            !ui.notices
+                .iter()
+                .any(|n| n.contains("reached max_iterations")),
+            "should have stopped on churn, not the iteration cap"
+        );
+        // … and it stopped well before exhausting the scripted turns.
+        assert!(
+            ran_count < total,
+            "guard should stop before running all {total} variants"
+        );
     }
 
     #[test]
