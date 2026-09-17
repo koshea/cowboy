@@ -20,7 +20,11 @@ agent can't reach the host directly, so the loop does it).
 | `request_path` | host | Ask the user for access to a host path outside the workspace. Approved paths apply to the *next* command. Credential stores are always refused. |
 | `final` | — | Finish the current *turn* with a summary. |
 | `ask_user` | host | Ask the user a question, optionally with selectable options. |
-| `subagent` | host | Delegate a focused sub-task to a fresh subagent in the same sandbox. |
+| `subagent` | host | Delegate a focused sub-task to a fresh subagent in the same sandbox. **Asynchronous**: returns a job id, and the result is delivered as a message when the job finishes. |
+| `jobs` | host | List the background subagent jobs, with each worker's turn usage. |
+| `wait` | host | Park until a background job reports. Bounded, and broken by an interrupt or by anything you type. |
+| `job_reply` | host | Answer a worker that asked for more turns: `grant`, `redirect`, `wrap_up`, or `stop`. |
+| `request_turns` | host | (Workers only) Report progress and ask the foreman for more turns. |
 
 The exact, current list is asserted by a test and rendered in the
 [CLI reference](../reference/cli.md) companion; adding a tool follows the pattern

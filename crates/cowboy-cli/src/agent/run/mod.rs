@@ -23,8 +23,10 @@ static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 mod handlers;
 mod support;
 use support::{
-    emit_delta, fileop_summary, parse_args, raw_tool_signature, render_plan, render_transcript,
-    self_exe, tool_signature, truncate, unified_diff,
+    delegation_available, effective_max_depth, emit_delta, fileop_summary, grant_notice,
+    grant_stage, is_coordination_only, parse_args, process_is_gone, raw_tool_signature,
+    render_plan, render_transcript, reread_notice, self_exe, system_prompt, tool_signature,
+    tool_surface, truncate, unified_diff, GrantStage, IterationBudget, ProgressTracker,
 };
 
 /// Default agent system prompt (see plan §10.3).
@@ -93,10 +95,10 @@ status, changed files, decisions, contracts, validation, risks, next steps) so t
 next worker can continue, then call `final` summarizing what changed, what was \
 validated, and remaining risks or follow-up work.";
 
-/// The crew-foreman delegation guidance, appended to the system prompt only in
-/// crew mode (a roster exists and delegation is enabled). In solo mode the
-/// selected model does all the work itself, so this isn't shown and the
-/// `subagent` tool isn't offered.
+/// The crew-foreman delegation guidance, appended to the system prompt only in crew
+/// mode (a roster exists and delegation is enabled) **and** only for a loop that can
+/// actually delegate. In solo mode — or in a worker already at the depth limit — this
+/// isn't shown and the `subagent` tool isn't offered.
 pub const FOREMAN_PROMPT: &str =
     "\n\nYou are the foreman of a crew. For focused, separable work, delegate it with the \
 `subagent` tool instead of doing everything yourself: describe the work by \
@@ -109,11 +111,30 @@ under `.claude/agents/`/`.cowboy/agents/` (`cowboy agents list`); adopt one by \
 passing `agent: <name>` to `subagent`. Delegate when work is scoped and separable \
 (exploration, test-writing, an independent component, a review pass); do it \
 yourself when the task is tiny, the hand-off costs more than the work, or it \
-needs continuous coordination with your current state. Prefer small, well-scoped \
-subagent tasks that return a concrete artifact. If a subagent result comes back \
-prefixed `[partial]`, it ran but did not finish cleanly — the text is its work so \
-far plus a session id. Treat that as a checkpoint: re-delegate continuing from \
-what's there (pass the prior work as `context`) rather than starting the task over.";
+needs continuous coordination with your current state.\n\n\
+Delegation is ASYNCHRONOUS. `subagent` returns a job id immediately and the worker \
+runs in the background — it does NOT return the answer. Keep working while it runs: \
+investigate something else, delegate more, or answer the user. Each result is \
+delivered to you automatically as a message when that job finishes; you never have \
+to poll for it. `jobs` lists what is running (with each worker's turn usage), and \
+`wait` parks you until something lands — use it only when you genuinely have nothing \
+else to do. You cannot call `final` while jobs are still running: their results are \
+part of the task.\n\n\
+Size each delegation to fit one worker. A worker starts with a small turn grant \
+scaled to its `effort`, so \"review these two crates\" or \"audit the whole repo\" \
+will run out mid-way; split that into one job per crate, module, or concern and fan \
+them out in parallel instead. A worker that needs more turns will report its progress \
+and ask you — you will get its report plus measured evidence (files read, edits made, \
+commands run, whether anything new happened) and reply with `job_reply`: `grant` more \
+turns when the report shows real progress, `redirect` when it is going the wrong way, \
+`wrap_up` to make it write up what it has, or `stop` when the work is no longer \
+wanted. Judge the evidence, not the worker's optimism: no new files, no edits and no \
+new commands means it is stuck, and more turns will not help.\n\n\
+Prefer small, well-scoped subagent tasks that return a concrete artifact. If a \
+subagent result comes back prefixed `[partial]`, it ran but did not finish cleanly — \
+the text is its work so far plus a session id. Treat that as a checkpoint: \
+re-delegate continuing from what's there (pass the prior work as `context`) rather \
+than starting the task over.";
 
 /// Extra guidance for a worker running *as* a subagent (depth > 0). Its result is
 /// captured from stdout by the foreman, so a single oversized tool call (e.g. a
@@ -130,6 +151,22 @@ arguments and lose everything. Instead `write` it to a file in the workspace as 
 you go, then `publish` it as an artifact by `path` and keep your final answer to a \
 short summary that points at the file. Save progress incrementally so partial work \
 survives even if you don't finish.";
+
+/// Guidance for a worker that has a turn grant *and* a live channel to ask for more.
+/// Kept separate from [`SUBAGENT_PROMPT`] because a worker whose roster disabled
+/// supervision has no one to ask, and telling it to ask would be advice it cannot act
+/// on.
+pub const TURN_REQUEST_PROMPT: &str =
+    "\n\nYou have a limited grant of turns for this task, and you will be told when it \
+is running low. The grant is deliberately small: if the task turns out to be bigger \
+than it, do NOT quietly run out — call `request_turns` with an honest report (what you \
+have established, what is left, the next concrete step, how many more turns you need) \
+and your foreman will decide. It may grant the turns, redirect you, tell you to write \
+up what you have, or stop the work. Cowboy attaches measured evidence of your progress \
+to the request — files read, edits made, commands run, and whether the last few steps \
+produced anything new — so an accurate report is in your interest, and going in circles \
+is visible whatever you say about it. Running out of turns without asking loses the \
+work; asking early costs almost nothing.";
 
 /// USD-per-1M-token pricing for the cost estimate. `cached_input` defaults to
 /// `input` when the model config names no cache discount.
@@ -176,6 +213,70 @@ pub struct AgentLoop<'a> {
     /// One-shot notice that older reasoning is being shed, so a long session does not
     /// repeat it every turn.
     reasoning_shed_notified: bool,
+    /// This turn's iteration budget: a small effort-scaled grant for a delegated
+    /// worker (extendable by the foreman, bounded host-side), or plain
+    /// `max_iterations` for the foreman. Reset at the start of every turn.
+    budget: IterationBudget,
+    /// The highest grant-depletion stage already announced this turn, so each nudge
+    /// fires once instead of on every iteration past the threshold.
+    grant_stage_seen: GrantStage,
+    /// What this session has actually read, edited and run — the host's own measure of
+    /// whether the worker is making progress, independent of what it claims.
+    progress: ProgressTracker,
+    /// Iterations of zero novelty that trigger a stall intervention (0 = off), from
+    /// the roster's `delegation.stall_window`.
+    stall_window: u32,
+    /// How many stall interventions this turn has needed. Escalates the wording, and
+    /// (for a supervised worker) is what turns a second stall into a forced progress
+    /// report rather than another directive.
+    stall_count: u32,
+    /// Background subagent jobs. **Session-scoped**, not turn-scoped: interrupting the
+    /// foreman to correct it must not throw away running children, so the registry
+    /// outlives `set_cancel` and every turn.
+    jobs: crate::agent::jobs::JobRegistry,
+    /// Where spawned jobs report Started / TurnRequest / Finished.
+    job_tx: tokio::sync::mpsc::UnboundedSender<crate::agent::jobs::JobEvent>,
+    job_rx: tokio::sync::mpsc::UnboundedReceiver<crate::agent::jobs::JobEvent>,
+    /// Session-wide fan-out cap (`delegation.max_parallel`). Replaces the old
+    /// `buffer_unordered` bound, which only capped a single batch — once dispatches
+    /// spanned turns, nothing bounded them.
+    fanout_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Fired to stop every running job. Cloneable and independent of `&mut self`, so
+    /// the worker can honour "stop the subagents" while a turn is in flight.
+    job_stopper: crate::agent::jobs::JobStopper,
+    /// This worker's own channel for asking its foreman for more turns. `None` for a
+    /// foreman, and for any worker whose roster disabled supervision.
+    control: Option<crate::agent::jobctl::ControlDir>,
+    /// How many turn requests this worker has made (the request sequence).
+    turn_requests: u32,
+    /// How many unanswered requests were resolved by the automatic extension. The
+    /// second one wraps up instead: an unattended foreman must not be able to keep a
+    /// worker running forever, nor to destroy its work by never answering.
+    auto_extensions: u32,
+    /// How long to wait for a verdict before falling back.
+    request_timeout: std::time::Duration,
+    /// Set once this worker has been told to wrap up (or stop). Terminal: it may spend
+    /// the turns it was given to write an answer, but it must not ask again. Without
+    /// this latch each wrap-up handed out a few more turns and then asked again, which
+    /// is how "wrap up" quietly became an unbounded extension.
+    wrapping_up: bool,
+    /// User input for the **running** turn.    ///
+    /// Typing while the agent works used to mean waiting: the message sat in the
+    /// worker's post-turn queue until the whole turn finished, which for an agentic turn
+    /// can be many minutes. Now it is delivered at the next iteration boundary, so
+    /// "also check the error path" lands on the next step instead of the next turn.
+    /// Boundary delivery rather than mid-flight: the history may only grow where a
+    /// complete assistant/tool exchange has closed.
+    steer_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    steer_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// The pid that spawned this worker, when it is a delegated one. Checked at
+    /// iteration boundaries so a worker whose parent was killed outright stops instead
+    /// of spending on work nobody will read.
+    parent_pid: Option<u32>,
+    /// Consecutive `final` calls refused because jobs were still running. Bounded: a
+    /// refusal loop is the one way this gate could wedge a session, so after a couple
+    /// of refusals the loop waits on the foreman's behalf instead.
+    final_refusals: u32,
     /// One-shot notice that the window cannot fit the reserve — a config problem, so
     /// repeating it every iteration would just bury the turn.
     zero_budget_warned: bool,
@@ -320,6 +421,15 @@ struct SubagentPlan {
     model: Option<String>,
     /// Per-task-type temperature override (routed via `COWBOY_TEMPERATURE`).
     temperature: Option<f32>,
+    /// Initial iteration grant for the child (effort-scaled), and the host-enforced
+    /// ceiling on however many extensions it later earns. `None` when the roster
+    /// disabled supervision, in which case the child falls back to
+    /// `agent.max_iterations`.
+    budget: Option<(u32, u32)>,
+    /// The host-side control directory this child reports turn requests through.
+    /// `None` when supervision is off or no state directory is available — the child
+    /// then simply cannot ask, and is not told it can.
+    control_dir: Option<std::path::PathBuf>,
     /// (category, effort, model, fell_back) for the lifecycle event.
     routed: Option<(String, String, String, bool)>,
 }
@@ -368,6 +478,20 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
     if let Some(t) = plan.temperature {
         cmd.env("COWBOY_TEMPERATURE", t.to_string());
     }
+    // The child's iteration budget: a small grant it must report progress to extend,
+    // and the ceiling it can never be granted past. Both are set here, host-side, so
+    // the worker cannot widen its own budget.
+    if let Some((grant, ceiling)) = plan.budget {
+        cmd.env(ENV_ITERATION_GRANT, grant.to_string())
+            .env(ENV_MAX_TOTAL_ITERATIONS, ceiling.to_string());
+    }
+    // The channel it asks for more turns on. Host-side, outside the workspace.
+    if let Some(dir) = &plan.control_dir {
+        cmd.env(crate::agent::jobctl::ENV_JOB_CONTROL_DIR, dir);
+    }
+    // So the child can notice if we are killed outright and stop rather than keep
+    // spending on work nobody will read.
+    cmd.env(ENV_PARENT_PID, std::process::id().to_string());
     match cmd.output().await {
         // Clean exit: the final answer is on stdout.
         Ok(o) if o.status.success() => {
@@ -405,6 +529,65 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         Err(e) => format!("subagent failed to start: {e}"),
     }
 }
+
+/// Watch a running child's control directory for turn requests and questions, forwarding
+/// each new one to the registry as a [`JobEvent`](crate::agent::jobs::JobEvent).
+///
+/// Never returns: it is a `select!` branch that runs for as long as the child does.
+/// `None` (no control directory) parks forever, which is the right shape for a child
+/// that cannot ask.
+async fn watch_turn_requests(
+    watch: Option<(
+        std::path::PathBuf,
+        String,
+        tokio::sync::mpsc::UnboundedSender<crate::agent::jobs::JobEvent>,
+    )>,
+) {
+    let Some((dir, id, tx)) = watch else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    // Requests are numbered from 1 and answered in order, so the watcher only ever
+    // looks for the next one — a re-read of an already-forwarded request would
+    // re-prompt the foreman about a question it has answered. Questions are a separate
+    // sequence for the same reason they are a separate file: they are a different
+    // conversation, and a worker can ask one without having asked for turns.
+    let mut next_seq = 1u32;
+    let mut next_question = 1u32;
+    loop {
+        tokio::time::sleep(REQUEST_POLL).await;
+        let path = dir.join(format!("request-{next_seq}.json"));
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            // A half-written file will parse on the next pass.
+            if let Ok(req) = serde_json::from_str::<crate::agent::jobctl::TurnRequest>(&text) {
+                let _ = tx.send(crate::agent::jobs::JobEvent::TurnRequest {
+                    id: id.clone(),
+                    seq: req.seq,
+                    report: format!("{}\n\nMeasured: {}", req.report.trim(), req.evidence),
+                    requested: req.requested,
+                    used: req.used,
+                });
+                next_seq = req.seq + 1;
+            }
+        }
+        let qpath = dir.join(format!("question-{next_question}.json"));
+        if let Ok(text) = tokio::fs::read_to_string(&qpath).await {
+            if let Ok(q) = serde_json::from_str::<crate::agent::jobctl::Question>(&text) {
+                let _ = tx.send(crate::agent::jobs::JobEvent::Question {
+                    id: id.clone(),
+                    seq: q.seq,
+                    question: q.question,
+                    options: q.options,
+                });
+                next_question = q.seq + 1;
+            }
+        }
+    }
+}
+
+/// How often each side polls the control directory. Short enough that a foreman's
+/// answer feels immediate, long enough to be free.
+const REQUEST_POLL: std::time::Duration = std::time::Duration::from_millis(400);
 
 /// Spend + token estimates rolled up from one finished subagent.
 #[derive(Default, Clone, Copy)]
@@ -621,6 +804,81 @@ const REASONING_TURNS_KEPT: usize = 2;
 /// Maximum subagent nesting depth (prevents runaway recursion).
 const MAX_SUBAGENT_DEPTH: usize = 2;
 
+/// Why [`AgentLoop::await_job_news`] stopped waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Woke {
+    /// A job reported something, and it was delivered to the conversation.
+    News,
+    /// The user said something; acting on that comes before waiting.
+    Steered,
+    /// The bound elapsed (or there was nothing to wait for).
+    TimedOut,
+    /// The turn was cancelled.
+    Cancelled,
+}
+
+/// The outcome of a worker asking its foreman for more turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestOutcome {
+    /// The budget grew; carry on.
+    Continue,
+    /// Finish now, with just enough turns to write the answer.
+    WrapUp,
+    /// The work was abandoned; report what there is and stop.
+    Stop,
+    /// There is nobody to ask (no control channel).
+    Unavailable,
+    /// The turn was cancelled while waiting.
+    Interrupted,
+}
+
+/// What a worker is told when it is out of turns for good.
+const WRAP_UP_DIRECTIVE: &str = "[wrap up] You have only enough turns left to report. Stop \
+investigating and stop editing. Write up what you established, what you did NOT get to, and \
+anything the next worker needs — then call `final` with it. An unreported result is a wasted \
+delegation.";
+
+/// Turns handed out when a request goes unanswered, once.
+const AUTO_EXTENSION_TURNS: u32 = 10;
+
+/// Hard cap on how many times one worker may ask. The ceiling already bounds total
+/// turns; this bounds the *ping-pong*, so a worker and a foreman cannot spend a
+/// session negotiating.
+const MAX_TURN_REQUESTS: u32 = 6;
+
+/// How long `wait` parks by default, and the hard cap on what a model can ask for. A
+/// model that asks to wait an hour has misjudged; the ceiling keeps a mistake cheap.
+const WAIT_DEFAULT_SECONDS: u64 = 300;
+const WAIT_MAX_SECONDS: u64 = 1800;
+
+/// Maximum consecutive `final` calls refused because subagents are still running.
+/// After this the loop waits for them itself: arguing with the model forever is worse
+/// than a bounded wait.
+const MAX_FINAL_REFUSALS: u32 = 2;
+
+/// How long that fallback wait lasts before the turn finishes regardless.
+const FINAL_AUTO_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Env: the pid of the process that spawned this worker.
+///
+/// Session-scoped jobs deliberately outlive individual turns, so a worker is only
+/// reaped by its parent asking it to stop — and a parent that is `kill -9`ed never
+/// asks. The child therefore checks for itself.
+///
+/// `PR_SET_PDEATHSIG` would be the kernel's answer to this, and is deliberately not
+/// used: it fires when the *spawning thread* exits, not the process, which on a
+/// multi-thread tokio runtime means a worker can be killed the moment the pool
+/// retires whichever thread happened to spawn it. A liveness check at the worker's own
+/// iteration boundaries is slower to notice but cannot misfire.
+const ENV_PARENT_PID: &str = "COWBOY_PARENT_PID";
+
+/// Env: a delegated worker's initial iteration grant, set by the parent that
+/// spawned it. Absent for the foreman, which uses `agent.max_iterations`.
+const ENV_ITERATION_GRANT: &str = "COWBOY_ITERATION_GRANT";
+/// Env: the host-enforced ceiling on a delegated worker's total iterations. The
+/// foreman may grant extensions; it may not raise this.
+const ENV_MAX_TOTAL_ITERATIONS: &str = "COWBOY_MAX_TOTAL_ITERATIONS";
+
 impl<'a> AgentLoop<'a> {
     pub fn new(
         model: Box<dyn ModelClient>,
@@ -635,30 +893,36 @@ impl<'a> AgentLoop<'a> {
         let mut runtime: Box<dyn Sandbox> = Box::new(runtime);
         let runtime_status = runtime.status_channel();
         // Crew mode (roster + delegation enabled) gates the foreman guidance and
-        // the `subagent` tool; in solo mode the selected model works alone.
-        let crew_on = crate::cmd::crew::crew_enabled();
+        // the `subagent` tool — and so does depth: a worker already at the limit
+        // is offered neither, rather than being told to delegate and refused when
+        // it tries. Loaded once here; `dispatch_subagents` re-reads the roster per
+        // turn so a mid-session `cowboy crew` edit still takes effect on routing.
+        let crew_cfg = cowboy_core::crew::load().ok().flatten();
+        let crew_on = crew_cfg.as_ref().is_some_and(|c| c.enabled());
         let subagent_depth = std::env::var("COWBOY_SUBAGENT_DEPTH")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        let mut system = if crew_on {
-            format!("{SYSTEM_PROMPT}{FOREMAN_PROMPT}")
-        } else {
-            SYSTEM_PROMPT.to_string()
-        };
-        // A worker spawned as a subagent gets extra guidance to stream large
-        // outputs to a file rather than risk losing them to a truncated tool call.
-        if subagent_depth > 0 {
-            system.push_str(SUBAGENT_PROMPT);
-        }
-        let tools = if crew_on {
-            tools::definitions()
-        } else {
-            tools::definitions()
-                .into_iter()
-                .filter(|t| t.name != tools::TOOL_SUBAGENT)
-                .collect()
-        };
+        let can_delegate = delegation_available(crew_on, subagent_depth, crew_cfg.as_ref());
+        // Computed before the struct literal, which moves `behavior`.
+        let budget = IterationBudget::from_env(behavior.max_iterations);
+        // A worker may ask for more turns only if it has a grant *and* a live channel
+        // to ask on. With a grant but no channel it would block for the request
+        // timeout and be answered by the fallback — worse than not asking.
+        let control = crate::agent::jobctl::ControlDir::from_env();
+        let can_request_turns = budget.supervised && control.is_some();
+        let system = system_prompt(can_delegate, subagent_depth, can_request_turns);
+        let tools = tool_surface(can_delegate, can_request_turns);
+        let stall_window = crew_cfg
+            .as_ref()
+            .map(|c| c.delegation.stall_window)
+            .unwrap_or_else(|| cowboy_core::crew::Delegation::default().stall_window);
+        let delegation = crew_cfg
+            .as_ref()
+            .map(|c| c.delegation.clone())
+            .unwrap_or_default();
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             model,
             summarizer: None,
@@ -670,6 +934,33 @@ impl<'a> AgentLoop<'a> {
             reprime_attempts: 0,
             minimize_reasoning_next_turn: false,
             reasoning_shed_notified: false,
+            budget,
+            grant_stage_seen: GrantStage::Fine,
+            progress: ProgressTracker::default(),
+            stall_window,
+            stall_count: 0,
+            jobs: crate::agent::jobs::JobRegistry::new(
+                delegation.max_parallel_per_provider as usize,
+            ),
+            job_tx,
+            job_rx,
+            fanout_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                delegation.max_parallel.max(1) as usize,
+            )),
+            job_stopper: crate::agent::jobs::JobStopper::default(),
+            control: can_request_turns.then_some(control).flatten(),
+            turn_requests: 0,
+            auto_extensions: 0,
+            request_timeout: std::time::Duration::from_secs(
+                delegation.request_timeout_seconds.max(5),
+            ),
+            wrapping_up: false,
+            steer_rx,
+            steer_tx,
+            parent_pid: std::env::var(ENV_PARENT_PID)
+                .ok()
+                .and_then(|v| v.parse().ok()),
+            final_refusals: 0,
             zero_budget_warned: false,
             compaction_stuck_warned: false,
             tools_tokens_cache: std::sync::OnceLock::new(),
@@ -1899,216 +2190,267 @@ impl<'a> AgentLoop<'a> {
         self.messages.push(user_msg);
         self.task = Some(task.to_string());
 
-        for _ in 0..self.behavior.max_iterations {
-            if self.cancel.is_cancelled() {
-                self.ui.notice("interrupted");
-                return Ok(None);
-            }
+        // Fresh budget for this turn. For the foreman that is `max_iterations`, as
+        // before; a delegated worker starts on its grant and may earn extensions.
+        self.budget.used = 0;
+        self.grant_stage_seen = GrantStage::Fine;
 
-            // Stop before spending more if a usage budget has been reached.
-            if let Some(reason) = self.budget_reached() {
-                self.ui.notice(&reason);
-                return Ok(None);
-            }
-            self.maybe_warn_budget();
-
-            // Shed old reasoning first: it is the largest re-sent term for a
-            // reasoning model, and dropping it is free. Doing it before
-            // `fit_context` often means there is nothing left to compact, which
-            // saves a summarization call.
-            let freed = self.shed_reasoning();
-            if freed > 0 && !self.reasoning_shed_notified {
-                self.reasoning_shed_notified = true;
-                self.ui.notice(&format!(
-                    "trimmed ~{freed} tokens of older reasoning from the context \
-                     (kept the last {REASONING_TURNS_KEPT} turns)"
-                ));
-            }
-
-            // Keep history within the model's context window.
-            self.fit_context().await;
-
-            // Estimate the prompt tokens actually sent (post-pruning).
-            let prompt_est: u64 = self
-                .messages
-                .iter()
-                .map(|m| self.tokens_of(m))
-                .sum::<usize>() as u64;
-            // Report what the request costs before making it, so the pressure is
-            // visible in the UI and the journal rather than only when it overflows.
-            let usage = self.context_usage();
-            self.ui.context_usage(&usage);
-
-            let response = match self.call_model().await {
-                Ok(r) => r,
-                Err(_) if self.cancel.is_cancelled() => {
+        // The outer loop exists for the grant-and-request cycle: when the inner loop
+        // runs the grant out, a supervised worker reports to its foreman and may be
+        // given more, at which point the inner loop resumes. `extend_or_report` only
+        // returns true when the budget actually grew, so this cannot spin.
+        'grant: loop {
+            while !self.budget.exhausted() {
+                self.budget.used += 1;
+                if self.cancel.is_cancelled() {
                     self.ui.notice("interrupted");
                     return Ok(None);
                 }
-                // The provider doesn't serve this model (a retired/renamed id in
-                // the roster). Retrying can't help, but another model can: reroute
-                // once and re-run the turn, rather than failing the whole session.
-                Err(e) if self.model_unavailable(&e) && self.try_fallback_model() => continue,
-                Err(e) => {
-                    self.ui.notice(&format!("model error: {e}"));
-                    return Err(e);
+                // The parent was killed rather than asked to stop: nothing will read
+                // this work, so stop spending on it.
+                if self.orphaned() {
+                    self.ui
+                        .notice("the parent session is gone — stopping this subagent");
+                    self.seal_dangling_tool_calls("not run: the parent session went away");
+                    return Ok(None);
                 }
-            };
-            self.account_tokens(prompt_est, &response);
 
-            // Record the assistant turn (content + reasoning + any tool calls).
-            // Preserving reasoning is what lets agentic reasoning models keep
-            // their plan across tool-use turns instead of re-deriving (and
-            // looping on) the same step.
-            let assistant = Message {
-                role: Role::Assistant,
-                content: response.content.clone().unwrap_or_default(),
-                tool_call_id: None,
-                tool_calls: response.tool_calls.clone(),
-                reasoning: response.reasoning.clone(),
-            };
-            if let Some(l) = &mut self.logger {
-                l.log_message(&assistant);
-            }
-            self.messages.push(assistant);
+                // Background delegation reports in here, at the one point in the turn where
+                // the history can safely grow: a finished subagent's result (or a request
+                // for more turns) becomes a message the model sees on this very call.
+                self.drain_job_events();
+                // Anything the user typed while this turn has been running lands here
+                // too, rather than waiting for the turn to end.
+                self.drain_steering();
 
-            if response.tool_calls.is_empty() {
-                // No tool call: treat any content as an implicit final answer.
-                let msg = response.content.clone().unwrap_or_default();
-                if !msg.is_empty() {
-                    self.ui.final_message(&msg);
-                    return Ok(Some(msg));
-                }
-                // Truncated mid-generation with nothing usable: a reasoning model
-                // can spend its entire output budget thinking and never emit an
-                // answer or tool call. Warn once that its output limit may be too
-                // low, then retry: salvage the wasted reasoning into
-                // conclusions-so-far when the provider returned any, and ask the
-                // provider for minimal reasoning effort so the retry cannot spend
-                // the same budget the same way. Bounded by MAX_REPRIME_ATTEMPTS so a
-                // model that always truncates can't spin.
-                if response.truncated {
-                    self.warn_output_limit();
-                    if self.reprime_attempts < MAX_REPRIME_ATTEMPTS {
-                        let directive = self.reprime_directive(&response).await;
-                        self.reprime_attempts += 1;
-                        // Drop the empty assistant turn we just recorded so the
-                        // giant truncated reasoning isn't re-sent; the compact
-                        // directive replaces it.
-                        self.messages.pop();
-                        // Words alone did not work here — "don't think further" is
-                        // advice a reasoning model can ignore, and did. Turn the knob
-                        // the provider honours for the next call as well.
-                        self.minimize_reasoning_next_turn = true;
-                        self.ui.notice(
-                            "recovering: asking the model to answer without further thinking",
-                        );
-                        let msg = Message::user(directive);
+                // Tell the model where it stands *before* it plans the next step, so it
+                // can choose to converge (or ask for more turns) while it still has the
+                // turns to do either. Injected as a user message, once per stage.
+                let stage = grant_stage(self.budget.used, self.budget.granted);
+                if stage > self.grant_stage_seen {
+                    self.grant_stage_seen = stage;
+                    if let Some(note) = grant_notice(stage, &self.budget) {
+                        self.ui.notice(&note);
+                        let msg = Message::user(note);
                         if let Some(l) = &mut self.logger {
                             l.log_message(&msg);
                         }
                         self.messages.push(msg);
-                        continue;
                     }
-                    // Attempts spent: report it explicitly so the caller (a foreman
-                    // reading a subagent's stdout, or the user) sees the cause
-                    // instead of a silent empty result.
-                    let note = format!(
-                        "model hit its output-token limit while reasoning and produced no \
+                }
+
+                // Stop before spending more if a usage budget has been reached.
+                if let Some(reason) = self.budget_reached() {
+                    self.ui.notice(&reason);
+                    return Ok(None);
+                }
+                self.maybe_warn_budget();
+
+                // Shed old reasoning first: it is the largest re-sent term for a
+                // reasoning model, and dropping it is free. Doing it before
+                // `fit_context` often means there is nothing left to compact, which
+                // saves a summarization call.
+                let freed = self.shed_reasoning();
+                if freed > 0 && !self.reasoning_shed_notified {
+                    self.reasoning_shed_notified = true;
+                    self.ui.notice(&format!(
+                        "trimmed ~{freed} tokens of older reasoning from the context \
+                     (kept the last {REASONING_TURNS_KEPT} turns)"
+                    ));
+                }
+
+                // Keep history within the model's context window.
+                self.fit_context().await;
+
+                // Estimate the prompt tokens actually sent (post-pruning).
+                let prompt_est: u64 = self
+                    .messages
+                    .iter()
+                    .map(|m| self.tokens_of(m))
+                    .sum::<usize>() as u64;
+                // Report what the request costs before making it, so the pressure is
+                // visible in the UI and the journal rather than only when it overflows.
+                let usage = self.context_usage();
+                self.ui.context_usage(&usage);
+
+                let response = match self.call_model().await {
+                    Ok(r) => r,
+                    Err(_) if self.cancel.is_cancelled() => {
+                        self.ui.notice("interrupted");
+                        return Ok(None);
+                    }
+                    // The provider doesn't serve this model (a retired/renamed id in
+                    // the roster). Retrying can't help, but another model can: reroute
+                    // once and re-run the turn, rather than failing the whole session.
+                    Err(e) if self.model_unavailable(&e) && self.try_fallback_model() => continue,
+                    Err(e) => {
+                        self.ui.notice(&format!("model error: {e}"));
+                        return Err(e);
+                    }
+                };
+                self.account_tokens(prompt_est, &response);
+
+                // Record the assistant turn (content + reasoning + any tool calls).
+                // Preserving reasoning is what lets agentic reasoning models keep
+                // their plan across tool-use turns instead of re-deriving (and
+                // looping on) the same step.
+                let assistant = Message {
+                    role: Role::Assistant,
+                    content: response.content.clone().unwrap_or_default(),
+                    tool_call_id: None,
+                    tool_calls: response.tool_calls.clone(),
+                    reasoning: response.reasoning.clone(),
+                };
+                if let Some(l) = &mut self.logger {
+                    l.log_message(&assistant);
+                }
+                self.messages.push(assistant);
+
+                if response.tool_calls.is_empty() {
+                    // No tool call: treat any content as an implicit final answer.
+                    let msg = response.content.clone().unwrap_or_default();
+                    if !msg.is_empty() {
+                        self.ui.final_message(&msg);
+                        return Ok(Some(msg));
+                    }
+                    // Truncated mid-generation with nothing usable: a reasoning model
+                    // can spend its entire output budget thinking and never emit an
+                    // answer or tool call. Warn once that its output limit may be too
+                    // low, then retry: salvage the wasted reasoning into
+                    // conclusions-so-far when the provider returned any, and ask the
+                    // provider for minimal reasoning effort so the retry cannot spend
+                    // the same budget the same way. Bounded by MAX_REPRIME_ATTEMPTS so a
+                    // model that always truncates can't spin.
+                    if response.truncated {
+                        self.warn_output_limit();
+                        if self.reprime_attempts < MAX_REPRIME_ATTEMPTS {
+                            let directive = self.reprime_directive(&response).await;
+                            self.reprime_attempts += 1;
+                            // Drop the empty assistant turn we just recorded so the
+                            // giant truncated reasoning isn't re-sent; the compact
+                            // directive replaces it.
+                            self.messages.pop();
+                            // Words alone did not work here — "don't think further" is
+                            // advice a reasoning model can ignore, and did. Turn the knob
+                            // the provider honours for the next call as well.
+                            self.minimize_reasoning_next_turn = true;
+                            self.ui.notice(
+                                "recovering: asking the model to answer without further thinking",
+                            );
+                            let msg = Message::user(directive);
+                            if let Some(l) = &mut self.logger {
+                                l.log_message(&msg);
+                            }
+                            self.messages.push(msg);
+                            continue;
+                        }
+                        // Attempts spent: report it explicitly so the caller (a foreman
+                        // reading a subagent's stdout, or the user) sees the cause
+                        // instead of a silent empty result.
+                        let note = format!(
+                            "model hit its output-token limit while reasoning and produced no \
                          answer after {MAX_REPRIME_ATTEMPTS} recovery attempts — raise \
                          max_tokens in models.yaml, or lower reasoning_effort"
-                    );
-                    self.ui.notice(&note);
-                    return Ok(Some(format!("[incomplete] {note}")));
-                }
-                self.ui.notice(
-                    "the model didn't return anything to do — rephrase your request, \
+                        );
+                        self.ui.notice(&note);
+                        return Ok(Some(format!("[incomplete] {note}")));
+                    }
+                    self.ui.notice(
+                        "the model didn't return anything to do — rephrase your request, \
                      or try a different model with /model",
-                );
-                return Ok(None);
-            }
+                    );
+                    return Ok(None);
+                }
 
-            // The turn produced a tool call — real progress — so a later
-            // truncation gets a fresh reprime budget rather than the tail of an
-            // earlier recovery.
-            self.reprime_attempts = 0;
+                // The turn produced a tool call — real progress — so a later
+                // truncation gets a fresh reprime budget rather than the tail of an
+                // earlier recovery.
+                self.reprime_attempts = 0;
 
-            // Loop guard: an identical tool call that ALSO returns an identical
-            // result makes no progress (a degenerate model loop). Nudge after a few
-            // repeats, abort if it persists — so a runaway costs seconds, not a
-            // hundred API calls.
-            //
-            // The result must be part of the test: a byte-identical call whose
-            // output *changes* is legitimate polling (`sleep 5 && curl health`,
-            // watching a build, waiting on a lock), and keying the guard on the call
-            // alone aborted those runs outright. `obs` is the digest of the previous
-            // iteration's tool results, so comparing it with the one before tells us
-            // whether repeating the call actually changed anything.
-            let sig = tool_signature(&response.tool_calls);
-            let raw_sig = raw_tool_signature(&response.tool_calls);
-            let same_call = self.last_tool_sig.as_deref() == Some(sig.as_str());
-            let same_raw = self.last_raw_tool_sig.as_deref() == Some(raw_sig.as_str());
-            if same_call && !self.last_obs_changed {
-                self.tool_repeat += 1;
-            } else {
-                self.tool_repeat = 0;
-            }
-            // Separately, count *cosmetic churn*: the normalized call is unchanged
-            // but the raw command was edited each turn (a different counter, an
-            // added `echo`, reflowed whitespace). That is the pattern the strict
-            // guard exempts as "polling" because the output changes — yet it is no
-            // progress. Byte-identical repetition (`same_raw`) is real polling and
-            // must NOT count here; it is the strict guard's job.
-            if same_call && !same_raw {
-                self.same_call_repeat += 1;
-            } else {
-                self.same_call_repeat = 0;
-            }
-            self.last_tool_sig = Some(sig);
-            self.last_raw_tool_sig = Some(raw_sig);
-            const LOOP_NUDGE_AT: u32 = 3;
-            const LOOP_ABORT_AT: u32 = 6;
-            // Cosmetic churn escalates in three stages, each stronger than the last,
-            // because the goal is to change the model's behavior — not just to stop.
-            // A model editing one inspection each turn (a different counter, an added
-            // `echo`, reflowed whitespace) gets a nudge, then a forceful directive it
-            // must act on, and only a model that ignores even that is hard-stopped —
-            // still an order of magnitude below max_iterations. `same_call_repeat`
-            // counts only churn (same normalized call, edited raw command).
-            const CHURN_NUDGE_AT: u32 = 8;
-            const CHURN_INTERVENE_AT: u32 = 12;
-            const CHURN_ABORT_AT: u32 = 15;
-            if self.same_call_repeat >= CHURN_ABORT_AT {
-                // It ignored the forceful directive and kept churning. Stop for real.
-                let reps = self.same_call_repeat + 1;
-                self.ui.notice(&format!(
+                // Coordination-only batches skip both progress guards. A foreman with four
+                // workers in flight legitimately calls `jobs` — or `wait` — several times
+                // with identical arguments and identical output, which is precisely the
+                // shape the repetition guard ends a turn for; and waiting on a worker is not
+                // "going in circles", so it must not feed the novelty metric either.
+                let coordination = is_coordination_only(&response.tool_calls);
+
+                if !coordination {
+                    // Loop guard: an identical tool call that ALSO returns an identical
+                    // result makes no progress (a degenerate model loop). Nudge after a few
+                    // repeats, abort if it persists — so a runaway costs seconds, not a
+                    // hundred API calls.
+                    //
+                    // The result must be part of the test: a byte-identical call whose
+                    // output *changes* is legitimate polling (`sleep 5 && curl health`,
+                    // watching a build, waiting on a lock), and keying the guard on the call
+                    // alone aborted those runs outright. `obs` is the digest of the previous
+                    // iteration's tool results, so comparing it with the one before tells us
+                    // whether repeating the call actually changed anything.
+                    let sig = tool_signature(&response.tool_calls);
+                    let raw_sig = raw_tool_signature(&response.tool_calls);
+                    let same_call = self.last_tool_sig.as_deref() == Some(sig.as_str());
+                    let same_raw = self.last_raw_tool_sig.as_deref() == Some(raw_sig.as_str());
+                    if same_call && !self.last_obs_changed {
+                        self.tool_repeat += 1;
+                    } else {
+                        self.tool_repeat = 0;
+                    }
+                    // Separately, count *cosmetic churn*: the normalized call is unchanged
+                    // but the raw command was edited each turn (a different counter, an
+                    // added `echo`, reflowed whitespace). That is the pattern the strict
+                    // guard exempts as "polling" because the output changes — yet it is no
+                    // progress. Byte-identical repetition (`same_raw`) is real polling and
+                    // must NOT count here; it is the strict guard's job.
+                    if same_call && !same_raw {
+                        self.same_call_repeat += 1;
+                    } else {
+                        self.same_call_repeat = 0;
+                    }
+                    self.last_tool_sig = Some(sig);
+                    self.last_raw_tool_sig = Some(raw_sig);
+                    const LOOP_NUDGE_AT: u32 = 3;
+                    const LOOP_ABORT_AT: u32 = 6;
+                    // Cosmetic churn escalates in three stages, each stronger than the last,
+                    // because the goal is to change the model's behavior — not just to stop.
+                    // A model editing one inspection each turn (a different counter, an added
+                    // `echo`, reflowed whitespace) gets a nudge, then a forceful directive it
+                    // must act on, and only a model that ignores even that is hard-stopped —
+                    // still an order of magnitude below max_iterations. `same_call_repeat`
+                    // counts only churn (same normalized call, edited raw command).
+                    const CHURN_NUDGE_AT: u32 = 8;
+                    const CHURN_INTERVENE_AT: u32 = 12;
+                    const CHURN_ABORT_AT: u32 = 15;
+                    if self.same_call_repeat >= CHURN_ABORT_AT {
+                        // It ignored the forceful directive and kept churning. Stop for real.
+                        let reps = self.same_call_repeat + 1;
+                        self.ui.notice(&format!(
                     "loop detected: same inspection re-run {reps}× with only cosmetic changes and \
                      no real progress, despite an explicit instruction to stop — ending the turn"
                 ));
-                for c in &response.tool_calls {
-                    self.push_tool_result(
+                        for c in &response.tool_calls {
+                            self.push_tool_result(
                         &c.id,
                         "[loop guard] aborted: you repeated the same inspection after being told to \
                          stop. The turn is over. No further tool calls will run.",
                     );
-                }
-                return Ok(None);
-            }
-            if self.same_call_repeat >= CHURN_INTERVENE_AT {
-                // Strong intervention: a forceful, specific directive injected as the
-                // tool result, then `continue` so the model actually gets to act on
-                // it. This is the "do something different" message — it forbids the
-                // repeat, spells out the only acceptable next moves, and warns that
-                // ignoring it ends the turn.
-                let reps = self.same_call_repeat + 1;
-                self.ui.notice(
-                    "loop guard: STRONG intervention — same inspection churned; ordering a \
+                        }
+                        return Ok(None);
+                    }
+                    if self.same_call_repeat >= CHURN_INTERVENE_AT {
+                        // Strong intervention: a forceful, specific directive injected as the
+                        // tool result, then `continue` so the model actually gets to act on
+                        // it. This is the "do something different" message — it forbids the
+                        // repeat, spells out the only acceptable next moves, and warns that
+                        // ignoring it ends the turn.
+                        let reps = self.same_call_repeat + 1;
+                        self.ui.notice(
+                        "loop guard: STRONG intervention — same inspection churned; ordering a \
                      different action",
-                );
-                for c in &response.tool_calls {
-                    self.push_tool_result(
-                        &c.id,
-                        &format!(
+                    );
+                        for c in &response.tool_calls {
+                            self.push_tool_result(
+                                &c.id,
+                                &format!(
                         "[loop guard — STOP] You have now run essentially this SAME inspection \
                          {reps} times, changing only cosmetic details (a counter, an `echo`, \
                          whitespace, `2>&1`). This is producing NO new information and NO progress \
@@ -2124,91 +2466,708 @@ impl<'a> AgentLoop<'a> {
                          If your very next action is another variant of this same inspection, the \
                          turn will be ended immediately."
                     ),
-                    );
-                }
-                continue;
-            }
-            if self.same_call_repeat >= CHURN_NUDGE_AT {
-                // First warning: gentle course-correction before the strong directive.
-                let reps = self.same_call_repeat + 1;
-                self.ui.notice(
+                            );
+                        }
+                        continue;
+                    }
+                    if self.same_call_repeat >= CHURN_NUDGE_AT {
+                        // First warning: gentle course-correction before the strong directive.
+                        let reps = self.same_call_repeat + 1;
+                        self.ui.notice(
                     "loop guard: same inspection re-run with cosmetic tweaks — nudging a change of \
                      approach",
                 );
-                for c in &response.tool_calls {
-                    self.push_tool_result(&c.id, &format!(
+                        for c in &response.tool_calls {
+                            self.push_tool_result(&c.id, &format!(
                         "[loop guard] You have re-run essentially this same inspection {reps}× with \
                          only cosmetic changes (a different counter, an added `echo`, reflowed \
                          whitespace). This is not progress. Draw a conclusion from what you already \
                          have and move on, or call `final` if the task is complete."
                     ));
-                }
-                continue;
-            }
-            if self.tool_repeat >= LOOP_ABORT_AT {
-                let reps = self.tool_repeat + 1;
-                self.ui.notice(&format!(
-                    "loop detected: same action repeated {reps}× with no progress — stopping"
-                ));
-                for c in &response.tool_calls {
-                    self.push_tool_result(
-                        &c.id,
-                        "[loop guard] aborted: identical action repeated with no progress.",
-                    );
-                }
-                return Ok(None);
-            }
-            if self.tool_repeat >= LOOP_NUDGE_AT {
-                let reps = self.tool_repeat + 1;
-                self.ui
-                    .notice("loop guard: repeated identical action — nudging a change of approach");
-                for c in &response.tool_calls {
-                    self.push_tool_result(&c.id, &format!(
+                        }
+                        continue;
+                    }
+                    if self.tool_repeat >= LOOP_ABORT_AT {
+                        let reps = self.tool_repeat + 1;
+                        self.ui.notice(&format!(
+                        "loop detected: same action repeated {reps}× with no progress — stopping"
+                    ));
+                        for c in &response.tool_calls {
+                            self.push_tool_result(
+                                &c.id,
+                                "[loop guard] aborted: identical action repeated with no progress.",
+                            );
+                        }
+                        return Ok(None);
+                    }
+                    if self.tool_repeat >= LOOP_NUDGE_AT {
+                        let reps = self.tool_repeat + 1;
+                        self.ui.notice(
+                            "loop guard: repeated identical action — nudging a change of approach",
+                        );
+                        for c in &response.tool_calls {
+                            self.push_tool_result(&c.id, &format!(
                         "[loop guard] You have issued this exact command {reps}× and gotten the same \
                          result. STOP repeating it — take a different approach, or call `final` if \
                          the task is complete."
                     ));
+                        }
+                        continue;
+                    }
                 }
-                continue;
+
+                let outcome = self.handle_tool_calls(&response).await;
+                // Record what this batch actually returned, so the next iteration can
+                // tell "same call, same result" (a loop) from "same call, new result"
+                // (polling). Done here — after a real execution — and never on the
+                // nudge/abort paths, which don't run the tools.
+                let obs = self.trailing_observation_sig();
+                self.last_obs_changed =
+                    self.last_obs_sig.is_some() && obs.is_some() && obs != self.last_obs_sig;
+                if obs.is_some() {
+                    self.last_obs_sig = obs;
+                }
+                // Did this iteration learn anything? Answered from what the tools touched,
+                // not from what the model says about itself.
+                if !coordination {
+                    self.progress
+                        .observe(&response.tool_calls, self.last_obs_changed);
+                }
+                match outcome {
+                    Ok(Some(final_msg)) => return Ok(Some(final_msg)),
+                    Ok(None) => {}
+                    Err(e) => {
+                        // A tool arm bailed mid-turn: whatever calls it hadn't answered
+                        // must still get results, or the next turn ships an assistant
+                        // message with dangling tool calls and the provider 400s.
+                        self.seal_dangling_tool_calls(
+                            "not run: the turn ended early with an internal error",
+                        );
+                        return Err(e);
+                    }
+                }
+                // Going in circles: several iterations in a row that read nothing new,
+                // changed nothing, ran no new command, and saw no changed output. Say so
+                // as a user message rather than a tool result — the results for this batch
+                // are already recorded, and the directive is for the *next* step.
+                if self.progress.stalled(self.stall_window) {
+                    self.stall_count += 1;
+                    let streak = self.progress.barren_streak();
+                    self.progress.clear_streak();
+                    self.ui.notice(&format!(
+                        "no progress in the last {streak} iterations — intervening"
+                    ));
+                    // A second stall from a supervised worker is not worth another
+                    // directive it has already ignored: escalate to its foreman, with
+                    // the measured evidence attached, and let a human-supervised
+                    // decision replace the guesswork.
+                    if self.stall_count >= 2 && self.control.is_some() && !self.wrapping_up {
+                        let report = format!(
+                            "This worker appears stuck: {streak} consecutive steps produced \
+                             nothing new. Its own account of where it is:\n\n{}",
+                            self.build_partial_result()
+                                .unwrap_or_else(|| "no reportable progress".to_string())
+                        );
+                        let asked = self.budget.remaining().max(5);
+                        self.ask_for_turns(report, asked).await;
+                    } else {
+                        let directive = self.stall_directive(streak);
+                        self.push_user_note(directive);
+                    }
+                }
+                // The turn may have been cancelled while a tool ran (a cancelled shell
+                // exits 130 rather than erroring, so the loop reaches here); seal before
+                // the top-of-loop cancel check unwinds us.
+                if self.cancel.is_cancelled() {
+                    self.seal_dangling_tool_calls("not run: the turn was interrupted");
+                }
             }
 
-            let outcome = self.handle_tool_calls(&response).await;
-            // Record what this batch actually returned, so the next iteration can
-            // tell "same call, same result" (a loop) from "same call, new result"
-            // (polling). Done here — after a real execution — and never on the
-            // nudge/abort paths, which don't run the tools.
-            let obs = self.trailing_observation_sig();
-            self.last_obs_changed =
-                self.last_obs_sig.is_some() && obs.is_some() && obs != self.last_obs_sig;
-            if obs.is_some() {
-                self.last_obs_sig = obs;
+            // The grant is spent. A supervised worker does not simply stop here: it
+            // reports what it has and asks its foreman for more, which is the whole
+            // point of a small initial grant. An unsupervised foreman has nobody to
+            // ask, so `extend_or_report` returns false and the loop ends as before.
+            if self.extend_or_report().await {
+                continue 'grant;
             }
-            match outcome {
-                Ok(Some(final_msg)) => return Ok(Some(final_msg)),
-                Ok(None) => {}
-                Err(e) => {
-                    // A tool arm bailed mid-turn: whatever calls it hadn't answered
-                    // must still get results, or the next turn ships an assistant
-                    // message with dangling tool calls and the provider 400s.
-                    self.seal_dangling_tool_calls(
-                        "not run: the turn ended early with an internal error",
-                    );
-                    return Err(e);
-                }
-            }
-            // The turn may have been cancelled while a tool ran (a cancelled shell
-            // exits 130 rather than erroring, so the loop reaches here); seal before
-            // the top-of-loop cancel check unwinds us.
-            if self.cancel.is_cancelled() {
-                self.seal_dangling_tool_calls("not run: the turn was interrupted");
-            }
+            break 'grant;
         }
 
         self.ui.notice(&format!(
-            "reached max_iterations ({})",
-            self.behavior.max_iterations
+            "reached the iteration budget ({} turns)",
+            self.budget.granted
         ));
         Ok(None)
+    }
+
+    /// `jobs`: what is running in the background, with the turn usage the foreman needs
+    /// to judge an extension request.
+    fn run_jobs(&mut self) -> String {
+        let views = self.jobs.views();
+        if views.is_empty() {
+            return "no background jobs have been dispatched in this session.".to_string();
+        }
+        let mut out = String::from("background jobs:\n");
+        for v in &views {
+            let secs = v.elapsed_ms / 1000;
+            out.push_str(&format!(
+                "- `{}` [{}] on {} — {} · {}s · turns {}/{}",
+                v.id, v.label, v.model, v.state, secs, v.used, v.granted
+            ));
+            if v.ceiling > 0 {
+                out.push_str(&format!(" (ceiling {})", v.ceiling));
+            }
+            if v.requested > 0 {
+                out.push_str(&format!(" · asking for {} more", v.requested));
+            }
+            out.push_str(&format!("\n    task: {}\n", v.task));
+        }
+        let waiting = self.jobs.awaiting_verdict().len();
+        if waiting > 0 {
+            out.push_str(&format!(
+                "{waiting} job(s) are paused waiting for you — answer with `job_reply`.\n"
+            ));
+        }
+        out
+    }
+
+    /// `wait`: park until a background job reports, bounded and interruptible.
+    ///
+    /// Results are delivered automatically at every iteration boundary, so waiting is
+    /// never *required* to receive them — this exists only so a foreman with nothing
+    /// left to do stops burning turns on filler.
+    async fn run_wait(&mut self, args: &tools::WaitArgs) -> String {
+        if self.jobs.is_idle() {
+            return "nothing to wait for: no background jobs are running.".to_string();
+        }
+        // Resolve the requested ids; an unknown one is reported rather than silently
+        // widening the wait to everything.
+        let mut unknown: Vec<String> = Vec::new();
+        let targets: Vec<String> = match &args.ids {
+            Some(ids) if !ids.is_empty() => ids
+                .iter()
+                .filter_map(|raw| match self.jobs.resolve_id(raw) {
+                    Some(id) => Some(id),
+                    None => {
+                        unknown.push(raw.clone());
+                        None
+                    }
+                })
+                .collect(),
+            _ => self
+                .jobs
+                .outstanding()
+                .iter()
+                .map(|j| j.id.clone())
+                .collect(),
+        };
+        if targets.is_empty() {
+            return format!(
+                "no such job(s): {}. Use `jobs` to see what is running.",
+                unknown.join(", ")
+            );
+        }
+        let all = args.all.unwrap_or(false);
+        let timeout = std::time::Duration::from_secs(
+            args.timeout_seconds
+                .unwrap_or(WAIT_DEFAULT_SECONDS)
+                .clamp(1, WAIT_MAX_SECONDS),
+        );
+        let deadline = tokio::time::Instant::now() + timeout;
+        self.ui.notice(&format!(
+            "⏳ waiting for {} background job(s)…",
+            targets.len()
+        ));
+
+        let settled = |me: &Self| -> bool {
+            let done = |id: &String| {
+                me.jobs
+                    .get(id)
+                    .is_none_or(|j| j.state.is_done() || j.report.is_some())
+            };
+            if all {
+                targets.iter().all(done)
+            } else {
+                targets.iter().any(done)
+            }
+        };
+
+        let mut landed = 0usize;
+        let mut steered = false;
+        while !settled(self) {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match self.await_job_news(left).await {
+                Woke::News => landed += 1,
+                // Acting on what the user just said comes before waiting for a worker.
+                Woke::Steered => {
+                    steered = true;
+                    break;
+                }
+                Woke::TimedOut => break,
+                Woke::Cancelled => return "interrupted while waiting.".to_string(),
+            }
+        }
+        if self.cancel.is_cancelled() {
+            return "interrupted while waiting.".to_string();
+        }
+        let still = self.jobs.outstanding().len();
+        if steered {
+            format!(
+                "stopped waiting: the user said something (above). {still} job(s) are still \
+                 running and will report as they land."
+            )
+        } else if settled(self) {
+            format!(
+                "{landed} job update(s) arrived — read the messages above for the results \
+                 and any turn requests. {still} job(s) still running."
+            )
+        } else {
+            format!(
+                "timed out after {}s with {still} job(s) still running. Do something else; \
+                 their results will be delivered to you as they land.",
+                timeout.as_secs()
+            )
+        }
+    }
+
+    /// `job_reply`: answer a worker that asked for more turns.
+    ///
+    /// The grant is clamped **here**, host-side, to the job's ceiling: the foreman
+    /// decides whether to extend, not how far the bound goes.
+    /// The parent side of a job's control channel.
+    ///
+    /// Keyed by *this* session's id, which is also how the child was told to find it.
+    /// Without a logger there is no id to key on, so the child falls through to its own
+    /// timeout — which for a turn request is a small extension, and for a question is
+    /// proceeding unaided.
+    fn job_control_dir(&self, id: &str) -> Option<crate::agent::jobctl::ControlDir> {
+        let parent = self.logger.as_ref()?.id().to_string();
+        crate::agent::jobctl::ControlDir::create(&parent, id)
+    }
+
+    fn run_job_reply(&mut self, args: &tools::JobReplyArgs) -> String {
+        use crate::agent::jobctl::Verdict;
+        let Some(id) = self.jobs.resolve_id(&args.id) else {
+            return format!(
+                "no such job `{}`. Use `jobs` to see what is running.",
+                args.id
+            );
+        };
+        let Some(job) = self.jobs.get(&id) else {
+            return format!("no such job `{id}`.");
+        };
+
+        // A question is answered, not adjudicated: it has no budget to clamp and no
+        // verdict to write, so it branches out before any of that.
+        if let crate::agent::jobs::JobState::AwaitingAnswer { seq } = job.state {
+            let label = job.label.clone();
+            let Some(answer) = args
+                .instructions
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return format!(
+                    "job `{id}` is waiting on an answer — put your reply in `instructions`."
+                );
+            };
+            let Some(dir) = self.job_control_dir(&id) else {
+                return format!(
+                    "could not reach job `{id}` to answer it; it will proceed on its own \
+                     judgement once it stops waiting."
+                );
+            };
+            if let Err(e) = dir.write_answer(&crate::agent::jobctl::Answer {
+                seq,
+                answer: answer.to_string(),
+            }) {
+                return format!("could not answer job `{id}`: {e}");
+            }
+            self.jobs.answered(&id);
+            self.emit_jobs();
+            self.ui
+                .notice(&format!("▶ answered subagent {label} ({id})"));
+            return format!("answered job `{id}` ({label}); it has resumed.");
+        }
+
+        let crate::agent::jobs::JobState::AwaitingVerdict { seq } = job.state else {
+            return format!(
+                "job `{id}` is not waiting for a verdict (it is {}). Nothing to answer.",
+                job.state.as_str()
+            );
+        };
+        // Clamp to the job's remaining headroom. A ceiling of 0 means the job was
+        // dispatched without supervision, in which case there is nothing to grant.
+        let headroom = job.ceiling.saturating_sub(job.granted);
+        let asked = args.iterations.unwrap_or(job.requested).max(1);
+        let grantable = asked.min(headroom);
+        let label = job.label.clone();
+
+        let verdict = match args.verdict.trim().to_ascii_lowercase().as_str() {
+            "grant" | "continue" if grantable > 0 => Verdict::Grant {
+                seq,
+                iterations: grantable,
+            },
+            // Nothing left to grant: say so and wrap it up rather than pretending.
+            "grant" | "continue" => Verdict::WrapUp { seq },
+            "redirect" => {
+                let Some(instructions) = args
+                    .instructions
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    return "a `redirect` needs `instructions` saying what to do differently."
+                        .to_string();
+                };
+                Verdict::Redirect {
+                    seq,
+                    iterations: grantable.max(1),
+                    instructions: instructions.to_string(),
+                }
+            }
+            "wrap_up" | "wrapup" | "wrap" => Verdict::WrapUp { seq },
+            "stop" | "cancel" | "abandon" => Verdict::Stop {
+                seq,
+                reason: args
+                    .instructions
+                    .clone()
+                    .unwrap_or_else(|| "the foreman stopped this work".to_string()),
+            },
+            // `answer` is valid, but only for a job that asked a question — which was
+            // handled above. Naming it here turns "used the right word at the wrong time"
+            // into a specific message instead of "unknown verdict".
+            "answer" | "reply" => {
+                return format!(
+                    "job `{id}` is asking for turns, not asking a question — use `grant`, \
+                     `redirect`, `wrap_up`, or `stop`."
+                )
+            }
+            other => {
+                return format!(
+                    "unknown verdict `{other}`; use `answer` (for a question), `grant`, \
+                     `redirect`, `wrap_up`, or `stop`."
+                )
+            }
+        };
+
+        let Some(dir) = self.job_control_dir(&id) else {
+            return format!(
+                "could not reach job `{id}` to answer it; it will take a small automatic \
+                 extension and then wrap up on its own."
+            );
+        };
+        if let Err(e) = dir.write_verdict(&verdict) {
+            return format!("could not answer job `{id}`: {e}");
+        }
+        let kind = verdict.kind();
+        let extra = verdict.extra_turns();
+        if matches!(verdict, Verdict::Stop { .. }) {
+            // Nothing more will come from it, and it is blocked waiting for us — so the
+            // registry (and the child) are settled here rather than left to time out.
+            self.jobs.stop(&id);
+            self.ui
+                .notice(&format!("✋ stopped subagent {label} ({id})"));
+            self.deliver_job_news();
+            return format!("stopped job `{id}`.");
+        }
+        self.jobs.resume(&id, extra);
+        self.ui.notice(&format!(
+            "▶ {kind} for subagent {label} ({id}): +{extra} turns"
+        ));
+        let clamped = if grantable < asked && kind != "wrap_up" {
+            format!(
+                " (asked for {asked}, clamped to {grantable} by its ceiling of {})",
+                self.jobs.get(&id).map(|j| j.ceiling).unwrap_or(0)
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "answered job `{id}` with `{kind}`: +{extra} turns{clamped}. Its result will \
+             be delivered to you when it finishes."
+        )
+    }
+
+    /// The outcome of asking the foreman for more turns.
+    ///
+    /// `Continue` means the budget grew; `WrapUp` and `Stop` mean it grew by just
+    /// enough to write an answer. There is deliberately no variant for "keep going with
+    /// no more turns": every path out of a request leaves the worker able to produce a
+    /// result, because the failure this mechanism replaces was a worker that spent
+    /// everything and returned nothing.
+    async fn ask_for_turns(&mut self, report: String, requested: u32) -> RequestOutcome {
+        use crate::agent::jobctl::Verdict;
+        let Some(dir) = self.control.clone() else {
+            return RequestOutcome::Unavailable;
+        };
+        if self.turn_requests >= MAX_TURN_REQUESTS {
+            self.ui
+                .notice("turn-request limit reached — wrapping up with what we have");
+            self.wrapping_up = true;
+            self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
+            return RequestOutcome::WrapUp;
+        }
+        let seq = self.turn_requests + 1;
+        self.turn_requests = seq;
+        let requested = requested.clamp(1, self.budget.ceiling.max(1));
+        let req = crate::agent::jobctl::TurnRequest {
+            seq,
+            report,
+            // The host's own account, attached to the worker's. A foreman judging an
+            // extension needs to know whether anything actually happened, and that is
+            // not something the asking worker is a reliable narrator of.
+            evidence: format!(
+                "{} · turns {}/{} (ceiling {})",
+                self.progress.evidence(),
+                self.budget.used,
+                self.budget.granted,
+                self.budget.ceiling
+            ),
+            requested,
+            used: self.budget.used,
+            granted: self.budget.granted,
+        };
+        if let Err(e) = dir.write_request(&req) {
+            self.ui.notice(&format!(
+                "could not reach the foreman to ask for turns: {e}"
+            ));
+            return RequestOutcome::Unavailable;
+        }
+        self.ui.notice(&format!(
+            "⏸ asked the foreman for {requested} more turns (used {}/{})",
+            self.budget.used, self.budget.granted
+        ));
+
+        // Poll for the answer. Bounded, interruptible, and never fatal on timeout.
+        let deadline = tokio::time::Instant::now() + self.request_timeout;
+        let verdict = loop {
+            if self.cancel.is_cancelled() {
+                return RequestOutcome::Interrupted;
+            }
+            // The longest a worker sits idle, so the most valuable place to notice that
+            // the foreman it is waiting on no longer exists.
+            if self.orphaned() {
+                self.ui
+                    .notice("the parent session is gone — nothing will answer this request");
+                return RequestOutcome::Interrupted;
+            }
+            if let Some(v) = dir.read_verdict(seq) {
+                break Some(v);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break None;
+            }
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return RequestOutcome::Interrupted,
+                _ = tokio::time::sleep(REQUEST_POLL) => {}
+            }
+        };
+
+        match verdict {
+            Some(Verdict::Grant { iterations, .. }) => {
+                let added = self.budget.extend(iterations);
+                if added == 0 {
+                    self.ui.notice(
+                        "the foreman granted more turns but the host ceiling is reached — \
+                         wrapping up",
+                    );
+                    self.wrapping_up = true;
+                    self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
+                    return RequestOutcome::WrapUp;
+                }
+                self.ui.notice(&format!("▶ granted {added} more turns"));
+                self.progress.clear_streak();
+                self.push_user_note(format!(
+                    "[foreman] Granted {added} more turns. Continue from where you are — do \
+                     not restart, and do not re-read what you have already read."
+                ));
+                RequestOutcome::Continue
+            }
+            Some(Verdict::Redirect {
+                iterations,
+                instructions,
+                ..
+            }) => {
+                let added = self.budget.extend(iterations.max(1));
+                self.ui
+                    .notice(&format!("▶ redirected with {added} more turns"));
+                // A redirect is a fresh start on a different track, so the stall streak
+                // that may have triggered this must not immediately re-fire.
+                self.progress.clear_streak();
+                self.push_user_note(format!(
+                    "[foreman] Change of direction, with {added} more turns. Do this \
+                     instead:\n\n{instructions}"
+                ));
+                if added == 0 {
+                    self.wrapping_up = true;
+                    self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
+                    return RequestOutcome::WrapUp;
+                }
+                RequestOutcome::Continue
+            }
+            Some(Verdict::WrapUp { .. }) => {
+                let added = self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
+                self.ui
+                    .notice(&format!("▣ told to wrap up ({added} turns to write it up)"));
+                self.wrapping_up = true;
+                self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
+                RequestOutcome::WrapUp
+            }
+            Some(Verdict::Stop { reason, .. }) => {
+                self.ui
+                    .notice(&format!("✋ the foreman stopped this: {reason}"));
+                self.wrapping_up = true;
+                self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
+                self.push_user_note(format!(
+                    "[foreman] Stop this work now: {reason}\n\nDo not investigate or change \
+                     anything further. Call `final` immediately, stating what you had \
+                     established and that the work was stopped."
+                ));
+                RequestOutcome::Stop
+            }
+            // Unanswered. One small extension, then wrap up.
+            //
+            // This is the one policy decision in the mechanism that matters most.
+            // Continuing indefinitely would restore the runaway this exists to prevent
+            // whenever the foreman is idle; stopping outright would destroy a worker's
+            // work over an unanswered message. A bounded extension, then a wrap-up,
+            // terminates *and* keeps the work.
+            None => {
+                if self.auto_extensions == 0 {
+                    self.auto_extensions += 1;
+                    let added = self.budget.extend(AUTO_EXTENSION_TURNS);
+                    if added > 0 {
+                        self.ui.notice(&format!(
+                            "no answer from the foreman — taking {added} more turns, then \
+                             wrapping up"
+                        ));
+                        self.push_user_note(format!(
+                            "[no answer] The foreman did not respond, so you have {added} more \
+                             turns and no more after that. Get to a reportable state now: \
+                             finish the most valuable remaining piece, then write up what you \
+                             have."
+                        ));
+                        return RequestOutcome::Continue;
+                    }
+                }
+                self.ui
+                    .notice("no answer from the foreman — wrapping up with what we have");
+                self.wrapping_up = true;
+                self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
+                self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
+                RequestOutcome::WrapUp
+            }
+        }
+    }
+
+    /// `request_turns`: the worker asks for more, on its own initiative.
+    async fn run_request_turns(&mut self, args: &tools::RequestTurnsArgs) -> String {
+        let report = format!(
+            "Progress: {}\nRemaining: {}\nNext step: {}",
+            args.progress.trim(),
+            args.remaining.trim(),
+            args.next_step.trim()
+        );
+        match self.ask_for_turns(report, args.iterations).await {
+            RequestOutcome::Continue => format!(
+                "granted: you now have {} turns ({} used). Continue from where you are.",
+                self.budget.granted, self.budget.used
+            ),
+            RequestOutcome::WrapUp => format!(
+                "not granted. You have {} turns left — write up what you have and call \
+                 `final` now.",
+                self.budget.remaining()
+            ),
+            RequestOutcome::Stop => {
+                "the foreman stopped this work. Call `final` now, reporting what you had \
+                 established."
+                    .to_string()
+            }
+            RequestOutcome::Unavailable => {
+                "there is no foreman to ask on this run. Work within the turns you have \
+                 and finish with `final`."
+                    .to_string()
+            }
+            RequestOutcome::Interrupted => "interrupted while asking for more turns.".to_string(),
+        }
+    }
+
+    /// The grant is spent. A supervised worker reports and asks rather than simply
+    /// stopping; returns true when it may keep going (the budget grew).
+    async fn extend_or_report(&mut self) -> bool {
+        if self.control.is_none() {
+            return false;
+        }
+        // Already told to finish: it was given turns to write an answer, and asking
+        // again would turn "wrap up" into an unbounded extension.
+        if self.wrapping_up {
+            return false;
+        }
+        let before = self.budget.granted;
+        // The worker did not ask, so the host asks on its behalf, using what it can see:
+        // the worker's own latest narration and plan, plus the measured evidence.
+        let report = format!(
+            "The worker's turn grant is spent and it did not ask for more. Its state:\n\n{}",
+            self.build_partial_result()
+                .unwrap_or_else(|| "no reportable progress".to_string())
+        );
+        self.ui
+            .notice("turn grant spent — reporting to the foreman");
+        let asked = self.budget.granted.max(1);
+        let outcome = self.ask_for_turns(report, asked).await;
+        if matches!(outcome, RequestOutcome::Interrupted) {
+            return false;
+        }
+        self.budget.granted > before
+    }
+    /// A one-line description of what is still running, for the `final` refusal.
+    fn outstanding_jobs_summary(&self) -> String {
+        let jobs = self.jobs.outstanding();
+        let names: Vec<String> = jobs
+            .iter()
+            .map(|j| format!("`{}` [{}]", j.id, j.label))
+            .collect();
+        match names.len() {
+            0 => "no subagents are".to_string(),
+            1 => format!("subagent {} is", names[0]),
+            n => format!("{n} subagents ({}) are", names.join(", ")),
+        }
+    }
+
+    /// The stall intervention text. Escalates: the first one asks for a change of
+    /// approach, a later one says to stop exploring altogether, because a directive a
+    /// model has already ignored once is not worth repeating verbatim.
+    fn stall_directive(&self, streak: u32) -> String {
+        let evidence = self.progress.evidence();
+        let base = format!(
+            "[no progress] The last {streak} steps produced nothing new — no new file read, \
+             no edit, no new command, and no changed output. Measured so far: {evidence}."
+        );
+        if self.stall_count <= 1 {
+            format!(
+                "{base}\n\nStop repeating what you have already done. Take one concrete \
+                 different action now: inspect a file or symbol you have NOT looked at, run a \
+                 command you have NOT run, make the edit the task calls for, or — if you \
+                 already know the answer — write it up and call `final`."
+            )
+        } else if self.budget.supervised {
+            format!(
+                "{base}\n\nThis is the second time. Do not continue exploring. Either make the \
+                 change the task asks for, or report honestly — what you have established, \
+                 what is left, why you are stuck — and call `final` with that. An unreported \
+                 loop wastes the whole delegation."
+            )
+        } else {
+            format!(
+                "{base}\n\nThis is the second time. Write up what you have established, state \
+                 plainly what you could not determine, and call `final` now."
+            )
+        }
     }
 
     /// Digest of the tool results at the end of the history — i.e. what the
@@ -2340,16 +3299,16 @@ impl<'a> AgentLoop<'a> {
     /// Process this turn's tool calls. Returns `Some(message)` if `final` was
     /// called.
     async fn handle_tool_calls(&mut self, response: &ChatResponse) -> Result<Option<String>> {
-        // Pre-pass: a planner that delegates several subtasks in one turn gets
-        // them run *concurrently* (the gateway is the real backpressure; we only
-        // cap local fan-out). Results are keyed by call id and consumed in order
-        // by the sequential loop below, so tool-result ordering is preserved.
-        // Skipped entirely while planning: the pre-pass would otherwise spawn
-        // workers (which DO edit files) before the plan-mode gate below ever runs.
+        // Pre-pass: start every delegation in this turn *in the background*, so the
+        // rest of the turn (and the next model call) proceeds while they run. Each call
+        // is answered with its job id; the actual results are injected at a later
+        // iteration boundary. Skipped entirely while planning: the pre-pass would
+        // otherwise spawn workers (which DO edit files) before the plan-mode gate
+        // below ever runs.
         let sub_results = if self.planning {
             Default::default()
         } else {
-            self.run_subagents(&response.tool_calls).await
+            self.dispatch_subagents(&response.tool_calls)
         };
 
         for (i, call) in response.tool_calls.iter().enumerate() {
@@ -2378,6 +3337,44 @@ impl<'a> AgentLoop<'a> {
                     let Some(args) = self.parse_or_report::<FinalArgs>(call) else {
                         continue;
                     };
+                    // Finishing with delegated work still in flight throws it away —
+                    // the results would arrive after the turn that wanted them. Refuse
+                    // and say what is outstanding.
+                    //
+                    // Bounded, because a hard refusal loop is the one way this gate
+                    // could wedge a session: after a couple of refusals the loop stops
+                    // arguing and waits on the foreman's behalf.
+                    if !self.jobs.is_idle() {
+                        if self.final_refusals < MAX_FINAL_REFUSALS {
+                            self.final_refusals += 1;
+                            let outstanding = self.outstanding_jobs_summary();
+                            self.push_tool_result(
+                                &call.id,
+                                &format!(
+                                    "blocked: {outstanding} still running. Their results are \
+                                     part of this task and will be delivered to you as they \
+                                     land. Either keep working on something else, or call \
+                                     `wait` — then finish once you have them."
+                                ),
+                            );
+                            self.answer_unrun(
+                                &response.tool_calls[i + 1..],
+                                "not run: `final` was refused while subagents are still running",
+                            );
+                            continue;
+                        }
+                        self.ui
+                            .notice("waiting for running subagents before finishing…");
+                        self.await_job_news(FINAL_AUTO_WAIT).await;
+                        if !self.jobs.is_idle() {
+                            // Still not done after the wait: let the answer stand rather
+                            // than blocking forever, but say so plainly.
+                            self.ui.notice(
+                                "finishing with subagents still running — their results will \
+                                 arrive in a later turn",
+                            );
+                        }
+                    }
                     if let Some(l) = &self.logger {
                         l.write_final(&args.message);
                     }
@@ -2433,7 +3430,29 @@ impl<'a> AgentLoop<'a> {
                         "op": "read", "path": args.path,
                         "offset": args.offset, "limit": args.limit,
                     });
-                    self.run_fileop(&call.id, &payload).await?;
+                    // Read it, then decide whether the *content* is worth spending
+                    // context on. Re-reading an unchanged file is the cheapest way for
+                    // a model to look busy — observed burning a whole grant on it — so
+                    // an identical re-read is answered with a pointer to the earlier
+                    // one instead of a second copy. The read still happens: that is
+                    // what proves it is unchanged.
+                    let (code, output, observation) = self.fileop_observation(&payload).await;
+                    let observation = if code == 0 {
+                        let key = ProgressTracker::read_key(&args.path, args.offset, args.limit);
+                        match self.progress.note_read(&key, &output, self.budget.used) {
+                            Some(prior) => {
+                                self.ui.notice(&format!(
+                                    "↺ {} unchanged since step {prior} — not re-reading",
+                                    args.path
+                                ));
+                                reread_notice(&args.path, prior)
+                            }
+                            None => observation,
+                        }
+                    } else {
+                        observation
+                    };
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_EDIT => {
                     let Some(args) = self.parse_or_report::<EditArgs>(call) else {
@@ -2479,6 +3498,32 @@ impl<'a> AgentLoop<'a> {
                         continue;
                     };
                     let observation = self.run_plan(args);
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_JOBS => {
+                    self.ui.tool_use("jobs");
+                    let observation = self.run_jobs();
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_WAIT => {
+                    let Some(args) = self.parse_or_report::<tools::WaitArgs>(call) else {
+                        continue;
+                    };
+                    let observation = self.run_wait(&args).await;
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_JOB_REPLY => {
+                    let Some(args) = self.parse_or_report::<tools::JobReplyArgs>(call) else {
+                        continue;
+                    };
+                    let observation = self.run_job_reply(&args);
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_REQUEST_TURNS => {
+                    let Some(args) = self.parse_or_report::<tools::RequestTurnsArgs>(call) else {
+                        continue;
+                    };
+                    let observation = self.run_request_turns(&args).await;
                     self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_ARTIFACT => {
@@ -2638,16 +3683,23 @@ impl<'a> AgentLoop<'a> {
         call_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(i32, String)> {
+        let (code, output, observation) = self.fileop_observation(payload).await;
+        self.push_tool_result(call_id, &observation);
+        Ok((code, output))
+    }
+
+    /// Run a fileop and shape its observation, *without* recording it in the
+    /// conversation. Split from [`Self::run_fileop`] for the read arm, which may
+    /// replace the observation with a pointer to an identical earlier read before it
+    /// lands in the context. Returns `(exit code, raw output, observation)`.
+    async fn fileop_observation(&mut self, payload: &serde_json::Value) -> (i32, String, String) {
         let outcome = self.runtime.fileop(&payload.to_string()).await;
         // A fileop can trigger container bring-up too (e.g. after an idle stop);
         // surface any status lines it queued, even though only after the fact.
         self.drain_runtime_status();
         let (result, output) = match outcome {
             Ok(v) => v,
-            Err(e) => {
-                self.push_tool_result(call_id, &format!("error: {e}"));
-                return Ok((-1, String::new()));
-            }
+            Err(e) => return (-1, String::new(), format!("error: {e}")),
         };
         let observation = if result.exit_code == 0 {
             output.clone()
@@ -2657,8 +3709,7 @@ impl<'a> AgentLoop<'a> {
         // `push_tool_result` applies the same cap; truncating here as well keeps the
         // `[exit code: N]` prefix outside the truncated region.
         let observation = truncate(&observation, self.behavior.max_command_output_bytes);
-        self.push_tool_result(call_id, &observation);
-        Ok((result.exit_code, output))
+        (result.exit_code, output, observation)
     }
 
     /// Run a shell command with live streaming to the UI (interruptible via the
@@ -2693,6 +3744,99 @@ impl<'a> AgentLoop<'a> {
         }
     }
 
+    /// A handle for delivering user input **into the running turn**.
+    ///
+    /// The worker holds a clone: a message typed while the agent is working goes here
+    /// rather than into the post-turn queue, and is picked up at the next iteration
+    /// boundary. Explicitly deferred input (`Enqueue`) still goes to the queue.
+    pub fn steer_sender(&self) -> tokio::sync::mpsc::UnboundedSender<String> {
+        self.steer_tx.clone()
+    }
+
+    /// Publish the current job state to the UI. Called after anything that changes it,
+    /// so a client renders from one level-triggered event rather than reconstructing the
+    /// pane from a stream of edges.
+    fn emit_jobs(&mut self) {
+        let views = self.jobs.views();
+        self.ui.jobs_changed(&views);
+    }
+
+    /// Whether the parent that dispatched this worker has disappeared.
+    ///
+    /// A worker's results go to one reader. If that reader is gone — the worker process
+    /// was killed rather than asked to stop — everything from here on is spend with
+    /// nowhere to land, so the worker stops itself. Always false for a top-level
+    /// session, which has no parent to lose.
+    fn orphaned(&self) -> bool {
+        self.parent_pid.is_some_and(process_is_gone)
+    }
+
+    /// Fold any user input that arrived mid-turn into the conversation. Returns how
+    /// many messages landed.
+    fn drain_steering(&mut self) -> usize {
+        let mut landed = 0;
+        while let Ok(text) = self.steer_rx.try_recv() {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            self.ui.steering(&text);
+            self.ui.notice(&format!("↳ steering: {text}"));
+            // A plain user message, marked so the model can tell mid-turn direction
+            // from the original task — it is a correction to act on now, not a new
+            // request to start from scratch.
+            self.push_user_note(format!(
+                "[the user says, while you are working] {text}\n\n\
+                 Take this into account from here on. Do not restart what you have \
+                 already done."
+            ));
+            landed += 1;
+        }
+        landed
+    }
+
+    /// A handle that stops every running subagent, usable while a turn is in flight.
+    ///
+    /// The worker holds a clone so "stop the subagents" (and session teardown) does not
+    /// have to wait for `&mut` on the loop. Session-scoped jobs make this necessary:
+    /// nothing else guarantees a child dies.
+    pub fn job_stopper(&self) -> crate::agent::jobs::JobStopper {
+        self.job_stopper.clone()
+    }
+
+    /// Stop every background job and settle the registry. Called on session end (and
+    /// by an explicit "stop subagents"), before [`Self::shutdown`].
+    ///
+    /// Load-bearing rather than tidy: children are host processes that outlive a turn
+    /// by design, so if this doesn't run they are only reaped when the worker exits —
+    /// and not at all if it is killed.
+    pub fn stop_all_jobs(&mut self) -> usize {
+        // Fire the shared switch first: it reaches tasks that are still queued behind a
+        // concurrency permit, which have no child to abort yet.
+        self.job_stopper.stop_all();
+        let stopped = self.jobs.stop_all();
+        for id in &stopped {
+            if let Some(dir) = self
+                .logger
+                .as_ref()
+                .and_then(|l| crate::agent::jobctl::ControlDir::create(l.id(), id))
+            {
+                dir.cleanup();
+            }
+        }
+        if !stopped.is_empty() {
+            self.ui
+                .notice(&format!("stopped {} background subagent(s)", stopped.len()));
+        }
+        self.emit_jobs();
+        stopped.len()
+    }
+
+    /// How many background jobs are still running (for the UI and the worker).
+    pub fn running_jobs(&self) -> usize {
+        self.jobs.outstanding().len()
+    }
+
     /// End-of-session teardown: stop managed processes, then the sandbox itself.
     ///
     /// The sandbox stop is explicit rather than left to `Drop`. `SessionSandbox` does
@@ -2717,14 +3861,21 @@ impl<'a> AgentLoop<'a> {
         self.behavior.idle_sandbox_timeout_seconds
     }
 
-    /// Plan every `subagent` call in this turn, announce them, then execute them
-    /// concurrently (capped by `delegation.max_parallel`). Returns call id →
-    /// result. Parse / depth errors become the result for that call.
-    async fn run_subagents(
+    /// Plan every `subagent` call in this turn, announce it, and **start it in the
+    /// background**. Returns call id → the result recorded for that call, which is a
+    /// dispatch acknowledgement rather than the subagent's answer: results arrive
+    /// later, injected at an iteration boundary by [`Self::drain_job_events`].
+    ///
+    /// This is the change that unwedges delegation. Awaiting the batch here meant the
+    /// foreman made no model calls, ran no other tools and answered nobody until the
+    /// slowest child exited. Now it keeps working, and `wait` is available for when it
+    /// genuinely has nothing else to do.
+    ///
+    /// Parse / depth errors still become the result for that call, immediately.
+    fn dispatch_subagents(
         &mut self,
         calls: &[cowboy_core::model::ToolCall],
     ) -> std::collections::HashMap<String, String> {
-        use futures::stream::StreamExt;
         let mut results: std::collections::HashMap<String, String> = Default::default();
         let sub_calls: Vec<&cowboy_core::model::ToolCall> = calls
             .iter()
@@ -2733,13 +3884,11 @@ impl<'a> AgentLoop<'a> {
         if sub_calls.is_empty() {
             return results;
         }
+        // Re-read per turn (not cached at construction) so a mid-session `cowboy crew`
+        // edit takes effect on routing.
         let crew_cfg = cowboy_core::crew::load().ok().flatten();
-        let max_parallel = crew_cfg
-            .as_ref()
-            .map(|c| c.delegation.max_parallel.max(1) as usize)
-            .unwrap_or(4);
 
-        // Plan + announce sequentially (needs &mut self); collect runnable plans.
+        // Plan + announce sequentially (needs `&mut self`); collect runnable plans.
         let mut plans: Vec<(String, SubagentPlan)> = Vec::new();
         for call in &sub_calls {
             match parse_args::<SubagentArgs>(&call.arguments) {
@@ -2763,19 +3912,19 @@ impl<'a> AgentLoop<'a> {
         if plans.is_empty() {
             return results;
         }
-        // Per-provider throttle: cap concurrent workers hitting the same provider
-        // so a batch of same-model subagents can't trip its rate limit (429),
-        // while different providers still run fully in parallel. Bounded further by
-        // `max_parallel`; 0 = unlimited.
+        let model_defs = load_model_defs(self.root());
+        let foreman = crate::cmd::crew::foreman_model();
         let per_provider = crew_cfg
             .as_ref()
             .map(|c| c.delegation.max_parallel_per_provider)
             .unwrap_or(2) as usize;
-        let model_defs = load_model_defs(self.root());
-        let foreman = crate::cmd::crew::foreman_model();
-        // Announce true concurrency, not just the batch size: with a per-provider
-        // cap, a batch of same-provider subagents runs a few at a time and the rest
-        // queue. Saying "running N in parallel" when only 2 can run is misleading.
+        let max_parallel = crew_cfg
+            .as_ref()
+            .map(|c| c.delegation.max_parallel.max(1) as usize)
+            .unwrap_or(4);
+        // Announce true concurrency, not just the batch size: with a per-provider cap,
+        // a batch of same-provider subagents runs a few at a time and the rest queue.
+        // Saying "running N in parallel" when only 2 can run is misleading.
         if plans.len() > 1 {
             self.ui.notice(&concurrency_notice(
                 &plans,
@@ -2785,157 +3934,293 @@ impl<'a> AgentLoop<'a> {
                 foreman.as_deref(),
             ));
         }
-        let mut provider_sems: std::collections::HashMap<
-            String,
-            std::sync::Arc<tokio::sync::Semaphore>,
-        > = std::collections::HashMap::new();
-        if per_provider > 0 {
-            for (_, plan) in &plans {
-                let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
-                provider_sems.entry(key).or_insert_with(|| {
-                    std::sync::Arc::new(tokio::sync::Semaphore::new(per_provider))
-                });
-            }
-        }
 
-        // Remember every dispatched call so an interrupt can synthesize results
-        // for the ones still running (see the salvage arm below).
-        let dispatched: Vec<(String, String, String)> = plans
-            .iter()
-            .map(|(id, plan)| {
-                let label = plan
-                    .label
-                    .split(" → ")
-                    .next()
-                    .unwrap_or(&plan.label)
-                    .to_string();
-                (id.clone(), label, plan.id.clone())
-            })
-            .collect();
-
-        // Execute concurrently (owned plans → no borrow of self), timing each and
-        // capturing a coarse outcome for the crew history. Process completions as
-        // they arrive so the background pane flips each subagent to done/failed
-        // with its own elapsed time (rather than all at once at the end).
-        // Signals a subagent flipping from pending → running the moment it acquires
-        // its provider permit, so the UI (which owns `&mut self`) can update the pane
-        // from the completion loop rather than from inside these owned tasks.
-        let (started_tx, mut started_rx) =
-            tokio::sync::mpsc::unbounded_channel::<(String, String, String)>();
-        let mut stream = futures::stream::iter(plans.into_iter().map(|(id, plan)| {
-            let routed = plan.routed.clone();
+        for (call_id, plan) in plans {
             let label = plan
                 .label
                 .split(" → ")
                 .next()
                 .unwrap_or(&plan.label)
                 .to_string();
-            let sub_id = plan.id.clone();
-            let model_disp = plan
-                .model
-                .clone()
-                .unwrap_or_else(|| "<default>".to_string());
-            let key = provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref());
-            let sem = provider_sems.get(&key).cloned();
-            let started_tx = started_tx.clone();
-            async move {
-                // Hold a provider permit for the worker's whole lifetime; `None`
-                // means the throttle is disabled (unlimited).
-                let _permit = match sem {
-                    Some(s) => s.acquire_owned().await.ok(),
-                    None => None,
-                };
-                // Permit in hand → actually running now; tell the UI to flip this
-                // subagent from pending to running.
-                let _ = started_tx.send((sub_id.clone(), label.clone(), model_disp.clone()));
-                let started = std::time::Instant::now();
-                let result = exec_subagent(plan).await;
-                let duration_ms = started.elapsed().as_millis() as u64;
-                let status = classify_subagent_result(&result).to_string();
-                let outcome = routed.map(|(category, effort, model, fell_back)| {
-                    cowboy_core::crew::CrewOutcome {
-                        ts_ms: now_ms(),
-                        category,
-                        effort,
-                        model,
-                        fell_back,
-                        status: status.clone(),
-                        duration_ms,
-                    }
-                });
-                (id, label, sub_id, result, status, outcome)
-            }
-        }))
-        .buffer_unordered(max_parallel);
-        // Note: `started_tx` stays captured by the stream's per-item closures for as
-        // long as the stream lives; the completion loop exits on stream exhaustion
-        // (not on the started-channel closing), so no explicit drop is needed.
-
-        let root = self.root().to_path_buf();
-        let cancel = self.cancel.clone();
-        loop {
-            let item = tokio::select! {
-                biased;
-                // Interrupted mid-batch: keep every completed subagent's result
-                // (finished work must reach the transcript, or the foreman re-runs
-                // it all from scratch next turn) and synthesize a checkpoint
-                // marker for the rest. Dropping `stream` kills the still-running
-                // children via kill_on_drop.
-                _ = cancel.cancelled() => {
-                    let mut stopped = 0usize;
-                    for (id, label, sub_id) in &dispatched {
-                        if results.contains_key(id) {
-                            continue;
+            let (granted, ceiling) = plan.budget.unwrap_or((0, 0));
+            let spec = crate::agent::jobs::JobSpec {
+                id: plan.id.clone(),
+                call_id: call_id.clone(),
+                label: label.clone(),
+                model: plan
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| "<default>".to_string()),
+                task: plan.display_task.clone(),
+                provider: provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref()),
+                granted,
+                ceiling,
+            };
+            let job_id = plan.id.clone();
+            let id_for_message = plan.id.clone();
+            let model_disp = spec.model.clone();
+            // Cloned out of `self` before the dispatch: the closure runs while the
+            // registry is mutably borrowed, so it must not touch `self` at all.
+            let tx = self.job_tx.clone();
+            let fanout = self.fanout_sem.clone();
+            let stop = self.job_stopper.token();
+            self.jobs.dispatch(spec, move |_, provider_sem| {
+                let handle = tokio::spawn(async move {
+                    // Two throttles, acquired in a fixed order: the session-wide
+                    // fan-out cap, then the per-provider one that keeps a burst of
+                    // same-model workers off a provider's rate limit. Held for the
+                    // child's whole life.
+                    let _fanout = fanout.acquire_owned().await.ok();
+                    let _provider = match provider_sem {
+                        Some(s) => s.acquire_owned().await.ok(),
+                        None => None,
+                    };
+                    let _ = tx.send(crate::agent::jobs::JobEvent::Started { id: job_id.clone() });
+                    let started = std::time::Instant::now();
+                    let routed = plan.routed.clone();
+                    let sub_dir = plan.id.clone();
+                    let watch = plan
+                        .control_dir
+                        .clone()
+                        .map(|d| (d, plan.id.clone(), tx.clone()));
+                    // Racing the stop switch, so "stop the subagents" reaches a running
+                    // child even while the foreman's turn holds `&mut` on the loop.
+                    // Dropping the exec future kills the child via `kill_on_drop`.
+                    //
+                    // The third branch is how a child's request for more turns reaches
+                    // the foreman: the child writes it to its control directory and
+                    // blocks, and this poll turns that file into a job event. Polling
+                    // rather than signalling because the two ends are separate
+                    // processes and the file *is* the message — a watch would add a
+                    // dependency for a check that costs nothing at this interval.
+                    let result = tokio::select! {
+                        biased;
+                        _ = stop.cancelled() => {
+                            let _ = tx.send(crate::agent::jobs::JobEvent::Finished {
+                                id: job_id,
+                                ok: false,
+                                result: format!(
+                                    "[stopped] this subagent was stopped before it finished. \
+                                     Whatever it completed is in its session directory \
+                                     ({sub_dir}) — resume from that checkpoint rather than \
+                                     redoing the work."
+                                ),
+                            });
+                            return;
                         }
-                        stopped += 1;
-                        self.ui.subagent_done(label, false, sub_id);
-                        results.insert(
-                            id.clone(),
-                            format!(
-                                "[interrupted] this subagent was stopped before it \
-                                 finished; whatever it completed (transcript, \
-                                 scratchpad, commands) is in .cowboy/sessions/{sub_id}/ \
-                                 — resume from that checkpoint rather than redoing \
-                                 work, and do NOT re-run subagents that returned \
-                                 results above"
-                            ),
-                        );
+                        _ = watch_turn_requests(watch) => unreachable!("the watcher never ends"),
+                        r = exec_subagent(plan) => r,
+                    };
+                    let status = classify_subagent_result(&result).to_string();
+                    // Recorded here rather than on delivery: the crew history is an
+                    // append to a file, and it should not depend on the foreman
+                    // getting around to reading the result.
+                    if let Some((category, effort, model, fell_back)) = routed {
+                        cowboy_core::crew::record_outcome(&cowboy_core::crew::CrewOutcome {
+                            ts_ms: now_ms(),
+                            category,
+                            effort,
+                            model,
+                            fell_back,
+                            status: status.clone(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        });
                     }
-                    self.ui.notice(&format!(
-                        "interrupted — kept {} finished subagent result(s); \
-                         stopped {stopped} still running",
-                        dispatched.len() - stopped
-                    ));
-                    break;
-                }
-                // A subagent just acquired its permit and started running: flip it
-                // from pending → running in the pane. Drained before `stream.next()`
-                // so the transition shows promptly.
-                Some((sub_id, label, model)) = started_rx.recv() => {
-                    self.ui.subagent_started(&label, &model, &sub_id);
-                    continue;
-                }
-                item = stream.next() => item,
-            };
-            let Some((id, label, sub_id, res, status, outcome)) = item else {
-                self.ui.notice("↳ subagent(s) finished");
-                break;
-            };
-            self.ui.subagent_done(&label, status == "complete", &sub_id);
-            if let Some(o) = outcome {
-                cowboy_core::crew::record_outcome(&o);
-            }
-            // Roll the finished subagent's spend into the session total so the UI
-            // reflects delegated work (subagents run as separate processes; their
-            // cost would otherwise be invisible). Reported as each child lands.
-            let usage = read_subagent_usage(&root, &sub_id);
-            self.subagent_cost_usd += usage.cost_usd;
-            self.subagent_tokens_in += usage.tokens_in;
-            self.subagent_tokens_out += usage.tokens_out;
-            self.report_usage();
-            results.insert(id, res);
+                    let _ = tx.send(crate::agent::jobs::JobEvent::Finished {
+                        id: job_id,
+                        ok: status == "complete",
+                        result,
+                    });
+                });
+                Box::new(handle.abort_handle())
+            });
+            results.insert(
+                call_id,
+                format!(
+                    "dispatched: job `{id_for_message}` [{label}] on {model_disp}. It runs \
+                     in the background — keep working. Its result will be delivered to \
+                     you automatically when it finishes; use `jobs` to check on it, and \
+                     `wait` when you have nothing else to do."
+                ),
+            );
         }
+        self.emit_jobs();
         results
+    }
+
+    /// Non-blocking: fold in whatever running jobs have reported, then inject any
+    /// undelivered news into the conversation.
+    ///
+    /// Called at the top of each iteration, which is the only safe place to add to the
+    /// history: mid-batch would interleave with the tool results the provider expects
+    /// to follow an assistant turn.
+    fn drain_job_events(&mut self) {
+        while let Ok(event) = self.job_rx.try_recv() {
+            self.jobs.apply_event(event);
+        }
+        self.deliver_job_news();
+    }
+
+    /// Turn undelivered job news into conversation messages (and UI events).
+    fn deliver_job_news(&mut self) {
+        use crate::agent::jobs::JobNews;
+        let news = self.jobs.drain_undelivered();
+        if !news.is_empty() {
+            self.emit_jobs();
+        }
+        for news in news {
+            match news {
+                JobNews::Started { id, label, model } => {
+                    self.ui.subagent_started(&label, &model, &id);
+                }
+                JobNews::Finished {
+                    id,
+                    label,
+                    ok,
+                    result,
+                } => {
+                    self.ui.subagent_done(&label, ok, &id);
+                    // Roll the finished subagent's spend into the session total so the
+                    // UI reflects delegated work; subagents run as separate processes,
+                    // so their cost would otherwise be invisible.
+                    let usage = read_subagent_usage(self.root(), &id);
+                    self.subagent_cost_usd += usage.cost_usd;
+                    self.subagent_tokens_in += usage.tokens_in;
+                    self.subagent_tokens_out += usage.tokens_out;
+                    self.report_usage();
+                    // The control channel is per-job; once it has finished there is
+                    // nothing left to ask or answer.
+                    if let Some(dir) = self
+                        .logger
+                        .as_ref()
+                        .and_then(|l| crate::agent::jobctl::ControlDir::create(l.id(), &id))
+                    {
+                        dir.cleanup();
+                    }
+                    // A user message, not a tool result: the `subagent` call that
+                    // started this job was already answered with its dispatch id, and a
+                    // second result for a settled call id is a malformed conversation.
+                    let capped = truncate(&result, self.behavior.max_command_output_bytes);
+                    let body = format!("[subagent {label} · job {id}] finished:\n{capped}");
+                    self.push_user_note(body);
+                }
+                JobNews::Question {
+                    id,
+                    label,
+                    question,
+                    options,
+                    ..
+                } => {
+                    self.ui
+                        .notice(&format!("⏸ subagent {label} ({id}) is asking a question"));
+                    // The foreman is asked, not told: a subagent that hits a genuine
+                    // ambiguity used to receive "" ("proceed") and guess, which surfaced
+                    // as a confidently wrong result with no trace of the fork in the road.
+                    let choices = if options.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n\nIt suggested: {}", options.join(" · "))
+                    };
+                    let body = format!(
+                        "[subagent {label} · job {id}] is blocked on a question and cannot \
+                         continue until you answer:\n\n{question}{choices}\n\n\
+                         Answer it with `job_reply` using `verdict: \"answer\"` and your \
+                         reply in `instructions`. Answer from what you know about the \
+                         overall task — that context is why it is asking you rather than \
+                         guessing. If you cannot, say so: it will proceed on its own \
+                         judgement, which is what it would have done anyway."
+                    );
+                    self.push_user_note(body);
+                }
+                JobNews::TurnRequest {
+                    id,
+                    label,
+                    report,
+                    requested,
+                    used,
+                    granted,
+                    ceiling,
+                    ..
+                } => {
+                    self.ui.notice(&format!(
+                        "⏸ subagent {label} ({id}) is asking for {requested} more turns"
+                    ));
+                    let headroom = ceiling.saturating_sub(granted);
+                    let body = format!(
+                        "[subagent {label} · job {id}] has spent its turn grant \
+                         ({used}/{granted}) and is asking for {requested} more. It is \
+                         paused until you answer.\n\n{report}\n\n\
+                         Decide with `job_reply`: `grant` (up to {headroom} more turns \
+                         are available before its host ceiling of {ceiling}), `redirect` \
+                         with instructions if it is going the wrong way, `wrap_up` to \
+                         make it write up what it has now, or `stop` if the work is no \
+                         longer wanted. Judge it on the measured evidence above, not on \
+                         its own optimism. If you do not answer, it takes one small \
+                         extension and then wraps up."
+                    );
+                    self.push_user_note(body);
+                }
+            }
+        }
+    }
+
+    /// Append a synthetic user message (job news, steering, a directive) to the
+    /// conversation and the session log.
+    fn push_user_note(&mut self, body: String) {
+        let msg = Message::user(body);
+        if let Some(l) = &mut self.logger {
+            l.log_message(&msg);
+        }
+        self.messages.push(msg);
+    }
+
+    /// Wait for a running job to report something, bounded and interruptible. Reports
+    /// *why* it woke, because the caller's next move depends on it: news means "check
+    /// whether we are done waiting", user input means "stop waiting and act".
+    ///
+    /// This is the only place the loop blocks on delegation, and it is reached only when
+    /// the foreman asks (`wait`) or when it tried to finish with jobs still running.
+    /// Cancellation is checked first so an interrupt is never swallowed by a long wait.
+    async fn await_job_news(&mut self, timeout: std::time::Duration) -> Woke {
+        if self.jobs.is_idle() {
+            return Woke::TimedOut;
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let event = tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Woke::Cancelled,
+                // The user typed something: stop waiting and act on it. Parking on a
+                // subagent must never make the session unresponsive — that is the
+                // defect this whole change exists to fix.
+                Some(text) = self.steer_rx.recv() => {
+                    self.ui.notice(&format!("↳ steering: {text}"));
+                    self.push_user_note(format!(
+                        "[the user says, while you are working] {text}\n\n\
+                         Take this into account from here on. Do not restart what you have \
+                         already done."
+                    ));
+                    return Woke::Steered;
+                }
+                _ = tokio::time::sleep_until(deadline) => return Woke::TimedOut,
+                e = self.job_rx.recv() => e,
+            };
+            let Some(event) = event else {
+                return Woke::TimedOut;
+            };
+            self.jobs.apply_event(event);
+            // Drain anything else that landed in the same instant, so a batch that
+            // finishes together is delivered together.
+            while let Ok(e) = self.job_rx.try_recv() {
+                self.jobs.apply_event(e);
+            }
+            let before = self.messages.len();
+            self.deliver_job_news();
+            if self.messages.len() > before {
+                return Woke::News;
+            }
+            // A `Started` event is not news the foreman needs; keep waiting.
+        }
     }
 
     /// Resolve a delegation into an executable plan: enforce the depth limit,
@@ -2949,11 +4234,7 @@ impl<'a> AgentLoop<'a> {
     ) -> std::result::Result<SubagentPlan, String> {
         use cowboy_core::crew;
 
-        let max_depth = match crew_cfg {
-            Some(c) if !c.delegation.allow_recursive_delegation => c.delegation.max_depth as usize,
-            _ => MAX_SUBAGENT_DEPTH,
-        }
-        .min(MAX_SUBAGENT_DEPTH);
+        let max_depth = effective_max_depth(crew_cfg.as_ref());
         if self.subagent_depth >= max_depth {
             return Err(format!(
                 "error: delegation depth limit ({max_depth}) reached; do this work directly"
@@ -2981,6 +4262,14 @@ impl<'a> AgentLoop<'a> {
             .as_ref()
             .map(|c| c.resolve(&category, effort, &foreman));
         let temperature = crew_cfg.as_ref().and_then(|c| c.temperature_for(&category));
+        // The child's iteration budget: an effort-scaled grant plus the ceiling it
+        // can be granted up to. `max_total_iterations: 0` opts out of supervision,
+        // and with no roster at all there is nothing to scale from — either way the
+        // child falls back to `agent.max_iterations`, as it did before.
+        let budget = crew_cfg.as_ref().and_then(|c| {
+            let d = &c.delegation;
+            (d.max_total_iterations > 0).then(|| (d.grant_for(effort), d.max_total_iterations))
+        });
 
         // Worker brief: an optional adopted agent persona, then context, the task,
         // then the expected artifact.
@@ -3032,6 +4321,16 @@ impl<'a> AgentLoop<'a> {
             now_ms(),
             SUBAGENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // The channel this child will ask for more turns on. Created here, eagerly, so
+        // the directory already exists when the child looks for it — and only when the
+        // child actually has a budget to ask about. Keyed by *this* session's id, so
+        // both ends derive the same path without passing one another a path to trust.
+        let control_dir = budget.and_then(|_| {
+            self.logger.as_ref().and_then(|l| {
+                crate::agent::jobctl::ControlDir::create(l.id(), &id)
+                    .map(|d| d.path().to_path_buf())
+            })
+        });
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
@@ -3042,6 +4341,8 @@ impl<'a> AgentLoop<'a> {
             label,
             model: routed.as_ref().map(|r| r.model.clone()),
             temperature,
+            budget,
+            control_dir,
             routed: routed.map(|r| (category, effort.as_str().to_string(), r.model, r.fell_back)),
         })
     }
@@ -3130,6 +4431,7 @@ use cowboy_core::time::now_ms;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::jobctl::Verdict;
     use crate::agent::ui::AgentUi;
     use crate::sandbox::ExecResult;
     use crate::sandbox::{Sandbox, StatusRx, StatusTx};
@@ -4680,8 +5982,157 @@ mod tests {
         );
         let res = agent.run("loop forever").await.unwrap();
         assert!(res.is_none());
-        assert!(ui.notices.iter().any(|n| n.contains("max_iterations")));
+        assert!(ui
+            .notices
+            .iter()
+            .any(|n| n.contains("reached the iteration budget")));
         assert_eq!(ui.commands.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_is_not_read_into_the_context_twice() {
+        // The loop reads the same path three times. The read is performed every time
+        // (that is what proves it is unchanged), but only the first copy of the
+        // contents reaches the conversation; the rest are answered with a pointer to
+        // the step that has it. This is the cheap half of the fix for a worker that
+        // spends its whole budget re-reading files.
+        let responses: Vec<ChatResponse> = (0..3)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "read",
+                    r#"{"path":"src/main.rs"}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::printing("FILE CONTENTS HERE"),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("read it repeatedly").await.unwrap();
+
+        let results: Vec<&str> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(results.len(), 3, "every call still gets a result");
+        assert!(
+            results[0].contains("FILE CONTENTS HERE"),
+            "the first read must deliver the file: {:?}",
+            results[0]
+        );
+        for r in &results[1..] {
+            assert!(
+                !r.contains("FILE CONTENTS HERE"),
+                "an unchanged re-read must not spend context again: {r:?}"
+            );
+            assert!(r.contains("not re-read"), "got: {r:?}");
+            assert!(
+                r.contains("step 1"),
+                "should point at the first read: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn going_in_circles_gets_a_directive_naming_the_measured_evidence() {
+        // Six identical reads with a stall window of 3: the host notices that nothing
+        // new is happening and injects a course-correction, without the model having
+        // to admit it is stuck.
+        let responses: Vec<ChatResponse> = (0..6)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(&i.to_string(), "read", r#"{"path":"a.rs"}"#)],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::printing("same bytes every time"),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 6,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.stall_window = 3;
+        agent.run("go in circles").await.unwrap();
+
+        let directive = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("[no progress]"))
+            .expect("a directive should be injected")
+            .content
+            .clone();
+        drop(agent);
+        assert!(
+            ui.notices.iter().any(|n| n.contains("no progress")),
+            "the stall should be reported: {:?}",
+            ui.notices
+        );
+        // It has to carry the measurement, not just an accusation.
+        assert!(directive.contains("unchanged re-reads"));
+        assert!(directive.contains("call `final`"));
+    }
+
+    #[tokio::test]
+    async fn polling_with_changing_output_is_never_called_a_stall() {
+        // The counting sandbox prints something different each call: a build log, a
+        // health check. The novelty metric must leave this alone — the existing loop
+        // guard deliberately allows it, and a second guard that didn't would break
+        // every "wait for the thing to come up" loop.
+        let responses: Vec<ChatResponse> = (0..6)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "shell",
+                    r#"{"command":"curl -s localhost:8080/health"}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::counting(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 6,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.stall_window = 2;
+        agent.run("poll until healthy").await.unwrap();
+        assert!(
+            !ui.notices.iter().any(|n| n.contains("no progress")),
+            "polling is not a stall: {:?}",
+            ui.notices
+        );
     }
 
     #[tokio::test]
@@ -4781,8 +6232,1421 @@ mod tests {
         assert!(err.contains("depth limit"), "got: {err}");
     }
 
+    /// Register a job without starting a process: the handle is a task that parks
+    /// forever, so `stop` has something real to abort.
+    fn register_fake_job(agent: &mut AgentLoop<'_>, id: &str) {
+        let spec = crate::agent::jobs::JobSpec {
+            id: id.into(),
+            call_id: format!("call-{id}"),
+            label: "tests/small".into(),
+            model: "cheap".into(),
+            task: "run the tests".into(),
+            provider: "p".into(),
+            granted: 25,
+            ceiling: 400,
+        };
+        agent.jobs.dispatch(spec, |_, _| {
+            Box::new(tokio::spawn(std::future::pending::<()>()).abort_handle())
+        });
+    }
+
     #[tokio::test]
-    async fn run_subagents_batches_results_by_call_id() {
+    async fn a_finished_job_is_injected_into_the_conversation_at_the_next_boundary() {
+        // The other half of async delegation: the result has to come back. It arrives as
+        // a *user* message (the `subagent` call was already answered with its job id, so
+        // a second tool result for that id would be a malformed conversation).
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"all done"}"#)],
+            }])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        agent
+            .job_tx
+            .send(crate::agent::jobs::JobEvent::Finished {
+                id: "j1".into(),
+                ok: true,
+                result: "the flaky test is a missing await in store.rs".into(),
+            })
+            .unwrap();
+
+        let out = agent.run("investigate the flake").await.unwrap();
+        assert_eq!(out.as_deref(), Some("all done"));
+        let injected = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.starts_with("[subagent"))
+            .expect("the result should be injected as a user message");
+        assert!(injected.content.contains("job j1"));
+        assert!(injected.content.contains("missing await in store.rs"));
+        // And the job is settled, so `final` was not refused.
+        assert!(agent.jobs.is_idle());
+    }
+
+    #[tokio::test]
+    async fn final_is_refused_while_a_subagent_is_still_running() {
+        // Finishing now would throw the delegated work away: its result would land
+        // after the turn that asked for it.
+        let responses: Vec<ChatResponse> = (0..2)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &format!("f{i}"),
+                    "final",
+                    r#"{"message":"done early"}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 2,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+
+        let out = agent.run("do it").await.unwrap();
+        assert!(
+            out.is_none(),
+            "the turn must not finish with work in flight"
+        );
+        let refusals: Vec<&str> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.content.starts_with("blocked:"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(refusals.len(), 2, "got: {refusals:?}");
+        assert!(
+            refusals[0].contains("subagent `j1`"),
+            "got: {}",
+            refusals[0]
+        );
+        assert!(refusals[0].contains("`wait`"), "got: {}", refusals[0]);
+        agent.jobs.stop_all();
+    }
+
+    #[tokio::test]
+    async fn after_repeated_refusals_the_loop_waits_rather_than_arguing() {
+        // A hard refusal loop is the one way this gate could wedge a session, so past
+        // the refusal bound the loop waits for the jobs itself and then lets the answer
+        // through.
+        let responses: Vec<ChatResponse> = (0..3)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &format!("f{i}"),
+                    "final",
+                    r#"{"message":"finished"}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 3,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        // The worker lands shortly after the loop starts waiting.
+        let tx = agent.job_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = tx.send(crate::agent::jobs::JobEvent::Finished {
+                id: "j1".into(),
+                ok: true,
+                result: "tests pass".into(),
+            });
+        });
+
+        let out = agent.run("do it").await.unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some("finished"),
+            "the third attempt should be allowed through after the wait"
+        );
+        assert!(agent.jobs.is_idle());
+        // The result still reached the conversation rather than being dropped.
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("tests pass")));
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_leaves_running_jobs_alone() {
+        // Session-scoped jobs: cancelling the turn must not reap the children. The
+        // old implementation killed the whole batch, so interrupting to say one thing
+        // threw away minutes of delegated work.
+        let mut ui = RecordingUi::default();
+        let cancel = CancellationToken::new();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            cancel.clone(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        cancel.cancel();
+        let out = agent.run("go").await.unwrap();
+        assert!(out.is_none());
+        assert_eq!(
+            agent.jobs.outstanding().len(),
+            1,
+            "the job should still be running after an interrupt"
+        );
+        agent.jobs.stop_all();
+    }
+
+    /// A supervised worker: a small grant, a real ceiling, and a control directory to
+    /// ask on. Returns the directory so a test can answer as the foreman would.
+    fn supervised_agent<'u>(
+        ui: &'u mut RecordingUi,
+        responses: Vec<ChatResponse>,
+        grant: u32,
+        ceiling: u32,
+    ) -> (
+        AgentLoop<'u>,
+        crate::agent::jobctl::ControlDir,
+        assert_fs::TempDir,
+    ) {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let ctl = tmp.path().join("control");
+        std::fs::create_dir_all(&ctl).unwrap();
+        let dir = crate::agent::jobctl::ControlDir::at(ctl);
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 1000,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            ui,
+        );
+        // Set up as if the parent had passed a grant and a channel, without touching
+        // process environment (which races across tests in one binary).
+        agent.budget = IterationBudget::resolve(Some(grant), Some(ceiling), 1000);
+        agent.control = Some(dir.clone());
+        agent.request_timeout = std::time::Duration::from_millis(400);
+        (agent, dir, tmp)
+    }
+
+    /// The foreman's side, in a background task: wait for request `seq`, then answer.
+    fn answer_as_foreman(dir: &crate::agent::jobctl::ControlDir, seq: u32, verdict: Verdict) {
+        let dir = dir.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                if dir.read_request(seq).is_some() {
+                    dir.write_verdict(&verdict).unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_worker_that_spends_its_grant_reports_and_is_granted_more() {
+        // The core of grant-and-request: the worker runs out, the host files a report on
+        // its behalf, the foreman grants more, and the worker keeps going and finishes —
+        // instead of hitting a cap and returning `[partial]`.
+        let mut responses: Vec<ChatResponse> = (0..2)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "read",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                )],
+            })
+            .collect();
+        responses.push(ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("f", "final", r#"{"message":"review complete"}"#)],
+        });
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, responses, 2, 400);
+        answer_as_foreman(
+            &dir,
+            1,
+            Verdict::Grant {
+                seq: 1,
+                iterations: 5,
+            },
+        );
+
+        let out = agent.run("review the crate").await.unwrap();
+        assert_eq!(out.as_deref(), Some("review complete"));
+        // The request carried the host's evidence, not just the worker's word.
+        let req = dir.read_request(1).expect("a request should be filed");
+        assert_eq!(req.used, 2);
+        assert_eq!(req.granted, 2);
+        assert!(req.evidence.contains("files read"), "got: {}", req.evidence);
+        assert!(req.evidence.contains("turns 2/2"), "got: {}", req.evidence);
+        assert_eq!(agent.budget.granted, 7, "the grant should have grown by 5");
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_extends_once_then_wraps_up() {
+        // The policy that matters most: an unattended foreman must neither let a worker
+        // run forever nor destroy its work. One small extension, then wrap up — and the
+        // worker still ends with a real answer.
+        let responses: Vec<ChatResponse> = (0..40)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "read",
+                    &format!(r#"{{"path":"f{i}.rs"}}"#),
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let (mut agent, _dir, _tmp) = supervised_agent(&mut ui, responses, 2, 400);
+        // Nobody answers.
+        let out = agent.run("wander forever").await.unwrap();
+        assert!(out.is_none(), "it ran out of turns rather than finishing");
+        // 2 (grant) + 10 (one automatic extension) + 3 (wrap-up turns).
+        assert_eq!(agent.budget.granted, 15, "bounded, not unbounded");
+        assert_eq!(agent.turn_requests, 2, "it asked twice and stopped asking");
+        drop(agent);
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("no answer from the foreman")),
+            "{:?}",
+            ui.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wrap_up_verdict_leaves_enough_turns_to_write_the_answer() {
+        // "Report now" with no turns to report in would produce exactly the empty
+        // result this mechanism exists to prevent.
+        let responses = vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("0", "read", r#"{"path":"a.rs"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "f",
+                    "final",
+                    r#"{"message":"partial but reported: found one issue"}"#,
+                )],
+            },
+        ];
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, responses, 1, 400);
+        answer_as_foreman(&dir, 1, Verdict::WrapUp { seq: 1 });
+
+        let out = agent.run("review it").await.unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some("partial but reported: found one issue")
+        );
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|m| m.content.contains("[wrap up]")),
+            "the worker should be told to write up"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_changes_direction_and_clears_the_stall_streak() {
+        // Two reads spend the grant; after the redirect the worker does what it was
+        // told and finishes, so the redirect is the only request.
+        let mut responses: Vec<ChatResponse> = (0..2)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(&i.to_string(), "read", r#"{"path":"a.rs"}"#)],
+            })
+            .collect();
+        responses.push(ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call(
+                "f",
+                "final",
+                r#"{"message":"checked the error paths"}"#,
+            )],
+        });
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, responses, 2, 400);
+        answer_as_foreman(
+            &dir,
+            1,
+            Verdict::Redirect {
+                seq: 1,
+                iterations: 3,
+                instructions: "look at the error paths in store.rs instead".into(),
+            },
+        );
+        let out = agent.run("review it").await.unwrap();
+        assert_eq!(out.as_deref(), Some("checked the error paths"));
+        let redirect = agent
+            .messages
+            .iter()
+            .find(|m| m.content.contains("[foreman] Change of direction"))
+            .expect("the instructions should reach the worker");
+        assert!(redirect.content.contains("error paths in store.rs"));
+        // It got turns to act on the redirect, and the stall streak it may have been
+        // reported for was cleared at that point (see `a_redirect_can_clear_the_streak`
+        // for the streak logic itself).
+        assert_eq!(agent.budget.granted, 5);
+        assert_eq!(agent.turn_requests, 1);
+        assert_eq!(agent.progress.barren_streak(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stop_verdict_ends_the_work_with_a_report_not_silence() {
+        let responses = vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("0", "read", r#"{"path":"a.rs"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "f",
+                    "final",
+                    r#"{"message":"stopped; had established the schema is fine"}"#,
+                )],
+            },
+        ];
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, responses, 1, 400);
+        answer_as_foreman(
+            &dir,
+            1,
+            Verdict::Stop {
+                seq: 1,
+                reason: "the approach was wrong".into(),
+            },
+        );
+        let out = agent.run("review it").await.unwrap();
+        assert!(out.unwrap().contains("stopped"));
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("the approach was wrong")));
+    }
+
+    #[tokio::test]
+    async fn the_voluntary_request_tool_asks_and_reports_the_answer() {
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, vec![], 40, 400);
+        answer_as_foreman(
+            &dir,
+            1,
+            Verdict::Grant {
+                seq: 1,
+                iterations: 25,
+            },
+        );
+        let out = agent
+            .run_request_turns(&tools::RequestTurnsArgs {
+                progress: "mapped the crate and reviewed 4 of 9 files".into(),
+                remaining: "5 files".into(),
+                next_step: "review journal.rs".into(),
+                iterations: 25,
+            })
+            .await;
+        assert!(out.contains("granted"), "got: {out}");
+        assert_eq!(agent.budget.granted, 65);
+        let req = dir.read_request(1).unwrap();
+        assert!(req.report.contains("reviewed 4 of 9 files"));
+        assert!(req.report.contains("Next step: review journal.rs"));
+    }
+
+    #[tokio::test]
+    async fn a_worker_with_no_foreman_is_told_so_rather_than_left_hanging() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let out = agent
+            .run_request_turns(&tools::RequestTurnsArgs {
+                progress: "p".into(),
+                remaining: "r".into(),
+                next_step: "n".into(),
+                iterations: 10,
+            })
+            .await;
+        assert!(out.contains("no foreman to ask"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn asking_is_bounded_so_a_worker_and_foreman_cannot_negotiate_forever() {
+        let mut ui = RecordingUi::default();
+        let (mut agent, _dir, _tmp) = supervised_agent(&mut ui, vec![], 10, 100_000);
+        agent.turn_requests = MAX_TURN_REQUESTS;
+        let out = agent
+            .run_request_turns(&tools::RequestTurnsArgs {
+                progress: "p".into(),
+                remaining: "r".into(),
+                next_step: "n".into(),
+                iterations: 10,
+            })
+            .await;
+        assert!(out.contains("write up what you have"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn a_grant_that_hits_the_ceiling_becomes_a_wrap_up() {
+        // The foreman can say "more turns"; the host still gets the last word.
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, vec![], 40, 40);
+        answer_as_foreman(
+            &dir,
+            1,
+            Verdict::Grant {
+                seq: 1,
+                iterations: 500,
+            },
+        );
+        let out = agent
+            .run_request_turns(&tools::RequestTurnsArgs {
+                progress: "p".into(),
+                remaining: "r".into(),
+                next_step: "n".into(),
+                iterations: 500,
+            })
+            .await;
+        assert!(out.contains("call\n                 `final`") || out.contains("`final`"));
+        assert_eq!(agent.budget.granted, 40, "the ceiling holds");
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("[wrap up]")));
+    }
+
+    #[tokio::test]
+    async fn a_worker_whose_parent_was_killed_stops_itself() {
+        // Session-scoped jobs are only reaped by a parent that asks. A parent killed
+        // outright never asks, so the worker has to notice — otherwise a `kill -9` on the
+        // worker process leaves children spending on results nobody will read.
+        let responses: Vec<ChatResponse> = (0..4)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "shell",
+                    r#"{"command":"echo hi"}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // A pid that cannot exist: the parent is gone.
+        agent.parent_pid = Some(u32::MAX);
+        let out = agent.run("keep working").await.unwrap();
+        assert!(out.is_none());
+        drop(agent);
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("parent session is gone")),
+            "{:?}",
+            ui.notices
+        );
+        // It stopped before doing any work, rather than after burning its grant.
+        assert!(ui.commands.is_empty(), "{:?}", ui.commands);
+    }
+
+    #[tokio::test]
+    async fn a_live_parent_does_not_stop_the_worker() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"done"}"#)],
+            }])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.parent_pid = Some(std::process::id());
+        assert_eq!(
+            agent.run("work").await.unwrap().as_deref(),
+            Some("done"),
+            "a live parent must not be mistaken for a dead one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_worker_waiting_on_a_dead_parent_stops_instead_of_waiting_out_the_timeout() {
+        let mut ui = RecordingUi::default();
+        let (mut agent, _dir, _tmp) = supervised_agent(&mut ui, vec![], 40, 400);
+        agent.parent_pid = Some(u32::MAX);
+        agent.request_timeout = std::time::Duration::from_secs(600);
+        let started = std::time::Instant::now();
+        let out = agent
+            .run_request_turns(&tools::RequestTurnsArgs {
+                progress: "p".into(),
+                remaining: "r".into(),
+                next_step: "n".into(),
+                iterations: 10,
+            })
+            .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "it must not wait out the request timeout for an answer that cannot come"
+        );
+        assert!(out.contains("interrupted"), "got: {out}");
+    }
+
+    #[tokio::test]
+    async fn user_input_reaches_a_running_turn_at_the_next_step() {
+        // Typing while the agent works used to mean waiting for the whole turn. Now the
+        // message lands on the next iteration — without cancelling anything.
+        let responses: Vec<ChatResponse> = vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("0", "shell", r#"{"command":"echo one"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"echo two"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"did both"}"#)],
+            },
+        ];
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // As if the user typed while the turn was already running.
+        agent
+            .steer_sender()
+            .send("also check the error path".into())
+            .unwrap();
+
+        let out = agent.run("do the thing").await.unwrap();
+        assert_eq!(out.as_deref(), Some("did both"), "the turn still completed");
+        let steered = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.contains("while you are working"))
+            .expect("the message should be injected into the running turn");
+        assert!(steered.content.contains("also check the error path"));
+        assert!(
+            steered.content.contains("Do not restart"),
+            "steering is a correction, not a new task: {}",
+            steered.content
+        );
+        // Both commands still ran: steering does not cancel work in progress.
+        drop(agent);
+        assert_eq!(ui.commands.len(), 2, "{:?}", ui.commands);
+    }
+
+    #[tokio::test]
+    async fn steering_breaks_a_wait_rather_than_being_stuck_behind_it() {
+        // `wait` is the one place the loop blocks on purpose. If user input could not
+        // interrupt it, parking on a subagent would recreate exactly the unresponsive
+        // session this change is about.
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        let steer = agent.steer_sender();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let _ = steer.send("stop looking at that, check the migration".into());
+        });
+        let started = std::time::Instant::now();
+        let out = agent
+            .run_wait(&tools::WaitArgs {
+                timeout_seconds: Some(600),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must end when the user speaks"
+        );
+        assert!(out.contains("the user said something"), "got: {out}");
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("check the migration")));
+        agent.jobs.stop_all();
+    }
+
+    #[tokio::test]
+    async fn empty_steering_is_ignored() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.steer_sender().send("   ".into()).unwrap();
+        assert_eq!(agent.drain_steering(), 0);
+        assert!(agent.messages.iter().all(|m| m.role != Role::User));
+    }
+
+    #[tokio::test]
+    async fn a_second_stall_escalates_to_the_foreman_instead_of_repeating_itself() {
+        // Task 3's directive is worth saying once. A worker that ignores it is not going
+        // to be talked out of the loop, so the host escalates: the foreman gets the
+        // report plus the measured evidence and decides.
+        //
+        // Driven with a `plan` call — bookkeeping, which produces no new files, edits or
+        // commands — and a one-iteration stall window, with one stall already recorded.
+        let responses: Vec<ChatResponse> = (0..4)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &i.to_string(),
+                    "plan",
+                    r#"{"steps":[{"step":"think about it","status":"in_progress"}]}"#,
+                )],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let (mut agent, dir, _tmp) = supervised_agent(&mut ui, responses, 4, 400);
+        agent.stall_window = 1;
+        agent.stall_count = 1; // the directive has already been given once
+        answer_as_foreman(&dir, 1, Verdict::WrapUp { seq: 1 });
+
+        agent.run("go in circles").await.unwrap();
+        let req = dir
+            .read_request(1)
+            .expect("the second stall should reach the foreman");
+        assert!(req.report.contains("appears stuck"), "got: {}", req.report);
+        // The evidence is the host's measurement, not the worker's account of itself.
+        assert!(
+            req.evidence.contains("nothing new"),
+            "got: {}",
+            req.evidence
+        );
+        assert!(req.evidence.contains("turns"), "got: {}", req.evidence);
+        assert!(agent.wrapping_up, "the verdict should be terminal");
+    }
+
+    #[tokio::test]
+    async fn jobs_lists_state_and_the_budget_columns() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        assert!(agent.run_jobs().contains("no background jobs"));
+
+        register_fake_job(&mut agent, "j1");
+        let out = agent.run_jobs();
+        assert!(out.contains("`j1`"), "got: {out}");
+        assert!(out.contains("pending"), "got: {out}");
+        // The foreman has to be able to see what an extension would cost.
+        assert!(out.contains("turns 0/25"), "got: {out}");
+        assert!(out.contains("ceiling 400"), "got: {out}");
+
+        // Once it asks for turns, the ask is visible and called out.
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::TurnRequest {
+                id: "j1".into(),
+                seq: 1,
+                report: "half done".into(),
+                requested: 30,
+                used: 25,
+            });
+        let out = agent.run_jobs();
+        assert!(out.contains("asking for 30 more"), "got: {out}");
+        assert!(out.contains("`job_reply`"), "got: {out}");
+        agent.jobs.stop_all();
+    }
+
+    #[tokio::test]
+    async fn wait_returns_when_a_job_lands_and_when_it_times_out() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // Nothing running: `wait` is a no-op rather than a hang.
+        assert!(agent
+            .run_wait(&tools::WaitArgs::default())
+            .await
+            .contains("nothing to wait for"));
+
+        register_fake_job(&mut agent, "j1");
+        // Times out rather than parking forever, and says what to do next.
+        let out = agent
+            .run_wait(&tools::WaitArgs {
+                timeout_seconds: Some(1),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.contains("timed out"), "got: {out}");
+        assert!(out.contains("1 job(s) still running"), "got: {out}");
+
+        // A worker landing wakes it immediately.
+        let tx = agent.job_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let _ = tx.send(crate::agent::jobs::JobEvent::Finished {
+                id: "j1".into(),
+                ok: true,
+                result: "all green".into(),
+            });
+        });
+        let out = agent
+            .run_wait(&tools::WaitArgs {
+                timeout_seconds: Some(30),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.contains("job update(s) arrived"), "got: {out}");
+        assert!(agent.jobs.is_idle());
+        // The result reached the conversation, not just the wait's return value.
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("all green")));
+    }
+
+    #[tokio::test]
+    async fn wait_is_interruptible() {
+        // An interrupt must never be swallowed by a wait: this is the failure the whole
+        // change is about, and `wait` is the one place the loop deliberately blocks.
+        let cancel = CancellationToken::new();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            cancel.clone(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        let c = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            c.cancel();
+        });
+        let started = std::time::Instant::now();
+        let out = agent
+            .run_wait(&tools::WaitArgs {
+                timeout_seconds: Some(600),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.contains("interrupted"), "got: {out}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "an interrupt must not wait out the timeout"
+        );
+        agent.jobs.stop_all();
+    }
+
+    #[tokio::test]
+    async fn wait_reports_an_unknown_job_instead_of_waiting_for_everything() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        let out = agent
+            .run_wait(&tools::WaitArgs {
+                ids: Some(vec!["nope".into()]),
+                timeout_seconds: Some(1),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.contains("no such job"), "got: {out}");
+        agent.jobs.stop_all();
+    }
+
+    #[tokio::test]
+    async fn a_subagents_question_is_delivered_to_the_foreman_and_answered() {
+        // The whole point of the feature: a worker that hits an ambiguity gets a real
+        // answer from the session that has the context, instead of the empty string that
+        // used to mean "guess".
+        let root = assert_fs::TempDir::new().unwrap();
+        let mut ui = RecordingUi::default();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "job-reply-answer").unwrap();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::at(root.path().to_path_buf()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::Question {
+                id: "j1".into(),
+                seq: 1,
+                question: "migrate the v1 endpoints too?".into(),
+                options: vec!["yes".into(), "no".into()],
+            });
+
+        // It reaches the conversation as a message the foreman can act on, with the
+        // suggested answers and the instruction for how to reply.
+        agent.deliver_job_news();
+        let note = agent
+            .messages
+            .iter()
+            .rev()
+            .map(|m| m.content.clone())
+            .find(|c| c.contains("v1 endpoints"))
+            .unwrap_or_default();
+        assert!(
+            note.contains("v1 endpoints"),
+            "the question should reach the conversation"
+        );
+        assert!(note.contains("yes · no"), "the options should show: {note}");
+        assert!(note.contains("job_reply"), "got: {note}");
+
+        // An `answer` with nothing in `instructions` is refused rather than sending an
+        // empty reply, which the worker would read as a real answer of "".
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "answer".into(),
+            iterations: None,
+            instructions: None,
+        });
+        assert!(
+            out.contains("put your reply in `instructions`"),
+            "got: {out}"
+        );
+        assert_eq!(
+            agent.jobs.get("j1").unwrap().state,
+            crate::agent::jobs::JobState::AwaitingAnswer { seq: 1 }
+        );
+
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "answer".into(),
+            iterations: None,
+            instructions: Some("no — v1 is being retired next quarter".into()),
+        });
+        assert!(out.contains("answered job"), "got: {out}");
+        assert_eq!(
+            agent.jobs.get("j1").unwrap().state,
+            crate::agent::jobs::JobState::Running,
+            "answering resumes the job"
+        );
+
+        // And the answer really landed in the control channel the worker polls.
+        let dir = crate::agent::jobctl::ControlDir::create("job-reply-answer", "j1").unwrap();
+        let answer = dir.read_answer(1).expect("the answer should be on disk");
+        assert!(answer.answer.contains("retired next quarter"));
+
+        agent.stop_all_jobs();
+    }
+
+    #[tokio::test]
+    async fn answering_a_job_that_is_asking_for_turns_says_so() {
+        // `answer` is a real verdict, so using it on a budget request should explain the
+        // mismatch rather than report "unknown verdict".
+        let root = assert_fs::TempDir::new().unwrap();
+        let mut ui = RecordingUi::default();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "job-reply-mismatch")
+                .unwrap();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::at(root.path().to_path_buf()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::TurnRequest {
+                id: "j1".into(),
+                seq: 1,
+                report: "half done".into(),
+                requested: 30,
+                used: 25,
+            });
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "answer".into(),
+            iterations: None,
+            instructions: Some("sure, go ahead".into()),
+        });
+        assert!(
+            out.contains("asking for turns, not asking a question"),
+            "got: {out}"
+        );
+        agent.stop_all_jobs();
+    }
+
+    #[tokio::test]
+    async fn job_reply_clamps_a_grant_to_the_host_ceiling() {
+        // The foreman decides *whether* to extend; the host decides how far the bound
+        // goes. A foreman granting 10_000 turns must not be able to.
+        let root = assert_fs::TempDir::new().unwrap();
+        let mut ui = RecordingUi::default();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "job-reply-clamp").unwrap();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::at(root.path().to_path_buf()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+        // Not waiting on anything yet: there is nothing to answer.
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "grant".into(),
+            iterations: Some(10),
+            instructions: None,
+        });
+        assert!(out.contains("not waiting for a verdict"), "got: {out}");
+
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::TurnRequest {
+                id: "j1".into(),
+                seq: 1,
+                report: "half done".into(),
+                requested: 30,
+                used: 25,
+            });
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "grant".into(),
+            iterations: Some(10_000),
+            instructions: None,
+        });
+        assert!(out.contains("clamped"), "got: {out}");
+        let job = agent.jobs.get("j1").unwrap();
+        assert_eq!(job.granted, 400, "the ceiling is the bound, not the ask");
+        assert_eq!(job.state, crate::agent::jobs::JobState::Running);
+        // `stop_all_jobs`, not `jobs.stop_all`: it also removes the job's host-side
+        // control directory, so a test run leaves nothing under $XDG_STATE_HOME.
+        agent.stop_all_jobs();
+    }
+
+    #[tokio::test]
+    async fn job_reply_validates_the_verdict_and_requires_redirect_instructions() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let mut ui = RecordingUi::default();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "job-reply-validate")
+                .unwrap();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::at(root.path().to_path_buf()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::TurnRequest {
+                id: "j1".into(),
+                seq: 1,
+                report: "stuck".into(),
+                requested: 30,
+                used: 25,
+            });
+
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "sure why not".into(),
+            iterations: None,
+            instructions: None,
+        });
+        assert!(out.contains("unknown verdict"), "got: {out}");
+
+        // A redirect with nothing to redirect *to* is refused rather than sent.
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "redirect".into(),
+            iterations: Some(10),
+            instructions: None,
+        });
+        assert!(out.contains("needs `instructions`"), "got: {out}");
+        // Still waiting, because neither reply was delivered.
+        assert!(matches!(
+            agent.jobs.get("j1").unwrap().state,
+            crate::agent::jobs::JobState::AwaitingVerdict { .. }
+        ));
+
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "unknown-job".into(),
+            iterations: None,
+            instructions: None,
+        });
+        assert!(out.contains("unknown verdict"), "got: {out}");
+        agent.stop_all_jobs();
+    }
+
+    #[tokio::test]
+    async fn a_result_from_before_an_interrupt_arrives_in_the_next_turn() {
+        // The payoff of session-scoped jobs: the user interrupts to correct the
+        // foreman, the delegated work keeps going, and its result lands in the turn
+        // after. Under the old batch-join this work was killed and re-done.
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"folded it in"}"#)],
+            }])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+
+        // Turn one is interrupted before it does anything.
+        let interrupted = CancellationToken::new();
+        interrupted.cancel();
+        assert!(agent
+            .run_turn("start the review", interrupted)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            agent.running_jobs(),
+            1,
+            "the worker must survive the cancel"
+        );
+
+        // The worker lands while the session sits idle.
+        agent
+            .job_tx
+            .send(crate::agent::jobs::JobEvent::Finished {
+                id: "j1".into(),
+                ok: true,
+                result: "review done: two real findings".into(),
+            })
+            .unwrap();
+
+        // The next turn picks it up.
+        let out = agent
+            .run_turn(
+                "actually, focus on the error paths",
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.as_deref(), Some("folded it in"));
+        assert!(
+            agent
+                .messages
+                .iter()
+                .any(|m| m.content.contains("two real findings")),
+            "the pre-interrupt result should reach the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_the_subagents_settles_them_without_touching_the_turn() {
+        // The interrupt this change adds: kill the delegated work, keep the session.
+        // Fired through the shared switch, which is what lets the worker honour it
+        // while a turn holds `&mut` on the loop.
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        register_fake_job(&mut agent, "j1");
+        register_fake_job(&mut agent, "j2");
+        assert_eq!(agent.running_jobs(), 2);
+
+        let stopped = agent.stop_all_jobs();
+        assert_eq!(stopped, 2);
+        assert_eq!(agent.running_jobs(), 0);
+        // The turn's own cancellation is untouched — stopping subagents is not
+        // stopping the foreman.
+        assert!(!agent.cancel.is_cancelled());
+
+        // And the foreman is told, so it does not sit waiting for results that will
+        // never come.
+        agent.deliver_job_news();
+        let notes: Vec<&str> = agent
+            .messages
+            .iter()
+            .filter(|m| m.content.contains("[stopped]"))
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(notes.len(), 2, "both jobs should report themselves stopped");
+        assert!(notes[0].contains("resume from that checkpoint"));
+    }
+
+    #[tokio::test]
+    async fn the_stop_switch_reaches_a_job_that_is_actually_running() {
+        // `stop_all_jobs` aborts the task; here the task is the one that matters — a
+        // long-lived future standing in for a child process — and it must be gone
+        // rather than left detached.
+        let mut ui = RecordingUi::default();
+        let agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let stop = agent.job_stopper();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        let token = stop.token();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                _ = token.cancelled() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        // Fired from a clone held outside the loop, exactly as the worker does.
+        stop.stop_all();
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("the job task must observe the stop")
+            .unwrap();
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the job should have been stopped, not run to completion"
+        );
+        // Re-armed, so the next dispatch is not born cancelled.
+        assert!(!agent.job_stopper().token().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_job_from_job_reply_settles_it_and_tells_the_foreman() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let mut ui = RecordingUi::default();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "job-reply-stop").unwrap();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::at(root.path().to_path_buf()),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+        agent
+            .jobs
+            .apply_event(crate::agent::jobs::JobEvent::TurnRequest {
+                id: "j1".into(),
+                seq: 1,
+                report: "going in circles".into(),
+                requested: 50,
+                used: 25,
+            });
+        let out = agent.run_job_reply(&tools::JobReplyArgs {
+            id: "j1".into(),
+            verdict: "stop".into(),
+            iterations: None,
+            instructions: Some("the approach is wrong".into()),
+        });
+        assert!(out.contains("stopped job"), "got: {out}");
+        // A stopped job must not be left outstanding — it is blocked waiting on us, so
+        // nothing else would ever settle it.
+        assert!(agent.jobs.is_idle());
+        assert!(agent
+            .messages
+            .iter()
+            .any(|m| m.content.contains("[stopped]")));
+    }
+
+    #[tokio::test]
+    async fn coordination_calls_do_not_trip_the_loop_guard() {
+        // A foreman with work in flight calls `jobs` repeatedly, with identical
+        // arguments and identical output. That is exactly the shape the repetition
+        // guard aborts a turn for, so it has to be exempt — otherwise supervising a
+        // crew would end the turn.
+        let responses: Vec<ChatResponse> = (0..8)
+            .map(|i| ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(&i.to_string(), "jobs", "{}")],
+            })
+            .collect();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(responses)),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations: 8,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.stall_window = 3;
+        register_fake_job(&mut agent, "j1");
+        agent.run("supervise").await.unwrap();
+        agent.jobs.stop_all();
+        drop(agent);
+
+        assert!(
+            !ui.notices.iter().any(|n| n.contains("loop")),
+            "coordination must not read as a loop: {:?}",
+            ui.notices
+        );
+        assert!(
+            !ui.notices.iter().any(|n| n.contains("no progress")),
+            "waiting on a worker is not going in circles: {:?}",
+            ui.notices
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_answers_every_call_by_id() {
         // Three delegations in one turn. At max depth they all short-circuit in
         // planning (no subprocess), but we still get one result per call id —
         // proving the batch maps every subagent call.
@@ -4809,21 +7673,21 @@ mod tests {
             ),
             tool_call("c", "shell", r#"{"command":"echo hi"}"#), // non-subagent ignored
         ];
-        let results = agent.run_subagents(&calls).await;
+        let results = agent.dispatch_subagents(&calls);
         assert_eq!(results.len(), 2, "only subagent calls produce results");
         assert!(results.contains_key("a") && results.contains_key("b"));
         assert!(!results.contains_key("c"));
         assert!(results["a"].contains("depth limit"));
+        // A refused delegation is not a job.
+        assert!(agent.jobs.is_idle());
     }
 
     #[tokio::test]
-    async fn interrupted_subagent_batch_salvages_results_instead_of_dropping_them() {
-        // An interrupt mid-batch must not throw away the batch: every dispatched
-        // call still gets a tool result (here a checkpoint marker, since nothing
-        // finished — the biased select sees the pre-cancelled token before the
-        // stream is first polled, so no child process ever spawns). Without this,
-        // the transcript ends the turn with dangling subagent calls and the
-        // foreman re-runs everything from scratch next turn.
+    async fn dispatch_does_not_block_on_the_children_it_starts() {
+        // The defect this whole change exists to fix: dispatch must return before the
+        // workers do. Two delegations are started with a cancelled token — which the
+        // old join-the-batch implementation treated as "salvage and give up" — and the
+        // dispatch still hands back a job id per call without awaiting anything.
         let mut ui = RecordingUi::default();
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -4835,26 +7699,34 @@ mod tests {
             cancel,
             &mut ui,
         );
-        let calls = vec![tool_call(
-            "a",
-            "subagent",
-            r#"{"task":"x","category":"tests","effort":"small"}"#,
-        )];
-        let results = agent.run_subagents(&calls).await;
-        let res = results
-            .get("a")
-            .expect("interrupted call still gets a result");
-        assert!(
-            res.contains("[interrupted]") && res.contains(".cowboy/sessions/"),
-            "should point at the child's checkpoint, got: {res}"
-        );
-        assert!(
-            ui.notices
-                .iter()
-                .any(|n| n.contains("interrupted — kept 0 finished subagent result(s)")),
-            "salvage notice should report what was kept/stopped: {:?}",
-            ui.notices
-        );
+        let calls = vec![
+            tool_call(
+                "a",
+                "subagent",
+                r#"{"task":"x","category":"tests","effort":"small"}"#,
+            ),
+            tool_call(
+                "b",
+                "subagent",
+                r#"{"task":"y","category":"docs","effort":"tiny"}"#,
+            ),
+        ];
+        let results = agent.dispatch_subagents(&calls);
+        assert_eq!(results.len(), 2);
+        for id in ["a", "b"] {
+            assert!(
+                results[id].starts_with("dispatched:"),
+                "the call is answered with a job, not an answer: {}",
+                results[id]
+            );
+        }
+        // Both jobs are registered and outstanding, so `final` is now premature.
+        assert_eq!(agent.jobs.outstanding().len(), 2);
+        assert!(!agent.jobs.is_idle());
+        let summary = agent.outstanding_jobs_summary();
+        assert!(summary.contains("2 subagents"), "got: {summary}");
+        // Nothing may leak: the children are host processes, so stop them explicitly.
+        agent.jobs.stop_all();
     }
 
     /// The tool schemas go out with every request, so the budget has to know about

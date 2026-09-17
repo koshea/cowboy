@@ -79,7 +79,8 @@ credentials); set the default with `cowboy models use [-g] <name>` and review wi
 
 Full documentation lives at **[cowboycode.io](https://cowboycode.io)**.
 
-Highlights: [Quick start](https://cowboycode.io/getting-started/quickstart.html) ·
+Highlights: [Your first five minutes](https://cowboycode.io/getting-started/first-five-minutes.html) ·
+[Quick start](https://cowboycode.io/getting-started/quickstart.html) ·
 [The boundary](https://cowboycode.io/security/model.html) ·
 [Network egress](https://cowboycode.io/security/network.html) ·
 [Sandbox design decisions](https://cowboycode.io/security/sandbox-decisions.html) ·

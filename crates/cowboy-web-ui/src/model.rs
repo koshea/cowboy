@@ -60,6 +60,12 @@ pub struct SubagentStatus {
     pub pending: bool,
     /// `None` = running, `Some(true)` = finished ok, `Some(false)` = failed.
     pub done: Option<bool>,
+    /// When the worker has spent its turn grant and is waiting for the foreman to
+    /// answer: how many more turns it asked for. `0` when it is not asking.
+    pub requested: u32,
+    /// Turns spent / granted, when the roster supervises turn budgets.
+    pub used: u32,
+    pub granted: u32,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -91,6 +97,8 @@ pub struct Model {
     pub running: bool,
     /// Crew subagents dispatched this session, for the watch list.
     pub subagents: Vec<SubagentStatus>,
+    /// Input the user queued to run after the current turn.
+    pub queued: Vec<String>,
 }
 
 impl Model {
@@ -258,6 +266,9 @@ impl Model {
                     model,
                     pending: true,
                     done: None,
+                    requested: 0,
+                    used: 0,
+                    granted: 0,
                 });
             }
             UiEventMsg::SubagentStarted { label, model, id } => {
@@ -279,6 +290,9 @@ impl Model {
                         model,
                         pending: false,
                         done: None,
+                        requested: 0,
+                        used: 0,
+                        granted: 0,
                     });
                 }
             }
@@ -291,6 +305,38 @@ impl Model {
                     s.done = Some(ok);
                 }
             }
+            // Level-triggered job state: authoritative where it is available, since the
+            // `Subagent*` edges cannot express a worker parked waiting for a decision or
+            // its turn usage.
+            UiEventMsg::JobsChanged(jobs) => {
+                self.subagents = jobs
+                    .into_iter()
+                    .map(|j| SubagentStatus {
+                        pending: j.state == "pending",
+                        done: match j.state.as_str() {
+                            "done" => Some(true),
+                            "failed" => Some(false),
+                            _ => None,
+                        },
+                        requested: if j.state == "awaiting verdict" {
+                            j.requested
+                        } else {
+                            0
+                        },
+                        used: j.used,
+                        granted: j.granted,
+                        id: j.id,
+                        label: j.label,
+                        model: j.model,
+                    })
+                    .collect();
+            }
+            UiEventMsg::QueueChanged { pending } => self.queued = pending,
+            // Shown in the transcript, so a message that steered the turn is not
+            // indistinguishable from one that started it.
+            UiEventMsg::SteerDelivered(text) => self
+                .blocks
+                .push(Block::Notice(format!("↳ steering: {text}"))),
             // Process / net-activity panes are not rendered in v1.
             UiEventMsg::NetEvent(_) | UiEventMsg::Processes(_) => {}
         }
@@ -307,6 +353,66 @@ mod tests {
             model: "m".into(),
             id: id.into(),
         }
+    }
+
+    /// A job snapshot replaces the chip row and carries the states the edge events
+    /// cannot express.
+    ///
+    /// The reason this test exists: this crate is not a workspace member, so a new
+    /// `UiEventMsg` variant breaks it invisibly to `cargo build --workspace`. A test
+    /// that names the variant fails loudly instead.
+    #[test]
+    fn a_job_snapshot_drives_the_chips_including_a_pending_turn_request() {
+        use cowboy_proto::daemonproto::JobInfo;
+        let job = |id: &str, state: &str, requested: u32| JobInfo {
+            id: id.into(),
+            label: format!("l-{id}"),
+            model: "m".into(),
+            task: "t".into(),
+            state: state.into(),
+            elapsed_ms: 1000,
+            used: 25,
+            granted: 25,
+            ceiling: 400,
+            requested,
+        };
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::JobsChanged(vec![
+            job("a", "running", 0),
+            job("b", "awaiting verdict", 30),
+            job("c", "pending", 0),
+            job("d", "done", 0),
+            job("e", "failed", 0),
+        ]));
+        assert_eq!(m.subagents.len(), 5);
+        let by = |id: &str| m.subagents.iter().find(|s| s.id == id).unwrap().clone();
+        assert_eq!(by("a").done, None);
+        assert_eq!(by("a").requested, 0);
+        // Waiting for a verdict is not "done" and not "pending": it is its own state.
+        assert_eq!(by("b").done, None);
+        assert!(!by("b").pending);
+        assert_eq!(by("b").requested, 30);
+        assert!(by("c").pending);
+        assert_eq!(by("d").done, Some(true));
+        assert_eq!(by("e").done, Some(false));
+
+        // A later snapshot replaces the row rather than accumulating stale chips.
+        m.apply_event(UiEventMsg::JobsChanged(vec![job("a", "done", 0)]));
+        assert_eq!(m.subagents.len(), 1);
+    }
+
+    #[test]
+    fn the_queue_and_steering_reach_the_view() {
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::QueueChanged {
+            pending: vec!["then update the docs".into()],
+        });
+        assert_eq!(m.queued, vec!["then update the docs".to_string()]);
+        m.apply_event(UiEventMsg::SteerDelivered("check the error path".into()));
+        assert!(m.blocks.iter().any(|b| matches!(
+            b,
+            Block::Notice(n) if n.contains("check the error path")
+        )));
     }
 
     /// Context utilisation reaches the header.

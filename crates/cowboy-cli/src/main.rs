@@ -9,9 +9,25 @@ use cowboy_cli::cli::{Cli, Command};
 use cowboy_cli::cmd;
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        // The command already printed a full report; adding `Error: …` to it would only
+        // repeat (or empty out) what the user just read.
+        Err(e) if e.downcast_ref::<cowboy_cli::AlreadyReported>().is_some() => {
+            std::process::ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
+    cowboy_cli::prompt::set_assume_yes(cli.yes);
 
     let start_flags = cli.start_flags();
     let resume = cli.resume_spec();
@@ -38,6 +54,7 @@ async fn main() -> Result<()> {
         Some(Command::Attach { target }) => cmd::attach::run(target).await,
         Some(Command::Sessions) => cmd::sessions::run().await,
         Some(Command::Session(args)) => match args.command {
+            cowboy_cli::cli::SessionCommand::List => cmd::sessions::run().await,
             cowboy_cli::cli::SessionCommand::Cleanup { dry_run } => {
                 cmd::sessions::cleanup(dry_run).await
             }
@@ -59,12 +76,21 @@ async fn main() -> Result<()> {
         Some(Command::Handoff { session }) => cmd::handoff::run(session),
         Some(Command::Decisions(args)) => cmd::decisions::run(args.command),
         Some(Command::Message { message, to, all }) => cmd::bus::send(message, to, all).await,
-        Some(Command::Inbox { session }) => cmd::bus::inbox(session).await,
+        Some(Command::Inbox { session, peek }) => cmd::bus::inbox(session, peek).await,
         Some(Command::Review { session, branch }) => cmd::review::run(session, branch),
         Some(Command::Ranch(args)) => cmd::ranch::run(args.command).await,
         Some(Command::Crew(args)) => cmd::crew::run(args.command).await,
         Some(Command::Logs) => cmd::logs::run().await,
         Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
+        Some(Command::Completions { shell }) => {
+            clap_complete::generate(
+                shell,
+                &mut <Cli as clap::CommandFactory>::command(),
+                "cowboy",
+                &mut std::io::stdout(),
+            );
+            Ok(())
+        }
         Some(Command::XFileop) => cmd::fileop::run(),
         Some(Command::XSandboxShim) => cowboy_cli::sandbox::shim::run(),
         Some(Command::XSandboxHolder) => cowboy_cli::sandbox::session::run_holder().await,

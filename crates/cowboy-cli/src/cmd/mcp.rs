@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use anyhow::{bail, Context, Result};
 use cowboy_core::mcp::{self, McpConfig, McpServer, McpTransport};
 
-use crate::cli::{McpAddArgs, McpCommand};
+use crate::cli::{McpAddArgs, McpCommand, Transport};
 
 pub async fn run(command: McpCommand) -> Result<()> {
     match command {
@@ -92,8 +92,10 @@ fn show(name: &str) -> Result<()> {
 }
 
 fn add(args: McpAddArgs) -> Result<()> {
-    let transport = match args.transport.as_str() {
-        "stdio" => {
+    // No catch-all arm: clap rejects anything that is not a `Transport`, so an unknown
+    // value is reported against the flag with the valid values listed, before we get here.
+    let transport = match args.transport {
+        Transport::Stdio => {
             let command = args
                 .command
                 .context("`--command` is required for a stdio server")?;
@@ -103,14 +105,13 @@ fn add(args: McpAddArgs) -> Result<()> {
                 env: parse_kv(&args.env).context("parsing --env")?,
             }
         }
-        "http" => {
+        Transport::Http => {
             let url = args.url.context("`--url` is required for an http server")?;
             McpTransport::Http {
                 url,
                 headers: parse_kv(&args.header).context("parsing --header")?,
             }
         }
-        other => bail!("unknown transport `{other}` (expected `stdio` or `http`)"),
     };
     let server = McpServer {
         description: args.description.unwrap_or_default(),
@@ -122,7 +123,7 @@ fn add(args: McpAddArgs) -> Result<()> {
     let existed = cfg.servers.insert(args.name.clone(), server).is_some();
     save(&cfg)?;
     let verb = if existed { "updated" } else { "added" };
-    println!("✓ {verb} MCP server `{}`", args.name);
+    crate::ui::ok(&format!("{verb} MCP server `{}`", args.name));
     println!("  check it with `cowboy mcp test {}`", args.name);
     Ok(())
 }
@@ -133,7 +134,7 @@ fn remove(name: &str) -> Result<()> {
         bail!("no MCP server `{name}`");
     }
     save(&cfg)?;
-    println!("✓ removed MCP server `{name}`");
+    crate::ui::ok(&format!("removed MCP server `{name}`"));
     Ok(())
 }
 
@@ -145,10 +146,10 @@ fn set_enabled(name: &str, enabled: bool) -> Result<()> {
         .with_context(|| format!("no MCP server `{name}`"))?;
     s.enabled = enabled;
     save(&cfg)?;
-    println!(
-        "✓ {} MCP server `{name}`",
+    crate::ui::ok(&format!(
+        "{} MCP server `{name}`",
         if enabled { "enabled" } else { "disabled" }
-    );
+    ));
     Ok(())
 }
 
@@ -174,15 +175,65 @@ async fn test(name: &str) -> Result<()> {
 }
 
 /// `cowboy mcp trust`: review + approve this repo's `.mcp.json` servers.
+///
+/// A gate, not a receipt. This used to trust first and print the server list after,
+/// which is exactly backwards for the one command whose whole job is consent: a stdio
+/// server is an arbitrary host command that arrived with a clone.
 fn trust() -> Result<()> {
     let root = crate::cmd::project_root()?;
-    let servers = crate::mcp::trust::trust(&root)?;
-    println!("✓ trusted {} server(s) from .mcp.json:", servers.len());
-    for (name, s) in &servers {
-        println!("  {name}  {}", s.transport_label());
+    let pending = crate::mcp::trust::pending(&root)?;
+    if pending.is_empty() {
+        crate::ui::info("this repo's .mcp.json declares no servers; nothing to trust");
+        return Ok(());
     }
-    println!("the agent can now use these via the `mcp` tool.");
-    println!("re-run `cowboy mcp trust` if .mcp.json changes.");
+
+    crate::ui::heading(&format!(
+        "{} server(s) declared by {}",
+        pending.len(),
+        root.join(".mcp.json").display()
+    ));
+    for (name, s) in &pending {
+        println!("\n  {}", crate::style::bold(name));
+        crate::ui::kv("purpose", &s.description);
+        match &s.transport {
+            McpTransport::Stdio { command, args, env } => {
+                // The full argv, not just the binary: `npx -y some-package` is the part
+                // that decides what actually runs.
+                let argv = std::iter::once(command.as_str())
+                    .chain(args.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                crate::ui::kv("runs (stdio)", &argv);
+                if !env.is_empty() {
+                    // Names only — a value here may be a `${VAR}` reference the host
+                    // expands, and printing expansions would leak the secret.
+                    let names = env.keys().cloned().collect::<Vec<_>>().join(", ");
+                    crate::ui::kv("env", &names);
+                }
+            }
+            McpTransport::Http { url, headers } => {
+                crate::ui::kv("connects to", url);
+                if !headers.is_empty() {
+                    let names = headers.keys().cloned().collect::<Vec<_>>().join(", ");
+                    crate::ui::kv("headers", &names);
+                }
+            }
+        }
+        crate::ui::kv("tools", &s.tools.join(", "));
+    }
+
+    crate::ui::warn("\ntrusting these lets the agent run them for this project.");
+    if !crate::prompt::confirm_destructive("Trust them?")? {
+        return Ok(());
+    }
+
+    let servers = crate::mcp::trust::trust(&root)?;
+    crate::ui::ok(&format!(
+        "trusted {} server(s) from .mcp.json",
+        servers.len()
+    ));
+    crate::ui::step("the agent can now use these via the `mcp` tool");
+    crate::ui::step("re-run `cowboy mcp trust` if .mcp.json changes");
     Ok(())
 }
 
@@ -190,7 +241,7 @@ fn trust() -> Result<()> {
 fn untrust() -> Result<()> {
     let root = crate::cmd::project_root()?;
     if crate::mcp::trust::untrust(&root)? {
-        println!("✓ revoked trust for this repo's .mcp.json servers");
+        crate::ui::ok("revoked trust for this repo's .mcp.json servers");
     } else {
         println!("this repo's .mcp.json was not trusted");
     }

@@ -20,7 +20,6 @@ use anyhow::Result;
 use cowboy_core::daemonproto::{DaemonReq, DaemonResp, SessionInfo};
 
 use crate::cli::DownArgs;
-use crate::style;
 
 /// Stop the worker processes of the given live sessions (SIGTERM).
 ///
@@ -56,18 +55,30 @@ async fn live_sessions(root: Option<&Path>) -> Vec<SessionInfo> {
 }
 
 pub async fn run(args: DownArgs) -> Result<()> {
-    let (scope, killed) = if args.all {
-        (
-            "every project",
-            kill_session_workers(&live_sessions(None).await),
-        )
+    let (scope, sessions) = if args.all {
+        ("every project", live_sessions(None).await)
     } else {
         let root = crate::cmd::project_root()?;
-        (
-            "this project",
-            kill_session_workers(&live_sessions(Some(&root)).await),
-        )
+        ("this project", live_sessions(Some(&root)).await)
     };
+
+    // `--all` reaches outside the project you are standing in, so the count is shown
+    // *before* the SIGTERM — "stopped 7 session(s) in every project" is a bad way to
+    // learn that six of them belonged to someone else's work.
+    let live = sessions.iter().filter(|s| !s.status.is_terminal()).count();
+    if args.all && live > 0 {
+        crate::ui::warn(&format!(
+            "{live} live session(s) across every project will be stopped:"
+        ));
+        for s in sessions.iter().filter(|s| !s.status.is_terminal()) {
+            crate::ui::kv(&s.id, &s.root.display().to_string());
+        }
+        if !crate::prompt::confirm_destructive("Stop them all?")? {
+            return Ok(());
+        }
+    }
+
+    let killed = kill_session_workers(&sessions);
 
     // Give the workers a moment to exit so their cgroups are empty and removable.
     if killed > 0 {
@@ -75,10 +86,10 @@ pub async fn run(args: DownArgs) -> Result<()> {
     }
     let reaped = crate::sandbox::cgroup::reap_empty();
 
-    let mut msg = format!("cowboy down: stopped {killed} session(s) in {scope}");
+    let mut msg = format!("stopped {killed} session(s) in {scope}");
     if reaped > 0 {
         msg.push_str(&format!(", reaped {reaped} leftover cgroup(s)"));
     }
-    println!("{}", style::success(&msg));
+    crate::ui::ok(&msg);
     Ok(())
 }

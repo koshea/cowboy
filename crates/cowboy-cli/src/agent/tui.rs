@@ -15,19 +15,27 @@ use std::time::Duration;
 use anyhow::Result;
 use cowboy_core::daemonproto::UiEventMsg;
 use cowboy_core::netproto::{ApprovalScope, Verdict};
-use cowboy_tui::{draw, App, LineKind, Mode, ModelChoice, ModelForm, ModelPicker, REASONING_OPTS};
+use cowboy_tui::{
+    draw, App, CrewMember, CrewStatus, LineKind, Mode, ModelChoice, ModelForm, ModelPicker,
+    REASONING_OPTS,
+};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio_util::sync::CancellationToken;
 
+use super::help;
 use super::ui::AgentUi;
 
 /// A command the TUI sends to the agent thread.
 pub enum AgentCmd {
     /// A user message to run as a turn.
     Message(String),
+    /// A user message to run *after* the current turn, rather than steering it.
+    Enqueue(String),
+    /// Drop everything queued for after the current turn.
+    QueueClear,
     /// Switch the active model to this name (applies from the next turn).
     SwitchModel(String),
     /// Turn plan mode on/off (file edits are blocked while on).
@@ -35,6 +43,8 @@ pub enum AgentCmd {
     /// Sign off on this session's ranch workstream (the user typed `/accept`):
     /// complete the workstream, advance the plan, and end the session.
     Accept { note: Option<String> },
+    /// Stop the background subagents, leaving the session and the current turn alone.
+    StopSubagents,
     /// Detach this client, leaving the session running for later re-attach.
     Detach,
     /// End the session.
@@ -235,6 +245,38 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
             app.subagent_started(label, model, id, now_ms())
         }
         UiEventMsg::SubagentDone { ok, id, .. } => app.subagent_done(&id, ok),
+        // Level-triggered job state: reconciles the background pane in one go,
+        // including the states the edge events cannot express (waiting for a verdict,
+        // turn usage).
+        UiEventMsg::JobsChanged(jobs) => {
+            // The wire → view mapping lives here, not in `cowboy-tui`: that crate is
+            // rendering only and deliberately knows nothing about the protocol.
+            let now = now_ms();
+            let members = jobs
+                .into_iter()
+                .map(|j| CrewMember {
+                    started_ms: now.saturating_sub(j.elapsed_ms),
+                    elapsed_secs: j.elapsed_ms / 1000,
+                    status: match j.state.as_str() {
+                        "pending" => CrewStatus::Pending,
+                        "running" => CrewStatus::Running,
+                        "awaiting verdict" => CrewStatus::Asking,
+                        "failed" => CrewStatus::Failed,
+                        _ => CrewStatus::Done,
+                    },
+                    id: j.id,
+                    label: j.label,
+                    model: j.model,
+                    used: j.used,
+                    granted: j.granted,
+                    ceiling: j.ceiling,
+                    requested: j.requested,
+                })
+                .collect();
+            app.apply_jobs(members);
+        }
+        UiEventMsg::QueueChanged { pending } => app.queued = pending,
+        UiEventMsg::SteerDelivered(text) => app.push(LineKind::Notice, format!("↳ {text}")),
         // Handled in the event loop (needs loop-local turn bookkeeping).
         UiEventMsg::TurnDone => {}
     }
@@ -451,6 +493,10 @@ fn event_loop(
     let mut pending_reply: Option<Sender<String>> = None;
     let mut pending_approval: Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>> = None;
     let mut mode_before_overlay = Mode::Idle;
+    // Whether a second Ctrl-C would end the session (see `handle_interrupt`).
+    let mut quit_armed = false;
+    // Whether the one-shot steering tip has been considered this session.
+    let mut steering_tip_done = false;
     // Outstanding messages sent to the agent but not yet acknowledged (TurnDone).
     let mut pending_turns: usize = 0;
     let mut task_tx = Some(task_tx);
@@ -515,7 +561,7 @@ fn event_loop(
                     pending_reply = Some(reply);
                 }
                 UiEvent::Approval(dest, reply) => {
-                    if !matches!(app.mode, Mode::Approval(_) | Mode::Paused) {
+                    if !matches!(app.mode, Mode::Approval(_) | Mode::Help) {
                         mode_before_overlay = app.mode.clone();
                     }
                     app.mode = Mode::Approval(dest);
@@ -575,6 +621,16 @@ fn event_loop(
             watch_pos = 0;
             watch_pos_id.clear();
         }
+        // The first time a turn is actually running, say the one thing that is not
+        // discoverable from F1: that the prompt is listening. Checked here rather than at
+        // the nine places that set `Mode::Running`, and gated on a loop-local flag so the
+        // marker file is read at most once per session.
+        if !steering_tip_done && app.mode == Mode::Running {
+            steering_tip_done = true;
+            if let Some(t) = crate::tips::once(crate::tips::STEERING) {
+                app.push(LineKind::Notice, t);
+            }
+        }
         terminal.draw(|f| draw(f, &app))?;
 
         // Flush any queued clipboard copy. Prefer the direct OS clipboard
@@ -631,6 +687,7 @@ fn event_loop(
                         history: &mut history,
                         hist_pos: &mut hist_pos,
                         session: &mut session,
+                        quit_armed: &mut quit_armed,
                     };
                     if handle_key(Event::Key(key), key, &mut app, ctx) {
                         break;
@@ -662,62 +719,13 @@ fn event_loop(
     Ok(())
 }
 
-/// Built-in slash commands offered by autocomplete (value, hint).
-const COMMAND_COMPLETIONS: &[(&str, &str)] = &[
-    ("help", "show help"),
-    ("skills", "list skills"),
-    ("model", "[name] show/switch model"),
-    ("models", "browse the model catalogue"),
-    (
-        "plan",
-        "<task> propose a plan first (edits blocked until /go)",
-    ),
-    ("go", "[note] approve the plan and start editing"),
-    (
-        "ranch",
-        "[note] promote the discussion into a multi-workstream ranch",
-    ),
-    ("crew", "[usage] show the crew roster"),
-    ("mcp", "list connected MCP servers"),
-    ("context", "context-window usage and what is filling it"),
-    ("diff", "working-tree diff"),
-    ("copy", "copy the last answer"),
-    ("clear", "clear the view"),
-    ("detach", "leave running, re-attach later"),
-    ("quit", "end the session"),
-];
-
-/// Build the autocomplete catalog once: built-in commands + discovered skills.
+/// Build the autocomplete catalog once: the slash-command table + discovered skills.
 fn build_completion_catalog(session: &SessionCtx) -> Vec<cowboy_tui::Completion> {
-    let mut out: Vec<cowboy_tui::Completion> = COMMAND_COMPLETIONS
-        .iter()
-        .map(|(v, h)| cowboy_tui::Completion {
-            value: v.to_string(),
-            hint: h.to_string(),
-        })
-        .collect();
-    // `/accept` only makes sense inside a ranch workstream session.
-    if session.workstream_id.is_some() {
-        out.push(cowboy_tui::Completion {
-            value: "accept".to_string(),
-            hint: "[note] sign off this workstream and advance the plan".to_string(),
-        });
-    }
-    for s in cowboy_core::skills::discover(&session.root) {
-        let hint = s.argument_hint.clone().unwrap_or_else(|| {
-            s.description
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        });
-        out.push(cowboy_tui::Completion {
-            value: s.name,
-            hint,
-        });
-    }
-    out
+    let skills = help_skills(session);
+    help::completions(&help::Ctx {
+        workstream: session.workstream_id.is_some(),
+        skills: &skills,
+    })
 }
 
 /// Recompute autocomplete candidates from the current input. Active only while
@@ -820,6 +828,112 @@ struct KeyCtx<'a> {
     history: &'a mut Vec<String>,
     hist_pos: &'a mut Option<usize>,
     session: &'a mut SessionCtx,
+    /// Set by the first Ctrl-C on an empty idle prompt, cleared by any other key.
+    ///
+    /// Ending a session used to need a menu, so it could afford to be one keystroke. A
+    /// bare Ctrl-C cannot: it is the key you hit reflexively, and reflexively ending the
+    /// session is not recoverable. So the second press is the decision, and anything in
+    /// between disarms it.
+    quit_armed: &'a mut bool,
+}
+
+/// Ctrl-C. Returns true if the loop should exit.
+///
+/// What it does depends on what is happening, which is the whole point of dropping the
+/// menu: the menu made you choose between "resume", "instruct" and "kill" when in every
+/// case you had already decided by pressing the key.
+fn handle_interrupt(app: &mut App, ctx: &mut KeyCtx) -> bool {
+    // 1. Something is running: stop it. Background subagents are left alone — `Alt-s`
+    //    stops those, and conflating them means one impatient keystroke discards work
+    //    that had nothing to do with the turn being corrected.
+    if matches!(app.mode, Mode::Running) {
+        if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
+            tok.cancel();
+        }
+        *ctx.quit_armed = false;
+        app.status = "interrupting — say what to do instead".into();
+        // Drop straight to Idle with the input focused, so redirecting is one keystroke
+        // and a sentence rather than a menu choice followed by a sentence. The
+        // conversation is intact, so the next message continues it.
+        app.mode = Mode::Idle;
+        return false;
+    }
+    // 2. Nothing running, but something typed: clear the draft.
+    if !app.input_text().trim().is_empty() {
+        app.set_input("");
+        *ctx.quit_armed = false;
+        app.status = "cleared".into();
+        return false;
+    }
+    // 3. Idle and empty: arm, then end.
+    if *ctx.quit_armed {
+        if let Some(tx) = ctx.task_tx.as_ref() {
+            // Explicit `End` before dropping the sender: the hangup route works too, but a
+            // side effect of a drop is invisible in a log and was the prime suspect the
+            // last time ending a session left a worker running.
+            let _ = tx.send(AgentCmd::End);
+        }
+        ctx.task_tx.take();
+        if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
+            tok.cancel();
+        }
+        *ctx.quit_armed = false;
+        app.status = "ending session…".into();
+        return false;
+    }
+    *ctx.quit_armed = true;
+    app.status = "press Ctrl-C again to end the session · Alt-d detaches instead".into();
+    false
+}
+
+/// Open the help overlay, remembering the mode to return to.
+fn open_help(app: &mut App, ctx: &mut KeyCtx, query: Option<&str>) {
+    // Don't stash an overlay as the thing to come back to, or dismissing help would
+    // reopen a modal whose reply channel is long gone.
+    if matches!(app.mode, Mode::Idle | Mode::Running) {
+        *ctx.mode_before_overlay = app.mode.clone();
+    }
+    let skills = help_skills(ctx.session);
+    let hctx = help::Ctx {
+        workstream: ctx.session.workstream_id.is_some(),
+        skills: &skills,
+    };
+    let sections = help::sections(&hctx, query);
+    if sections.is_empty() {
+        app.push(
+            LineKind::Notice,
+            format!(
+                "nothing in help matches {:?} — F1 shows everything",
+                query.unwrap_or("")
+            ),
+        );
+        return;
+    }
+    app.open_help(sections, query.map(str::to_string));
+}
+
+fn scroll_help(app: &mut App, delta: isize) {
+    if let Some(h) = app.help.as_mut() {
+        h.scroll_by(delta);
+    }
+}
+
+/// This project's skills as `(name, hint)`, for help and autocomplete.
+fn help_skills(session: &SessionCtx) -> Vec<(String, String)> {
+    cowboy_core::skills::discover(&session.root)
+        .into_iter()
+        .map(|s| {
+            let hint = s.argument_hint.clone().unwrap_or_else(|| {
+                s.description
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            });
+            (s.name, hint)
+        })
+        .collect()
 }
 
 /// Returns true if the loop should exit.
@@ -931,16 +1045,79 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         _ => {}
     }
 
-    // Ctrl-C opens the interrupt menu (during a turn or while idle).
+    // Ctrl-C acts, rather than opening a menu to act from.
+    //
+    // Three meanings, picked from what is on screen rather than from a submenu — this is
+    // the terminal convention, and each is the obvious response to the situation:
+    // interrupt what is running; else clear what you typed; else (twice) end the session.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if matches!(
-            app.mode,
-            Mode::Running | Mode::Idle | Mode::AwaitingInput(_)
-        ) {
-            *ctx.mode_before_overlay = app.mode.clone();
-            app.mode = Mode::Paused;
+        return handle_interrupt(app, &mut ctx);
+    }
+    // Any other key disarms a pending "press again to end".
+    if *ctx.quit_armed {
+        *ctx.quit_armed = false;
+    }
+
+    // The help overlay: F1 anywhere, Esc to leave. Purely a view; the turn keeps running
+    // behind it, so it is safe to open mid-flight and nothing is queued up waiting on it.
+    if key.code == KeyCode::F(1) && app.mode != Mode::Help {
+        open_help(app, &mut ctx, None);
+        return false;
+    }
+    if app.mode == Mode::Help {
+        match key.code {
+            KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter | KeyCode::Char('q') => {
+                app.close_help(ctx.mode_before_overlay.clone());
+            }
+            KeyCode::Up => scroll_help(app, -1),
+            KeyCode::Down => scroll_help(app, 1),
+            KeyCode::PageUp => scroll_help(app, -10),
+            KeyCode::PageDown => scroll_help(app, 10),
+            KeyCode::Home => scroll_help(app, isize::MIN / 2),
+            KeyCode::End => scroll_help(app, isize::MAX / 2),
+            _ => {}
         }
         return false;
+    }
+
+    // Direct hotkeys for what used to be behind Ctrl-C. Alt- rather than Ctrl- or bare
+    // letters: a bare letter is typed text in the editing modes, and the Ctrl- space is
+    // almost entirely claimed by the input editor's own bindings.
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            // What is running in the background, answered from local state — no round
+            // trip, and nothing added to the conversation the model has to read.
+            KeyCode::Char('j') => {
+                app.push(LineKind::Notice, app.jobs_summary());
+                return false;
+            }
+            // Stop the delegated work, leaving this turn running. Deliberately separate
+            // from interrupting: throwing away minutes of subagent work to correct one
+            // sentence was the behaviour worth avoiding.
+            KeyCode::Char('s') => {
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::StopSubagents);
+                }
+                app.status = "stopping subagents…".into();
+                return false;
+            }
+            KeyCode::Char('w') => {
+                match app.next_watch_target() {
+                    Some((id, label)) => app.watch_subagent(id, label),
+                    None => app.status = "no subagents to watch".into(),
+                }
+                return false;
+            }
+            // Detach: leave the session running and exit this client.
+            KeyCode::Char('d') => {
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::Detach);
+                }
+                app.status = "detaching…".into();
+                return true; // exit the event loop; the worker keeps running
+            }
+            _ => {}
+        }
     }
 
     // Network approval modal.
@@ -958,73 +1135,6 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 let _ = reply.send(d);
             }
             app.mode = ctx.mode_before_overlay.clone();
-        }
-        return false;
-    }
-
-    // Interrupt menu: resume / instruct / kill (this turn) / end (session).
-    if app.mode == Mode::Paused {
-        match key.code {
-            KeyCode::Char('r') | KeyCode::Esc => {
-                app.mode = ctx.mode_before_overlay.clone();
-            }
-            KeyCode::Char('i') => {
-                // Instruct: cancel the current turn and drop to Idle with the
-                // input focused. The user's next message starts a fresh turn
-                // with the full conversation (container + history) intact.
-                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
-                    tok.cancel();
-                }
-                app.status = "give a new instruction…".into();
-                app.mode = Mode::Idle;
-            }
-            KeyCode::Char('k') => {
-                // Cancel just the current turn; the session continues.
-                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
-                    tok.cancel();
-                }
-                app.status = "interrupting turn…".into();
-                app.mode = ctx.mode_before_overlay.clone();
-            }
-            KeyCode::Char('w') => {
-                // Watch a subagent's live output (cycles if several). No-op with none.
-                match app.next_watch_target() {
-                    Some((id, label)) => app.watch_subagent(id, label),
-                    None => {
-                        app.status = "no subagents to watch".into();
-                        app.mode = ctx.mode_before_overlay.clone();
-                    }
-                }
-            }
-            KeyCode::Char('d') => {
-                // Detach: leave the session running and exit this client.
-                if let Some(tx) = ctx.task_tx.as_ref() {
-                    let _ = tx.send(AgentCmd::Detach);
-                }
-                app.status = "detaching…".into();
-                return true; // exit the event loop; the worker keeps running
-            }
-            KeyCode::Char('e') => {
-                // End the session. Send `End` explicitly, THEN drop the sender:
-                // the message is the request, and the hangup is only a backstop for
-                // the case where it never got through. Order matters — dropping
-                // first would leave nothing to send it on.
-                //
-                // The worker finalizes and broadcasts `Ended`, which arrives as
-                // `UiEvent::Done`. Close the overlay so the user sees the transcript
-                // and "ending session…" while that round-trip happens (otherwise the
-                // menu lingers and it looks like the key did nothing).
-                if let Some(tx) = ctx.task_tx.as_ref() {
-                    let _ = tx.send(AgentCmd::End);
-                }
-                ctx.task_tx.take();
-                if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
-                    tok.cancel();
-                }
-                app.mode = ctx.mode_before_overlay.clone();
-                app.status = "ending session…".into();
-            }
-            _ => {}
         }
         return false;
     }
@@ -1129,33 +1239,6 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
     }
     false
 }
-
-/// Help text for `/help`.
-const HELP_LINES: &[&str] = &[
-    "commands:",
-    "  /help          show this help",
-    "  /skills        list available skills",
-    "  /<skill> [args]  run a skill (e.g. /github:review-pr 162)",
-    "  /plan <task>   propose a plan first — edits are blocked until you approve",
-    "  /go [note]     approve the plan and let the agent start editing",
-    "  /ranch [note]  promote the discussion into a multi-workstream ranch plan",
-    "  /accept [note] sign off this ranch workstream → advance the plan (workstreams only)",
-    "  /model [name]  show or switch the active model",
-    "  /models        browse the provider catalogue and add/select a model",
-    "  /crew [usage]  show the crew roster (model routing) or its usage",
-    "  /mcp           list connected MCP servers (manage with `cowboy mcp`)",
-    "  /diff          show the working-tree diff",
-    "  /context       context-window usage and what is filling it",
-    "  /copy          copy the last answer to the system clipboard",
-    "  /clear         clear the view (conversation memory is kept)",
-    "  /detach        leave the session running and exit (re-attach later)",
-    "  /quit          end the session",
-    "copy: drag to select (drag to the top/bottom edge to extend across scrollback),",
-    "      then `y` to copy (Esc clears) · or /copy for the whole last answer",
-    "keys: Enter send · Shift/Alt+Enter newline · Up/Down history · Ctrl-C menu",
-    "scroll: PgUp/PgDn · Shift+Up/Down line · Shift+End jump to tail & follow",
-    "Ctrl-C menu: r resume · i instruct (redirect) · k kill turn · d detach · e end",
-];
 
 /// `/mcp`: list the configured MCP servers (host + this repo's trust-gated
 /// `.mcp.json`) as notices. Read-only — manage servers with the `cowboy mcp` CLI.
@@ -1357,7 +1440,6 @@ fn crew_command(arg: Option<&str>, app: &mut App) {
     }
 }
 
-/// Handle a `/command` typed into the input (the leading `/` is stripped).
 /// Handle a `/command`. Returns `true` if the client should exit the event loop
 /// now (e.g. `/detach`).
 fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
@@ -1365,11 +1447,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next();
     match cmd {
-        "help" | "h" | "?" => {
-            for l in HELP_LINES {
-                app.push(LineKind::Notice, *l);
-            }
-        }
+        "help" | "h" | "?" => open_help(app, ctx, arg),
         "clear" => {
             app.transcript.clear();
             app.activity.clear();
@@ -1521,6 +1599,49 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             }
         }
         "crew" => crew_command(arg, app),
+        // Read from the state the worker already publishes, so both work while a turn is
+        // running and need no round trip.
+        "jobs" => app.push(LineKind::Notice, app.jobs_summary()),
+        "queue" => match arg.map(str::trim) {
+            Some("clear") => {
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::QueueClear);
+                }
+                app.push(LineKind::Notice, "clearing the queued messages…");
+            }
+            _ if app.queued.is_empty() => {
+                app.push(
+                    LineKind::Notice,
+                    "nothing queued — while the agent works, typing steers the current \
+                     turn; use /after <msg> to queue instead",
+                );
+            }
+            _ => {
+                let mut s = format!("{} queued message(s):", app.queued.len());
+                for (i, q) in app.queued.iter().enumerate() {
+                    s.push_str(&format!("\n  {}. {q}", i + 1));
+                }
+                s.push_str("\n/queue clear drops them");
+                app.push(LineKind::Notice, s);
+            }
+        },
+        // Deferral, as opposed to steering: this runs as its own turn afterwards.
+        "after" | "then" => match arg.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(text) => {
+                if let Some(tx) = ctx.task_tx.as_ref() {
+                    let _ = tx.send(AgentCmd::Enqueue(text.to_string()));
+                }
+                app.push(LineKind::User, format!("/{input}"));
+                app.push(
+                    LineKind::Notice,
+                    "queued to run after the current turn (/queue to review)",
+                );
+            }
+            None => app.push(
+                LineKind::Notice,
+                "usage: /after <message> — queues it to run after the current turn",
+            ),
+        },
         "mcp" => mcp_command(app, &ctx.session.root),
         "context" => context_command(app),
         "quit" | "exit" | "q" => {
@@ -1576,10 +1697,14 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                     app.status = format!("running skill {}", skill.name);
                 }
             } else {
-                app.push(
-                    LineKind::Error,
-                    format!("unknown command /{other} — try /help or /skills"),
-                );
+                // Suggest, rather than just refusing: a mistyped command is nearly always
+                // one edit away from a real one, and the alternative is the user opening
+                // help to scan twenty rows for the name they almost typed.
+                let hint = match help::nearest(other) {
+                    Some(c) => format!("unknown command /{other} — did you mean /{c}?"),
+                    None => format!("unknown command /{other} — press F1 for the list"),
+                };
+                app.push(LineKind::Error, hint);
             }
         }
     }

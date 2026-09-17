@@ -7,7 +7,7 @@
 //! (`.cowboy/models.yaml`); project entries override user entries by name.
 
 use std::collections::BTreeMap;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{
@@ -80,16 +80,21 @@ fn setup() -> Result<()> {
         },
     );
     providers.save(&providers_path)?;
-    println!(
-        "{}",
-        style::success(&format!(
-            "✓ saved provider `{pname}` to {}",
-            providers_path.display()
-        ))
-    );
+    crate::ui::ok(&format!(
+        "saved provider `{pname}` to {}",
+        providers_path.display()
+    ));
 
     // --- model ---
-    if yes_no("\nDefine a model that uses this provider now?", true)? {
+    //
+    // Not optional. Declining used to leave a provider saved and no model, and the next
+    // `cowboy` failed inside `resolve_model` with a message about configuration shape —
+    // the one gap in this flow with no remedy attached. A provider on its own cannot run
+    // anything, so setup is not done until there is a model.
+    println!(
+        "\nNow a model that uses it. `cowboy models available` lists what the endpoint offers."
+    );
+    {
         let mname = prompt("Model name", Some(&pname))?;
         let model_id = prompt("Model id (e.g. anthropic/claude-sonnet-4-6)", None)?;
         if model_id.is_empty() {
@@ -125,19 +130,17 @@ fn setup() -> Result<()> {
             user_models.default = Some(mname.clone());
         }
         user_models.save(&user_models_path)?;
-        println!(
-            "{}",
-            style::success(&format!(
-                "✓ saved model `{mname}` to {}",
-                user_models_path.display()
-            ))
-        );
+        crate::ui::ok(&format!(
+            "saved model `{mname}` to {}",
+            user_models_path.display()
+        ));
         if user_models.default.as_deref() == Some(mname.as_str()) {
             println!("  (set as the default model)");
         }
     }
 
-    println!("\nDone. Run `cowboy models list` to review, or `cowboy doctor` to verify.");
+    println!("\n{}", style::success("Done — you can run `cowboy` now."));
+    println!("  review it with `cowboy models list`, or verify the host with `cowboy doctor`");
     Ok(())
 }
 
@@ -250,22 +253,19 @@ fn use_default(name: &str, global: bool) -> Result<()> {
         let mut cfg = user.unwrap_or_default();
         cfg.default = Some(name.to_string());
         cfg.save(&path)?;
-        println!(
-            "{}",
-            style::success(&format!(
-                "✓ user default is now `{name}` ({})",
-                path.display()
-            ))
-        );
+        crate::ui::ok(&format!(
+            "user default is now `{name}` ({})",
+            path.display()
+        ));
     } else {
         let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
         let mut cfg = project.unwrap_or_default();
         cfg.default = Some(name.to_string());
         cfg.save(&paths.models)?;
-        println!(
-            "✓ project default is now `{name}` ({})",
+        crate::ui::ok(&format!(
+            "project default is now `{name}` ({})",
             paths.models.display()
-        );
+        ));
     }
     Ok(())
 }
@@ -329,7 +329,7 @@ struct AddArgs {
     temp: Option<f32>,
     context: Option<u32>,
     max_output: Option<u32>,
-    reasoning: Option<String>,
+    reasoning: Option<crate::cli::Reasoning>,
     default: bool,
 }
 
@@ -361,7 +361,7 @@ fn add(a: AddArgs) -> Result<()> {
     let d = model_defaults::lookup(&a.id);
     let name = a.name.unwrap_or(d.name);
     let reasoning_effort = match a.reasoning {
-        Some(s) => parse_reasoning(&s)?,
+        Some(r) => r.effort(),
         None => d.reasoning_effort,
     };
     let def = ModelDef {
@@ -390,14 +390,11 @@ fn add(a: AddArgs) -> Result<()> {
         cfg.default = Some(name.clone());
     }
     cfg.save(&path)?;
-    println!(
-        "{}",
-        style::success(&format!(
-            "✓ saved model `{name}` ({}) to {}",
-            a.id,
-            path.display()
-        ))
-    );
+    crate::ui::ok(&format!(
+        "saved model `{name}` ({}) to {}",
+        a.id,
+        path.display()
+    ));
     if cfg.default.as_deref() == Some(name.as_str()) {
         println!("  (default model)");
     }
@@ -497,21 +494,10 @@ fn read_secret(label: &str) -> Result<String> {
     }
 }
 
-/// Prompt for a line, returning the trimmed input (or the default on empty).
+/// Prompt for a line. Thin alias for the shared helper, kept for readability at the
+/// many call sites in this module.
 fn prompt(label: &str, default: Option<&str>) -> Result<String> {
-    match default {
-        Some(d) => print!("{label} [{d}]: "),
-        None => print!("{label}: "),
-    }
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    let t = line.trim();
-    Ok(if t.is_empty() {
-        default.unwrap_or("").to_string()
-    } else {
-        t.to_string()
-    })
+    crate::prompt::line(label, default)
 }
 
 /// Prompt for a value parseable to `T`, falling back to `default` on empty;
@@ -519,16 +505,4 @@ fn prompt(label: &str, default: Option<&str>) -> Result<String> {
 fn prompt_parsed<T: std::str::FromStr + std::fmt::Display>(label: &str, default: T) -> Result<T> {
     let raw = prompt(label, Some(&default.to_string()))?;
     Ok(raw.parse().unwrap_or(default))
-}
-
-fn yes_no(question: &str, default_yes: bool) -> Result<bool> {
-    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
-    print!("{question} {hint} ");
-    std::io::stdout().flush().ok();
-    let mut line = String::new();
-    std::io::stdin().read_line(&mut line)?;
-    Ok(match line.trim() {
-        "" => default_yes,
-        s => matches!(s, "y" | "Y" | "yes"),
-    })
 }

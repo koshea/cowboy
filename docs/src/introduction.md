@@ -41,8 +41,9 @@ model behaving, that's a bug in the docs (or the code).
 
 ## How to read this
 
-- New here? Start with [Installation](getting-started/installation.md) and the
-  [Quick start](getting-started/quickstart.md).
+- New here? Start with [Installation](getting-started/installation.md), then walk
+  through [Your first five minutes](getting-started/first-five-minutes.md). The
+  [Quick start](getting-started/quickstart.md) is the cheat-sheet to come back to.
 - Want to understand the guarantees? Read [The boundary](security/model.md) and
   [Network egress](security/network.md). For *why* each mechanism was chosen, and
   the evidence behind it, see

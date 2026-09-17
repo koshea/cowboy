@@ -16,6 +16,8 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `~/.config/cowboy/skills/` | User-level [skills](../using/skills-and-subagents.md). |
 | `~/.config/cowboy/approvals/<project>.json` | Persisted [network approvals](../security/network.md), per project (`0600`). Host-side **on purpose**: in the workspace the agent could widen its own egress by writing the file. |
 | `~/.config/cowboy/grants/` | Persisted path [grants](../security/model.md), per project + global (`0600`, dir `0700`). Host-side for the same reason. |
+| `~/.config/cowboy/mcp-trust/<project>.json` | Which `.mcp.json` server set you approved with [`cowboy mcp trust`](../how-to.md), pinned so a later edit goes stale. Host-side: the agent must not be able to trust servers on its own. |
+| `~/.config/cowboy/tips/` | Marks for one-shot hints already shown. Host-side so a repository cannot suppress or resurrect them. |
 
 ## Per-project (`.cowboy/`)
 
@@ -54,6 +56,7 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 |------|---------|
 | `$XDG_RUNTIME_DIR/cowboy/` | Daemon + worker sockets, lock (`0700`; the sockets are `0600` and peer-uid checked — see [the boundary](../security/model.md)). |
 | `$XDG_STATE_HOME/cowboy/daemon/state.json` | Session registry + leases. |
+| `$XDG_STATE_HOME/cowboy/jobs/<parent>/<job>/` | The parent↔subagent control channel (`0700`, files `0600`): turn requests, verdicts, [questions and answers](../using/crew.md#a-worker-can-ask-a-question). Deliberately **not** in `.cowboy/`, which is writable from inside the sandbox — a verdict file there could be written by sandboxed content and would then steer another agent. |
 
 ## Unknown keys are an error
 

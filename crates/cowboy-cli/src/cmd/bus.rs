@@ -34,8 +34,13 @@ pub async fn send(message: String, to: Option<String>, all: bool) -> Result<()> 
     }
 }
 
-/// `cowboy inbox [session]` — read (and drain) a session's inbox.
-pub async fn inbox(session: Option<String>) -> Result<()> {
+/// `cowboy inbox [session] [--peek]` — read a session's inbox.
+///
+/// Reading **drains** by default (the inbox is a queue, and the common case is "show me
+/// what came in"), but the drain is destructive and was previously not optional: a typo
+/// in the session id was recoverable, running it on the right session twice was not.
+/// `--peek` reads without consuming.
+pub async fn inbox(session: Option<String>, peek: bool) -> Result<()> {
     let id = match session {
         Some(s) => s,
         None => {
@@ -47,7 +52,7 @@ pub async fn inbox(session: Option<String>) -> Result<()> {
     daemon::ensure_running().await?;
     let resp = daemon::request(DaemonReq::GetInbox {
         session: id.clone(),
-        drain: true,
+        drain: !peek,
     })
     .await
     .context("reading inbox via cowboyd")?;
@@ -57,11 +62,17 @@ pub async fn inbox(session: Option<String>) -> Result<()> {
         other => bail!("unexpected daemon response: {other:?}"),
     };
     if messages.is_empty() {
-        println!("inbox empty for {id}");
+        crate::ui::info(&format!("inbox empty for {id}"));
         return Ok(());
     }
     for m in &messages {
         println!("from {}: {}", m.from, describe(&m.event));
+    }
+    if peek {
+        crate::ui::info(&format!(
+            "\n({} message(s) left in place; omit --peek to drain)",
+            messages.len()
+        ));
     }
     Ok(())
 }

@@ -44,6 +44,15 @@ pub async fn run(
         None => None,
     };
 
+    // Everything a start needs, checked here rather than discovered one failure at a
+    // time — the second of which used to arrive as a worker log tail (see
+    // `cmd::firstrun`). Nothing has been started yet, so this is also the last moment
+    // we can offer to fix it.
+    let gaps = crate::cmd::firstrun::check(&root);
+    if !gaps.is_empty() {
+        crate::cmd::firstrun::resolve_or_bail(&root, &gaps)?;
+    }
+
     // Providers are host-owned (home dir); models may be user- or project-level.
     let providers = ProvidersConfig::load_global().context("loading providers.yaml")?;
     if providers.providers.is_empty() {
@@ -410,7 +419,7 @@ fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
             style::warning("This worktree already has an active session:")
         );
         println!("  id      {}", held_by.id);
-        println!("  status  {:?}", held_by.status);
+        println!("  status  {}", held_by.status);
         if let Some(b) = &held_by.branch {
             println!("  branch  {b}");
         }
@@ -424,6 +433,8 @@ fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
         io::stdout().flush().ok();
 
         let mut line = String::new();
+        // prompt-ok: a four-way menu, not a yes/no — and EOF here means "quit", which is
+        // the safe answer for this choice rather than a default that `prompt` could pick.
         if io::stdin().read_line(&mut line)? == 0 {
             return Ok(Collision::Quit);
         }
@@ -435,7 +446,7 @@ fn prompt_collision(held_by: &SessionInfo, live: bool) -> Result<Collision> {
             "q" | "quit" | "" => return Ok(Collision::Quit),
             other => println!(
                 "{}",
-                style::warning(&format!("unrecognized choice: {other:?}"))
+                style::warning(&format!("unrecognized choice: {other}"))
             ),
         }
     }
@@ -604,6 +615,8 @@ fn resolve_task(task: Option<String>) -> Result<Option<String>> {
     print!("cowboy› what should I work on?\n> ");
     std::io::stdout().flush().ok();
     let mut line = String::new();
+    // prompt-ok: free-text task entry, not a confirmation — the two-line banner shape is
+    // the session's own, and an empty answer is a valid "no task" rather than a default.
     std::io::stdin().read_line(&mut line)?;
     let t = line.trim().to_string();
     Ok((!t.is_empty()).then_some(t))

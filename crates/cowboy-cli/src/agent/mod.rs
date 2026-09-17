@@ -1,5 +1,8 @@
 //! The Cowboy-owned agent loop and its tool surface.
 
+pub mod help;
+pub mod jobctl;
+pub mod jobs;
 pub mod journal_ui;
 pub mod run;
 pub mod socket_ui;

@@ -582,7 +582,7 @@ expression: defs
     }
   },
   {
-    "description": "Delegate a focused, independent sub-task to a worker that shares this workspace/container. Describe the work by `category` (the kind: tests, exploration, frontend, review, …) and `effort` (tiny/small/medium/large/deep) — Cowboy routes it to the right model from the user's crew roster. Do NOT pick a model. Optionally set `agent` to adopt a named specialist definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \"security-reviewer\"; discover with `cowboy agents list`). Include a `reason` and the `expected_artifact`. Returns the worker's final summary. Prefer small, well-scoped tasks; emit several calls in one message to run them in parallel.",
+    "description": "Delegate a focused, independent sub-task to a worker that shares this workspace/container. Describe the work by `category` (the kind: tests, exploration, frontend, review, …) and `effort` (tiny/small/medium/large/deep) — Cowboy routes it to the right model from the user's crew roster. Do NOT pick a model. Optionally set `agent` to adopt a named specialist definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \"security-reviewer\"; discover with `cowboy agents list`). Include a `reason` and the `expected_artifact`. ASYNCHRONOUS: returns a job id immediately, NOT the worker's answer — keep working, and the result is delivered to you as a message when the job finishes (`jobs` to check, `wait` only when you have nothing else to do). Size each task to fit one worker's turn grant: split large work (per crate, module, or concern) and emit several calls in one message to run them in parallel.",
     "name": "subagent",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -645,6 +645,135 @@ expression: defs
         "task"
       ],
       "title": "SubagentArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "List the background subagent jobs you have dispatched: state, how long each has been running, and its turn usage (used/granted, and the host ceiling it can be granted up to). Read-only — use it to decide whether to keep working, `wait`, or grant a worker more turns.",
+    "name": "jobs",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `jobs` tool — no arguments; it lists everything.",
+      "title": "JobsArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Pause until a background subagent job reports — it finishes, or it asks for more turns. Use this ONLY when you have nothing else useful to do; results are delivered to you automatically either way, so waiting is never required to receive them. Returns early on a timeout so you are never stuck, and the user can always interrupt you.",
+    "name": "wait",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `wait` tool.",
+      "properties": {
+        "all": {
+          "default": null,
+          "description": "Wait for *all* the named jobs (or all running jobs) instead of returning as\nsoon as the first one reports. Defaults to false.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "ids": {
+          "default": null,
+          "description": "Job ids to wait for. Omit to wait for whichever background job reports next.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "default": null,
+          "description": "Give up waiting after this many seconds and return so you can do something\nelse. Defaults to a few minutes; capped by the host.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "title": "WaitArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Answer a blocked subagent. Use `answer` (with your reply in `instructions`) when it asked a question about the work — it is asking you because you have the context it lacks. When it has spent its turn grant: `grant` gives it more turns, `redirect` gives it turns plus a different approach, `wrap_up` makes it write up what it has now, `stop` abandons it. For turn requests, judge the measured evidence in its report (files read, edits made, commands run, whether anything new happened) rather than its own optimism: no new files and no edits means more turns will not help.",
+    "name": "job_reply",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `job_reply` tool.",
+      "properties": {
+        "id": {
+          "description": "The job asking for more turns, or asking a question.",
+          "type": "string"
+        },
+        "instructions": {
+          "default": null,
+          "description": "What to do differently — required for `redirect`, the reason for `stop`, and the\nreply itself for `answer`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "iterations": {
+          "default": null,
+          "description": "How many more turns to grant, for `grant`/`redirect`. The host clamps this to\nthe worker's remaining ceiling.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "verdict": {
+          "description": "One of: `answer` (reply to a question), `grant` (more turns), `redirect` (more\nturns, different approach), `wrap_up` (stop exploring and write up what it has),\n`stop` (abandon it).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "verdict"
+      ],
+      "title": "JobReplyArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Ask your foreman for more turns, because the task is larger than the grant you were given. Report honestly: what you have established, what is left, the next concrete step, and how many more turns you need. You will be paused until the foreman answers — it may grant the turns, redirect you, tell you to write up what you have, or stop the work. Cowboy attaches measured evidence of your progress to the request, so an accurate report is in your interest.",
+    "name": "request_turns",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `request_turns` tool (a delegated worker asking its foreman for\nmore turns).",
+      "properties": {
+        "iterations": {
+          "description": "How many more turns you need to finish.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "next_step": {
+          "description": "The single next concrete step you would take.",
+          "type": "string"
+        },
+        "progress": {
+          "description": "What you have established so far — concrete findings, not \"making progress\".",
+          "type": "string"
+        },
+        "remaining": {
+          "description": "What is still left to do.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "progress",
+        "remaining",
+        "next_step",
+        "iterations"
+      ],
+      "title": "RequestTurnsArgs",
       "type": "object"
     }
   }

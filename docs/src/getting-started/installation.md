@@ -74,6 +74,23 @@ reports a couple of transitive crates as behind their latest release — `matchi
 `generic-array`, both pinned to an exact version by `axum`, so there is nothing to
 update and nothing wrong.
 
+## Shell completions
+
+The command tree is wide and several arguments are session ids you would otherwise
+copy by hand, so this is worth two minutes:
+
+```sh
+# zsh
+cowboy completions zsh > "${fpath[1]}/_cowboy"
+# bash
+cowboy completions bash > ~/.local/share/bash-completion/completions/cowboy
+# fish
+cowboy completions fish > ~/.config/fish/completions/cowboy.fish
+```
+
+`elvish` and `powershell` also work. Completions cover subcommands, flags, and the
+enumerated values of `--transport`, `--kind` and `--reasoning`.
+
 ## Upgrading
 
 Re-run the install command. One thing to know: **end your sessions first.**

@@ -291,7 +291,7 @@ fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> 
     }
     ranch.updated_ms = now_ms();
     ranch::save_progress(root, &before, &ranch)?;
-    println!("✓ {workstream} {verb} — promoted {n} artifact(s)");
+    crate::ui::ok(&format!("{workstream} {verb} — promoted {n} artifact(s)"));
     if !newly.is_empty() {
         println!("newly ready: {}", newly.join(", "));
         println!("launch them with `cowboy ranch start {id}`.");
@@ -365,7 +365,7 @@ fn propose(
         decision_reason: None,
     };
     scope::save(root, &p)?;
-    println!("✓ filed proposal {} — {}", p.id, p.change.label());
+    crate::ui::ok(&format!("filed proposal {} — {}", p.id, p.change.label()));
     println!("  review with `cowboy ranch proposals {id}`,");
     println!("  then `cowboy ranch approve {id} {}` (or reject).", p.id);
     Ok(())
@@ -426,7 +426,7 @@ fn approve(root: &std::path::Path, id: &str, pid: &str) -> Result<()> {
     p.status = ProposalStatus::Approved;
     p.decided_ms = Some(now_ms());
     scope::save(root, &p)?;
-    println!("✓ approved {pid}: {msg}");
+    crate::ui::ok(&format!("approved {pid}: {msg}"));
     Ok(())
 }
 
@@ -443,7 +443,7 @@ fn reject(root: &std::path::Path, id: &str, pid: &str, reason: Option<String>) -
     p.decided_ms = Some(now_ms());
     p.decision_reason = reason;
     scope::save(root, &p)?;
-    println!("✓ rejected {pid} (plan unchanged)");
+    crate::ui::ok(&format!("rejected {pid} (plan unchanged)"));
     Ok(())
 }
 
@@ -549,7 +549,7 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
     std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
     // Validate it parses.
     ranch::load(root, &id).context("the new ranch.yaml should parse")?;
-    println!("✓ created ranch `{id}` at {}", path.display());
+    crate::ui::ok(&format!("created ranch `{id}` at {}", path.display()));
     println!("  add workstreams: `cowboy ranch add {id} <ws-id> --goal \"…\" [--depends-on a,b]`");
     println!("  then check it with `cowboy ranch status {id}`.");
     Ok(())
@@ -641,12 +641,13 @@ fn draft(root: &Path, spec_path: &str) -> Result<()> {
         )
     })?;
     ranch::save(root, &ranch)?;
-    println!(
-        "✓ drafted ranch `{id}` with {} workstream(s). Review it with \
-         `cowboy ranch status {id}`, adjust with `cowboy ranch add {id} …`, then launch with \
-         `cowboy ranch start {id}`.",
+    crate::ui::ok(&format!(
+        "drafted ranch `{id}` with {} workstream(s)",
         ranch.workstreams.len()
-    );
+    ));
+    crate::ui::step(&format!("review it with `cowboy ranch status {id}`"));
+    crate::ui::step(&format!("adjust it with `cowboy ranch add {id} …`"));
+    crate::ui::step(&format!("launch it with `cowboy ranch start {id}`"));
     Ok(())
 }
 
@@ -723,7 +724,9 @@ fn add_workstream(
     } else {
         ws.depends_on.join(", ")
     };
-    println!("✓ added workstream `{ws_id}` to ranch `{ranch_id}` (depends on: {deps})");
+    crate::ui::ok(&format!(
+        "added workstream `{ws_id}` to ranch `{ranch_id}` (depends on: {deps})"
+    ));
     println!(
         "  next: `cowboy ranch status {ranch_id}` · start with `cowboy ranch start {ranch_id}`"
     );
@@ -772,6 +775,7 @@ fn show_one(root: &std::path::Path, id: &str) -> Result<()> {
     }
     // Dependency tree: lay workstreams out by dependency depth (deepest chain),
     // indented so the execution order and what-waits-on-what read at a glance.
+    // legend-ok: a glyph key for the status column, not a success message.
     println!("\n  ✓ done · ⟳ running · ◷ ready · ⊘ blocked · ⏸ waiting · · planned");
     println!("\nworkstreams (top runs first):");
     let depths = dep_depths(&r);

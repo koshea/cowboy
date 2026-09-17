@@ -418,10 +418,25 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if let Some(wid) = &args.workstream_id {
         std::env::set_var("COWBOY_WORKSTREAM_ID", wid);
     }
+    // Stops the session's background subagents without needing `&mut agent`, so a
+    // "stop the subagents" arriving mid-turn is honoured immediately rather than when
+    // the turn happens to end. Jobs outlive turns by design; this is what bounds them.
+    let job_stopper = agent.job_stopper();
+    // Delivers user input into a *running* turn (the agent picks it up at its next
+    // iteration boundary). Only `Message` steers; `Enqueue` still defers to the queue.
+    let steer_tx = agent.steer_sender();
     let mut queue: VecDeque<String> = VecDeque::new();
+    // Publish the queue whenever it changes: deferred input that is invisible until it
+    // suddenly starts running is worse than no queue at all.
+    let publish_queue = |q: &VecDeque<String>| {
+        emitter.emit(UiEventMsg::QueueChanged {
+            pending: q.iter().cloned().collect(),
+        });
+    };
     if let Some(task) = args.task.clone() {
         emitter.emit(UiEventMsg::UserMessage(task.clone()));
         queue.push_back(task);
+        publish_queue(&queue);
     }
     // Run startup setup eagerly (bring the container up + `mise install` + the
     // repo's `setup` hook) as soon as the session comes up, before any turn —
@@ -471,10 +486,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                                 emitter.emit(UiEventMsg::Notice("setup interrupted".into()));
                                 break;
                             }
-                            // A message typed during setup runs after it finishes.
-                            Some(ClientMsg::Message(m)) => {
+                            // A message typed during setup runs after it finishes —
+                            // there is no turn yet to steer.
+                            Some(ClientMsg::Message(m) | ClientMsg::Enqueue(m)) => {
                                 emitter.emit(UiEventMsg::UserMessage(m.clone()));
                                 queue.push_back(m);
+                                publish_queue(&queue);
+                            }
+                            Some(ClientMsg::QueueClear) => {
+                                queue.clear();
+                                publish_queue(&queue);
+                            }
+                            // Nothing has been dispatched yet, but honour it rather
+                            // than dropping it: the switch re-arms, so this is a no-op.
+                            Some(ClientMsg::StopSubagents) => {
+                                job_stopper.stop_all();
                             }
                             // Settings changed during setup apply once it finishes. They
                             // need `&mut agent`, which the setup future is holding, so they
@@ -505,7 +531,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             continue; // setup done/aborted → pop any queued message, else idle
         }
         let next = match queue.pop_front() {
-            Some(m) => m,
+            Some(m) => {
+                publish_queue(&queue);
+                m
+            }
             None => {
                 // Idle: wait for the next client message, or shut down if orphaned.
                 // If we sit idle with no client attached past the configured
@@ -549,7 +578,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 };
                 match msg {
                     None => break,
-                    Some(ClientMsg::Message(m)) => {
+                    // Idle: there is no turn to steer, so both forms start one.
+                    Some(ClientMsg::Message(m) | ClientMsg::Enqueue(m)) => {
                         emitter.emit(UiEventMsg::UserMessage(m.clone()));
                         m
                     }
@@ -576,6 +606,23 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     Some(ClientMsg::Accept { note }) => {
                         sign_off(&id, note, &emitter).await;
                         break 'serve;
+                    }
+                    // Idle, but jobs can still be running: they outlive turns.
+                    Some(ClientMsg::StopSubagents) => {
+                        let n = agent.stop_all_jobs();
+                        emitter.emit(UiEventMsg::Notice(if n == 0 {
+                            "no background subagents are running".into()
+                        } else {
+                            format!("stopped {n} background subagent(s)")
+                        }));
+                        continue;
+                    }
+                    // Idle: the queue is normally empty here (we just drained it), but a
+                    // clear must still be answered rather than ignored.
+                    Some(ClientMsg::QueueClear) => {
+                        queue.clear();
+                        publish_queue(&queue);
+                        continue;
                     }
                     // No turn is running; interrupts and other control messages are
                     // no-ops.
@@ -642,8 +689,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             }
                             match kind {
                                 InterruptKind::End => end = true,
-                                // Turn / Instruct: drop queued work, return to idle.
-                                _ => queue.clear(),
+                                // Drop queued work only when the user is explicitly
+                                // redirecting: a plain "stop this turn" is not a
+                                // retraction of what they already queued up.
+                                InterruptKind::Instruct => {
+                                    queue.clear();
+                                    publish_queue(&queue);
+                                }
+                                InterruptKind::Turn => {}
                             }
                             break;
                         }
@@ -662,11 +715,24 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             end = true;
                             break;
                         }
-                        // Queue further input to run after this turn. Bounded so a
-                        // client streaming faster than turns complete can't grow
-                        // memory without limit; drop the oldest queued input once
-                        // the cap is hit (a turn is in flight, so this is backlog).
+                        // Steer the turn in flight: delivered at the agent's next
+                        // iteration boundary rather than after the whole turn. Typing
+                        // "also check the error path" used to mean waiting for the turn
+                        // to end — often minutes, sometimes the wrong work already done.
                         Some(ClientMsg::Message(m)) => {
+                            emitter.emit(UiEventMsg::UserMessage(m.clone()));
+                            if steer_tx.send(m.clone()).is_err() {
+                                // The loop is gone; fall back to the queue so the input
+                                // is not silently lost.
+                                queue.push_back(m);
+                                publish_queue(&queue);
+                            }
+                        }
+                        // Explicitly deferred: run it as its own turn after this one.
+                        // Bounded so a client streaming faster than turns complete can't
+                        // grow memory without limit; drop the oldest once the cap is hit
+                        // (a turn is in flight, so this is backlog).
+                        Some(ClientMsg::Enqueue(m)) => {
                             emitter.emit(UiEventMsg::UserMessage(m.clone()));
                             const MAX_QUEUED: usize = 256;
                             if queue.len() >= MAX_QUEUED {
@@ -677,6 +743,24 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                                 );
                             }
                             queue.push_back(m);
+                            publish_queue(&queue);
+                        }
+                        // Drop what was queued, without touching the turn or the jobs.
+                        Some(ClientMsg::QueueClear) => {
+                            queue.clear();
+                            publish_queue(&queue);
+                            emitter.emit(UiEventMsg::Notice("queued messages dropped".into()));
+                        }
+                        // Mid-turn: stop what was delegated, not what the foreman is
+                        // doing. Honoured through the shared switch, since the turn
+                        // holds `&mut agent`; each stopped job reports itself as
+                        // stopped, so the foreman learns rather than waiting forever.
+                        Some(ClientMsg::StopSubagents) => {
+                            job_stopper.stop_all();
+                            emitter.emit(UiEventMsg::Notice(
+                                "stopping background subagents; the current turn continues"
+                                    .into(),
+                            ));
                         }
                         // Swapping the model needs &mut agent, so finish the
                         // current turn first, then apply below.
@@ -726,8 +810,19 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
     }
 
-    // Tell the world the session has ended BEFORE any container cleanup. The
-    // cleanup below touches Docker (a `container_state` probe, exec, container +
+    // Reap the background subagents first. They are host processes deliberately
+    // outliving individual turns, so nothing else stops them: without this a session
+    // that ends while three workers are running leaves three `cowboy` processes (and
+    // their sandboxes) behind. Synchronous and fast — aborting each task drops the
+    // child, whose `kill_on_drop` does the killing.
+    let reaped = agent.stop_all_jobs();
+    if reaped > 0 {
+        tracing::info!(
+            reaped,
+            "stopped {reaped} background subagent(s) on session end"
+        );
+    }
+    // Tell the world the session has ended BEFORE any container cleanup. The    // cleanup below touches Docker (a `container_state` probe, exec, container +
     // network removal) and a wedged/unreachable Docker can make those calls hang
     // for their full timeout — that must not delay the daemon learning the session
     // is over, or it keeps reporting it `Running` (and a client keeps waiting) long
@@ -971,8 +1066,20 @@ fn control_approver(
                 Some(r) => format!("{dest} — {r}"),
                 None => dest.clone(),
             };
+            // The command, not the pid. `[command 84213]` is attribution the reader cannot
+            // use: deciding whether to allow a destination depends on what wants it —
+            // `cargo test` reaching crates.io is a different question from a `curl` in a
+            // script the agent just wrote — and the destination alone does not say.
+            //
+            // SECURITY: display only, and host-derived (see `sandbox::attribution`). It is
+            // appended after the verdict was computed, exactly as the pid already was, so
+            // it cannot reach `policy::evaluate`. An unresolvable pid falls back to the pid
+            // and then to nothing, rather than to a different decision.
             if let Some(pid) = req.attempt.command_pid {
-                prompt.push_str(&format!(" [command {pid}]"));
+                match crate::sandbox::attribution::command_for(pid) {
+                    Some(cmd) => prompt.push_str(&format!("\n\nrequested by:  {cmd}")),
+                    None => prompt.push_str(&format!(" [command {pid}]")),
+                }
             }
             let (verdict, scope) = ui.request_approval(prompt).await;
             if verdict == Verdict::Allow

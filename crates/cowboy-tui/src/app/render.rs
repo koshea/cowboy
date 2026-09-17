@@ -174,18 +174,11 @@ pub fn draw(f: &mut Frame, app: &App) {
             ),
             "press a key  ·  Esc = deny",
         ),
-        Mode::Paused => draw_modal(
-            f,
-            area,
-            "Paused",
-            "r  resume\n\
-             i  instruct — stop this turn and redirect (history kept)\n\
-             k  kill — stop the running command/turn only\n\
-             w  watch — open a subagent's live output\n\
-             d  detach — leave it running in the background, exit\n\
-             e  end — finish the session",
-            "press a key  ·  Esc = resume",
-        ),
+        Mode::Help => {
+            if let Some(h) = &app.help {
+                draw_help(f, area, h);
+            }
+        }
         Mode::ModelPicker => {
             if let Some(p) = &app.model_picker {
                 draw_model_picker(f, area, p);
@@ -257,6 +250,145 @@ pub(super) fn centered(area: Rect, w: u16, h: u16) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// Break `s` into lines of at most `width` columns, on word boundaries.
+///
+/// Hand-rolled because ratatui's `Wrap` applies to a whole `Paragraph`, and here only the
+/// second column may wrap — the key column has to stay a column.
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        let extra = if cur.is_empty() { 0 } else { 1 };
+        if cur.chars().count() + extra + word.chars().count() > width && !cur.is_empty() {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(word);
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// The keys/commands reference: grouped rows, scrollable, filling most of the screen.
+///
+/// Deliberately not a [`draw_modal`]: that helper clamps its height to the terminal and
+/// silently truncates, which is exactly the failure mode a long reference hits. This one
+/// takes the space it can get, reports its own viewport back through
+/// [`HelpView::viewport`] so paging knows the page size, and shows a position indicator
+/// so a reader can tell there is more.
+pub(super) fn draw_help(f: &mut Frame, area: Rect, h: &HelpView) {
+    // Takes the width it can get up to 96: the two-column layout reads better wide, and
+    // a fixed 78 wasted a third of the screen on a modern terminal.
+    let rect = centered(
+        area,
+        area.width.saturating_sub(4).min(96),
+        area.height.saturating_sub(2),
+    );
+    f.render_widget(Clear, rect);
+    let title = match &h.filter {
+        Some(q) => format!(" Help: {q} "),
+        None => " Keys & commands ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+
+    // Body rows, then a one-line footer that stays put while the body scrolls.
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    h.viewport.set(body.height as usize);
+
+    // Widest key column across every section, so the two columns line up throughout
+    // rather than per-section — a reference is read down the left edge.
+    let keyw = h
+        .sections
+        .iter()
+        .flat_map(|s| s.rows.iter())
+        .map(|(k, _)| k.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(22);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, s) in h.sections.iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            s.title.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        // Descriptions wrap into continuation rows indented to the description column
+        // rather than being clipped at the border. Clipping is what a `Paragraph` with no
+        // `Wrap` does, and it silently ate the second half of the longer entries — on a
+        // reference, a truncated line is worse than no line.
+        // +5, not +4: two of indent, two between the columns, and one of right margin so
+        // a full line does not read as clipped at the border.
+        let descw = (body.width as usize).saturating_sub(keyw + 5).max(20);
+        for (k, v) in &s.rows {
+            for (n, chunk) in wrap_words(v, descw).into_iter().enumerate() {
+                let key = if n == 0 { k.as_str() } else { "" };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {key:<keyw$}  "),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(chunk, Style::default().fg(Color::Gray)),
+                ]));
+            }
+        }
+    }
+
+    h.total.set(lines.len());
+    let total = lines.len();
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(h.scroll)
+        .take(body.height as usize)
+        .collect();
+    f.render_widget(Paragraph::new(visible), body);
+
+    let more = total.saturating_sub(h.scroll + body.height as usize);
+    let pos = if more > 0 {
+        format!("↑↓ scroll · {more} more below · Esc closes")
+    } else if h.scroll > 0 {
+        "↑↓ scroll · end · Esc closes".to_string()
+    } else {
+        "Esc closes".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            pos,
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        footer,
+    );
 }
 
 pub(super) fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
@@ -859,16 +991,18 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
         let (mark, color) = match m.status {
             CrewStatus::Pending => ("⋯", Color::DarkGray),
             CrewStatus::Running => ("⟳", Color::Yellow),
+            CrewStatus::Asking => ("⏸", Color::Magenta),
             CrewStatus::Done => ("✓", Color::Green),
             CrewStatus::Failed => ("✗", Color::Red),
         };
         // Pending members are queued behind the per-provider concurrency cap and
         // aren't consuming a model connection yet, so show "queued" rather than a
-        // ticking timer that would imply work is happening.
-        let trailing = if m.status == CrewStatus::Pending {
-            " queued".to_string()
-        } else {
-            format!(" {}s", m.elapsed_secs)
+        // ticking timer that would imply work is happening. A worker that is *asking*
+        // is also not working — and the number it is waiting on is the useful part.
+        let trailing = match m.status {
+            CrewStatus::Pending => " queued".to_string(),
+            CrewStatus::Asking => format!(" wants +{} turns", m.requested),
+            _ => format!(" {}s", m.elapsed_secs),
         };
         lines.push(Line::from(vec![
             Span::styled(format!("{mark} "), Style::default().fg(color)),
@@ -906,7 +1040,7 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         Mode::AwaitingInput(_) => "your turn — answer above",
         Mode::AwaitingChoice => "your turn — pick above",
         Mode::Approval(_) => "paused for you — your call",
-        Mode::Paused => "paused",
+        Mode::Help => "help",
         Mode::ModelPicker => "models",
         Mode::ModelForm => "models",
         Mode::WatchingSubagent => "watching",
@@ -926,6 +1060,24 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     let mut segs: Vec<String> = Vec::new();
     if app.blocked.is_some() {
         segs.push("⏸ blocked".to_string());
+    }
+    // Background work and deferred input, so neither is invisible: a session with three
+    // subagents running looks identical to an idle one without this.
+    let asking = app
+        .crew
+        .iter()
+        .filter(|m| m.status == CrewStatus::Asking)
+        .count();
+    let live = app.live_jobs();
+    if live > 0 {
+        segs.push(if asking > 0 {
+            format!("{live} jobs ({asking} asking)")
+        } else {
+            format!("{live} jobs")
+        });
+    }
+    if !app.queued.is_empty() {
+        segs.push(format!("{} queued", app.queued.len()));
     }
     if app.tokens_in > 0 || app.tokens_out > 0 {
         let mut seg = format!(
@@ -1076,10 +1228,11 @@ pub(super) fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let hint = match &app.mode {
         Mode::Done => "session finished — press q to quit",
         Mode::AwaitingInput(_) => "type your answer · Enter submits",
-        Mode::Idle => {
-            "Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help · Ctrl-C menu"
-        }
-        _ => "Enter send · Shift+Enter newline · /help · Ctrl-C interrupt",
+        Mode::Idle => "Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end",
+        // While the agent works, typing steers the turn in flight rather than waiting
+        // for it — worth saying, because the old behaviour was the opposite.
+        Mode::Running => "type to steer · /after <msg> to queue · Ctrl-C interrupts · F1 help",
+        _ => "Enter send · Shift+Enter newline · F1 help",
     };
     let accent = if app.mode == Mode::Idle {
         Color::Cyan
@@ -1162,8 +1315,17 @@ pub(super) fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, foo
     // `body` may be multi-line (e.g. a key legend); size the modal to fit it.
     let body_lines: Vec<&str> = body.lines().collect();
     let w = area.width.saturating_sub(8).min(72);
+    // Count *wrapped* rows, not source lines. The `Paragraph` below wraps, so sizing from
+    // `body.lines().len()` under-measures any line longer than the modal — which the
+    // network approval hit as soon as it started naming the command that asked, and the
+    // overflow silently cut the once/session/project/global legend off the bottom.
+    let inner_w = w.saturating_sub(2) as usize;
+    let rows: usize = body_lines
+        .iter()
+        .map(|l| wrap_words(l, inner_w.max(1)).len())
+        .sum();
     // borders (2) + body + blank separator (1) + footer (1).
-    let h = (body_lines.len() as u16 + 4).min(area.height);
+    let h = (rows as u16 + 4).min(area.height);
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);

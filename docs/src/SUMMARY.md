@@ -5,6 +5,7 @@
 # Getting started
 
 - [Installation](getting-started/installation.md)
+- [Your first five minutes](getting-started/first-five-minutes.md)
 - [Quick start](getting-started/quickstart.md)
 - [Configuration](getting-started/configuration.md)
 - [How-to guides](how-to.md)

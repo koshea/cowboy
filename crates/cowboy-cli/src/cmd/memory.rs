@@ -33,8 +33,19 @@ pub fn run(args: MemoryCmdArgs) -> Result<()> {
             None => anyhow::bail!("no memory named {name:?}"),
         },
         MemoryCommand::Delete { name } => {
+            // Deleting shows the body first: a memory is a few lines the agent chose to
+            // keep, and there is no undo, so "is this the one?" should be answerable
+            // without a second command.
+            let Some(body) = memory::recall(&key, &name)? else {
+                anyhow::bail!("no memory named {name:?}");
+            };
+            crate::ui::heading(&format!("memory `{name}`"));
+            println!("{}", body.trim_end());
+            if !crate::prompt::confirm_destructive(&format!("\nDelete memory `{name}`?"))? {
+                return Ok(());
+            }
             if memory::delete(&key, &name)? {
-                println!("deleted memory `{name}`");
+                crate::ui::ok(&format!("deleted memory `{name}`"));
             } else {
                 anyhow::bail!("no memory named {name:?}");
             }

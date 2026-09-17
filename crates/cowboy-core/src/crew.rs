@@ -118,6 +118,54 @@ impl Ramp {
 /// re-points every `<default>` slot without editing the roster.
 pub const DEFAULT_MODEL: &str = "<default>";
 
+/// Per-effort **initial iteration grant** for a delegated worker: sparse floors
+/// (effort → turns) that fill upward, the same rule as [`Ramp`] but carrying a
+/// turn count instead of a model name.
+///
+/// A grant is deliberately small — smaller than the old flat `max_iterations` —
+/// because a worker that needs more is expected to *report progress and ask*
+/// (see `request_turns`), and one that cannot show progress should not get more.
+/// The alternative, a single large cap, is what let a review subagent spend 100
+/// turns re-reading files and return a `[partial]` with no report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Grants(pub BTreeMap<Effort, u32>);
+
+impl Grants {
+    /// The grant for a requested effort: the highest floor ≤ `effort`, else (below
+    /// all floors) the lowest floor. Falls back to the built-in ladder when empty,
+    /// so a roster that omits the key — or sets it to `{}` — still gets sane turns
+    /// rather than zero.
+    pub fn pick(&self, effort: Effort) -> u32 {
+        let from = |m: &BTreeMap<Effort, u32>| -> Option<u32> {
+            m.range(..=effort)
+                .next_back()
+                .map(|(_, n)| *n)
+                .or_else(|| m.values().next().copied())
+        };
+        from(&self.0)
+            .or_else(|| from(&Self::default().0))
+            .unwrap_or(DEFAULT_GRANT)
+    }
+}
+
+/// The built-in grant ladder. Sized so the common small delegation finishes well
+/// inside its grant and only genuinely large work has to come back and ask.
+impl Default for Grants {
+    fn default() -> Self {
+        Self(BTreeMap::from([
+            (Effort::Tiny, 15),
+            (Effort::Small, 25),
+            (Effort::Medium, 40),
+            (Effort::Large, 60),
+            (Effort::Deep, 80),
+        ]))
+    }
+}
+
+/// Last-resort grant if even the built-in ladder is somehow empty.
+const DEFAULT_GRANT: u32 = 40;
+
 /// Delegation limits + the crew on/off switch. These are *throughput / safety*
 /// knobs, not quota or budget controls (the gateway owns those).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +192,42 @@ pub struct Delegation {
     /// Whether a worker may itself delegate (off by default).
     #[serde(default)]
     pub allow_recursive_delegation: bool,
+    /// Per-effort initial iteration grant for a delegated worker.
+    #[serde(default)]
+    pub iterations: Grants,
+    /// Hard per-job ceiling on total iterations, however many extensions the
+    /// foreman grants. Enforced host-side: the foreman *asks* for turns, it does
+    /// not get to raise this. `0` disables supervision entirely — the worker falls
+    /// back to `agent.max_iterations` with no reports (the escape hatch if
+    /// grant-and-request proves noisy for a given workflow).
+    #[serde(default = "default_max_total_iterations")]
+    pub max_total_iterations: u32,
+    /// How long a worker waits for the foreman's verdict on a turn request. On
+    /// timeout it takes one small automatic extension, and on a second timeout it
+    /// wraps up — so an unattended foreman neither strands the worker forever nor
+    /// throws away its work.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// Iterations of *zero novelty* (no new files read, no edits, no new commands)
+    /// that force an early progress report, before the grant is spent. This is the
+    /// host's own stall detector: it does not rely on the worker noticing that it is
+    /// going in circles. `0` disables it.
+    #[serde(default = "default_stall_window")]
+    pub stall_window: u32,
+}
+
+impl Delegation {
+    /// The initial grant for an effort, clamped to the ceiling (a grant larger than
+    /// the total it may never exceed would be a lie to the worker).
+    pub fn grant_for(&self, effort: Effort) -> u32 {
+        let ceiling = self.max_total_iterations;
+        let grant = self.iterations.pick(effort);
+        if ceiling == 0 {
+            grant
+        } else {
+            grant.min(ceiling)
+        }
+    }
 }
 
 impl Default for Delegation {
@@ -154,6 +238,10 @@ impl Default for Delegation {
             max_parallel_per_provider: default_max_parallel_per_provider(),
             max_depth: default_max_depth(),
             allow_recursive_delegation: false,
+            iterations: Grants::default(),
+            max_total_iterations: default_max_total_iterations(),
+            request_timeout_seconds: default_request_timeout_seconds(),
+            stall_window: default_stall_window(),
         }
     }
 }
@@ -595,6 +683,24 @@ fn default_max_depth() -> u32 {
     1
 }
 
+/// Ceiling on a single worker's total turns, extensions included. Generous enough
+/// that a genuinely large task can be granted its way there in steps, low enough
+/// that a worker going in circles costs a bounded amount before the foreman's
+/// grants stop mattering.
+fn default_max_total_iterations() -> u32 {
+    400
+}
+
+/// Long enough for a busy foreman to get back to a worker at its next iteration
+/// boundary, short enough that a worker isn't parked for minutes if nobody does.
+fn default_request_timeout_seconds() -> u64 {
+    120
+}
+
+fn default_stall_window() -> u32 {
+    8
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,6 +744,89 @@ mod tests {
         assert_eq!(r.pick(Effort::Medium), Some("cheap"));
         assert_eq!(r.pick(Effort::Large), Some("opus"));
         assert_eq!(r.pick(Effort::Deep), Some("opus"));
+    }
+
+    #[test]
+    fn grants_rise_with_effort_and_stay_below_the_old_flat_cap() {
+        let g = Grants::default();
+        let ladder: Vec<u32> = Effort::all().into_iter().map(|e| g.pick(e)).collect();
+        // Monotonic, and every rung below the 100 that used to be handed to every
+        // delegation regardless of size.
+        assert!(ladder.windows(2).all(|w| w[0] <= w[1]), "got {ladder:?}");
+        assert!(ladder.iter().all(|&n| n < 100), "got {ladder:?}");
+        assert!(g.pick(Effort::Tiny) < g.pick(Effort::Deep));
+    }
+
+    #[test]
+    fn grant_floors_fill_upward_and_below_the_lowest_floor_uses_it() {
+        // Sparse: only medium and deep are pinned.
+        let g = Grants(BTreeMap::from([(Effort::Medium, 30), (Effort::Deep, 200)]));
+        assert_eq!(g.pick(Effort::Tiny), 30, "below all floors → lowest floor");
+        assert_eq!(g.pick(Effort::Small), 30);
+        assert_eq!(g.pick(Effort::Medium), 30);
+        assert_eq!(g.pick(Effort::Large), 30, "fills upward from medium");
+        assert_eq!(g.pick(Effort::Deep), 200);
+    }
+
+    #[test]
+    fn an_empty_grant_map_falls_back_to_the_builtin_ladder() {
+        // `iterations: {}` in a roster must not mean "zero turns" — that would
+        // make every delegation fail before its first model call.
+        let empty = Grants(BTreeMap::new());
+        for e in Effort::all() {
+            assert_eq!(empty.pick(e), Grants::default().pick(e), "effort {e:?}");
+            assert!(empty.pick(e) > 0);
+        }
+    }
+
+    #[test]
+    fn a_grant_is_clamped_to_the_ceiling() {
+        // A roster that grants more than the total a job may ever use would be
+        // promising turns the host will refuse.
+        let d = Delegation {
+            iterations: Grants(BTreeMap::from([(Effort::Tiny, 500)])),
+            max_total_iterations: 50,
+            ..Delegation::default()
+        };
+        assert_eq!(d.grant_for(Effort::Tiny), 50);
+        // Ceiling 0 = supervision off; the grant is passed through untouched.
+        let off = Delegation {
+            max_total_iterations: 0,
+            ..Delegation::default()
+        };
+        assert_eq!(
+            off.grant_for(Effort::Medium),
+            Grants::default().pick(Effort::Medium)
+        );
+    }
+
+    #[test]
+    fn a_roster_without_the_new_keys_still_parses_with_defaults() {
+        // Existing crew.yaml files predate grant-and-request; `deny_unknown_fields`
+        // makes the reverse (a typo) loud, but the absence must stay silent.
+        let c: CrewConfig =
+            serde_yaml_ng::from_str("crew:\n  general: cheap\ndelegation:\n  max_parallel: 3\n")
+                .unwrap();
+        assert_eq!(c.delegation.max_parallel, 3);
+        assert_eq!(
+            c.delegation.max_total_iterations,
+            default_max_total_iterations()
+        );
+        assert_eq!(c.delegation.stall_window, default_stall_window());
+        assert_eq!(c.delegation.iterations, Grants::default());
+    }
+
+    #[test]
+    fn a_roster_can_override_one_grant_rung() {
+        let c: CrewConfig = serde_yaml_ng::from_str(
+            "crew:\n  general: cheap\ndelegation:\n  iterations:\n    deep: 150\n",
+        )
+        .unwrap();
+        assert_eq!(c.delegation.grant_for(Effort::Deep), 150);
+        // Rungs below an explicit `deep` floor take that floor too (fill-upward is
+        // defined from the lowest present key), which is why an override is a
+        // deliberate act rather than a partial edit.
+        assert_eq!(c.delegation.grant_for(Effort::Tiny), 150);
     }
 
     #[test]

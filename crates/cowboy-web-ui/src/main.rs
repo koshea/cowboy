@@ -404,6 +404,11 @@ fn session(props: &SessionProps) -> Html {
                             { for model.subagents.iter().map(|s| render_subagent_chip(s, on_watch.clone())) }
                         </div>
                     }
+                    if !model.queued.is_empty() {
+                        <div class="queued" title={model.queued.join("\n")}>
+                            { format!("⏭ {} queued", model.queued.len()) }
+                        </div>
+                    }
                 }
             }
 
@@ -456,7 +461,11 @@ fn session(props: &SessionProps) -> Html {
 fn render_subagent_chip(s: &model::SubagentStatus, on_watch: Callback<String>) -> Html {
     let id = s.id.clone();
     let onclick = Callback::from(move |_| on_watch.emit(id.clone()));
-    let (mark, cls) = if s.pending {
+    // A worker asking for turns is parked, not working, and the number it is waiting on
+    // is the actionable part — so it gets its own mark rather than looking "running".
+    let (mark, cls) = if s.requested > 0 {
+        ("⏸", "asking")
+    } else if s.pending {
         ("⋯", "pending")
     } else {
         match s.done {
@@ -465,10 +474,24 @@ fn render_subagent_chip(s: &model::SubagentStatus, on_watch: Callback<String>) -
             Some(false) => ("✗", "failed"),
         }
     };
+    let detail = if s.requested > 0 {
+        format!(" +{}?", s.requested)
+    } else if s.granted > 0 && s.done.is_none() && !s.pending {
+        format!(" {}/{}", s.used, s.granted)
+    } else {
+        String::new()
+    };
+    let tip = if s.requested > 0 {
+        format!(
+            "{} ({}) is asking for {} more turns — answer it in the session",
+            s.label, s.model, s.requested
+        )
+    } else {
+        format!("watch {} ({})", s.label, s.model)
+    };
     html! {
-        <button class={classes!("subagent-chip", cls)} {onclick}
-            title={format!("watch {} ({})", s.label, s.model)}>
-            { "👁 " }{ s.label.clone() }{ " " }<span class="dot">{ mark }</span>
+        <button class={classes!("subagent-chip", cls)} {onclick} title={tip}>
+            { "👁 " }{ s.label.clone() }{ detail }{ " " }<span class="dot">{ mark }</span>
         </button>
     }
 }
@@ -720,7 +743,6 @@ fn plan_mark(status: &str) -> &'static str {
 fn main() {
     yew::Renderer::<App>::new().render();
 }
-
 
 #[cfg(test)]
 mod url_tests {

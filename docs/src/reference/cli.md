@@ -12,12 +12,29 @@ An opinionated local coding agent that runs wild inside a corral you own.
 |-----|-------------|
 | `<TASK>` | Optional one-shot task. With no subcommand, `cowboy 'fix the tests'` starts a session with the task prefilled |
 | `-v, --verbose` | Enable debug logging (or set COWBOY_LOG=...) |
+| `-y, --yes` | Answer every confirmation with yes (or set COWBOY_ASSUME_YES=1) |
 | `--attach-if-active` | On a same-worktree collision, attach to the active session instead of prompting |
 | `--read-only` | On a same-worktree collision, attach read-only (watch without driving) |
 | `--new-worktree` | On a same-worktree collision, create a new git worktree and run there |
 | `--force-same-worktree` | Take over a *stale* lease on this worktree (never a live one) |
 | `--continue` | Continue the most recent session in this worktree, keeping its history |
 | `--resume` | Resume a specific session by id, keeping its conversation history |
+
+```text
+Getting started:
+  cowboy init                     # set up .cowboy/ in this repo
+  cowboy models setup             # configure a provider + model (once per machine)
+  cowboy doctor                   # check the host can sandbox and the config is sane
+
+Everyday use:
+  cowboy                          # open the TUI and pick a task
+  cowboy "fix the failing tests"  # start with the task prefilled
+  cowboy --continue               # resume the most recent session in this worktree
+  cowboy sessions                 # list sessions, then: cowboy attach <id>
+  cowboy down                     # end this project's sessions
+
+Type /help inside the TUI for keys and slash commands.
+```
 
 
 ## `cowboy agents`
@@ -51,10 +68,10 @@ Publish a file as a session artifact
 | Arg | Description |
 |-----|-------------|
 | `<PATH>` | Path to the file to publish |
-| `--kind` | Kind: contract\|summary\|patch\|diff\|test_result\|notes\|review\|other |
+| `--kind` | What sort of artifact this is (defaults to `notes`) |
 | `--title` | Friendly title (defaults to the file name) |
 | `--summary` | One-line summary |
-| `--session` |  |
+| `--session` | Session to publish into (defaults to the most recent in this worktree) |
 
 
 ### `cowboy artifact list`
@@ -72,8 +89,8 @@ Print an artifact's body by id
 
 | Arg | Description |
 |-----|-------------|
-| `<ID>` |  |
-| `--session` |  |
+| `<ID>` | The artifact id, as shown by `cowboy artifact list` |
+| `--session` | Session to read from (defaults to the most recent in this worktree) |
 
 
 ## `cowboy attach`
@@ -83,6 +100,22 @@ Attach the TUI to a running session (by id, or a worker socket path)
 | Arg | Description |
 |-----|-------------|
 | `<SESSION>` |  |
+
+
+## `cowboy completions`
+
+Print a shell completion script
+
+| Arg | Description |
+|-----|-------------|
+| `<SHELL>` |  |
+
+```text
+Examples:
+  cowboy completions zsh  > "${fpath[1]}/_cowboy"
+  cowboy completions bash > ~/.local/share/bash-completion/completions/cowboy
+  cowboy completions fish > ~/.config/fish/completions/cowboy.fish
+```
 
 
 ## `cowboy crew`
@@ -96,7 +129,7 @@ Write a default crew roster (tiers derived from your models' prices)
 
 | Arg | Description |
 |-----|-------------|
-| `--force` | Overwrite an existing crew.yaml |
+| `--force` | Overwrite an existing crew.yaml (asks first) |
 
 
 ### `cowboy crew list`
@@ -144,8 +177,8 @@ Show one decision by id
 
 | Arg | Description |
 |-----|-------------|
-| `<ID>` |  |
-| `--session` |  |
+| `<ID>` | The decision id, as shown by `cowboy decisions list` |
+| `--session` | Session to read from (defaults to the most recent in this worktree) |
 
 
 ## `cowboy doctor`
@@ -159,7 +192,7 @@ End this project's running sessions and release their sandboxes
 
 | Arg | Description |
 |-----|-------------|
-| `--all` | End sessions for EVERY project, not just this one |
+| `--all` | End sessions for EVERY project, not just this one (asks first) |
 
 
 ## `cowboy grant`
@@ -174,6 +207,15 @@ Let the sandbox see a host path outside this project
 | `--remove` | Forget a previously granted path |
 | `--list` | Show the saved grants for this project |
 
+```text
+Examples:
+  cowboy grant ~/src/shared-lib           # read-write, this project only
+  cowboy grant --ro /opt/reference-data   # read-only
+  cowboy grant --global ~/src/shared-lib  # every project on this machine
+  cowboy grant --list                     # what is granted here
+  cowboy grant --remove ~/src/shared-lib  # take it back
+```
+
 
 ## `cowboy handoff`
 
@@ -186,11 +228,12 @@ Print a session's handoff summary (defaults to the most recent)
 
 ## `cowboy inbox`
 
-Read (and drain) a session's message inbox (defaults to the most recent)
+Read a session's message inbox (defaults to the most recent). Reading drains the inbox unless --peek is given
 
 | Arg | Description |
 |-----|-------------|
 | `<SESSION>` |  |
+| `--peek` | Show the messages without consuming them |
 
 
 ## `cowboy init`
@@ -199,7 +242,7 @@ Create initial project config files under `.cowboy/`
 
 | Arg | Description |
 |-----|-------------|
-| `--force` | Overwrite existing config files if present |
+| `--force` | Overwrite existing config files if present (asks first) |
 | `--git` | Also run `git init` if the project is not already a git repository |
 
 
@@ -228,6 +271,16 @@ Add or replace an MCP server in ~/.config/cowboy/mcp.yaml
 | `--url` | http: the server URL |
 | `--header` | http: a request header, `KEY=VALUE` (repeatable). Use `${VAR}` in VALUE |
 | `--tool` | Tool names to expose (repeatable), fail-closed: omit to expose NONE, or pass `--tool '*'` to expose all of the server's tools |
+
+```text
+Examples:
+  cowboy mcp add filesystem --transport stdio --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /workspace --description "files under /workspace" --tool "*"
+  cowboy mcp add docs --transport http --url https://mcp.example.com/sse --header "Authorization=Bearer ${TOKEN}" --tool search
+
+--tool is fail-closed: with none given the server is configured but exposes nothing.
+Pass --tool '*' to expose everything, or name each tool. Check the result with
+`cowboy mcp test <name>`.
+```
 
 
 ### `cowboy mcp disable`
@@ -297,7 +350,7 @@ Inspect the agent's saved memory (project + global)
 
 ### `cowboy memory delete`
 
-Delete a memory by name
+Delete a memory by name (shows it, then asks)
 
 | Arg | Description |
 |-----|-------------|
@@ -328,10 +381,27 @@ Send a structured message to a session inbox (daemon-mediated bus)
 | `--to` | Target session id |
 | `--all` | Broadcast to all other sessions instead of one |
 
+```text
+Examples:
+  cowboy message "the API contract changed" --to 1788401869978-1
+  cowboy message "pausing for a release" --all
+```
+
 
 ## `cowboy models`
 
 Configure model providers (home-owned) and models
+
+```text
+Examples:
+  cowboy models setup                  # the guided path: provider, key, then a model
+  cowboy models list                   # what is configured, and the effective default
+  cowboy models available              # what your endpoint actually offers
+  cowboy models use claude-sonnet-4-6  # set the project default
+
+Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are read
+host-side. They are never written into a project or bound into the sandbox.
+```
 
 
 ### `cowboy models add`
@@ -343,11 +413,21 @@ Register a model by its provider id, prefilled from shipped defaults
 | `<ID>` | The provider-side model id, e.g. `cerebras/zai-glm-4.7` |
 | `--name` | Friendly name (config key). Defaults to the recommended name |
 | `--provider` | Provider to use (defaults to the only configured one) |
-| `--temp` |  |
-| `--context` |  |
-| `--max-output` |  |
-| `--reasoning` | Reasoning effort: none\|minimal\|low\|medium\|high |
+| `--temp` | Sampling temperature (provider default if omitted) |
+| `--context` | Context window in tokens, used to size the /context gauge and to decide when to compact |
+| `--max-output` | Cap on tokens generated per response |
+| `--reasoning` | Reasoning effort to request. `none` sends no hint at all |
 | `--default` | Make this the default model |
+
+```text
+Examples:
+  cowboy models add anthropic/claude-sonnet-4-6
+  cowboy models add cerebras/zai-glm-4.7 --name fast --default
+  cowboy models add openai/gpt-5 --reasoning high --max-output 32000
+
+Shipped defaults fill in temperature, context window and pricing for known ids;
+`cowboy models available` lists what your endpoint actually offers.
+```
 
 
 ### `cowboy models available`
@@ -383,6 +463,16 @@ Set the default model. Writes to the project unless `--global`
 
 Patch helper (wraps git inside the sandbox)
 
+```text
+Examples:
+  cowboy patch show   # the working-tree diff
+  cowboy patch save   # write it to .cowboy/diff.patch
+  cowboy patch revert # discard uncommitted tracked changes (asks first)
+
+The workspace is bind-mounted, so the agent's edits are already in your real working
+tree — commit them with plain git.
+```
+
 
 ### `cowboy patch apply`
 
@@ -401,7 +491,7 @@ Revert uncommitted changes (asks for confirmation)
 
 ### `cowboy patch save`
 
-Save the current git diff to the session `diff.patch`
+Save the current git diff to `.cowboy/diff.patch`
 
 
 ### `cowboy patch show`
@@ -458,6 +548,20 @@ Stop a process by name
 ## `cowboy ranch`
 
 Create or inspect Ranch Plans (multi-workstream tasks)
+
+```text
+A ranch splits one large task into dependency-aware workstreams, each a normal session in
+its own worktree and branch. The usual arc:
+
+  cowboy ranch plan "migrate to the new auth service"  # an agent proposes the workstreams
+  cowboy ranch status my-ranch                         # review the plan it drafted
+  cowboy ranch start my-ranch                          # launch whatever is ready
+  cowboy ranch watch my-ranch                          # live dashboard
+  cowboy ranch accept my-ranch api-layer               # sign off a gated workstream
+
+`plan` reads the codebase and starts nothing, so the plan is yours to edit first.
+`ranch draft <spec>` is the lower-level form the agent itself uses.
+```
 
 
 ### `cowboy ranch accept`
@@ -578,7 +682,7 @@ Reject a pending proposal (records the decision; plan unchanged)
 |-----|-------------|
 | `<RANCH>` |  |
 | `<PROPOSAL>` |  |
-| `--reason` |  |
+| `--reason` | Why it was rejected. Recorded with the decision and shown to the workstream that proposed it, so it can try something else |
 
 
 ### `cowboy ranch retry`
@@ -645,10 +749,27 @@ Run a command inside the agent sandbox
 |-----|-------------|
 | `<COMMAND>` | The command and its arguments |
 
+```text
+Examples:
+  cowboy run cargo test  # run it under the same confinement the agent gets
+  cowboy run -- ls -la   # use -- when the command has its own flags
+
+There is no network unless the project's security.yaml allows the destination.
+```
+
 
 ## `cowboy sandbox`
 
 Inspect the sandbox boundary for this project
+
+```text
+Examples:
+  cowboy sandbox plan          # what the agent can read, write and reach
+  cowboy sandbox exec cargo test
+
+`plan` is the honest answer to "what is the agent allowed to do here?" — it is rendered
+from the same pure logic the session builds the boundary from, not a separate summary.
+```
 
 
 ### `cowboy sandbox exec`
@@ -672,7 +793,7 @@ Grant host credentials (gh, gcloud, kubectl, …) into the sandbox
 
 ### `cowboy secrets add`
 
-Print a paste-ready grant (a known preset and/or explicit env/file grants) to add to .cowboy/security.yaml. Non-destructive
+Add a credential grant (a known preset and/or explicit env/file grants) to your personal host-side overlay; --repo prints a snippet to paste instead
 
 | Arg | Description |
 |-----|-------------|
@@ -682,6 +803,19 @@ Print a paste-ready grant (a known preset and/or explicit env/file grants) to ad
 | `--global` | Write to the cross-project user overlay instead of this worktree's |
 | `--repo` | Print a snippet to paste into the repo's .cowboy/security.yaml instead of writing your personal (home-dir) overlay |
 
+```text
+Examples:
+  cowboy secrets add gh                       # a known preset (gh, gcloud, kubectl, aws, git, ssh)
+  cowboy secrets add --env GITHUB_TOKEN       # pass a host env var through by name
+  cowboy secrets add --env TOKEN=MY_HOST_VAR  # ...under a different name inside
+  cowboy secrets add --file ~/.netrc          # bind a host file read-only
+  cowboy secrets add gh --global              # every project, not just this one
+  cowboy secrets add gh --repo                # print a security.yaml snippet instead of writing
+
+Values are resolved host-side. The overlay lives in ~/.config/cowboy/secrets/, which the
+agent cannot write.
+```
+
 
 ### `cowboy secrets list`
 
@@ -690,7 +824,7 @@ Show configured credential grants and whether each host source exists
 
 ## `cowboy session`
 
-Session maintenance (reap stale records and their leases)
+Inspect and maintain sessions (list, reap stale records and their leases)
 
 
 ### `cowboy session cleanup`
@@ -700,6 +834,11 @@ Reap stale (crashed/abandoned) session records and release their leases. Worktre
 | Arg | Description |
 |-----|-------------|
 | `--dry-run` | Show what would be reaped without changing anything |
+
+
+### `cowboy session list`
+
+List sessions tracked by the daemon (same as `cowboy sessions`)
 
 
 ## `cowboy sessions`
@@ -735,6 +874,14 @@ Print a skill's instructions (to follow / pull into context)
 
 Serve a web UI to attach to running sessions from a browser (e.g. a phone over Tailscale). Binds loopback by default; token-authenticated
 
+```text
+Examples:
+  cowboy web on                          # loopback only
+  cowboy web on --bind 100.x.y.z:7777    # a Tailscale address
+  cowboy web status                      # the URL, plus a QR code for a remote bind
+  cowboy web off
+```
+
 
 ### `cowboy web off`
 
@@ -759,6 +906,17 @@ Show whether the web UI is enabled + serving, with its URL (and a QR for a remot
 ## `cowboy worktree`
 
 List or create git worktrees for parallel sessions
+
+```text
+Examples:
+  cowboy worktree create "fix login"      # make cowboy/fix-login and a branch for it
+  cowboy worktree list                    # which worktree each session is holding
+  cowboy worktree status cowboy/fix-login # is it mergeable into HEAD?
+  cowboy worktree diff --session 1788401869978-1
+
+Running `cowboy` inside a worktree confines the agent to that worktree, so two sessions
+can work the same repo without stepping on each other.
+```
 
 
 ### `cowboy worktree create`
@@ -791,8 +949,8 @@ Summarize a branch's changes + mergeability vs HEAD (read-only)
 
 | Arg | Description |
 |-----|-------------|
-| `<BRANCH>` |  |
-| `--session` |  |
+| `<BRANCH>` | Branch to inspect (or use --session) |
+| `--session` | Resolve the branch from a session id instead |
 
 
 ## `cowboy x-fileop`
@@ -823,5 +981,5 @@ Internal: headless session worker spawned by the daemon. Not for direct use
 | `--register` | Register with (and heartbeat to) the daemon |
 | `--resume` | Continue a prior session: load its transcript as the starting history |
 | `--ranch-id` | Tag this session as a Ranch workstream |
-| `--workstream-id` |  |
+| `--workstream-id` | Which workstream of `--ranch-id` this session is running |
 

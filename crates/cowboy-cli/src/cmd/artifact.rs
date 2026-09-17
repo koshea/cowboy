@@ -23,7 +23,7 @@ pub fn run(command: ArtifactCommand) -> Result<()> {
             title,
             summary,
             session,
-        } => add(&root, session.as_deref(), &path, kind, title, summary),
+        } => add(&root, session.as_deref(), kind, &path, title, summary),
     }
 }
 
@@ -85,8 +85,8 @@ fn show(root: &Path, session: Option<&str>, id: &str) -> Result<()> {
 fn add(
     root: &Path,
     session: Option<&str>,
+    kind: Option<crate::cli::Kind>,
     path: &str,
-    kind: Option<String>,
     title: Option<String>,
     summary: Option<String>,
 ) -> Result<()> {
@@ -99,21 +99,20 @@ fn add(
             .unwrap_or_else(|| "artifact".into())
     });
     let kind = kind
-        .as_deref()
-        .map(ArtifactKind::parse)
+        .map(crate::cli::Kind::artifact_kind)
         .unwrap_or(ArtifactKind::Notes);
     let id = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let r = artifact::add_in(&dir, &id, kind, &title, &content, summary, now_ms())?;
-    println!(
-        "✓ published {} [{}] {} → {}",
+    crate::ui::ok(&format!(
+        "published {} [{}] {} → {}",
         r.id,
         r.kind.as_str(),
         r.title,
         r.path.display()
-    );
+    ));
     Ok(())
 }
 

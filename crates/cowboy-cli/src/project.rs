@@ -320,6 +320,61 @@ pub fn repo_key(root: &Path) -> String {
     project_key_hex(&repo_root(root))
 }
 
+/// Resolve the project root for a starting directory: the nearest ancestor with a
+/// `.cowboy/` directory, else the nearest enclosing git worktree, else `start`.
+///
+/// Pure (no cwd, no subprocess) so the precedence is testable. The two fallbacks are
+/// ordered deliberately:
+///
+/// - **`.cowboy/` first**, because that is the user's own statement of where the
+///   project begins. A repo can hold several (a monorepo package with its own agent
+///   config), and the nearest one wins.
+/// - **then the git worktree**, so a repo that has never run `cowboy init` still
+///   resolves to something a developer recognises as "the project" — and so
+///   `cowboy init` from a subdirectory writes at the root rather than burying config
+///   three levels down. A *linked* worktree has a `.git` **file**, not a directory, so
+///   both shapes are accepted; the nearest match wins, which keeps submodules and
+///   nested repos resolving to themselves.
+/// - **then `start`**, for a plain directory outside any repo, where the old behaviour
+///   was already correct.
+pub fn resolve_root(start: &Path) -> PathBuf {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    resolve_root_within(start, home.as_deref())
+}
+
+/// [`resolve_root`] with the home directory injected, so the "implausible root" rule is
+/// testable without touching process environment.
+pub(crate) fn resolve_root_within(start: &Path, home: Option<&Path>) -> PathBuf {
+    let mut git_root: Option<&Path> = None;
+    for dir in start.ancestors() {
+        // A marker in a shared or top-level directory is somebody else's accident, not
+        // a project. This is not hypothetical: a stray `git init` in `/tmp` — or a
+        // `~/.cowboy` — would otherwise make *every* directory beneath it resolve to
+        // one enormous "project", and the workspace mount would follow.
+        if implausible_root(dir, home) {
+            continue;
+        }
+        if dir.join(config::COWBOY_DIR).is_dir() {
+            return dir.to_path_buf();
+        }
+        // Remember the *nearest* enclosing repo, but keep looking: an explicit
+        // `.cowboy/` further up still wins over it.
+        if git_root.is_none() && dir.join(".git").exists() {
+            git_root = Some(dir);
+        }
+    }
+    git_root.unwrap_or(start).to_path_buf()
+}
+
+/// Directories that are never a project root, however they are marked: the filesystem
+/// root, the shared temp directories, and the user's home itself.
+fn implausible_root(dir: &Path, home: Option<&Path>) -> bool {
+    dir.parent().is_none()
+        || dir == Path::new("/tmp")
+        || dir == Path::new("/var/tmp")
+        || home.is_some_and(|h| dir == h)
+}
+
 /// The shared git directory to mount when `root` is a *linked worktree* — i.e.
 /// `<root>/.git` is a file (a `gitdir:` pointer into the main repo) rather than
 /// a directory. Returns the main repo's git common dir (e.g. `<main>/.git`),
@@ -394,6 +449,103 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A directory tree builder: `tree(&["a/.cowboy", "a/b/c"])` creates those dirs.
+    fn tree(dirs: &[&str]) -> assert_fs::TempDir {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        for d in dirs {
+            std::fs::create_dir_all(tmp.path().join(d)).unwrap();
+        }
+        tmp
+    }
+
+    /// Resolve with no home involved. `/tmp` is already refused as a root, which is
+    /// what keeps these tests honest on a machine where somebody once ran `git init`
+    /// there — as this one had.
+    fn resolve(start: &Path) -> PathBuf {
+        resolve_root_within(start, None)
+    }
+
+    #[test]
+    fn the_project_root_is_found_from_a_subdirectory() {
+        // The bug this fixes: `cowboy` run from `crates/foo/` used to resolve the
+        // project to `crates/foo/`, so it found no config, mounted the wrong
+        // workspace, and failed to collide with the session already running at the
+        // root.
+        let t = tree(&[".cowboy", "crates/cowboy-cli/src"]);
+        let root = t.path().canonicalize().unwrap();
+        for from in ["", "crates", "crates/cowboy-cli", "crates/cowboy-cli/src"] {
+            assert_eq!(resolve(&root.join(from)), root, "from {from:?}");
+        }
+    }
+
+    #[test]
+    fn the_nearest_cowboy_dir_wins_over_an_outer_one() {
+        // A monorepo package with its own agent config is the point of allowing more
+        // than one: the closest statement of "the project starts here" governs.
+        let t = tree(&[".cowboy", "pkg/api/.cowboy", "pkg/api/src"]);
+        let root = t.path().canonicalize().unwrap();
+        assert_eq!(
+            resolve_root(&root.join("pkg/api/src")),
+            root.join("pkg/api")
+        );
+        // A sibling without its own config still resolves to the outer root.
+        std::fs::create_dir_all(root.join("pkg/web")).unwrap();
+        assert_eq!(resolve(&root.join("pkg/web")), root);
+    }
+
+    #[test]
+    fn a_repo_without_config_resolves_to_the_repo_root() {
+        // So `cowboy init` from a subdirectory writes at the root instead of burying
+        // config three levels down.
+        let t = tree(&[".git", "src/deep"]);
+        let root = t.path().canonicalize().unwrap();
+        assert_eq!(resolve(&root.join("src/deep")), root);
+    }
+
+    #[test]
+    fn a_linked_worktree_is_its_own_root() {
+        // A linked worktree has a `.git` *file*, not a directory — the shape cowboy's
+        // own parallel-session workflow creates.
+        let t = tree(&["wt/src"]);
+        let root = t.path().canonicalize().unwrap();
+        std::fs::write(root.join("wt/.git"), "gitdir: /elsewhere/.git/worktrees/wt").unwrap();
+        assert_eq!(resolve(&root.join("wt/src")), root.join("wt"));
+    }
+
+    #[test]
+    fn an_explicit_config_outranks_a_nearer_repo() {
+        // A nested repo (a vendored dependency, a submodule) inside a configured
+        // project must not silently become "the project" — the user said where it
+        // begins.
+        let t = tree(&[".cowboy", "vendor/dep/.git", "vendor/dep/src"]);
+        let root = t.path().canonicalize().unwrap();
+        assert_eq!(resolve(&root.join("vendor/dep/src")), root);
+    }
+
+    #[test]
+    fn a_plain_directory_resolves_to_itself() {
+        let t = tree(&["scratch"]);
+        let dir = t.path().canonicalize().unwrap().join("scratch");
+        assert_eq!(resolve(&dir), dir);
+    }
+
+    #[test]
+    fn a_marker_in_a_shared_or_home_directory_is_never_the_project() {
+        // Observed on a real machine: `/tmp/.git` existed, so an unbounded walk-up made
+        // every temp directory resolve to `/tmp` — and the sandbox would have mounted it
+        // as the workspace. The same applies to a stray `~/.cowboy`.
+        let t = tree(&[".cowboy", "work/deep"]);
+        let fake_home = t.path().canonicalize().unwrap();
+        let deep = fake_home.join("work/deep");
+        assert_eq!(
+            resolve_root_within(&deep, Some(&fake_home)),
+            deep,
+            "a marker in $HOME must not swallow everything under it"
+        );
+        // With the same tree but a different home, the marker is a legitimate root.
+        assert_eq!(resolve_root_within(&deep, None), fake_home);
+    }
 
     /// The same project always yields the same session name — the daemon registry
     /// finds a session by it without asking a running worker.

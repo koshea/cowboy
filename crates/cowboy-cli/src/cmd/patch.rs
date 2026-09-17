@@ -125,17 +125,18 @@ fn revert(root: &Path) -> Result<()> {
         println!("(no uncommitted changes to revert)");
         return Ok(());
     }
-    // Confirm unless explicitly bypassed for non-interactive use.
-    if std::env::var("COWBOY_ASSUME_YES").is_err() {
-        use std::io::{BufRead, Write};
-        print!("Revert ALL uncommitted changes? This cannot be undone. [y/N] ");
-        std::io::stdout().flush().ok();
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if !matches!(line.trim(), "y" | "Y" | "yes") {
-            println!("aborted.");
-            return Ok(());
-        }
+    // `git checkout -- .` is unrecoverable: the changes were never committed, so there
+    // is no reflog to walk back to. Show the scale before asking.
+    let files = diff
+        .lines()
+        .filter(|l| l.starts_with("diff --git "))
+        .count();
+    crate::ui::warn(&format!(
+        "reverting will discard uncommitted changes in {files} tracked file(s); this cannot be undone"
+    ));
+    crate::ui::step("`cowboy patch save` first if you want to keep them");
+    if !crate::prompt::confirm_destructive("Revert ALL uncommitted changes?")? {
+        return Ok(());
     }
     // Discard tracked changes; leave untracked files in place.
     let out = Command::new("git")

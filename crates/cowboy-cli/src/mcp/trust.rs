@@ -96,6 +96,17 @@ pub fn trusted_servers(root: &Path) -> BTreeMap<String, McpServer> {
     }
 }
 
+/// The servers the repo's `.mcp.json` currently declares, without trusting them.
+///
+/// Exists so `cowboy mcp trust` can show what it is about to approve *before* writing
+/// the record. Trusting a stdio server means agreeing to run an arbitrary host command
+/// that arrived with the repo, so the approval has to be a gate, not a receipt.
+pub fn pending(root: &Path) -> Result<BTreeMap<String, McpServer>> {
+    load_project_mcp(root)
+        .context("reading .mcp.json")?
+        .ok_or_else(|| anyhow!("no .mcp.json in this repo"))
+}
+
 /// Approve the repo's current `.mcp.json` server set. Returns the approved servers
 /// (for display). Errors if there is no `.mcp.json` or it doesn't parse.
 pub fn trust(root: &Path) -> Result<BTreeMap<String, McpServer>> {

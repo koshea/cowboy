@@ -118,23 +118,131 @@ Categories: `general exploration backend frontend tests docs debugging
 refactor e2e` (unknown → `general`). Effort defaults to `medium`. Each routed
 launch is recorded as a `SubagentRouted` lifecycle event.
 
+`effort` now sizes the worker's **turn grant** as well as its model (see [Turn
+grants](#turn-grants-report-progress-request-more)), so size each delegation to fit
+one worker: "review these two crates" will run out mid-way, whereas one job per
+crate fans out and finishes. A worker already at the delegation depth limit is not
+offered the `subagent` tool at all, so it cannot waste a round trip discovering
+that it cannot delegate.
+
 ## Parallel delegation
 
-When the foreman delegates **several** sub-tasks in one turn, Cowboy runs them
-**concurrently** and joins the results — the efficiency payoff. Fan-out is capped
-by `delegation.max_parallel` (a local throughput hint; the gateway is the real
-backpressure). Independent read/explore/review work parallelizes safely in the
-shared sandbox; isolated parallel *writers* compose with
-[Ranch](../ranch/overview.md) worktrees.
+Delegation is **asynchronous**. `subagent` returns a job id immediately and the
+worker runs in the background, so the foreman keeps working: it can investigate
+something else, delegate more, or answer you while children run. Each result is
+delivered into its context as a message when that job finishes — it never has to
+poll. Three tools support this:
+
+| Tool | What it does |
+|---|---|
+| `jobs` | list the running jobs with their turn usage |
+| `wait` | park until something lands (bounded, and interruptible) |
+| `job_reply` | answer a blocked worker — a question, or a request for more turns |
+
+The foreman cannot call `final` while jobs are still running: their results are
+part of the task. It is refused twice, after which Cowboy waits on its behalf
+rather than arguing indefinitely.
+
+Fan-out is capped by `delegation.max_parallel` (a local throughput hint; the
+gateway is the real backpressure) and by `delegation.max_parallel_per_provider`,
+which keeps a burst of same-model workers off one provider's rate limit. Both
+caps are **session-wide**, so they still hold when dispatches span several turns.
+Independent read/explore/review work parallelizes safely in the shared sandbox;
+isolated parallel *writers* compose with [Ranch](../ranch/overview.md) worktrees.
 
 Once the roster is set up, delegation is frictionless — no per-task approvals, no
 budget gates. Configure the crew once, then let it work.
 
+## Turn grants: report progress, request more
+
+A worker does not get an open-ended iteration cap. It starts with a small grant
+scaled to its `effort`, and if the task turns out to be bigger it must **report
+its progress and ask for more turns**. This replaced a flat 100-iteration cap that
+let a review subagent spend everything re-reading files and return a `[partial]`
+with no report.
+
+```yaml
+delegation:
+  iterations:            # initial grant per effort (sparse floors fill upward)
+    tiny: 15
+    small: 25
+    medium: 40
+    large: 60
+    deep: 80
+  max_total_iterations: 400   # hard per-job ceiling; 0 disables supervision
+  request_timeout_seconds: 120
+  stall_window: 8             # iterations with nothing new → an early report
+```
+
+A request happens two ways: **voluntarily**, when the worker realises the task is
+larger than its grant (the `request_turns` tool), and **compulsorily**, when the
+grant runs out or the host notices it has stalled. Either way the worker pauses and
+the foreman receives its report — plus **measured evidence** Cowboy attaches
+itself: files read, edits made, commands run, and whether the last several steps
+produced anything new. That way an extension is judged against what happened, not
+against the worker's own optimism.
+
+The foreman answers with `job_reply`:
+
+| Verdict | Effect |
+|---|---|
+| `grant` | more turns, clamped host-side to the job's ceiling |
+| `redirect` | more turns plus instructions to do something different |
+| `wrap_up` | stop investigating; a few turns to write up what it has |
+| `stop` | abandon the work; it still reports what it established |
+
+Two bounds are the host's, not the model's. `max_total_iterations` caps the total
+however many turns the foreman grants, and an **unanswered** request takes one
+small automatic extension and then wraps up — so an unattended foreman can neither
+leave a worker running forever nor destroy its work by ignoring it. A worker told
+to wrap up always keeps enough turns to write its answer.
+
+## A worker can ask a question
+
+Turns are not the only thing a worker can be blocked on. When it hits a genuine
+ambiguity — "the task says migrate the endpoints; does that include v1?" — it asks
+over the same channel, and the foreman answers with
+`job_reply` / `verdict: answer`:
+
+```
+[subagent api/medium · job 178…-sub1] is blocked on a question…
+
+  migrate the v1 endpoints too?
+  It suggested: yes · no
+```
+
+The foreman is the right respondent because it holds the context the worker lacks:
+it wrote the task, and it can see the other workstreams. This replaced returning the
+empty string, which the worker read as "proceed" — so it guessed, and the guess came
+back as a confidently wrong result with no sign that there had been a fork in the
+road.
+
+Fail-open, deliberately: an unsupervised worker, or one whose question goes
+unanswered, proceeds on its own judgement after a timeout rather than blocking
+forever. That is the old behaviour, now the fallback instead of the rule. The
+question and the answer are both journaled, so watching a worker (**Alt-w**) shows
+why it paused rather than an unexplained gap.
+
+## Stopping and steering
+
+While a foreman is working you can:
+
+- **type** — a message goes into the *running* turn, delivered at its next step,
+  rather than waiting for the turn to finish;
+- **`/after <msg>`** — queue a message to run as its own turn afterwards
+  (`/queue` lists them, `/queue clear` drops them);
+- **Alt-s** — stop the background subagents and leave the turn running;
+- **Ctrl-C** — stop the turn and leave the subagents running. Their
+  results arrive in a later turn, so correcting the foreman does not throw away
+  minutes of delegated work.
+
+Ending the session reaps every running worker.
+
 ## Partial results
 
 A subagent that does real work but ends without a clean final answer — e.g. it
-truncates a large output, errors out, or hits its iteration cap — doesn't return
-empty. Cowboy salvages a checkpoint and hands it back prefixed `[partial]`: the
+truncates a large output or errors out — doesn't return empty. Cowboy salvages a
+checkpoint and hands it back prefixed `[partial]`: the
 agent's latest narration, its plan progress, and the session id (whose
 `.cowboy/sessions/<id>/` directory holds the full transcript, scratchpad, and
 commands). The foreman is told to **resume from that checkpoint** — re-delegating

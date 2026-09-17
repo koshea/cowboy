@@ -64,6 +64,15 @@ pub trait AgentUi {
     /// A crew subagent finished (`ok` = whether it produced a result; `id`
     /// correlates to the start). Default: ignored.
     fn subagent_done(&mut self, _label: &str, _ok: bool, _id: &str) {}
+    /// The full state of the session's background jobs changed (dispatched, started,
+    /// asked for turns, finished, stopped). Level-triggered, unlike the `subagent_*`
+    /// edges: a client can render the whole pane from this one event. Default: ignored.
+    fn jobs_changed(&mut self, _jobs: &[cowboy_core::daemonproto::JobInfo]) {}
+    /// The input queued to run after the current turn changed. Default: ignored.
+    fn queue_changed(&mut self, _pending: &[String]) {}
+    /// A message the user sent mid-turn was delivered into the running turn.
+    /// Default: ignored.
+    fn steering(&mut self, _text: &str) {}
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question and return their answer. `options` (possibly

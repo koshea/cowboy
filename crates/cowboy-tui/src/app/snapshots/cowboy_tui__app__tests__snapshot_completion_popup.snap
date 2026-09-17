@@ -17,6 +17,6 @@ expression: render(&app)
 │/github:review-pr  <pr-number-or-url> [filename]│                     │
 │/git:setup-worktree  set up a new worktree      │─────────────────────╯
 ╰────────────────────────────────────────────────╯
-╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
+╭ Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end╮
 │/gi                                                                   │
 ╰──────────────────────────────────────────────────────────────────────╯

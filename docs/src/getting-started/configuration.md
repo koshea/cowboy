@@ -120,7 +120,7 @@ agent:
   command_timeout_seconds: 600
   model_timeout_seconds: 120
   idle_sandbox_timeout_seconds: 1800   # tear down an idle detached session's sandbox (0 = off)
-  max_iterations: 100
+  max_iterations: 100                    # turns per turn for THIS session (see note)
   max_command_output_bytes: 60000
   setup:                                 # repo setup, run once per worktree (after mise install)
     - mise run sync
@@ -129,6 +129,11 @@ processes:
 commands:
   test: cargo test
 ```
+**Iteration budgets.** `agent.max_iterations` bounds a turn of the session you are
+talking to. A **delegated** worker does not use it: it gets a small grant sized by
+`effort` and must report progress to earn more, bounded by a host-enforced ceiling.
+Those knobs live in the crew roster — see
+[Turn grants](../using/crew.md#turn-grants-report-progress-request-more).
 
 **Startup setup.** When a session comes up, cowboy eagerly (before the first
 message) brings the sandbox up and — if the repo uses [mise](https://mise.jdx.dev)

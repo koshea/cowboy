@@ -1,6 +1,44 @@
 //! Command-line surface for `cowboy`, defined with clap derive.
+//!
+//! Two conventions worth knowing before adding to this file.
+//!
+//! **Enumerated values are `ValueEnum`s, not `String`s.** `--transport`, `--kind` and
+//! `--reasoning` each used to be a string parsed in the command body, so the only way to
+//! learn the accepted values was to guess wrong and read the error — `--help` listed
+//! nothing, and `cowboy completions` could not offer them. The variants live here rather
+//! than in `cowboy-core` because core is deliberately clap-free; each one converts into
+//! its core counterpart.
+//!
+//! **Aliases absorb the plural/singular coin flips**, so `cowboy skills` and
+//! `cowboy skill` both work. They are hidden from the command list (`visible_alias` would
+//! double its length) but are listed in each command's own `--help`.
+//!
+//! **Examples live in `after_help`, and they are tested.** Every line in one of these
+//! blocks that begins with `cowboy ` is parsed by the real command tree in
+//! `tests/cli_docs.rs`, so an example cannot survive the flag it demonstrates being
+//! renamed. Write them as complete, runnable commands for that reason — a fragment or a
+//! `…` placeholder will fail the check.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+/// Examples for the root command.
+///
+/// Answers the question a bare `--help` did not: of thirty-odd subcommands, which three
+/// do you need on day one?
+const ROOT_EXAMPLES: &str = "\
+Getting started:
+  cowboy init                     # set up .cowboy/ in this repo
+  cowboy models setup             # configure a provider + model (once per machine)
+  cowboy doctor                   # check the host can sandbox and the config is sane
+
+Everyday use:
+  cowboy                          # open the TUI and pick a task
+  cowboy \"fix the failing tests\"  # start with the task prefilled
+  cowboy --continue               # resume the most recent session in this worktree
+  cowboy sessions                 # list sessions, then: cowboy attach <id>
+  cowboy down                     # end this project's sessions
+
+Type /help inside the TUI for keys and slash commands.";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -9,7 +47,8 @@ use clap::{Args, Parser, Subcommand};
     about = "An opinionated local coding agent that runs wild inside a corral you own.",
     long_about = "cowboy runs an AI coding agent in a sandbox built from your own machine \
                   — namespaces, Landlock, seccomp and a sole-egress gateway — while the \
-                  host enforces the boundary. The agent is never trusted to self-police."
+                  host enforces the boundary. The agent is never trusted to self-police.",
+    after_help = ROOT_EXAMPLES
 )]
 pub struct Cli {
     /// Optional one-shot task. With no subcommand, `cowboy 'fix the tests'`
@@ -20,6 +59,10 @@ pub struct Cli {
     /// Enable debug logging (or set COWBOY_LOG=...).
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Answer every confirmation with yes (or set COWBOY_ASSUME_YES=1).
+    #[arg(short = 'y', long, global = true)]
+    pub yes: bool,
 
     /// On a same-worktree collision, attach to the active session instead of
     /// prompting.
@@ -93,6 +136,75 @@ pub struct StartFlags {
     pub force: bool,
 }
 
+/// `cowboy mcp add --transport …`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Transport {
+    /// A local subprocess speaking MCP over stdio.
+    Stdio,
+    /// A remote server over streamable HTTP / SSE.
+    Http,
+}
+
+/// `cowboy models add --reasoning …`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Reasoning {
+    /// Send no reasoning-effort hint at all.
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl Reasoning {
+    /// The core value, where "no hint" is `None` rather than a variant.
+    pub fn effort(self) -> Option<cowboy_core::config::ReasoningEffort> {
+        use cowboy_core::config::ReasoningEffort as E;
+        match self {
+            Reasoning::None => None,
+            Reasoning::Minimal => Some(E::Minimal),
+            Reasoning::Low => Some(E::Low),
+            Reasoning::Medium => Some(E::Medium),
+            Reasoning::High => Some(E::High),
+        }
+    }
+}
+
+/// `cowboy artifact add --kind …`.
+///
+/// Deliberately narrower than [`cowboy_core::artifact::ArtifactKind`]: `handoff` and
+/// `decision_record` are published by the agent and the session machinery, so offering
+/// them here would invite a hand-written artifact that downstream code expects to have
+/// been generated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Kind {
+    Contract,
+    Summary,
+    Patch,
+    Diff,
+    #[value(name = "test-result", alias = "test_result")]
+    TestResult,
+    Notes,
+    Review,
+    Other,
+}
+
+impl Kind {
+    pub fn artifact_kind(self) -> cowboy_core::artifact::ArtifactKind {
+        use cowboy_core::artifact::ArtifactKind as K;
+        match self {
+            Kind::Contract => K::Contract,
+            Kind::Summary => K::Summary,
+            Kind::Patch => K::Patch,
+            Kind::Diff => K::Diff,
+            Kind::TestResult => K::TestResult,
+            Kind::Notes => K::Notes,
+            Kind::Review => K::Review,
+            Kind::Other => K::Other,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Create initial project config files under `.cowboy/`.
@@ -102,6 +214,13 @@ pub enum Command {
     Doctor,
 
     /// Inspect the sandbox boundary for this project.
+    #[command(after_help = "\
+Examples:
+  cowboy sandbox plan          # what the agent can read, write and reach
+  cowboy sandbox exec cargo test
+
+`plan` is the honest answer to \"what is the agent allowed to do here?\" — it is rendered
+from the same pure logic the session builds the boundary from, not a separate summary.")]
     Sandbox(SandboxArgs),
 
     /// Let the sandbox see a host path outside this project.
@@ -109,12 +228,31 @@ pub enum Command {
     /// Takes effect for the next command, including in a session already running.
     /// Credential stores (~/.aws, ~/.ssh, browser profiles, …) are always refused —
     /// use `cowboy secrets add` for those.
+    #[command(after_help = "\
+Examples:
+  cowboy grant ~/src/shared-lib           # read-write, this project only
+  cowboy grant --ro /opt/reference-data   # read-only
+  cowboy grant --global ~/src/shared-lib  # every project on this machine
+  cowboy grant --list                     # what is granted here
+  cowboy grant --remove ~/src/shared-lib  # take it back")]
     Grant(GrantArgs),
 
     /// Open an interactive shell inside the agent sandbox.
     Shell,
 
     /// Run a command inside the agent sandbox.
+    ///
+    /// The same thing as `cowboy sandbox exec`, which spells out that the command is
+    /// confined; this is the short form you actually type.
+    #[command(
+        alias = "exec",
+        after_help = "\
+Examples:
+  cowboy run cargo test  # run it under the same confinement the agent gets
+  cowboy run -- ls -la   # use -- when the command has its own flags
+
+There is no network unless the project's security.yaml allows the destination."
+    )]
     Run {
         /// The command and its arguments.
         #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
@@ -122,18 +260,37 @@ pub enum Command {
     },
 
     /// Patch helper (wraps git inside the sandbox).
+    #[command(after_help = "\
+Examples:
+  cowboy patch show   # the working-tree diff
+  cowboy patch save   # write it to .cowboy/diff.patch
+  cowboy patch revert # discard uncommitted tracked changes (asks first)
+
+The workspace is bind-mounted, so the agent's edits are already in your real working
+tree — commit them with plain git.")]
     Patch(PatchArgs),
 
     /// Managed long-running process commands.
     Proc(ProcArgs),
 
     /// Configure model providers (home-owned) and models.
+    #[command(after_help = "\
+Examples:
+  cowboy models setup                  # the guided path: provider, key, then a model
+  cowboy models list                   # what is configured, and the effective default
+  cowboy models available              # what your endpoint actually offers
+  cowboy models use claude-sonnet-4-6  # set the project default
+
+Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are read
+host-side. They are never written into a project or bound into the sandbox.")]
     Models(ModelsArgs),
 
     /// List or show agent skills (reusable instructions under .cowboy/skills/).
+    #[command(alias = "skills")]
     Skill(SkillArgs),
 
     /// List or show agent definitions (specialist personas under .claude/agents/).
+    #[command(alias = "agent")]
     Agents(AgentsArgs),
 
     /// End this project's running sessions and release their sandboxes.
@@ -141,6 +298,12 @@ pub enum Command {
 
     /// Serve a web UI to attach to running sessions from a browser (e.g. a phone
     /// over Tailscale). Binds loopback by default; token-authenticated.
+    #[command(after_help = "\
+Examples:
+  cowboy web on                          # loopback only
+  cowboy web on --bind 100.x.y.z:7777    # a Tailscale address
+  cowboy web status                      # the URL, plus a QR code for a remote bind
+  cowboy web off")]
     Web(WebArgs),
 
     /// Attach the TUI to a running session (by id, or a worker socket path).
@@ -150,24 +313,41 @@ pub enum Command {
     },
 
     /// List sessions tracked by the daemon.
+    ///
+    /// A shortcut for `cowboy session list`.
     Sessions,
 
-    /// Session maintenance (reap stale records and their leases).
+    /// Inspect and maintain sessions (list, reap stale records and their leases).
     Session(SessionCmdArgs),
 
     /// List or create git worktrees for parallel sessions.
+    #[command(
+        alias = "worktrees",
+        after_help = "\
+Examples:
+  cowboy worktree create \"fix login\"      # make cowboy/fix-login and a branch for it
+  cowboy worktree list                    # which worktree each session is holding
+  cowboy worktree status cowboy/fix-login # is it mergeable into HEAD?
+  cowboy worktree diff --session 1788401869978-1
+
+Running `cowboy` inside a worktree confines the agent to that worktree, so two sessions
+can work the same repo without stepping on each other."
+    )]
     Worktree(WorktreeArgs),
 
     /// Inspect the agent's saved memory (project + global).
+    #[command(alias = "memories")]
     Memory(MemoryCmdArgs),
 
     /// Grant host credentials (gh, gcloud, kubectl, …) into the sandbox.
+    #[command(alias = "secret")]
     Secrets(SecretsCmdArgs),
 
     /// Configure MCP servers the agent can discover and call (host-owned).
     Mcp(McpCmdArgs),
 
     /// Inspect or publish session artifacts (contracts, summaries, handoffs, …).
+    #[command(alias = "artifacts")]
     Artifact(ArtifactCmdArgs),
 
     /// Print a session's handoff summary (defaults to the most recent).
@@ -177,9 +357,14 @@ pub enum Command {
     },
 
     /// List or show decisions recorded in a session.
+    #[command(alias = "decision")]
     Decisions(DecisionsCmdArgs),
 
     /// Send a structured message to a session inbox (daemon-mediated bus).
+    #[command(after_help = "\
+Examples:
+  cowboy message \"the API contract changed\" --to 1788401869978-1
+  cowboy message \"pausing for a release\" --all")]
     Message {
         /// The message text.
         message: String,
@@ -191,10 +376,15 @@ pub enum Command {
         all: bool,
     },
 
-    /// Read (and drain) a session's message inbox (defaults to the most recent).
+    /// Read a session's message inbox (defaults to the most recent). Reading
+    /// drains the inbox unless --peek is given.
     Inbox {
         #[arg(value_name = "SESSION")]
         session: Option<String>,
+
+        /// Show the messages without consuming them.
+        #[arg(long)]
+        peek: bool,
     },
 
     /// Read-only review of a session's output (or a branch): prints a bundle
@@ -208,6 +398,18 @@ pub enum Command {
     },
 
     /// Create or inspect Ranch Plans (multi-workstream tasks).
+    #[command(after_help = "\
+A ranch splits one large task into dependency-aware workstreams, each a normal session in
+its own worktree and branch. The usual arc:
+
+  cowboy ranch plan \"migrate to the new auth service\"  # an agent proposes the workstreams
+  cowboy ranch status my-ranch                         # review the plan it drafted
+  cowboy ranch start my-ranch                          # launch whatever is ready
+  cowboy ranch watch my-ranch                          # live dashboard
+  cowboy ranch accept my-ranch api-layer               # sign off a gated workstream
+
+`plan` reads the codebase and starts nothing, so the plan is yours to edit first.
+`ranch draft <spec>` is the lower-level form the agent itself uses.")]
     Ranch(RanchArgs),
 
     /// Manage the Crew Roster (route delegated work to models by category/effort).
@@ -222,6 +424,19 @@ pub enum Command {
         session_id: String,
     },
 
+    /// Print a shell completion script.
+    ///
+    /// Completions matter more here than in most CLIs: the command tree is wide, and
+    /// several arguments are ids you would otherwise copy by hand.
+    #[command(after_help = "\
+Examples:
+  cowboy completions zsh  > \"${fpath[1]}/_cowboy\"
+  cowboy completions bash > ~/.local/share/bash-completion/completions/cowboy
+  cowboy completions fish > ~/.config/fish/completions/cowboy.fish")]
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Internal: in-sandbox worker for the structured file tools (reads a JSON
     /// request on stdin). Not for direct use.
     #[command(name = "x-fileop", hide = true)]
@@ -266,6 +481,7 @@ pub struct SessionWorkerArgs {
     /// Tag this session as a Ranch workstream.
     #[arg(long)]
     pub ranch_id: Option<String>,
+    /// Which workstream of `--ranch-id` this session is running.
     #[arg(long)]
     pub workstream_id: Option<String>,
 }
@@ -317,7 +533,7 @@ pub enum SandboxCommand {
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
-    /// Overwrite existing config files if present.
+    /// Overwrite existing config files if present (asks first).
     #[arg(long)]
     pub force: bool,
 
@@ -336,7 +552,7 @@ pub struct PatchArgs {
 pub enum PatchCommand {
     /// Display the current git diff.
     Show,
-    /// Save the current git diff to the session `diff.patch`.
+    /// Save the current git diff to `.cowboy/diff.patch`.
     Save,
     /// Apply a patch read from stdin.
     Apply,
@@ -354,7 +570,7 @@ pub struct ProcArgs {
 
 #[derive(Debug, Args)]
 pub struct DownArgs {
-    /// End sessions for EVERY project, not just this one.
+    /// End sessions for EVERY project, not just this one (asks first).
     #[arg(long)]
     pub all: bool,
 }
@@ -415,6 +631,14 @@ pub enum ModelsCommand {
         all: bool,
     },
     /// Register a model by its provider id, prefilled from shipped defaults.
+    #[command(after_help = "\
+Examples:
+  cowboy models add anthropic/claude-sonnet-4-6
+  cowboy models add cerebras/zai-glm-4.7 --name fast --default
+  cowboy models add openai/gpt-5 --reasoning high --max-output 32000
+
+Shipped defaults fill in temperature, context window and pricing for known ids;
+`cowboy models available` lists what your endpoint actually offers.")]
     Add {
         /// The provider-side model id, e.g. `cerebras/zai-glm-4.7`.
         id: String,
@@ -424,15 +648,19 @@ pub enum ModelsCommand {
         /// Provider to use (defaults to the only configured one).
         #[arg(long)]
         provider: Option<String>,
-        #[arg(long)]
+        /// Sampling temperature (provider default if omitted).
+        #[arg(long, value_name = "FLOAT")]
         temp: Option<f32>,
-        #[arg(long)]
+        /// Context window in tokens, used to size the /context gauge and to decide
+        /// when to compact.
+        #[arg(long, value_name = "TOKENS")]
         context: Option<u32>,
-        #[arg(long = "max-output")]
+        /// Cap on tokens generated per response.
+        #[arg(long = "max-output", value_name = "TOKENS")]
         max_output: Option<u32>,
-        /// Reasoning effort: none|minimal|low|medium|high.
-        #[arg(long)]
-        reasoning: Option<String>,
+        /// Reasoning effort to request. `none` sends no hint at all.
+        #[arg(long, value_enum)]
+        reasoning: Option<Reasoning>,
         /// Make this the default model.
         #[arg(long)]
         default: bool,
@@ -447,6 +675,8 @@ pub struct SessionCmdArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
+    /// List sessions tracked by the daemon (same as `cowboy sessions`).
+    List,
     /// Reap stale (crashed/abandoned) session records and release their leases.
     /// Worktrees and branches are never touched.
     Cleanup {
@@ -466,8 +696,19 @@ pub struct SecretsCmdArgs {
 pub enum SecretsCommand {
     /// Show configured credential grants and whether each host source exists.
     List,
-    /// Print a paste-ready grant (a known preset and/or explicit env/file
-    /// grants) to add to .cowboy/security.yaml. Non-destructive.
+    /// Add a credential grant (a known preset and/or explicit env/file grants) to
+    /// your personal host-side overlay; --repo prints a snippet to paste instead.
+    #[command(after_help = "\
+Examples:
+  cowboy secrets add gh                       # a known preset (gh, gcloud, kubectl, aws, git, ssh)
+  cowboy secrets add --env GITHUB_TOKEN       # pass a host env var through by name
+  cowboy secrets add --env TOKEN=MY_HOST_VAR  # ...under a different name inside
+  cowboy secrets add --file ~/.netrc          # bind a host file read-only
+  cowboy secrets add gh --global              # every project, not just this one
+  cowboy secrets add gh --repo                # print a security.yaml snippet instead of writing
+
+Values are resolved host-side. The overlay lives in ~/.config/cowboy/secrets/, which the
+agent cannot write.")]
     Add(SecretsAddArgs),
 }
 
@@ -503,6 +744,14 @@ pub enum McpCommand {
     /// Show one server's full configuration.
     Show { name: String },
     /// Add or replace an MCP server in ~/.config/cowboy/mcp.yaml.
+    #[command(after_help = "\
+Examples:
+  cowboy mcp add filesystem --transport stdio --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /workspace --description \"files under /workspace\" --tool \"*\"
+  cowboy mcp add docs --transport http --url https://mcp.example.com/sse --header \"Authorization=Bearer ${TOKEN}\" --tool search
+
+--tool is fail-closed: with none given the server is configured but exposes nothing.
+Pass --tool '*' to expose everything, or name each tool. Check the result with
+`cowboy mcp test <name>`.")]
     Add(McpAddArgs),
     /// Remove an MCP server.
     Remove { name: String },
@@ -524,8 +773,8 @@ pub struct McpAddArgs {
     /// Local name for the server (e.g. `linear`, `filesystem`).
     pub name: String,
     /// Transport: `stdio` (local subprocess) or `http` (remote endpoint).
-    #[arg(long, value_name = "stdio|http")]
-    pub transport: String,
+    #[arg(long, value_enum)]
+    pub transport: Transport,
     /// One-line description shown to the agent (e.g. "issue tracking").
     #[arg(long)]
     pub description: Option<String>,
@@ -567,24 +816,27 @@ pub enum ArtifactCommand {
     },
     /// Print an artifact's body by id.
     Show {
+        /// The artifact id, as shown by `cowboy artifact list`.
         id: String,
-        #[arg(long)]
+        /// Session to read from (defaults to the most recent in this worktree).
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
     /// Publish a file as a session artifact.
     Add {
         /// Path to the file to publish.
         path: String,
-        /// Kind: contract|summary|patch|diff|test_result|notes|review|other.
-        #[arg(long)]
-        kind: Option<String>,
+        /// What sort of artifact this is (defaults to `notes`).
+        #[arg(long, value_enum)]
+        kind: Option<Kind>,
         /// Friendly title (defaults to the file name).
         #[arg(long)]
         title: Option<String>,
         /// One-line summary.
         #[arg(long)]
         summary: Option<String>,
-        #[arg(long)]
+        /// Session to publish into (defaults to the most recent in this worktree).
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
 }
@@ -599,7 +851,7 @@ pub struct CrewArgs {
 pub enum CrewCommand {
     /// Write a default crew roster (tiers derived from your models' prices).
     Init {
-        /// Overwrite an existing crew.yaml.
+        /// Overwrite an existing crew.yaml (asks first).
         #[arg(long)]
         force: bool,
     },
@@ -765,6 +1017,8 @@ pub enum RanchCommand {
         id: String,
         #[arg(value_name = "PROPOSAL")]
         proposal: String,
+        /// Why it was rejected. Recorded with the decision and shown to the
+        /// workstream that proposed it, so it can try something else.
         #[arg(long)]
         reason: Option<String>,
     },
@@ -785,8 +1039,10 @@ pub enum DecisionsCommand {
     },
     /// Show one decision by id.
     Show {
+        /// The decision id, as shown by `cowboy decisions list`.
         id: String,
-        #[arg(long)]
+        /// Session to read from (defaults to the most recent in this worktree).
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
 }
@@ -803,7 +1059,7 @@ pub enum MemoryCommand {
     List,
     /// Print a memory's full body by name.
     Show { name: String },
-    /// Delete a memory by name.
+    /// Delete a memory by name (shows it, then asks).
     Delete { name: String },
 }
 
@@ -829,14 +1085,16 @@ pub enum WorktreeCommand {
         #[arg(value_name = "BRANCH")]
         branch: Option<String>,
         /// Resolve the branch from a session id instead.
-        #[arg(long)]
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
     /// Summarize a branch's changes + mergeability vs HEAD (read-only).
     Status {
+        /// Branch to inspect (or use --session).
         #[arg(value_name = "BRANCH")]
         branch: Option<String>,
-        #[arg(long)]
+        /// Resolve the branch from a session id instead.
+        #[arg(long, value_name = "SESSION")]
         session: Option<String>,
     },
 }

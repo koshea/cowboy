@@ -885,3 +885,88 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
         "and not surface as bwrap failing to exec a path inside the sandbox: {err}"
     );
 }
+
+/// A network approval says which command wants the destination. That is worth an end-to-end
+/// test rather than only unit-testing the ancestry walk, because the whole mechanism rests
+/// on an assumption about namespaces: the relay reports a **host** pid, so the pid it hands
+/// the broker has to be resolvable against pids the host recorded. If bwrap's per-command
+/// PID namespace ever hid that, every prompt would quietly go back to saying nothing —
+/// which looks like working software.
+#[tokio::test]
+async fn a_running_command_is_attributable_from_a_descendant_pid() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    // A marker unique to this run, so the /proc sweep cannot match another test's process.
+    // It has to survive into a real argv: `sleep 60 # marker` does not, because the shell
+    // strips the comment before exec and the sweep then finds nothing — which looked
+    // exactly like a broken attribution mechanism.
+    let marker = format!("cowboy-attr-{}", std::process::id());
+    let command = format!("touch /tmp/{marker} && tail -f /tmp/{marker}");
+
+    let root = p.path();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let c = cancel.clone();
+    let cmd = command.clone();
+    let handle = tokio::spawn(async move { run_cancellable(&root, &cmd, 0, c).await });
+
+    // Wait for the descendant to exist, then attribute it. Polling rather than a fixed
+    // sleep: sandbox startup is not instant and a fixed wait is either flaky or slow.
+    let mut attributed = None;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Some(pid) = pid_matching(&marker) {
+            attributed = cowboy_cli::sandbox::attribution::command_for(pid).map(|c| (pid, c));
+            if attributed.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    cancel.cancel();
+    let _ = handle.await;
+
+    let (pid, resolved) = attributed.expect(
+        "a running sandboxed command should be attributable from one of its descendant pids",
+    );
+    assert!(
+        resolved.contains(&marker),
+        "pid {pid} resolved to {resolved:?}, which is not the command that was run"
+    );
+
+    // And once it is gone, the attribution is gone: a stale entry would label a later
+    // command with this one's text after the kernel reuses the pid.
+    let mut cleared = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if cowboy_cli::sandbox::attribution::command_for(pid).is_none() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        cleared,
+        "pid {pid} is still attributed after the command ended"
+    );
+}
+
+/// The pid of a live process whose `/proc/<pid>/cmdline` contains `marker`.
+///
+/// Reads `/proc` directly rather than shelling out to `pgrep -f`: per this repo's own
+/// gotchas, a `-f` pattern also matches the shell running the command.
+fn pid_matching(marker: &str) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            continue;
+        };
+        if String::from_utf8_lossy(&raw).contains(marker) {
+            return Some(pid);
+        }
+    }
+    None
+}

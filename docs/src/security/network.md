@@ -148,8 +148,24 @@ straight past every gate above.
 An `ask` opens an approval modal in the TUI — allow once / session / project /
 global, or deny. Project and global approvals persist host-side (never in the
 workspace) and merge into the policy on the next run. Non-interactive runs fail
-closed and log the decision. When several commands run at once, the prompt names
-the one that is asking.
+closed and log the decision.
+
+The prompt also names **the command that wants the destination**, because the
+destination alone rarely settles the question: `cargo test` reaching crates.io is a
+different proposition from a `curl` in a script the agent just wrote.
+
+```text
+crates.io:443
+
+requested by:  cargo test --workspace
+```
+
+That attribution is host-derived and display-only. The command string is recorded when
+the *host* spawns the sandbox, before the command can run, and the pid is matched to it
+by walking `/proc` ancestry — the kernel's answer, not the agent's. It is attached
+**after** the verdict is computed, so it cannot reach the policy engine, and a pid that
+cannot be resolved falls back to a destination-only prompt rather than to a different
+decision.
 
 **An approval grants exactly what the prompt showed**: that host (or that address) on
 that port. Not other ports on the same host, not other hosts on that port, and not

@@ -16,6 +16,26 @@ pub fn run(args: InitArgs) -> Result<()> {
 
     fs::create_dir_all(&paths.dir).with_context(|| format!("creating {}", paths.dir.display()))?;
 
+    // One confirmation for the whole scaffold rather than one per file: `--force`
+    // overwrites `security.yaml`, which is the file the boundary is built from, so
+    // clobbering hand-edited mounts and grants should never be a silent side effect of
+    // re-running init.
+    if args.force {
+        let existing: Vec<&Path> = [paths.security.as_path(), paths.agent.as_path()]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect();
+        if !existing.is_empty() {
+            crate::ui::warn("--force will overwrite existing config:");
+            for p in &existing {
+                crate::ui::kv("overwrite", &p.display().to_string());
+            }
+            if !crate::prompt::confirm_destructive("Overwrite?")? {
+                return Ok(());
+            }
+        }
+    }
+
     write_file(&paths.security, &config::security_template(), args.force)?;
     write_file(&paths.agent, &config::agent_template(), args.force)?;
     // Note: models/providers are NOT scaffolded into the project. Provider

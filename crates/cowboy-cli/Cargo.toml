@@ -24,6 +24,7 @@ cowboy-tui.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

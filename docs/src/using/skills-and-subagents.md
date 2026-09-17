@@ -30,10 +30,25 @@ frontmatter — Cowboy's routing stays in charge.
 ## Subagents
 
 **Subagents** let the agent delegate a focused sub-task via the `subagent` tool.
-It recursively invokes `cowboy` in one-shot mode, reusing the same sandbox (so
-the subagent shares the workspace and gateway), and folds the subagent's final
-answer back into the parent's context. Nesting is depth-limited to prevent runaway
-recursion.
+It runs `cowboy` as a background child process reusing the same sandbox (so the
+subagent shares the workspace and gateway). Dispatch is **asynchronous**: the tool
+returns a job id and the parent keeps working, with the subagent's final answer
+folded into its context as a message when the job finishes. Nesting is
+depth-limited to prevent runaway recursion, and a worker already at the limit is
+not offered the tool at all.
+
+Jobs are **session-scoped**, not turn-scoped: interrupting the parent's turn leaves
+them running, and their results arrive in a later turn. They are reaped when the
+session ends, or on demand (**Alt-s**).
+
+A worker can also **ask the foreman a question** when it hits an ambiguity it cannot
+settle from its task description, and blocks until the foreman answers (or a timeout
+lets it proceed on its own judgement). See
+[A worker can ask a question](crew.md#a-worker-can-ask-a-question).
+
+Each worker gets a small [turn grant](crew.md#turn-grants-report-progress-request-more)
+and must report progress to earn more, so a subagent that goes in circles is
+stopped by its supervisor rather than by a silent iteration cap.
 
 Use a subagent for independent, well-scoped work you want handled with its own
 context budget — distinct from a [Ranch](../ranch/overview.md) workstream, which
@@ -46,7 +61,7 @@ Each running subagent streams its own live journal, so you can look inside one
 instead of waiting for its final answer. They appear in the background pane as the
 foreman fans them out; to watch one:
 
-- **TUI** — press **Ctrl-C → `w`** to open a subagent's live output (press `w`
+- **TUI** — press **Alt-w** to open a subagent's live output (press it
   again to cycle through them; **Esc** returns to the main session).
 - **Web UI** — tap a subagent chip above the transcript to open its live view
   (read-only); a finished subagent replays its recorded transcript.

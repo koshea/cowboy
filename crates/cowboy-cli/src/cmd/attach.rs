@@ -271,9 +271,12 @@ pub async fn bridge(
             }
             let msg = match cmd {
                 AgentCmd::Message(m) => ClientMsg::Message(m),
+                AgentCmd::Enqueue(m) => ClientMsg::Enqueue(m),
+                AgentCmd::QueueClear => ClientMsg::QueueClear,
                 AgentCmd::SwitchModel(n) => ClientMsg::SwitchModel(n),
                 AgentCmd::PlanMode(b) => ClientMsg::PlanMode(b),
                 AgentCmd::Accept { note } => ClientMsg::Accept { note },
+                AgentCmd::StopSubagents => ClientMsg::StopSubagents,
                 AgentCmd::Detach | AgentCmd::End => unreachable!("handled above"),
             };
             if cmd_out.send(msg).is_err() {

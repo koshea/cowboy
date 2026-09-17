@@ -17,6 +17,6 @@ expression: render(&app)
 │   │press a key  ·  Esc = deny                                    │   │
 ╰───╰──────────────────────────────────────────────────────────────╯───╯
    paused for you — your call — ready
-╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+╭ Enter send · Shift+Enter newline · F1 help ──────────────────────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

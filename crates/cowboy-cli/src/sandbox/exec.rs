@@ -174,6 +174,16 @@ pub async fn run_streaming(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().context("spawning the sandbox")?;
+    // Record what this pid is running, so a network approval can say which command wants
+    // the destination instead of only quoting a pid. Held for the life of the call: the
+    // guard's `Drop` removes the entry on every exit path, including a timeout or a
+    // cancellation, so a later command cannot inherit this label after pid reuse.
+    //
+    // SECURITY: the string is the command the *host* passed to bwrap, taken before the
+    // command can run. It is display-only — see `sandbox::attribution`.
+    let _attributed = child
+        .id()
+        .map(|pid| crate::sandbox::attribution::record(pid, &shell_command));
     send_request(&mut child, &request, None).await?;
 
     let mut stdout = child.stdout.take().context("sandbox stdout unavailable")?;
@@ -331,6 +341,11 @@ pub async fn run_with_stdin(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().context("spawning the sandbox")?;
+    // The file tools reach the network far less often than a shell command, but "which
+    // command wants this?" should not answer "unknown" just because the caller was `write`.
+    let _attributed = child
+        .id()
+        .map(|pid| crate::sandbox::attribution::record(pid, command));
     send_request(&mut child, &request, Some(payload)).await?;
 
     let out = child

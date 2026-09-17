@@ -54,7 +54,14 @@ pub enum Mode {
     /// Answering a multiple-choice question (state in `App::choice`).
     AwaitingChoice,
     Approval(String),
-    Paused,
+    /// Browsing the keys/commands reference (state in `App::help`).
+    ///
+    /// Replaced `Paused`. That mode was a modal you had to open with Ctrl-C and then
+    /// pick a letter from before anything happened — including interrupting, which is
+    /// the one thing you press Ctrl-C in a hurry to do. Its eight options are now direct
+    /// hotkeys, and this overlay is where you look them up rather than where you invoke
+    /// them.
+    Help,
     /// Choosing a model from the provider catalogue (state in `App::model_picker`).
     ModelPicker,
     /// Configuring a newly chosen model (state in `App::model_form`).
@@ -201,6 +208,48 @@ pub struct CompletionState {
     pub selected: usize,
 }
 
+/// One group of the help overlay: a heading and its `key/command → meaning` rows.
+///
+/// Built by the CLI, not here, because what belongs in it is context-dependent — the
+/// slash-command table, the skills discovered in this project, whether this session is a
+/// ranch workstream. This crate only knows how to draw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelpSection {
+    pub title: String,
+    pub rows: Vec<(String, String)>,
+}
+
+/// The help overlay: grouped rows plus where the reader has scrolled to.
+///
+/// Scrollable because the content does not fit. The old `/help` printed 25 lines into the
+/// transcript, which pushed the conversation off-screen to tell you how to use it, and a
+/// fixed-size modal would simply truncate on a short terminal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HelpView {
+    pub sections: Vec<HelpSection>,
+    /// First visible content row.
+    pub scroll: usize,
+    /// Rows the last render could show, so paging knows the page size.
+    pub viewport: std::cell::Cell<usize>,
+    /// Rows the last render produced. Measured rather than computed because
+    /// descriptions wrap, so the count depends on the width — computing it here would
+    /// clamp scrolling short of the tail on a narrow terminal.
+    pub total: std::cell::Cell<usize>,
+    /// Set when the overlay was opened with a filter (`/help jobs`), for the title.
+    pub filter: Option<String>,
+}
+
+impl HelpView {
+    /// Scroll by `delta` rows, clamped so the last page stays full rather than scrolling
+    /// into empty space. Both bounds come from the last render, so calling this before
+    /// one has happened is a no-op rather than a jump to a wrong offset.
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.total.get().saturating_sub(self.viewport.get().max(1));
+        let next = self.scroll as isize + delta;
+        self.scroll = next.clamp(0, max as isize) as usize;
+    }
+}
+
 /// One aggregated network-activity row: a verdict + destination, with how many
 /// times it's been seen (gateway decisions repeat a lot for chatty hosts).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,6 +292,10 @@ pub enum CrewStatus {
     /// consuming a model connection.
     Pending,
     Running,
+    /// Spent its turn grant and is waiting for the foreman to answer. Distinct from
+    /// `Running` because nothing is happening: the worker is parked, and the reason it
+    /// is parked is a decision someone has to make.
+    Asking,
     Done,
     Failed,
 }
@@ -260,6 +313,13 @@ pub struct CrewMember {
     pub started_ms: u64,
     /// Seconds elapsed (frozen when the subagent finishes).
     pub elapsed_secs: u64,
+    /// Turns spent / granted, and the host ceiling. Zero when the roster runs without
+    /// turn supervision.
+    pub used: u32,
+    pub granted: u32,
+    pub ceiling: u32,
+    /// When `Asking`: how many more turns it wants.
+    pub requested: u32,
 }
 
 /// What the live prompt costs, as last reported by the agent loop.
@@ -309,6 +369,10 @@ pub struct App {
     pub processes: Vec<(String, String)>,
     /// Spawned crew subagents (this turn's fan-out), shown in the background pane.
     pub crew: Vec<CrewMember>,
+    /// Input the user has queued to run *after* the current turn, oldest first. Shown
+    /// in the status bar so deferred work is visible rather than invisible until it
+    /// suddenly starts.
+    pub queued: Vec<String>,
     /// The agent's working plan: ordered (step, status) pairs. When non-empty a
     /// dedicated pane is shown on the right.
     pub plan: Vec<(String, String)>,
@@ -378,6 +442,8 @@ pub struct App {
     pub model_form: Option<ModelForm>,
     /// Pending multiple-choice question (set while `mode == AwaitingChoice`).
     pub choice: Option<Choice>,
+    /// Keys/commands reference (set while `mode == Help`).
+    pub help: Option<HelpView>,
     /// Slash-command autocomplete popup (set while the input is `/<partial>`).
     pub completion: Option<CompletionState>,
     /// Text awaiting copy to the system clipboard. The event loop drains it
@@ -446,6 +512,7 @@ impl App {
             activity: Vec::new(),
             processes: Vec::new(),
             crew: Vec::new(),
+            queued: Vec::new(),
             plan: Vec::new(),
             blocked: None,
             running: None,
@@ -473,6 +540,7 @@ impl App {
             model_picker: None,
             model_form: None,
             choice: None,
+            help: None,
             completion: None,
             pending_copy: None,
             watching: None,
@@ -497,6 +565,27 @@ impl App {
         self.watching = None;
         self.watch_id.clear();
         self.mode = Mode::Idle;
+    }
+
+    /// Open the help overlay over whatever the current mode is.
+    ///
+    /// The caller stashes the mode to come back to; the overlay never changes what the
+    /// agent is doing, so it can be opened mid-turn and dismissed with no side effect.
+    pub fn open_help(&mut self, sections: Vec<HelpSection>, filter: Option<String>) {
+        self.help = Some(HelpView {
+            sections,
+            scroll: 0,
+            viewport: std::cell::Cell::new(1),
+            total: std::cell::Cell::new(0),
+            filter,
+        });
+        self.mode = Mode::Help;
+    }
+
+    /// Close the help overlay, returning to `back_to`.
+    pub fn close_help(&mut self, back_to: Mode) {
+        self.help = None;
+        self.mode = back_to;
     }
 
     /// Pick the next subagent to watch (cycles through the crew, most-recent
@@ -761,6 +850,75 @@ impl App {
         });
     }
 
+    /// A one-line-per-job summary of the background pane, for `/jobs` and the pause
+    /// menu. Read from the pane the client already maintains, so it needs no round
+    /// trip to the worker — the point is to answer "what is still running?" while the
+    /// agent is busy.
+    pub fn jobs_summary(&self) -> String {
+        if self.crew.is_empty() {
+            return "no background subagents in this session".to_string();
+        }
+        let mut s = String::from("background subagents:");
+        for m in &self.crew {
+            let state = match m.status {
+                CrewStatus::Pending => "queued",
+                CrewStatus::Running => "running",
+                CrewStatus::Asking => "waiting for your decision",
+                CrewStatus::Done => "done",
+                CrewStatus::Failed => "failed",
+            };
+            let model = m.model.rsplit('/').next().unwrap_or(&m.model);
+            s.push_str(&format!(
+                "\n  {} [{}] {model} — {state} · {}s",
+                m.id, m.label, m.elapsed_secs
+            ));
+            if m.granted > 0 {
+                s.push_str(&format!(" · turns {}/{}", m.used, m.granted));
+            }
+            if m.status == CrewStatus::Asking {
+                s.push_str(&format!(" · asking for {} more", m.requested));
+            }
+        }
+        let live = self
+            .crew
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.status,
+                    CrewStatus::Running | CrewStatus::Pending | CrewStatus::Asking
+                )
+            })
+            .count();
+        if live > 0 {
+            s.push_str(&format!(
+                "\n{live} still running — Ctrl-C then `s` stops them, `w` watches one"
+            ));
+        }
+        s
+    }
+
+    /// Reconcile the background pane from a level-triggered snapshot.
+    ///
+    /// Preferred over the `subagent_*` edges where available: those cannot express a
+    /// worker parked waiting for a decision, or how much of its turn grant it has
+    /// spent. Takes already-mapped rows, keeping this crate free of the wire protocol.
+    pub fn apply_jobs(&mut self, members: Vec<CrewMember>) {
+        self.crew = members;
+    }
+
+    /// How many background jobs are not finished, for the status bar.
+    pub fn live_jobs(&self) -> usize {
+        self.crew
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m.status,
+                    CrewStatus::Running | CrewStatus::Pending | CrewStatus::Asking
+                )
+            })
+            .count()
+    }
+
     /// Refresh the running command's elapsed time (called each event-loop tick).
     pub fn tick_command(&mut self, now_ms: u64) {
         if let Some(r) = &mut self.running {
@@ -798,6 +956,10 @@ impl App {
             status: CrewStatus::Pending,
             started_ms: now_ms,
             elapsed_secs: 0,
+            used: 0,
+            granted: 0,
+            ceiling: 0,
+            requested: 0,
         });
     }
 
@@ -836,6 +998,10 @@ impl App {
             status: CrewStatus::Running,
             started_ms: now_ms,
             elapsed_secs: 0,
+            used: 0,
+            granted: 0,
+            ceiling: 0,
+            requested: 0,
         });
     }
 
@@ -1250,6 +1416,88 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_background_jobs_and_queue() {
+        // The three states that matter while work is delegated: one running, one queued
+        // behind the provider cap, and one parked waiting for the foreman to answer a
+        // turn request — plus deferred user input, all visible at a glance.
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "review the storage crates");
+        app.apply_jobs(vec![
+            CrewMember {
+                id: "s1".into(),
+                label: "review/redb".into(),
+                model: "anthropic/opus".into(),
+                status: CrewStatus::Running,
+                started_ms: 0,
+                elapsed_secs: 42,
+                used: 30,
+                granted: 60,
+                ceiling: 400,
+                requested: 0,
+            },
+            CrewMember {
+                id: "s2".into(),
+                label: "review/columnar".into(),
+                model: "anthropic/opus".into(),
+                status: CrewStatus::Pending,
+                started_ms: 0,
+                elapsed_secs: 0,
+                used: 0,
+                granted: 60,
+                ceiling: 400,
+                requested: 0,
+            },
+            CrewMember {
+                id: "s3".into(),
+                label: "tests/small".into(),
+                model: "cheap".into(),
+                status: CrewStatus::Asking,
+                started_ms: 0,
+                elapsed_secs: 120,
+                used: 25,
+                granted: 25,
+                ceiling: 400,
+                requested: 30,
+            },
+        ]);
+        app.queued = vec!["and then update the docs".into()];
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn a_job_snapshot_replaces_the_pane_and_counts_only_live_work() {
+        let mut app = App::new("cowboy");
+        let member = |id: &str, status| CrewMember {
+            id: id.into(),
+            label: "l".into(),
+            model: "m".into(),
+            status,
+            started_ms: 0,
+            elapsed_secs: 1,
+            used: 0,
+            granted: 0,
+            ceiling: 0,
+            requested: 0,
+        };
+        app.apply_jobs(vec![
+            member("a", CrewStatus::Running),
+            member("b", CrewStatus::Asking),
+            member("c", CrewStatus::Done),
+            member("d", CrewStatus::Failed),
+        ]);
+        // A worker waiting for a decision is still live work — it is *waiting on us*,
+        // which is precisely when it must not be hidden.
+        assert_eq!(app.live_jobs(), 2);
+        let s = app.jobs_summary();
+        assert!(s.contains("waiting for your decision"), "got: {s}");
+        // The snapshot is authoritative: a later one replaces the pane rather than
+        // accumulating stale rows.
+        app.apply_jobs(vec![member("a", CrewStatus::Done)]);
+        assert_eq!(app.crew.len(), 1);
+        assert_eq!(app.live_jobs(), 0);
+    }
+
+    #[test]
     fn snapshot_markdown_and_diff_rendering() {
         let mut app = App::new("cowboy");
         app.mode = Mode::Idle;
@@ -1308,11 +1556,96 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_paused_menu() {
+    fn snapshot_approval_modal_names_the_command_that_asked() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "build the project");
+        app.mode = Mode::Approval(
+            "crates.io:443\n\nrequested by:  cargo test --workspace --all-targets".into(),
+        );
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn an_approval_legend_is_not_clipped_by_a_long_command() {
+        // The modal sizes itself from the body, and used to count source lines rather than
+        // wrapped rows — so naming the command pushed the once/session/project/global
+        // legend off the bottom, leaving a prompt with no visible way to answer it.
+        let long = "requested by:  bash -c 'curl -sSL https://example.com/very/long/path \
+                    | tar xz -C /tmp/somewhere && ./configure --with-everything'";
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Approval(format!("example.com:443\n\n{long}"));
+        let out = render(&app);
+        for key in [
+            "o  once",
+            "s  session",
+            "p  project",
+            "g  global",
+            "d  deny",
+        ] {
+            assert!(out.contains(key), "{key:?} was clipped:\n{out}");
+        }
+        assert!(out.contains("Esc = deny"), "the footer was clipped:\n{out}");
+    }
+
+    #[test]
+    fn snapshot_help_overlay() {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "do work");
-        app.mode = Mode::Paused;
+        app.open_help(
+            vec![
+                HelpSection {
+                    title: "Steering a run".into(),
+                    rows: vec![
+                        ("Ctrl-C".into(), "interrupt the turn".into()),
+                        ("/after <msg>".into(), "queue for after this turn".into()),
+                    ],
+                },
+                HelpSection {
+                    title: "Delegated work".into(),
+                    rows: vec![("Alt-j".into(), "what the subagents are doing".into())],
+                },
+            ],
+            None,
+        );
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn a_long_help_body_scrolls_instead_of_being_truncated() {
+        // The regression this replaces: `/help` printed 25 lines into the transcript, and
+        // a fixed-size modal would simply have clipped them. Here the tail must be
+        // reachable — and scrolling must stop at the end rather than run off into blanks.
+        let rows: Vec<(String, String)> = (0..40)
+            .map(|i| (format!("key{i}"), format!("does thing {i}")))
+            .collect();
+        let mut app = App::new("cowboy");
+        app.open_help(
+            vec![HelpSection {
+                title: "Lots".into(),
+                rows,
+            }],
+            None,
+        );
+        // A render measures the viewport, which is what paging is relative to.
+        let first = render(&app);
+        assert!(first.contains("key0"));
+        assert!(first.contains("more below"));
+
+        let h = app.help.as_mut().unwrap();
+        let (viewport, total) = (h.viewport.get(), h.total.get());
+        assert!(viewport > 0, "the render should have reported a viewport");
+        assert!(total > viewport, "40 rows should not fit in one page");
+        h.scroll_by(1000);
+        let at_end = h.scroll;
+        assert_eq!(at_end, total - viewport, "clamped to a full last page");
+        let last = render(&app);
+        assert!(last.contains("key39"), "the tail is reachable:\n{last}");
+
+        // And scrolling further changes nothing.
+        app.help.as_mut().unwrap().scroll_by(1000);
+        assert_eq!(app.help.as_ref().unwrap().scroll, at_end);
+        app.help.as_mut().unwrap().scroll_by(-1000);
+        assert_eq!(app.help.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

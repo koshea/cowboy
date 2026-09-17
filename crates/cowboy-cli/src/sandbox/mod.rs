@@ -9,6 +9,7 @@
 //! replaces it. The trait is kept after Docker is removed because it is also the
 //! seam the follow-up portability work plugs into.
 
+pub mod attribution;
 pub mod bwrap;
 pub mod cgroup;
 pub mod exec;

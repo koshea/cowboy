@@ -21,26 +21,43 @@ inserts a newline. The first run builds the agent image (a few minutes, shown as
 a step) and, if the repo uses [mise](https://mise.jdx.dev), installs the toolchain
 once into a persistent cache.
 
-## Interrupt and redirect mid-run
+## Interrupt, steer, and redirect mid-run
 
-Press **Ctrl-C** while the agent is working to open the pause menu (each option is
-labeled on screen):
+You do not have to interrupt to be heard. **Typing while the agent works steers
+the turn in flight**: your message is delivered at its next step, so "also check
+the error path" lands immediately rather than after the turn ends. Use
+`/after <msg>` when you want the opposite — a message that runs as its own turn
+afterwards (`/queue` lists what is waiting, `/queue clear` drops it).
 
-- **r** resume — keep going
-- **i** instruct — stop this turn and give a new direction (history is kept; your
-  next message starts a fresh turn)
-- **k** kill — stop just the running command/turn; the session stays put
-- **d** detach — leave it running in the background and exit
-- **e** end — finish the session
+Press **Ctrl-C** to interrupt. It acts immediately rather than opening a menu, and
+what it does depends on what is on screen:
 
-The common case is **i**: you see the agent heading the wrong way, hit Ctrl-C,
-press `i`, and type the correction. **Esc** resumes.
+| Situation | Ctrl-C |
+|---|---|
+| the agent is working | stops the turn and drops you into the input to say what to do instead — history kept, background subagents left running |
+| you have typed something and nothing is running | clears the draft |
+| idle and empty | arms; press again to end the session |
+
+The rest of what used to live in that menu is a direct key:
+
+| Key | Does |
+|---|---|
+| **F1** | the keys-and-commands reference (also `/help [topic]`) |
+| **Alt-j** | what the background subagents are doing |
+| **Alt-w** | watch a subagent's live output (again to cycle, **Esc** to leave) |
+| **Alt-s** | stop the subagents, leaving the turn running |
+| **Alt-d** | detach — leave it running in the background and exit |
+
+The common case is still just typing. Reach for **Ctrl-C** when the whole turn is
+going the wrong way, and **Alt-s** when it is the delegated work you want to stop —
+they are separate on purpose, so correcting the foreman does not throw away minutes
+of subagent work.
 
 ## Exit, detach, and come back later
 
-- **Detach** (Ctrl-C → `d`, or `/detach`) leaves the session running in the
+- **Detach** (Alt-d, or `/detach`) leaves the session running in the
   background under the daemon. Re-attach later.
-- **End** (Ctrl-C → `e`, or `/quit`) finishes the session.
+- **End** (Ctrl-C twice when idle, or `/quit`) finishes the session.
 
 Coming back:
 
@@ -71,6 +88,35 @@ cowboy patch revert   # discard uncommitted changes (asks to confirm)
 The workspace is bind-mounted, so edits land in your real working tree — commit
 with normal `git` (`git add -p`, `git commit`), or just ask the agent to commit.
 
+## Answer (or skip) confirmations
+
+Anything that destroys work you cannot get back asks first, shows you what it is
+about to affect, and defaults to **no**:
+
+| Command | What it shows before asking |
+|---|---|
+| `cowboy down --all` | every live session across every project, with its worktree |
+| `cowboy patch revert` | how many tracked files have uncommitted changes |
+| `cowboy memory delete <name>` | the memory's body |
+| `cowboy init --force` | which config files would be overwritten |
+| `cowboy crew init --force` | that your hand-edited roster is about to be replaced |
+| `cowboy mcp trust` | each server's full command line, env var *names*, and tools |
+
+Two rules hold everywhere:
+
+- **No terminal is not consent.** Piped or CI runs get the default, which for
+  these commands is no. Opt in explicitly with `-y`/`--yes`, or
+  `COWBOY_ASSUME_YES=1` — set to `0` or empty to turn an inherited value back off.
+  Either way the question is still printed, marked `[assumed yes]`, so what was
+  agreed to shows up in captured output.
+- **The prompt says which way Enter goes** — `[y/N]` means Enter declines.
+
+`--yes` is not passed to anything Cowboy spawns: the sandbox, workers and the
+daemon never inherit it.
+
+Reading an inbox is the one destructive default, because an inbox is a queue.
+`cowboy inbox --peek` shows the messages without consuming them.
+
 ## Switch model · solo vs. crew
 
 - `/model` — show the current model and the available list.
@@ -86,7 +132,7 @@ delegates sub-tasks to specialists; see `/crew` for the routing table.
 ## Approve (or deny) a network request
 
 Cowboy denies network by default and asks when the agent reaches for something
-new. The prompt explains each scope:
+new. The prompt shows the destination, the command that asked for it, and each scope:
 
 - **o** once — just this request
 - **s** session — every request to this host until the session ends
@@ -101,7 +147,7 @@ request shows a `🛡 blocked …` note explaining what to allow.
 
 ## Run a long task and walk away
 
-Start the task, press **Ctrl-C → d** (detach), and close the terminal. The daemon
+Start the task, press **Alt-d** (detach), and close the terminal. The daemon
 keeps the session running, and the worker survives a daemon restart. Check back
 with `cowboy sessions` and `cowboy attach <id>`. Everything is journaled to
 `.cowboy/sessions/<id>/`, so even a crashed session can be replayed; `cowboy
@@ -346,6 +392,10 @@ cowboy mcp untrust    # revoke
 
 Trust is recorded host-side (never in the repo) and pinned to the exact server set
 you approved: if `.mcp.json` later changes, it goes **stale** and you must
-`cowboy mcp trust` again. Your host `mcp.yaml` always wins over a repo server of the
-same name. A session in a repo with an untrusted `.mcp.json` shows a one-line notice
-pointing you to `cowboy mcp trust`.
+`cowboy mcp trust` again. `cowboy mcp trust` prints each server's full command
+line, the *names* (never the values) of the env vars it would receive, and the
+tools it exposes, and then asks — a stdio server is an arbitrary host command that
+arrived with a clone, so approving it is a gate, not a receipt. Your host
+`mcp.yaml` always wins over a repo server of the same name. A session in a repo
+with an untrusted `.mcp.json` shows a one-line notice pointing you to
+`cowboy mcp trust`.

@@ -61,6 +61,32 @@ impl SessionStatus {
             SessionStatus::Completed | SessionStatus::Failed | SessionStatus::Stale
         )
     }
+
+    /// The wire spelling, which is also the one to show a user.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionStatus::Starting => "starting",
+            SessionStatus::Running => "running",
+            SessionStatus::Idle => "idle",
+            SessionStatus::AwaitingApproval => "awaiting approval",
+            SessionStatus::AwaitingInput => "awaiting input",
+            SessionStatus::Blocked => "blocked",
+            SessionStatus::Completed => "completed",
+            SessionStatus::Failed => "failed",
+            SessionStatus::Stale => "stale",
+        }
+    }
+}
+
+/// So a status can be *shown* without `{:?}`.
+///
+/// The collision prompt — one of the few places cowboy asks a new user to make a
+/// decision — printed `AwaitingApproval` straight out of `Debug`. Rust enum casing in a
+/// sentence is a tell that nobody looked at the output.
+impl std::fmt::Display for SessionStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Registry record for a session, as reported by the daemon.
@@ -471,7 +497,44 @@ pub enum UiEventMsg {
         #[serde(default)]
         id: String,
     },
+    /// The full state of the session's background subagent jobs, whenever it changes.
+    ///
+    /// Supersedes the `Subagent*` lifecycle events for display purposes: those are
+    /// edge-triggered and cannot express "waiting for a verdict" or a worker's turn
+    /// usage. They are still emitted (and still replay from older journals), so a
+    /// client can render from either.
+    JobsChanged(Vec<JobInfo>),
+    /// The input the user has queued to run *after* the current turn.
+    QueueChanged {
+        pending: Vec<String>,
+    },
+    /// A message the user sent mid-turn, delivered into the running turn rather than
+    /// queued behind it.
+    SteerDelivered(String),
     TurnDone,
+}
+
+/// One background subagent job, for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobInfo {
+    /// The child's session id — also the job id, and where its live journal is.
+    pub id: String,
+    /// Short routing label (e.g. `tests/small`).
+    pub label: String,
+    /// Resolved model.
+    pub model: String,
+    /// The one-line task, for display.
+    pub task: String,
+    /// `pending` | `running` | `awaiting verdict` | `done` | `failed`.
+    pub state: String,
+    /// Milliseconds since dispatch, frozen when the job finishes.
+    pub elapsed_ms: u64,
+    /// Turns spent, turns granted, and the host ceiling grants are clamped to.
+    pub used: u32,
+    pub granted: u32,
+    pub ceiling: u32,
+    /// When waiting for a verdict: how many more turns it asked for.
+    pub requested: u32,
 }
 
 /// Worker → client messages over the per-session socket.
@@ -507,9 +570,13 @@ pub enum ServerMsg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterruptKind {
-    /// Cancel the current turn; the session continues.
+    /// Cancel the current turn; the session continues. Queued input and background
+    /// subagents are left alone — stopping the turn is not a retraction of either.
     Turn,
-    /// Cancel the turn and return to idle for a new instruction.
+    /// Cancel the turn, drop any queued input, and return to idle for a new
+    /// instruction. Background subagents keep running: their results are still wanted,
+    /// and killing minutes of delegated work to say one sentence is what this whole
+    /// interrupt path exists to avoid.
     Instruct,
     /// End the whole session.
     End,
@@ -527,6 +594,10 @@ pub enum ClientMsg {
         read_only: bool,
     },
     Message(String),
+    /// Explicitly deferred input: run this as its own turn *after* the current one,
+    /// rather than steering the turn in flight. A plain `Message` typed mid-turn is
+    /// delivered to the running turn; this is how a user says "and then do X".
+    Enqueue(String),
     AskReply {
         id: u64,
         answer: String,
@@ -550,6 +621,14 @@ pub enum ClientMsg {
     Interrupt {
         kind: InterruptKind,
     },
+    /// Stop the background subagents this session dispatched, leaving the session (and
+    /// the current turn) running. Separate from `Interrupt` because the two are
+    /// genuinely different requests: jobs outlive a turn, so "stop what you delegated"
+    /// must not also mean "stop what you are doing".
+    StopSubagents,
+    /// Drop everything the user has queued for after the current turn, without
+    /// touching the turn or the running subagents.
+    QueueClear,
     /// Disconnect but leave the session running.
     Detach,
     /// End the session.
@@ -673,6 +752,16 @@ mod tests {
             note: Some("ship it".into()),
         });
         roundtrip(&ClientMsg::Accept { note: None });
+        // Stopping the delegated work is its own message, not an interrupt kind: jobs
+        // outlive turns, so the two requests must stay distinguishable on the wire.
+        roundtrip(&ClientMsg::StopSubagents);
+        roundtrip(&ClientMsg::Enqueue("and then run the tests".into()));
+        roundtrip(&ClientMsg::Interrupt {
+            kind: InterruptKind::Turn,
+        });
+        roundtrip(&ClientMsg::Interrupt {
+            kind: InterruptKind::Instruct,
+        });
     }
 
     #[test]

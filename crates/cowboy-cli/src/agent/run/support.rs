@@ -14,6 +14,434 @@ pub(super) fn self_exe() -> std::result::Result<PathBuf, String> {
     crate::project::self_exe()
 }
 
+/// Whether the process with this pid is gone.
+///
+/// One direction of this is reliable and that is the direction we use: a missing
+/// `/proc/<pid>` means the process is definitely gone. The converse is not certain (a
+/// recycled pid could be a different process), and the cost of that is a worker running
+/// slightly longer than it needed to — much cheaper than killing a live worker because
+/// the check guessed wrong.
+pub(super) fn process_is_gone(pid: u32) -> bool {
+    !std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// The effective delegation depth limit for a roster: the configured `max_depth`
+/// when a worker may not itself delegate, else the hard ceiling — always clamped
+/// by [`MAX_SUBAGENT_DEPTH`].
+pub(super) fn effective_max_depth(crew_cfg: Option<&cowboy_core::crew::CrewConfig>) -> usize {
+    match crew_cfg {
+        Some(c) if !c.delegation.allow_recursive_delegation => c.delegation.max_depth as usize,
+        _ => MAX_SUBAGENT_DEPTH,
+    }
+    .min(MAX_SUBAGENT_DEPTH)
+}
+
+/// Whether a loop may delegate at all: crew mode is on **and** it is not already
+/// at the depth limit.
+///
+/// One predicate, used by three call sites that previously disagreed. The tool
+/// surface and the foreman guidance were gated on crew mode alone, while
+/// `plan_subagent` refused the call at depth — so a max-depth child was told to
+/// delegate, tried, and spent a model round-trip learning it could not ("Delegation
+/// isn't available at this depth"). The runtime check in `plan_subagent` stays as
+/// the authority; this only stops us advertising what we will refuse.
+pub(super) fn delegation_available(
+    crew_on: bool,
+    depth: usize,
+    crew_cfg: Option<&cowboy_core::crew::CrewConfig>,
+) -> bool {
+    crew_on && depth < effective_max_depth(crew_cfg)
+}
+
+/// The tool surface for a loop: everything, minus the delegation tools it cannot use.
+///
+/// Two independent gates, because the two roles are different. A loop that can
+/// delegate gets `subagent` and the tools for supervising what it dispatched
+/// (`jobs`/`wait`/`job_reply`). A loop that *is* a supervised worker gets
+/// `request_turns` — and a foreman must not, because it has no foreman to ask.
+pub(super) fn tool_surface(delegation_available: bool, can_request_turns: bool) -> Vec<ToolDef> {
+    let foreman_only = [
+        tools::TOOL_SUBAGENT,
+        tools::TOOL_JOBS,
+        tools::TOOL_WAIT,
+        tools::TOOL_JOB_REPLY,
+    ];
+    tools::definitions()
+        .into_iter()
+        .filter(|t| delegation_available || !foreman_only.contains(&t.name.as_str()))
+        .filter(|t| can_request_turns || t.name != tools::TOOL_REQUEST_TURNS)
+        .collect()
+}
+
+/// Tool calls that are pure coordination: checking on jobs, waiting for one, answering
+/// a worker's request for turns.
+///
+/// The loop guards must skip a batch of these. A foreman with four subagents in flight
+/// legitimately calls `jobs` — or `wait` — several times with identical arguments and
+/// gets identical output, which is exactly the shape the repetition guard aborts a turn
+/// for. They are also not *investigation*, so they must not feed the novelty metric
+/// either: waiting for a worker is not going in circles.
+pub(super) fn is_coordination_only(calls: &[cowboy_core::model::ToolCall]) -> bool {
+    !calls.is_empty()
+        && calls.iter().all(|c| {
+            matches!(
+                c.name.as_str(),
+                tools::TOOL_JOBS | tools::TOOL_WAIT | tools::TOOL_JOB_REPLY
+            )
+        })
+}
+
+/// The system prompt for a loop: the base, plus foreman guidance when it can
+/// delegate, plus subagent guidance when it *is* one.
+pub(super) fn system_prompt(
+    delegation_available: bool,
+    subagent_depth: usize,
+    can_request_turns: bool,
+) -> String {
+    let mut system = String::from(SYSTEM_PROMPT);
+    if delegation_available {
+        system.push_str(FOREMAN_PROMPT);
+    }
+    // A worker spawned as a subagent gets extra guidance to stream large outputs
+    // to a file rather than risk losing them to a truncated tool call.
+    if subagent_depth > 0 {
+        system.push_str(SUBAGENT_PROMPT);
+    }
+    // Only mentioned when the channel to ask actually exists; otherwise it is advice
+    // the worker cannot act on.
+    if can_request_turns {
+        system.push_str(TURN_REQUEST_PROMPT);
+    }
+    system
+}
+
+/// A worker's iteration budget for one turn: how many turns it has been granted,
+/// the host-enforced total it can never be granted past, and what it has spent.
+///
+/// The foreman is *unsupervised* — it holds `agent.max_iterations` with nobody to
+/// ask for more, so `ceiling == grant` and the request machinery stays dormant. A
+/// delegated worker is supervised: it starts with a small effort-scaled grant and
+/// must report progress to earn extensions, up to `ceiling`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct IterationBudget {
+    /// Turns granted so far (initial grant + extensions).
+    pub granted: u32,
+    /// Hard ceiling on `granted`, whatever the foreman says.
+    pub ceiling: u32,
+    /// Turns consumed this turn.
+    pub used: u32,
+    /// Whether this worker has someone to ask for more turns.
+    pub supervised: bool,
+}
+
+impl IterationBudget {
+    /// Read a delegated worker's budget from the environment the parent set, falling
+    /// back to `max_iterations` for a foreman (or any worker whose roster disabled
+    /// supervision by setting `max_total_iterations: 0`).
+    pub fn from_env(max_iterations: u32) -> Self {
+        let read =
+            |k: &str| -> Option<u32> { std::env::var(k).ok().and_then(|v| v.parse::<u32>().ok()) };
+        Self::resolve(
+            read(ENV_ITERATION_GRANT),
+            read(ENV_MAX_TOTAL_ITERATIONS),
+            max_iterations,
+        )
+    }
+
+    /// The env-independent half of [`Self::from_env`], so the fallback rules are
+    /// testable without mutating process environment (which races under `cargo test`,
+    /// where a binary's tests share one process).
+    ///
+    /// A malformed, zero, or half-present pair falls back rather than being trusted: a
+    /// worker that believes it has 0 turns cannot make its first model call, which
+    /// would turn a config typo into "delegation silently does nothing".
+    pub fn resolve(grant: Option<u32>, ceiling: Option<u32>, max_iterations: u32) -> Self {
+        match (grant.filter(|n| *n > 0), ceiling.filter(|n| *n > 0)) {
+            (Some(grant), Some(ceiling)) => Self {
+                granted: grant.min(ceiling),
+                ceiling,
+                used: 0,
+                supervised: true,
+            },
+            _ => Self {
+                granted: max_iterations,
+                ceiling: max_iterations,
+                used: 0,
+                supervised: false,
+            },
+        }
+    }
+
+    /// Turns left before the current grant runs out.
+    pub fn remaining(&self) -> u32 {
+        self.granted.saturating_sub(self.used)
+    }
+    /// Whether the grant is spent.
+    pub fn exhausted(&self) -> bool {
+        self.used >= self.granted
+    }
+
+    /// Extend by `n` turns, clamped to the ceiling. Returns how many were actually
+    /// added — `0` means the ceiling is reached and no further grant is possible,
+    /// which the caller must report rather than looping on a request that can never
+    /// be satisfied. The clamp is host-side on purpose: the foreman asks, the host
+    /// decides, so a confused (or captured) foreman cannot grant its way past the
+    /// bound.
+    pub fn extend(&mut self, n: u32) -> u32 {
+        let headroom = self.ceiling.saturating_sub(self.granted);
+        let added = n.min(headroom);
+        self.granted += added;
+        added
+    }
+}
+
+/// How close a worker is to spending its grant. Ordered, so the loop can fire each
+/// nudge exactly once by remembering the highest stage it has announced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum GrantStage {
+    /// Plenty left; say nothing.
+    Fine,
+    /// ~70% spent: time to think about converging or asking for more.
+    Nudge,
+    /// ~90% spent: converge or ask now.
+    Urgent,
+}
+
+/// The nudge stage for `used` of `granted` turns.
+///
+/// Proportional rather than "N turns left" so it works for a 15-turn tiny grant and
+/// a 400-turn ceiling alike. A worker that is never told it is running out spends
+/// its last turn mid-exploration and returns a `[partial]` — the observed failure.
+pub(super) fn grant_stage(used: u32, granted: u32) -> GrantStage {
+    if granted == 0 {
+        return GrantStage::Urgent;
+    }
+    // Integer arithmetic, no floats: used/granted >= 9/10, then >= 7/10.
+    if used * 10 >= granted * 9 {
+        GrantStage::Urgent
+    } else if used * 10 >= granted * 7 {
+        GrantStage::Nudge
+    } else {
+        GrantStage::Fine
+    }
+}
+
+/// The nudge text for a stage. A supervised worker is pointed at `request_turns`
+/// (it has a foreman to ask); an unsupervised one is only told to converge, since
+/// there is nobody on the other end.
+pub(super) fn grant_notice(stage: GrantStage, b: &IterationBudget) -> Option<String> {
+    let (used, granted, left) = (b.used, b.granted, b.remaining());
+    match (stage, b.supervised) {
+        (GrantStage::Fine, _) => None,
+        (GrantStage::Nudge, true) => Some(format!(
+            "iteration budget: {used}/{granted} turns used ({left} left). If this task \
+             genuinely needs more, call `request_turns` with a progress report; otherwise \
+             start converging."
+        )),
+        (GrantStage::Nudge, false) => Some(format!(
+            "iteration budget: {used}/{granted} turns used ({left} left) — start converging \
+             on an answer."
+        )),
+        (GrantStage::Urgent, true) => Some(format!(
+            "iteration budget nearly spent ({used}/{granted}, {left} left). Either call \
+             `request_turns` now with a progress report and how many more turns you need, or \
+             write up what you have and call `final`. Do not run out mid-exploration."
+        )),
+        (GrantStage::Urgent, false) => Some(format!(
+            "iteration budget nearly spent ({used}/{granted}, {left} left) — write up what you \
+             have and call `final` now."
+        )),
+    }
+}
+
+/// What a worker has already seen, so the loop can tell "still working" from "going
+/// in circles" **without asking the model**.
+///
+/// This is deliberately narrower than the existing signature guards, and they cover
+/// different failures. `tool_repeat`/`same_call_repeat` compare one iteration's tool
+/// *batch* with the previous one, so they only fire on repetition; a worker that
+/// wanders across many different files never trips them. This tracker instead asks
+/// "did this iteration learn anything new?" — a new file, an edit, a new command, or
+/// changed output from an old one. A tight loop goes barren immediately; broad
+/// wandering does not, and is caught by the iteration grant instead. Two mechanisms,
+/// two failure modes.
+#[derive(Debug, Default)]
+pub(super) struct ProgressTracker {
+    /// Read key → the step it was first read at (for the "already read" pointer).
+    reads: std::collections::HashMap<String, u32>,
+    /// Content digest per read key, so an unchanged re-read can be elided while a
+    /// changed one passes through.
+    read_digests: std::collections::HashMap<String, u64>,
+    /// Normalized signatures of commands already run.
+    commands: std::collections::HashSet<String>,
+    /// Consecutive iterations that produced nothing new.
+    barren: u32,
+    /// Read outcomes recorded since the last `observe`, drained by it. Reads are
+    /// classified where the *content* comes back (`note_read`) rather than from the
+    /// call's arguments, because "did this teach us anything" is a fact about the
+    /// bytes, not about the request. One owner, so a first read cannot be
+    /// miscounted as a re-read by a second bookkeeper.
+    pending_new_reads: u32,
+    pending_rereads: u32,
+    /// Totals since the last progress report, for the evidence block.
+    files_read: u32,
+    files_edited: u32,
+    commands_run: u32,
+    reread_count: u32,
+}
+
+/// What one iteration's tool calls actually accomplished.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Novelty {
+    pub new_reads: u32,
+    pub edits: u32,
+    pub new_commands: u32,
+    /// A re-read of a file already in context: the cheapest way to look busy.
+    pub rereads: u32,
+    /// An old command whose output changed — legitimate polling, so not barren.
+    pub changed_output: bool,
+}
+
+impl Novelty {
+    /// Nothing new happened this iteration.
+    pub fn is_barren(&self) -> bool {
+        self.new_reads == 0 && self.edits == 0 && self.new_commands == 0 && !self.changed_output
+    }
+}
+
+impl ProgressTracker {
+    /// The cache key for a read: the path plus any window, so a full read and a
+    /// windowed read of the same file are distinct observations.
+    pub fn read_key(path: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+        match (offset, limit) {
+            (None, None) => path.to_string(),
+            (o, l) => format!("{path}@{}:{}", o.unwrap_or(0), l.unwrap_or(0)),
+        }
+    }
+
+    /// Record a completed read. Returns `Some(step)` when this exact read was already
+    /// made and the content has not changed since — the caller elides the body and
+    /// points at the earlier one instead.
+    pub fn note_read(&mut self, key: &str, content: &str, step: u32) -> Option<u32> {
+        let digest = digest(content);
+        let prior_step = self.reads.get(key).copied();
+        let unchanged = self.read_digests.get(key) == Some(&digest);
+        self.read_digests.insert(key.to_string(), digest);
+        match prior_step {
+            Some(step) if unchanged => {
+                self.reread_count += 1;
+                self.pending_rereads += 1;
+                Some(step)
+            }
+            // Read before, but it changed (the agent edited it, a build wrote it):
+            // the new bytes are new information and must reach the model.
+            Some(_) => {
+                self.pending_new_reads += 1;
+                None
+            }
+            None => {
+                self.reads.insert(key.to_string(), step);
+                self.files_read += 1;
+                self.pending_new_reads += 1;
+                None
+            }
+        }
+    }
+
+    /// Classify an iteration's tool calls, updating the barren streak. Consumes the
+    /// read outcomes recorded by [`Self::note_read`] during this iteration, so it must
+    /// be called once per iteration *after* the tools have run.
+    ///
+    /// `output_changed` is the loop's existing "same call, different result" signal,
+    /// which keeps genuine polling (`sleep 5 && curl health`) off the barren path.
+    pub fn observe(
+        &mut self,
+        calls: &[cowboy_core::model::ToolCall],
+        output_changed: bool,
+    ) -> Novelty {
+        let mut n = Novelty {
+            changed_output: output_changed,
+            new_reads: std::mem::take(&mut self.pending_new_reads),
+            rereads: std::mem::take(&mut self.pending_rereads),
+            ..Default::default()
+        };
+        for c in calls {
+            match c.name.as_str() {
+                tools::TOOL_EDIT | tools::TOOL_WRITE => {
+                    n.edits += 1;
+                    self.files_edited += 1;
+                }
+                tools::TOOL_SHELL => {
+                    let sig = normalize_shell_args(&c.arguments);
+                    self.commands_run += 1;
+                    if self.commands.insert(sig) {
+                        n.new_commands += 1;
+                    }
+                }
+                // Reads are accounted in `note_read`. Anything else (plan, memory,
+                // artifact, delegation, a turn request) is bookkeeping, not
+                // investigation: neither progress nor circling.
+                _ => {}
+            }
+        }
+        if n.is_barren() {
+            self.barren += 1;
+        } else {
+            self.barren = 0;
+        }
+        n
+    }
+
+    /// Consecutive barren iterations.
+    pub fn barren_streak(&self) -> u32 {
+        self.barren
+    }
+
+    /// Whether the worker has been going in circles for `window` iterations.
+    /// `window == 0` disables the check.
+    pub fn stalled(&self, window: u32) -> bool {
+        window > 0 && self.barren >= window
+    }
+
+    /// Objective evidence for a progress report: what the worker has actually
+    /// touched. Attached host-side so the foreman adjudicates a turn request against
+    /// measurements, not against the worker's own account of itself.
+    pub fn evidence(&self) -> String {
+        format!(
+            "files read: {} · files edited: {} · commands run: {} · unchanged re-reads: {} · \
+             consecutive iterations with nothing new: {}",
+            self.files_read, self.files_edited, self.commands_run, self.reread_count, self.barren
+        )
+    }
+
+    /// Clear the barren streak — e.g. after a redirect, so the worker isn't
+    /// immediately reported as stalled for the loop it was just pulled out of.
+    pub fn clear_streak(&mut self) {
+        self.barren = 0;
+    }
+}
+
+/// The observation that replaces an unchanged re-read. Names the earlier step so the
+/// model can find the content it already has, and says what to do instead — a bare
+/// refusal just invites a retry.
+pub(super) fn reread_notice(path: &str, prior_step: u32) -> String {
+    format!(
+        "(not re-read) `{path}` is unchanged since you read it at step {prior_step}; its \
+         contents are already earlier in this conversation. Scroll back rather than \
+         re-reading. If you need a different part of the file, read it with an explicit \
+         offset/limit; if you are looking for something specific, grep for it; otherwise \
+         move on to the next step."
+    )
+}
+
+/// A stable 64-bit digest, for "is this the same content as last time".
+fn digest(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// Forward a streamed [`Delta`] to the UI. A free function so it borrows only
 /// the UI, not all of `self` (the in-flight chat future holds an immutable
 /// borrow of the loop).
@@ -259,6 +687,413 @@ pub(super) fn truncate(output: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use cowboy_core::model::ToolCall;
+
+    /// A roster from YAML: exercises the real deserialization (and its defaults)
+    /// instead of hand-building a struct, and keeps these tests independent of the
+    /// host's `~/.config/cowboy/crew.yaml`.
+    fn roster(yaml: &str) -> cowboy_core::crew::CrewConfig {
+        serde_yaml_ng::from_str(yaml).expect("test roster parses")
+    }
+
+    #[test]
+    fn liveness_is_only_trusted_in_the_direction_that_is_certain() {
+        // A missing `/proc/<pid>` means the process is definitely gone; that is the only
+        // conclusion this draws, and it is the one the reaping logic needs.
+        assert!(!process_is_gone(std::process::id()));
+        // Above any possible `pid_max` (which is capped at 2^22), so this cannot exist.
+        assert!(process_is_gone(u32::MAX));
+    }
+
+    #[test]
+    fn depth_limit_honours_the_roster_but_never_exceeds_the_ceiling() {
+        // No roster: the hard ceiling.
+        assert_eq!(effective_max_depth(None), MAX_SUBAGENT_DEPTH);
+        // A shallower roster limit wins.
+        let shallow = roster("crew:\n  general: cheap\ndelegation:\n  max_depth: 1\n");
+        assert_eq!(effective_max_depth(Some(&shallow)), 1);
+        // A roster asking for more than the ceiling is clamped to it.
+        let deep = roster("crew:\n  general: cheap\ndelegation:\n  max_depth: 99\n");
+        assert_eq!(effective_max_depth(Some(&deep)), MAX_SUBAGENT_DEPTH);
+        // Recursive delegation ignores max_depth and takes the ceiling.
+        let recursive = roster(
+            "crew:\n  general: cheap\ndelegation:\n  max_depth: 1\n  \
+             allow_recursive_delegation: true\n",
+        );
+        assert_eq!(effective_max_depth(Some(&recursive)), MAX_SUBAGENT_DEPTH);
+    }
+
+    #[test]
+    fn delegation_needs_crew_mode_and_headroom() {
+        let cfg = roster("crew:\n  general: cheap\ndelegation:\n  max_depth: 1\n");
+        // Solo mode: never, at any depth.
+        assert!(!delegation_available(false, 0, Some(&cfg)));
+        // Crew mode with headroom: yes.
+        assert!(delegation_available(true, 0, Some(&cfg)));
+        // At the limit: no — this is the case that used to cost a round-trip.
+        assert!(!delegation_available(true, 1, Some(&cfg)));
+        // Past the limit (defensive): still no.
+        assert!(!delegation_available(true, 5, Some(&cfg)));
+    }
+
+    #[test]
+    fn a_loop_that_cannot_delegate_is_offered_neither_the_tool_nor_the_guidance() {
+        let names = |ts: &[ToolDef]| -> Vec<String> { ts.iter().map(|t| t.name.clone()).collect() };
+        let foreman_tools = names(&tool_surface(true, false));
+        for t in [
+            tools::TOOL_SUBAGENT,
+            tools::TOOL_JOBS,
+            tools::TOOL_WAIT,
+            tools::TOOL_JOB_REPLY,
+        ] {
+            assert!(foreman_tools.iter().any(|n| n == t), "missing {t}");
+        }
+        // A foreman has no foreman of its own to ask for turns.
+        assert!(!foreman_tools.iter().any(|n| n == tools::TOOL_REQUEST_TURNS));
+
+        // A worker that cannot delegate gets none of the supervision tools — offering
+        // `jobs`/`wait` to a loop with no jobs is just noise it can waste a turn on.
+        let leaf_tools = names(&tool_surface(false, true));
+        for t in [
+            tools::TOOL_SUBAGENT,
+            tools::TOOL_JOBS,
+            tools::TOOL_WAIT,
+            tools::TOOL_JOB_REPLY,
+        ] {
+            assert!(!leaf_tools.iter().any(|n| n == t), "should not offer {t}");
+        }
+        assert!(leaf_tools.iter().any(|n| n == tools::TOOL_REQUEST_TURNS));
+
+        // A solo run gets neither side.
+        let solo = names(&tool_surface(false, false));
+        assert!(!solo.iter().any(|n| n == tools::TOOL_REQUEST_TURNS));
+        assert!(!solo.iter().any(|n| n == tools::TOOL_SUBAGENT));
+
+        // The prompt must agree with the tool surface: telling a worker to delegate
+        // with no `subagent` tool is what produced "Delegation isn't available at this
+        // depth".
+        let foreman = system_prompt(true, 0, false);
+        assert!(foreman.contains("foreman of a crew"));
+        assert!(!foreman.contains(SUBAGENT_PROMPT));
+        assert!(!foreman.contains(TURN_REQUEST_PROMPT));
+
+        let leaf = system_prompt(false, MAX_SUBAGENT_DEPTH, true);
+        assert!(!leaf.contains("foreman of a crew"));
+        // …but it still gets the subagent-specific guidance, since it *is* one.
+        assert!(leaf.contains(SUBAGENT_PROMPT));
+        assert!(leaf.contains(TURN_REQUEST_PROMPT));
+
+        // A worker with a grant but no channel to ask on is not told to ask.
+        let unsupervised_leaf = system_prompt(false, 1, false);
+        assert!(!unsupervised_leaf.contains(TURN_REQUEST_PROMPT));
+
+        let solo_prompt = system_prompt(false, 0, false);
+        assert!(!solo_prompt.contains("foreman of a crew"));
+        assert!(!solo_prompt.contains(SUBAGENT_PROMPT));
+    }
+
+    #[test]
+    fn only_pure_coordination_batches_are_exempt_from_the_progress_guards() {
+        let call = |name: &str| cowboy_core::model::ToolCall {
+            id: "x".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        };
+        assert!(is_coordination_only(&[call(tools::TOOL_JOBS)]));
+        assert!(is_coordination_only(&[
+            call(tools::TOOL_WAIT),
+            call(tools::TOOL_JOB_REPLY)
+        ]));
+        // A batch that also does real work is judged like any other.
+        assert!(!is_coordination_only(&[
+            call(tools::TOOL_JOBS),
+            call(tools::TOOL_SHELL)
+        ]));
+        assert!(!is_coordination_only(&[call(tools::TOOL_READ)]));
+        // Dispatching is work, not coordination.
+        assert!(!is_coordination_only(&[call(tools::TOOL_SUBAGENT)]));
+        assert!(!is_coordination_only(&[]));
+    }
+
+    #[test]
+    fn a_delegated_worker_is_supervised_and_a_foreman_is_not() {
+        // Parent set both: supervised, on its grant.
+        let b = IterationBudget::resolve(Some(60), Some(400), 100);
+        assert_eq!((b.granted, b.ceiling, b.used), (60, 400, 0));
+        assert!(b.supervised);
+
+        // No env (the foreman): plain max_iterations, nobody to ask.
+        let mut f = IterationBudget::resolve(None, None, 100);
+        assert_eq!((f.granted, f.ceiling), (100, 100));
+        assert!(!f.supervised);
+        assert_eq!(f.extend(50), 0, "an unsupervised loop cannot be extended");
+    }
+
+    #[test]
+    fn a_broken_or_half_present_budget_falls_back_rather_than_stranding_the_worker() {
+        // Zero grant would mean "no turns at all" — a config typo must not silently
+        // make delegation do nothing.
+        for (grant, ceiling) in [
+            (Some(0), Some(400)),
+            (Some(60), Some(0)),
+            (Some(60), None),
+            (None, Some(400)),
+            (None, None),
+        ] {
+            let b = IterationBudget::resolve(grant, ceiling, 100);
+            assert_eq!(b.granted, 100, "grant={grant:?} ceiling={ceiling:?}");
+            assert!(!b.supervised);
+        }
+    }
+
+    #[test]
+    fn a_grant_larger_than_the_ceiling_is_clamped_on_the_way_in() {
+        let b = IterationBudget::resolve(Some(500), Some(50), 100);
+        assert_eq!(b.granted, 50);
+        assert_eq!(b.ceiling, 50);
+    }
+
+    #[test]
+    fn extensions_stop_at_the_ceiling_and_report_how_many_landed() {
+        let mut b = IterationBudget::resolve(Some(60), Some(100), 100);
+        assert_eq!(b.extend(20), 20);
+        assert_eq!(b.granted, 80);
+        // Asking for more than the headroom grants only the headroom …
+        assert_eq!(b.extend(50), 20);
+        assert_eq!(b.granted, 100);
+        // … and at the ceiling nothing lands, which the caller must report rather
+        // than looping on a request that can never be satisfied.
+        assert_eq!(b.extend(10), 0);
+        assert_eq!(b.granted, 100);
+    }
+
+    #[test]
+    fn remaining_and_exhausted_track_use() {
+        let mut b = IterationBudget::resolve(Some(3), Some(10), 100);
+        assert_eq!(b.remaining(), 3);
+        b.used = 3;
+        assert!(b.exhausted());
+        assert_eq!(b.remaining(), 0);
+        // A grant extension un-exhausts it.
+        b.extend(2);
+        assert!(!b.exhausted());
+        assert_eq!(b.remaining(), 2);
+    }
+
+    #[test]
+    fn the_depletion_nudge_fires_at_seventy_then_ninety_percent() {
+        // A 100-turn grant: quiet until 70, nudge, then urgent from 90.
+        assert_eq!(grant_stage(1, 100), GrantStage::Fine);
+        assert_eq!(grant_stage(69, 100), GrantStage::Fine);
+        assert_eq!(grant_stage(70, 100), GrantStage::Nudge);
+        assert_eq!(grant_stage(89, 100), GrantStage::Nudge);
+        assert_eq!(grant_stage(90, 100), GrantStage::Urgent);
+        assert_eq!(grant_stage(100, 100), GrantStage::Urgent);
+        // Proportional, so a small grant gets the same warning shape.
+        assert_eq!(grant_stage(10, 15), GrantStage::Fine);
+        assert_eq!(grant_stage(11, 15), GrantStage::Nudge);
+        assert_eq!(grant_stage(14, 15), GrantStage::Urgent);
+        // Stages are ordered so the loop can fire each exactly once.
+        assert!(GrantStage::Urgent > GrantStage::Nudge);
+        assert!(GrantStage::Nudge > GrantStage::Fine);
+    }
+
+    #[test]
+    fn the_nudge_only_mentions_asking_when_there_is_someone_to_ask() {
+        let supervised = IterationBudget::resolve(Some(60), Some(400), 100);
+        let solo = IterationBudget::resolve(None, None, 100);
+        assert!(grant_notice(GrantStage::Fine, &supervised).is_none());
+
+        let s = grant_notice(GrantStage::Urgent, &supervised).unwrap();
+        assert!(s.contains("request_turns"), "got: {s}");
+        // A foreman has no foreman: pointing it at `request_turns` would be advice it
+        // cannot act on.
+        let f = grant_notice(GrantStage::Urgent, &solo).unwrap();
+        assert!(!f.contains("request_turns"), "got: {f}");
+        assert!(f.contains("final"), "got: {f}");
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            id: "r".into(),
+            name: tools::TOOL_READ.into(),
+            arguments: serde_json::json!({ "path": path }).to_string(),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_reread_is_elided_but_a_changed_one_is_not() {
+        let mut t = ProgressTracker::default();
+        let key = ProgressTracker::read_key("src/main.rs", None, None);
+        // First read: novel, content passes through.
+        assert_eq!(t.note_read(&key, "fn main() {}", 1), None);
+        // Same content again: point at step 1 instead of spending context twice.
+        assert_eq!(t.note_read(&key, "fn main() {}", 4), Some(1));
+        assert_eq!(t.note_read(&key, "fn main() {}", 5), Some(1));
+        // The file changed (the agent edited it): the new content must get through,
+        // or the agent would be reasoning about a stale copy.
+        assert_eq!(t.note_read(&key, "fn main() { work() }", 6), None);
+        // …and the *new* content is what a later re-read is compared against.
+        assert_eq!(t.note_read(&key, "fn main() { work() }", 7), Some(1));
+    }
+
+    #[test]
+    fn a_windowed_read_is_a_different_observation_from_a_full_one() {
+        let full = ProgressTracker::read_key("a.rs", None, None);
+        let windowed = ProgressTracker::read_key("a.rs", Some(100), Some(50));
+        assert_ne!(full, windowed);
+        let mut t = ProgressTracker::default();
+        assert_eq!(t.note_read(&full, "whole file", 1), None);
+        // Reading a different part of the same file is real work, not a re-read.
+        assert_eq!(t.note_read(&windowed, "just lines 100-150", 2), None);
+    }
+
+    #[test]
+    fn the_observed_reread_loop_goes_barren_immediately() {
+        // The failure from the field: the same file read over and over, each read
+        // returning the same bytes, for ~90 iterations. The batch-signature guards
+        // can miss this; the novelty metric cannot.
+        //
+        // Mirrors the loop's order: the read completes (`note_read`), then the
+        // iteration is classified (`observe`).
+        let mut t = ProgressTracker::default();
+        let path = "crates/riffdb-storage-redb/src/changelog_v3_cursor.rs";
+        let key = ProgressTracker::read_key(path, None, None);
+        let body = "fn next_receipt() {}";
+
+        t.note_read(&key, body, 1);
+        assert!(
+            !t.observe(&[read_call(path)], false).is_barren(),
+            "the first read is new information"
+        );
+        for i in 0..5 {
+            t.note_read(&key, body, i + 2);
+            let n = t.observe(&[read_call(path)], false);
+            assert!(n.is_barren(), "re-read {i} should be barren: {n:?}");
+            assert_eq!(n.rereads, 1);
+            assert_eq!(n.new_reads, 0);
+        }
+        assert_eq!(t.barren_streak(), 5);
+        assert!(t.stalled(4));
+        assert!(!t.stalled(6));
+        // A window of 0 disables the check entirely.
+        assert!(!t.stalled(0));
+    }
+
+    #[test]
+    fn a_changed_file_reread_counts_as_new_information() {
+        let mut t = ProgressTracker::default();
+        let key = ProgressTracker::read_key("a.rs", None, None);
+        t.note_read(&key, "before", 1);
+        t.observe(&[read_call("a.rs")], false);
+        // The agent edited the file and read it back: not a wasted step.
+        t.note_read(&key, "after", 2);
+        let n = t.observe(&[read_call("a.rs")], false);
+        assert!(!n.is_barren(), "{n:?}");
+        assert_eq!(n.new_reads, 1);
+        assert_eq!(n.rereads, 0);
+    }
+
+    #[test]
+    fn legitimate_iterative_work_is_never_barren() {
+        let mut t = ProgressTracker::default();
+        // Reading a *different* file each time is exploration, not circling — that
+        // failure mode is the iteration grant's job, not this metric's.
+        for f in ["a.rs", "b.rs", "c.rs", "d.rs"] {
+            t.note_read(&ProgressTracker::read_key(f, None, None), "body", 1);
+            assert!(!t.observe(&[read_call(f)], false).is_barren());
+        }
+        assert_eq!(t.barren_streak(), 0);
+
+        // Polling: the same command, byte-identical, but the output keeps changing
+        // (a build log, a health check). The existing guard deliberately allows this,
+        // and so must this one.
+        let poll = ToolCall {
+            id: "s".into(),
+            name: tools::TOOL_SHELL.into(),
+            arguments: serde_json::json!({ "command": "cargo build 2>&1 | tail -5" }).to_string(),
+        };
+        assert!(
+            !t.observe(std::slice::from_ref(&poll), false).is_barren(),
+            "new command"
+        );
+        for _ in 0..3 {
+            let n = t.observe(std::slice::from_ref(&poll), true);
+            assert!(!n.is_barren(), "changed output is progress: {n:?}");
+        }
+        assert_eq!(t.barren_streak(), 0);
+        // The same command with unchanged output *is* barren.
+        assert!(t.observe(&[poll], false).is_barren());
+    }
+
+    #[test]
+    fn an_edit_is_always_progress() {
+        let mut t = ProgressTracker::default();
+        let edit = ToolCall {
+            id: "e".into(),
+            name: tools::TOOL_EDIT.into(),
+            arguments: serde_json::json!({ "path": "a.rs", "old_str": "x", "new_str": "y" })
+                .to_string(),
+        };
+        // Even repeated on the same file: an edit changes the world.
+        for _ in 0..3 {
+            assert!(!t.observe(std::slice::from_ref(&edit), false).is_barren());
+        }
+        assert!(t.evidence().contains("files edited: 3"));
+    }
+
+    #[test]
+    fn bookkeeping_calls_neither_count_as_progress_nor_as_circling() {
+        let mut t = ProgressTracker::default();
+        let plan = ToolCall {
+            id: "p".into(),
+            name: tools::TOOL_PLAN.into(),
+            arguments: serde_json::json!({ "steps": ["a"] }).to_string(),
+        };
+        // Updating a plan is barren (nothing was learned) …
+        assert!(t.observe(std::slice::from_ref(&plan), false).is_barren());
+        // … but a real read alongside it is not.
+        t.note_read(&ProgressTracker::read_key("a.rs", None, None), "body", 2);
+        assert!(!t.observe(&[plan, read_call("a.rs")], false).is_barren());
+    }
+
+    #[test]
+    fn a_redirect_can_clear_the_streak() {
+        let mut t = ProgressTracker::default();
+        let key = ProgressTracker::read_key("a.rs", None, None);
+        t.note_read(&key, "body", 1);
+        t.observe(&[read_call("a.rs")], false);
+        for _ in 0..3 {
+            t.note_read(&key, "body", 2);
+            t.observe(&[read_call("a.rs")], false);
+        }
+        assert_eq!(t.barren_streak(), 3);
+        t.clear_streak();
+        assert_eq!(t.barren_streak(), 0);
+    }
+
+    #[test]
+    fn the_evidence_block_reports_what_was_measured() {
+        let mut t = ProgressTracker::default();
+        let key = ProgressTracker::read_key("a.rs", None, None);
+        t.note_read(&key, "body", 1);
+        t.observe(&[read_call("a.rs")], false);
+        t.note_read(&key, "body", 2);
+        t.observe(&[read_call("a.rs")], false);
+        let e = t.evidence();
+        assert!(e.contains("files read: 1"), "got: {e}");
+        assert!(e.contains("unchanged re-reads: 1"), "got: {e}");
+        assert!(e.contains("nothing new: 1"), "got: {e}");
+    }
+
+    #[test]
+    fn the_reread_notice_says_what_to_do_instead() {
+        let n = reread_notice("src/main.rs", 7);
+        assert!(n.contains("src/main.rs"));
+        assert!(n.contains("step 7"));
+        // A bare refusal invites a retry; this has to name the alternatives.
+        assert!(n.contains("offset"), "got: {n}");
+        assert!(n.contains("grep"), "got: {n}");
+    }
 
     fn shell(cmd: &str) -> Vec<ToolCall> {
         vec![ToolCall {

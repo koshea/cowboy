@@ -139,6 +139,33 @@ impl Env {
         }
     }
 
+    /// A **real** provider with a **controlled crew roster**: the user's
+    /// `providers.yaml`/`models.yaml` are copied into a throwaway config home and a
+    /// `crew.yaml` is written next to them.
+    ///
+    /// Delegation is gated on a roster existing, and the turn grants under test come
+    /// from it, so a delegation test cannot depend on whatever the developer happens to
+    /// have configured. Returns `None` when there is no real provider to copy.
+    fn real_with_crew(crew_yaml: &str) -> Option<Self> {
+        let providers = real_provider()?;
+        let src = providers.parent()?.to_path_buf();
+        let config = assert_fs::TempDir::new().unwrap();
+        let dst = config.child("cowboy");
+        dst.create_dir_all().unwrap();
+        for name in ["providers.yaml", "models.yaml"] {
+            let from = src.join(name);
+            if from.is_file() {
+                std::fs::copy(&from, dst.path().join(name)).unwrap();
+            }
+        }
+        std::fs::write(dst.path().join("crew.yaml"), crew_yaml).unwrap();
+        Some(Self {
+            runtime: assert_fs::TempDir::new().unwrap(),
+            state: assert_fs::TempDir::new().unwrap(),
+            config: Some(config),
+        })
+    }
+
     fn sock(&self) -> PathBuf {
         self.runtime.path().join("cowboy/cowboyd.sock")
     }
@@ -327,11 +354,400 @@ impl Client {
             Ok(_) => serde_json::from_str(line.trim()).ok(),
         }
     }
+
+    /// Collect display events until `stop` says so (or the stream ends / the read
+    /// timeout fires). Returns every `UiEventMsg` seen, so an assertion can look at the
+    /// whole turn rather than racing a single message.
+    fn drain_until(&mut self, mut stop: impl FnMut(&UiEventMsg) -> bool) -> Vec<UiEventMsg> {
+        let mut seen = Vec::new();
+        loop {
+            match self.recv() {
+                Some(ServerMsg::Event { event, .. }) => {
+                    let done = stop(&event);
+                    seen.push(event);
+                    if done {
+                        return seen;
+                    }
+                }
+                Some(ServerMsg::Ended { .. }) | None => return seen,
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+/// A short name for a display event, so a failing e2e prints a readable timeline
+/// instead of pages of pretty-printed payloads.
+fn event_name(e: &UiEventMsg) -> String {
+    match e {
+        UiEventMsg::SubagentPending { id, .. } => format!("SubagentPending({id})"),
+        UiEventMsg::SubagentStarted { id, .. } => format!("SubagentStarted({id})"),
+        UiEventMsg::SubagentDone { id, ok, .. } => format!("SubagentDone({id},ok={ok})"),
+        UiEventMsg::JobsChanged(j) => format!(
+            "JobsChanged[{}]",
+            j.iter()
+                .map(|x| format!("{}:{}", x.id, x.state))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        UiEventMsg::CommandStart(c) => format!("CommandStart({c})"),
+        UiEventMsg::ToolUse(s) => format!("ToolUse({s})"),
+        UiEventMsg::Notice(n) => format!("Notice({n})"),
+        UiEventMsg::SteerDelivered(t) => format!("Steer({t})"),
+        UiEventMsg::Final(_) => "Final".into(),
+        UiEventMsg::TurnDone => "TurnDone".into(),
+        UiEventMsg::Delta(_) => "Delta".into(),
+        UiEventMsg::Reasoning(_) => "Reasoning".into(),
+        UiEventMsg::CommandOutput(_) => "CommandOutput".into(),
+        UiEventMsg::CommandEnd { code, .. } => format!("CommandEnd({code})"),
+        UiEventMsg::UserMessage(_) => "UserMessage".into(),
+        UiEventMsg::FileDiff { path, .. } => format!("FileDiff({path})"),
+        UiEventMsg::QueueChanged { pending } => format!("QueueChanged({})", pending.len()),
+        _ => "…".into(),
+    }
+}
+
+/// A crew roster with one cheap model for everything and a **tiny** turn grant, so a
+/// delegated worker runs out quickly and has to ask for more.
+///
+/// `model` must exist in the copied `models.yaml`; `<default>` means "the foreman's
+/// model", which is the only name guaranteed to resolve on any developer's machine.
+fn crew_yaml(grant: u32, ceiling: u32) -> String {
+    format!(
+        "version: 1\ncrew:\n  general: \"<default>\"\ndelegation:\n  enabled: true\n  \
+         max_parallel: 4\n  max_parallel_per_provider: 2\n  max_depth: 1\n  \
+         iterations:\n    tiny: {grant}\n  max_total_iterations: {ceiling}\n  \
+         request_timeout_seconds: 60\n"
+    )
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// Async delegation, end to end: the foreman dispatches a subagent and **keeps
+/// working in the same turn** instead of blocking on it.
+///
+/// This is the defect the whole change exists to fix, and it can only be checked
+/// against a real model: the ordering that matters is "dispatch, then the foreman does
+/// something else, then the result arrives". Asserted on the journal's event order, not
+/// on wording.
+#[test]
+#[ignore = "real model: dispatches a real subagent process"]
+fn e2e_delegation_does_not_block_the_foreman() {
+    let Some(env) = Env::real_with_crew(&crew_yaml(25, 400)) else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    if !sandbox_ok() {
+        eprintln!("skipping: this host cannot create a user namespace");
+        return;
+    }
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    let task = "Use the `subagent` tool ONCE to delegate this task: \"write the single \
+        line 'hello from the subagent' to the file sub.txt, then finish\" (category \
+        general, effort tiny). The tool returns a job id, NOT the answer. Immediately \
+        after dispatching, and BEFORE the job finishes, use the `write` tool to create \
+        foreman.txt containing the word DISPATCHED. Then use `wait`. When the \
+        subagent's result arrives, call `final` with a one-line summary.";
+    let (id, ws) = match start(&sock, proj.path(), Some(task)) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    let mut a = Client::connect(&ws);
+    a.hello(None);
+    let events = a.drain_until(|e| matches!(e, UiEventMsg::TurnDone));
+    a.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .arg("down")
+        .output();
+    reap_session_residue();
+
+    // The foreman's own write must land *before* the delegated result arrives —
+    // proof it was not parked waiting.
+    let pos = |pred: fn(&UiEventMsg) -> bool| events.iter().position(pred);
+    let dispatched = pos(|e| matches!(e, UiEventMsg::SubagentPending { .. }))
+        .or_else(|| pos(|e| matches!(e, UiEventMsg::SubagentStarted { .. })))
+        .unwrap_or_else(|| panic!("no subagent was dispatched; events: {events:#?}"));
+    let own_work = events
+        .iter()
+        .position(|e| match e {
+            UiEventMsg::ToolUse(s) => s.contains("foreman.txt"),
+            UiEventMsg::FileDiff { path, .. } => path.contains("foreman.txt"),
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("the foreman did no work of its own; events: {events:#?}"));
+    let result_arrived = events
+        .iter()
+        .position(|e| matches!(e, UiEventMsg::SubagentDone { .. }))
+        .unwrap_or_else(|| panic!("the subagent never finished; events: {events:#?}"));
+    assert!(
+        dispatched < own_work && own_work < result_arrived,
+        "the foreman must work between dispatch and delivery (dispatch={dispatched}, \
+         own work={own_work}, result={result_arrived})"
+    );
+    // And both wrote their files, so the subagent really ran in the shared workspace.
+    assert!(
+        proj.path().join("foreman.txt").is_file(),
+        "the foreman's own file should exist"
+    );
+    assert!(
+        proj.path().join("sub.txt").is_file(),
+        "the subagent's file should exist"
+    );
+    // The job's control directory is cleaned up when it finishes.
+    let jobs_dir = env.state.path().join("cowboy/jobs").join(&id);
+    assert!(
+        !jobs_dir.exists() || std::fs::read_dir(&jobs_dir).map(|d| d.count()).unwrap_or(0) == 0,
+        "the job control dir should be cleaned up: {}",
+        jobs_dir.display()
+    );
+}
+
+/// Grant-and-request against a real model: a worker given a tiny grant runs out,
+/// reports, and the **foreman** decides. Asserted from the control channel + the
+/// worker's own final answer, so both halves of the mechanism are covered.
+#[test]
+#[ignore = "real model: exercises the turn-request loop"]
+fn e2e_a_worker_that_runs_out_of_turns_reports_and_is_answered() {
+    // A one-turn grant guarantees the request happens on the first boundary.
+    let Some(env) = Env::real_with_crew(&crew_yaml(1, 40)) else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    if !sandbox_ok() {
+        eprintln!("skipping: this host cannot create a user namespace");
+        return;
+    }
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    let task = "Use the `subagent` tool ONCE (category general, effort tiny) to \
+        delegate: \"list every file in the repository, then write a one-paragraph \
+        summary of the project to summary.md, then finish\". Its turn grant is \
+        deliberately tiny, so it will report progress and ask you for more turns: when \
+        it does, answer with `job_reply` verdict=grant, iterations=15. Then `wait` for \
+        its result and call `final` with a one-line summary.";
+    let (id, ws) = match start(&sock, proj.path(), Some(task)) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    let mut a = Client::connect(&ws);
+    a.hello(None);
+    let events = a.drain_until(|e| matches!(e, UiEventMsg::TurnDone));
+    a.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .arg("down")
+        .output();
+    reap_session_residue();
+
+    // The foreman was told about the request (the notice names the ask).
+    let notices: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            UiEventMsg::Notice(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notices.iter().any(|n| n.contains("asking for")),
+        "the foreman should be told a worker wants more turns; notices: {notices:#?}"
+    );
+    // Whatever the foreman decided, the worker must have ended with a REPORT rather
+    // than silently hitting a cap: that is the outcome this replaced.
+    let sub_id = events
+        .iter()
+        .find_map(|e| match e {
+            UiEventMsg::SubagentStarted { id, .. } | UiEventMsg::SubagentPending { id, .. } => {
+                Some(id.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no subagent was dispatched; events: {events:#?}"));
+    let sub_final = std::fs::read_to_string(
+        proj.path()
+            .join(".cowboy/sessions")
+            .join(&sub_id)
+            .join("final.md"),
+    )
+    .unwrap_or_default();
+    assert!(
+        !sub_final.trim().is_empty(),
+        "the worker must finish with a written answer, not a silent cap; \
+         session {sub_id} produced no final.md"
+    );
+    assert!(
+        !sub_final.contains("[partial]"),
+        "grant-and-request should replace the `[partial]` outcome; got:\n{sub_final}"
+    );
+    let _ = id;
+}
+
+/// Mid-turn steering against a real model: a message typed while the agent works
+/// reaches it *within the same turn*, and is acted on.
+#[test]
+#[ignore = "real model: steers a running turn"]
+fn e2e_steering_reaches_a_running_turn() {
+    let Some(_) = real_provider() else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    if !sandbox_ok() {
+        eprintln!("skipping: this host cannot create a user namespace");
+        return;
+    }
+    let env = Env::real();
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    // A deliberately slow first step, so the steer lands while the turn is running.
+    let task = "Run the shell command `sleep 6` first. Then write the file first.txt \
+        containing FIRST. Then call `final`.";
+    let (_id, ws) = match start(&sock, proj.path(), Some(task)) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    let mut a = Client::connect(&ws);
+    a.hello(None);
+    // Wait until the turn is demonstrably underway, then speak.
+    a.drain_until(|e| matches!(e, UiEventMsg::CommandStart(c) if c.contains("sleep")));
+    // Phrased as an instruction the model cannot read as optional. The delivery half of
+    // this test is deterministic (`SteerDelivered` below), but "did the model then act on
+    // it" depends on the model choosing to, and a politely-worded aside got skipped in
+    // favour of the plan it had already made — failing the test for a reason that is not
+    // cowboy's behaviour.
+    a.send(&ClientMsg::Message(
+        "IMPORTANT, do this before you call final: also write the file steered.txt \
+         containing STEERED."
+            .into(),
+    ));
+    let events = a.drain_until(|e| matches!(e, UiEventMsg::TurnDone));
+    a.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .arg("down")
+        .output();
+    reap_session_residue();
+
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, UiEventMsg::SteerDelivered(t) if t.contains("steered.txt"))),
+        "the steer should be delivered into the running turn; events: {events:#?}"
+    );
+    assert!(
+        proj.path().join("steered.txt").is_file(),
+        "the agent should act on mid-turn input within the same turn"
+    );
+    assert!(
+        proj.path().join("first.txt").is_file(),
+        "steering must not cancel the work already in progress"
+    );
+}
+
+/// Interrupting a turn leaves the delegated work alone: the subagent keeps running and
+/// its result arrives in a **later** turn. Under the old batch-join this work was
+/// killed and re-done.
+#[test]
+#[ignore = "real model: interrupts a turn with a subagent in flight"]
+fn e2e_an_interrupt_keeps_the_subagents_and_their_results() {
+    let Some(env) = Env::real_with_crew(&crew_yaml(25, 400)) else {
+        eprintln!("skipping: no model provider in ~/.config/cowboy");
+        return;
+    };
+    if !sandbox_ok() {
+        eprintln!("skipping: this host cannot create a user namespace");
+        return;
+    }
+    let _d = env.spawn_daemon();
+    let sock = env.sock();
+    assert!(wait_pong(&sock));
+    let proj = make_project();
+
+    let task = "Use the `subagent` tool ONCE (category general, effort tiny) to \
+        delegate: \"run the shell command `sleep 5`, then write the line DONE to \
+        worker.txt, then finish\". After dispatching, call `wait`.";
+    let (_id, ws) = match start(&sock, proj.path(), Some(task)) {
+        DaemonResp::Started { id, worker_sock } => (id, worker_sock),
+        other => panic!("expected Started, got {other:?}"),
+    };
+
+    let mut a = Client::connect(&ws);
+    a.hello(None);
+    // Once the worker is actually running, interrupt the *foreman's* turn.
+    a.drain_until(|e| matches!(e, UiEventMsg::SubagentStarted { .. }));
+    a.send(&ClientMsg::Interrupt {
+        kind: cowboy_core::daemonproto::InterruptKind::Turn,
+    });
+    // Everything from the interrupt onwards, across both turns: the result is
+    // delivered at whichever iteration boundary comes first, and which turn that falls
+    // in is a timing detail, not the property under test.
+    let mut events = a.drain_until(|e| matches!(e, UiEventMsg::TurnDone));
+
+    // A second turn: the pre-interrupt worker's result must reach the conversation.
+    a.send(&ClientMsg::Message(
+        "What did the subagent you dispatched earlier report? Answer from what you \
+         already know and call `final` — do not run any commands."
+            .into(),
+    ));
+    events.extend(a.drain_until(|e| matches!(e, UiEventMsg::TurnDone)));
+    a.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(800));
+    let _ = Command::new(env!("CARGO_BIN_EXE_cowboy"))
+        .current_dir(proj.path())
+        .arg("down")
+        .output();
+    reap_session_residue();
+
+    // The interrupt did not reap the worker: it finished its `sleep` and wrote its file.
+    assert!(
+        proj.path().join("worker.txt").is_file(),
+        "the subagent should have kept running through the interrupt"
+    );
+    // And its result reached the foreman rather than being lost with the cancelled
+    // turn: it can only report the worker's outcome if the result was delivered.
+    //
+    // Asserted on the answer rather than on a `SubagentDone` edge: *which* turn's event
+    // stream carries the delivery depends on when the child happens to exit relative to
+    // the interrupt unwind, and that timing is not the property under test. The
+    // deterministic version of the event-level claim is
+    // `a_result_from_before_an_interrupt_arrives_in_the_next_turn` in the unit tests.
+    let last_final = events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            UiEventMsg::Final(m) => Some(m.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        last_final.contains("worker.txt") || last_final.contains("done"),
+        "the foreman should be able to report the subagent's result after the \
+         interrupt; got final: {last_final:?}\nevents: {:#?}",
+        events
+            .iter()
+            .map(event_name)
+            .collect::<Vec<_>>()
+            .join(" → ")
+    );
+}
 
 /// Two `cowboy` invocations in the same worktree: the daemon refuses the second
 /// (its worktree lease is held by the live first session).

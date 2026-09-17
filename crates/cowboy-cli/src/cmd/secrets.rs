@@ -152,10 +152,7 @@ fn add(args: SecretsAddArgs) -> Result<()> {
     } else {
         "this repo (all worktrees)"
     };
-    println!(
-        "{}",
-        style::success(&format!("✓ wrote credential grant to {}", path.display()))
-    );
+    crate::ui::ok(&format!("wrote credential grant to {}", path.display()));
     println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
     for n in &c.notes {
         println!("  {n}");
@@ -175,6 +172,8 @@ fn print_repo_snippet(c: &Collected) {
         }
         for (name, cmd) in &c.env_cmd {
             println!("    - name: {name}");
+            // debug-ok: `{:?}` is doing YAML quoting/escaping here, not showing a
+            // Rust value — this line is part of a paste-able snippet.
             println!("      source_command: {cmd:?}");
         }
     }

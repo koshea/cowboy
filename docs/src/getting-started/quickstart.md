@@ -1,5 +1,9 @@
 # Quick start
 
+The commands, condensed. For a narrated walkthrough of one session — what each step
+prints and what to do when the agent asks for the network — see
+[Your first five minutes](first-five-minutes.md).
+
 ```sh
 cd your-project
 cowboy init                 # writes .cowboy/{security,agent,models}.yaml
@@ -14,8 +18,8 @@ conversational REPL — like Claude Code. The agent answers a turn, then returns
 the prompt for your next message, keeping the **full conversation and the same
 sandbox** alive. The `final` tool ends a *turn*, not the session.
 
-- **Ctrl-C** opens an interrupt menu: `k` cancels the current turn (you keep
-  going), `e` ends the session (finalizes the log).
+- **Ctrl-C** interrupts the current turn (you keep going); pressing it twice at an
+  empty prompt ends the session. **F1** lists every key and command.
 - **Piped / non-TTY** runs (`cowboy "task" | …`) stay single-shot, for scripting.
 
 The default network policy allows common dev registries (npm, PyPI, Go, crates,
@@ -38,7 +42,11 @@ cowboy sessions              # list live/registered sessions
 cowboy logs                  # list past sessions
 cowboy replay <id>           # replay a past session
 cowboy down [--all]          # end this project's (or every) session
+cowboy completions zsh       # shell completion script
 ```
+
+Plural and singular both work (`cowboy skill` / `cowboy skills`), `cowboy exec` is
+`cowboy run`, and `-y`/`--yes` pre-answers the confirmation on anything destructive.
 
 See the [CLI reference](../reference/cli.md) for the full, auto-generated command
 tree, and [Ranch Plans](../ranch/overview.md) for multi-workstream orchestration.

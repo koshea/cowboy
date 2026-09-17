@@ -372,6 +372,17 @@ impl AgentUi for SocketUi {
             id: id.to_string(),
         });
     }
+    fn jobs_changed(&mut self, jobs: &[cowboy_core::daemonproto::JobInfo]) {
+        self.emit(UiEventMsg::JobsChanged(jobs.to_vec()));
+    }
+    fn queue_changed(&mut self, pending: &[String]) {
+        self.emit(UiEventMsg::QueueChanged {
+            pending: pending.to_vec(),
+        });
+    }
+    fn steering(&mut self, text: &str) {
+        self.emit(UiEventMsg::SteerDelivered(text.to_string()));
+    }
     fn final_message(&mut self, message: &str) {
         self.emit(UiEventMsg::Final(message.to_string()));
     }

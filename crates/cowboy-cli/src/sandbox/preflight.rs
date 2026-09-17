@@ -104,11 +104,7 @@ pub fn check_all() -> Vec<Requirement> {
 /// design deliberately does not have: everything here works as an ordinary user.
 fn check_bwrap() -> Requirement {
     match super::bwrap::resolve_bwrap() {
-        Err(e) => Requirement::missing(
-            "bubblewrap",
-            e.to_string(),
-            "install bubblewrap (Gentoo: `emerge sys-apps/bubblewrap`)",
-        ),
+        Err(e) => Requirement::missing("bubblewrap", e.to_string(), install_hint("bubblewrap")),
         Ok(path) => match super::bwrap::ensure_not_setuid(&path) {
             Err(e) => Requirement::missing(
                 "bubblewrap",
@@ -237,40 +233,57 @@ fn check_seccomp() -> Requirement {
 }
 
 /// Command-line tools the sandbox shells out to.
+///
+/// The remedy names the **upstream project** rather than one distribution's package
+/// atom. `emerge sys-apps/util-linux` is useless advice on Debian, and cowboy is
+/// documented as Linux-only, not Gentoo-only — so the package hint is now labelled by
+/// distro family and the project name is always given.
 fn check_tools() -> Vec<Requirement> {
     const TOOLS: &[(&str, &str, &str)] = &[
-        (
-            "unshare",
-            "creates the session's namespaces",
-            "sys-apps/util-linux",
-        ),
+        ("unshare", "creates the session's namespaces", "util-linux"),
         (
             "ip",
             "configures the sandbox's black-hole device",
-            "sys-apps/iproute2",
+            "iproute2",
         ),
         (
             "nft",
             "installs the egress interception ruleset",
-            "net-firewall/nftables",
+            "nftables",
         ),
         (
             "sysctl",
             "enables loopback delivery for intercepted traffic",
-            "sys-apps/procps",
+            "procps",
         ),
     ];
     TOOLS
         .iter()
         .map(|(bin, why, pkg)| match which(bin) {
             Some(p) => Requirement::ok(bin, p.display().to_string()),
-            None => Requirement::missing(
-                bin,
-                format!("not on PATH — {why}"),
-                format!("install {pkg}"),
-            ),
+            None => Requirement::missing(bin, format!("not on PATH — {why}"), install_hint(pkg)),
         })
         .collect()
+}
+
+/// "install <project>" plus this machine's own package command, when we can tell which
+/// one it is. Detected from the package managers actually present, so the hint is
+/// copy-pasteable instead of aspirational.
+pub(crate) fn install_hint(project: &str) -> String {
+    let managers: &[(&str, &str)] = &[
+        ("apt-get", "sudo apt install"),
+        ("dnf", "sudo dnf install"),
+        ("pacman", "sudo pacman -S"),
+        ("zypper", "sudo zypper install"),
+        ("emerge", "sudo emerge"),
+        ("apk", "sudo apk add"),
+        ("nix-env", "nix-env -iA nixpkgs."),
+    ];
+    match managers.iter().find(|(bin, _)| which(bin).is_some()) {
+        Some((_, cmd)) if cmd.ends_with('.') => format!("install {project} (`{cmd}{project}`)"),
+        Some((_, cmd)) => format!("install {project} (`{cmd} {project}`)"),
+        None => format!("install {project}"),
+    }
 }
 
 /// Whether egress interception can actually be installed, checked by installing it

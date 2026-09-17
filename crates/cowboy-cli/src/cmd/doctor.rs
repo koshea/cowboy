@@ -14,11 +14,22 @@ enum Status {
     Ok(String),
     Warn(String),
     Fail(String),
+    /// A failure whose cause is specifically "the file is not there".
+    ///
+    /// Distinct from [`Status::Fail`] because it needs different advice: `cowboy init`
+    /// creates a missing file, but for one that exists and is *wrong* it refuses, and
+    /// `--force` would discard the user's edits. Reported identically to the reader — it
+    /// is still `[fail]` — but the verdict branches on it.
+    Missing(String),
 }
 
 struct Report {
     failures: usize,
     warnings: usize,
+    /// Labels that failed, so the verdict can say which *kind* of problem this is.
+    failed: Vec<String>,
+    /// Of those, the ones that failed because the file is absent.
+    absent: Vec<String>,
 }
 
 impl Report {
@@ -26,6 +37,8 @@ impl Report {
         Self {
             failures: 0,
             warnings: 0,
+            failed: Vec::new(),
+            absent: Vec::new(),
         }
     }
 
@@ -40,6 +53,13 @@ impl Report {
             }
             Status::Fail(m) => {
                 self.failures += 1;
+                self.failed.push(label.to_string());
+                (style::error("[fail]"), m)
+            }
+            Status::Missing(m) => {
+                self.failures += 1;
+                self.failed.push(label.to_string());
+                self.absent.push(label.to_string());
                 (style::error("[fail]"), m)
             }
         };
@@ -96,7 +116,16 @@ pub async fn run() -> Result<()> {
                 r.failures, r.warnings
             ))
         );
-        anyhow::bail!("doctor found {} problem(s)", r.failures);
+        // Say what the failures *mean*, because the two kinds have different
+        // consequences and different fixes: config gaps stop `cowboy` from starting at
+        // all, kernel gaps stop the sandbox from confining anything. Reading a column
+        // of `[fail]` lines and working that out is the reader's job otherwise.
+        for line in verdict(&r) {
+            println!("  {line}");
+        }
+        // Everything above *is* the report; anyhow adding "Error: doctor found N
+        // problem(s)" underneath it says nothing new.
+        return Err(crate::AlreadyReported.into());
     }
     let summary = format!("All checks passed ({} warning(s)).", r.warnings);
     println!(
@@ -165,7 +194,7 @@ fn check_security(path: &Path) -> Status {
             }
         }
         Err(cowboy_core::Error::ConfigNotFound(_)) => {
-            Status::Fail("missing; run `cowboy init`".to_string())
+            Status::Missing("missing; run `cowboy init`".to_string())
         }
         Err(e) => Status::Fail(e.to_string()),
     }
@@ -248,7 +277,7 @@ fn check_agent(path: &Path) -> Status {
             cfg.agent.command_timeout_seconds, cfg.agent.max_iterations
         )),
         Err(cowboy_core::Error::ConfigNotFound(_)) => {
-            Status::Fail("missing; run `cowboy init`".to_string())
+            Status::Missing("missing; run `cowboy init`".to_string())
         }
         Err(e) => Status::Fail(e.to_string()),
     }
@@ -261,8 +290,11 @@ fn check_providers() -> Status {
         None => return Status::Warn("cannot resolve home config dir".to_string()),
     };
     match ProvidersConfig::load_global() {
+        // A failure, not a warning: with no provider every session ends before its
+        // first model call, and `doctor` exiting 0 on such a host is the one answer
+        // that is certainly wrong.
         Ok(cfg) if cfg.providers.is_empty() => {
-            Status::Warn("none configured; run `cowboy models setup`".to_string())
+            Status::Fail("none configured; run `cowboy models setup`".to_string())
         }
         // Loud warning if the key file lost its 0600 perms (hand-edited, restored
         // from backup, copied) — group/other can read the API keys.
@@ -287,7 +319,9 @@ fn check_models(project_path: &Path) -> Status {
         Err(e) => return Status::Fail(e.to_string()),
     };
     if providers.providers.is_empty() {
-        return Status::Warn("no provider; run `cowboy models setup`".to_string());
+        // Already reported against `providers`; keep it quiet here rather than failing
+        // twice for one cause.
+        return Status::Warn("no provider (see above)".to_string());
     }
     let user = match ModelsConfig::user_path().map(|p| ModelsConfig::load_opt(&p)) {
         Some(Ok(m)) => m,
@@ -300,8 +334,61 @@ fn check_models(project_path: &Path) -> Status {
     };
     match resolve_model(&providers, user.as_ref(), project.as_ref(), None) {
         Ok(m) => Status::Ok(format!("default resolves to {} @ {}", m.model, m.base_url)),
-        Err(e) => Status::Warn(e.to_string()),
+        // Same reasoning as `providers`: a provider with no usable model cannot run a
+        // turn, so this is a failure the exit code has to carry.
+        Err(e) => Status::Fail(format!("{e}; add one with `cowboy models add <model-id>`")),
     }
+}
+
+/// One or two sentences naming what the failures prevent, and where to start.
+///
+/// Split by kind because the consequences differ: a config gap means `cowboy` will not
+/// start, a kernel gap means the *sandbox* will not, and a user reading a column of
+/// `[fail]` lines should not have to classify them to know which they have.
+fn verdict(r: &Report) -> Vec<String> {
+    const CONFIG: &[&str] = &["security.yaml", "agent.yaml", "providers", "models"];
+    let (config, host): (Vec<&String>, Vec<&String>) =
+        r.failed.iter().partition(|l| CONFIG.contains(&l.as_str()));
+    let mut out = Vec::new();
+    if !config.is_empty() {
+        let project = |l: &str| l == "security.yaml" || l == "agent.yaml";
+        let broken: Vec<&str> = config
+            .iter()
+            .map(|l| l.as_str())
+            .filter(|l| project(l) && !r.absent.iter().any(|a| a == l))
+            .collect();
+        if !broken.is_empty() {
+            // Present but wrong. `cowboy init` is the wrong advice here — it refuses to
+            // overwrite, and `--force` would throw away whatever the user edited. The
+            // detail line above already says what is wrong with it; this says where.
+            out.push(format!(
+                "fix {} in .cowboy/ — the problem is in the file, not that it is missing",
+                broken.join(" and ")
+            ));
+        } else {
+            // `init` first when the project itself is missing: `models setup` would
+            // succeed and the next run would still fail. This is the same ordering the
+            // first-run report uses, for the same reason.
+            let first = if config.iter().any(|l| project(l)) {
+                "cowboy init"
+            } else {
+                "cowboy models setup"
+            };
+            out.push(format!(
+                "cowboy cannot start here yet — start with `{first}`"
+            ));
+        }
+    }
+    if !host.is_empty() {
+        out.push(format!(
+            "the sandbox cannot run on this host ({}) — see the remedies above",
+            host.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    out
 }
 
 fn check_config_separation(path: &Path) -> Status {
@@ -328,6 +415,81 @@ mod tests {
             detail: "ABI 2, but 6 is required".into(),
             remedy: remedy.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn the_verdict_sends_you_to_init_before_models() {
+        // Both orders "work" in the sense of fixing a line, but only one order fixes the
+        // session: `models setup` on an uninitialized project leaves it still unable to
+        // start.
+        let mut r = Report::new();
+        r.check("security.yaml", Status::Missing("missing".into()));
+        r.check("providers", Status::Fail("none".into()));
+        let v = verdict(&r);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("cowboy init"), "{v:?}");
+    }
+
+    #[test]
+    fn a_broken_config_file_is_not_answered_with_init() {
+        // The misdirection this replaces: any security.yaml failure sent you to
+        // `cowboy init`, which refuses to overwrite an existing file — and `--force`
+        // would discard whatever you had edited. A present-but-invalid file needs fixing,
+        // not scaffolding.
+        let mut r = Report::new();
+        r.check(
+            "security.yaml",
+            Status::Fail("mount source \".\" would expose host-owned secrets".into()),
+        );
+        let v = verdict(&r);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("fix security.yaml"), "{v:?}");
+        assert!(!v[0].contains("cowboy init"), "{v:?}");
+    }
+
+    #[test]
+    fn a_missing_file_and_a_broken_one_are_told_apart() {
+        // Both are `[fail] security.yaml` to the reader; only the advice differs.
+        let mut missing = Report::new();
+        missing.check("agent.yaml", Status::Missing("missing".into()));
+        assert!(verdict(&missing)[0].contains("cowboy init"));
+
+        let mut broken = Report::new();
+        broken.check("agent.yaml", Status::Fail("unknown field `timout`".into()));
+        assert!(verdict(&broken)[0].contains("fix agent.yaml"));
+
+        // A missing project file alongside a broken one: fixing the broken one is still
+        // the harder half, and `init` will not touch it, so say that.
+        let mut both = Report::new();
+        both.check("security.yaml", Status::Fail("bad mount".into()));
+        both.check("agent.yaml", Status::Missing("missing".into()));
+        assert!(
+            verdict(&both)[0].contains("fix security.yaml"),
+            "{:?}",
+            verdict(&both)
+        );
+    }
+
+    #[test]
+    fn config_and_host_failures_are_reported_as_different_problems() {
+        // They have different consequences — one stops cowboy starting, the other stops
+        // the sandbox confining — and lumping them together buries the second.
+        let mut r = Report::new();
+        r.check("providers", Status::Fail("none".into()));
+        r.check("landlock", Status::Fail("ABI too old".into()));
+        let v = verdict(&r);
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert!(v[0].contains("cowboy models setup"), "{v:?}");
+        assert!(v[1].contains("landlock"), "{v:?}");
+        assert!(v[1].contains("sandbox cannot run"), "{v:?}");
+    }
+
+    #[test]
+    fn a_healthy_run_has_no_verdict_to_give() {
+        let mut r = Report::new();
+        r.check("landlock", Status::Ok("ABI 6".into()));
+        r.check("models", Status::Warn("something minor".into()));
+        assert!(verdict(&r).is_empty());
     }
 
     /// A prerequisite the sandbox cannot run without must be a **failure**, so

@@ -17,6 +17,6 @@ expression: render(&app)
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    ready · /diff to review, then commit                     Δ 2f +30 -4
-╭ Enter send · Shift+Enter newline · ↑↓ history · drag+y copy · /help ·╮
+╭ Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

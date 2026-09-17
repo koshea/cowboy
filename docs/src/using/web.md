@@ -44,7 +44,9 @@ Open the URL and you get a list of your sessions; tap one to:
 - **interrupt** the current turn;
 - **watch a subagent** — when the agent fans work out to a [crew](crew.md), the
   subagents appear as chips above the transcript; tap one to open its live output
-  read-only (and tap back to return).
+  read-only (and tap back to return). A chip marked `⏸ +N?` is a worker waiting for
+  the foreman to grant it more turns; a `⏭ N queued` marker shows input deferred to
+  after the current turn.
 
 The view **sticks to the bottom** as new content streams in (scroll up to read
 back; it re-follows when you return to the bottom). If the connection drops — a

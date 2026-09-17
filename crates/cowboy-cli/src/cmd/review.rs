@@ -46,7 +46,11 @@ pub fn run(session: Option<String>, branch: Option<String>) -> Result<()> {
         None,
         now_ms(),
     ) {
-        Ok(a) => println!("\n✓ recorded review as {} ({})", a.id, a.path.display()),
+        Ok(a) => crate::ui::ok(&format!(
+            "recorded review as {} ({})",
+            a.id,
+            a.path.display()
+        )),
         Err(e) => eprintln!("review printed but not recorded: {e}"),
     }
     Ok(())

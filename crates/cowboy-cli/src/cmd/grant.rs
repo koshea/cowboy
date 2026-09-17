@@ -44,10 +44,10 @@ pub fn run(args: GrantArgs) -> Result<()> {
         let changed = grants::remove_in(&dir, &root, &resolved)
             .with_context(|| format!("forgetting the grant for {}", resolved.display()))?;
         if changed {
-            println!("forgot the grant for {}", resolved.display());
-            println!("Running commands keep it until the session restarts.");
+            crate::ui::ok(&format!("forgot the grant for {}", resolved.display()));
+            crate::ui::step("running commands keep it until the session restarts");
         } else {
-            println!("no saved grant for {}", resolved.display());
+            crate::ui::info(&format!("no saved grant for {}", resolved.display()));
         }
         return Ok(());
     }
@@ -84,19 +84,19 @@ pub fn run(args: GrantArgs) -> Result<()> {
 
     let access = if args.ro { "read-only" } else { "read-write" };
     if changed {
-        println!(
+        crate::ui::ok(&format!(
             "granted {access} access to {} for {}",
             path.display(),
             persistence.label()
-        );
-        println!("It applies to the next command, in this session and future ones.");
-        println!("Already-running processes keep their old view until restarted.");
+        ));
+        crate::ui::step("it applies to the next command, in this session and future ones");
+        crate::ui::step("already-running processes keep their old view until restarted");
     } else {
-        println!(
+        crate::ui::info(&format!(
             "{} was already granted {access} for {}",
             path.display(),
             persistence.label()
-        );
+        ));
     }
     Ok(())
 }
@@ -104,8 +104,8 @@ pub fn run(args: GrantArgs) -> Result<()> {
 fn list(dir: &Path, root: &Path) -> Result<()> {
     let entries = grants::listing(dir, root);
     if entries.is_empty() {
-        println!("no saved grants for {}", root.display());
-        println!("Add one with `cowboy grant <path>`.");
+        crate::ui::info(&format!("no saved grants for {}", root.display()));
+        crate::ui::step("add one with `cowboy grant <path>`");
         return Ok(());
     }
     // Flag anything the denylist now refuses. A grant can become invalid after it was

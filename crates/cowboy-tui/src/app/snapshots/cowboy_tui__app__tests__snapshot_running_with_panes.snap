@@ -17,6 +17,6 @@ expression: render(&app)
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
 ⠷  thinking 0s…
-╭ Enter send · Shift+Enter newline · /help · Ctrl-C interrupt ─────────╮
+╭ type to steer · /after <msg> to queue · Ctrl-C interrupts · F1 help ─╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

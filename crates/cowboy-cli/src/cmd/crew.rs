@@ -152,11 +152,23 @@ fn price_sorted(models: &BTreeMap<String, ModelDef>) -> Vec<String> {
 
 fn init(force: bool) -> Result<()> {
     let path = crew::path().context("cannot resolve home config dir")?;
-    if path.exists() && !force {
-        bail!(
-            "crew.yaml already exists at {} (use --force to overwrite)",
+    if path.exists() {
+        if !force {
+            bail!(
+                "crew.yaml already exists at {} (use --force to overwrite)",
+                path.display()
+            );
+        }
+        // The roster is hand-tuned in practice — which model each role gets, and the
+        // delegation grants — so regenerating it from price tiers discards choices the
+        // template cannot reconstruct.
+        crate::ui::warn(&format!(
+            "--force will replace your hand-edited roster at {}",
             path.display()
-        );
+        ));
+        if !crate::prompt::confirm_destructive("Overwrite crew.yaml?")? {
+            return Ok(());
+        }
     }
     let models = merged_models()?;
     if models.is_empty() {
@@ -173,7 +185,7 @@ fn init(force: bool) -> Result<()> {
 
     let cfg = crew::default_with_tiers(&cheap, &standard, &premium);
     crew::save(&cfg)?;
-    println!("✓ wrote crew roster to {}", path.display());
+    crate::ui::ok(&format!("wrote crew roster to {}", path.display()));
     println!("  tiers: cheap={cheap}  standard={standard}  premium={premium}");
     println!(
         "  foreman: your selected model ({}) — change it with `cowboy models use` or /model",
@@ -255,7 +267,10 @@ fn validate() -> Result<()> {
     let names = model_names(&models);
     match cfg.validate(&names) {
         Ok(()) => {
-            println!("✓ crew roster is valid ({} categories)", cfg.crew.len());
+            crate::ui::ok(&format!(
+                "crew roster is valid ({} categories)",
+                cfg.crew.len()
+            ));
             Ok(())
         }
         Err(e) => bail!("crew roster invalid: {e}"),

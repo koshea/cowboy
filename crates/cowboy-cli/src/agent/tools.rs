@@ -11,6 +11,10 @@ pub const TOOL_SHELL: &str = "shell";
 pub const TOOL_FINAL: &str = "final";
 pub const TOOL_ASK_USER: &str = "ask_user";
 pub const TOOL_SUBAGENT: &str = "subagent";
+pub const TOOL_JOBS: &str = "jobs";
+pub const TOOL_WAIT: &str = "wait";
+pub const TOOL_JOB_REPLY: &str = "job_reply";
+pub const TOOL_REQUEST_TURNS: &str = "request_turns";
 pub const TOOL_READ: &str = "read";
 pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_WRITE: &str = "write";
@@ -85,6 +89,59 @@ pub struct SubagentArgs {
     /// `cowboy agents list`. (The crew still picks the model from category/effort.)
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+/// Arguments for the `jobs` tool — no arguments; it lists everything.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct JobsArgs {}
+
+/// Arguments for the `wait` tool.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// Job ids to wait for. Omit to wait for whichever background job reports next.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    /// Wait for *all* the named jobs (or all running jobs) instead of returning as
+    /// soon as the first one reports. Defaults to false.
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// Give up waiting after this many seconds and return so you can do something
+    /// else. Defaults to a few minutes; capped by the host.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Arguments for the `job_reply` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct JobReplyArgs {
+    /// The job asking for more turns, or asking a question.
+    pub id: String,
+    /// One of: `answer` (reply to a question), `grant` (more turns), `redirect` (more
+    /// turns, different approach), `wrap_up` (stop exploring and write up what it has),
+    /// `stop` (abandon it).
+    pub verdict: String,
+    /// How many more turns to grant, for `grant`/`redirect`. The host clamps this to
+    /// the worker's remaining ceiling.
+    #[serde(default)]
+    pub iterations: Option<u32>,
+    /// What to do differently — required for `redirect`, the reason for `stop`, and the
+    /// reply itself for `answer`.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
+/// Arguments for the `request_turns` tool (a delegated worker asking its foreman for
+/// more turns).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct RequestTurnsArgs {
+    /// What you have established so far — concrete findings, not "making progress".
+    pub progress: String,
+    /// What is still left to do.
+    pub remaining: String,
+    /// The single next concrete step you would take.
+    pub next_step: String,
+    /// How many more turns you need to finish.
+    pub iterations: u32,
 }
 
 /// Arguments for the `read` tool.
@@ -476,11 +533,59 @@ pub fn definitions() -> Vec<ToolDef> {
                           Do NOT pick a model. Optionally set `agent` to adopt a named specialist \
                           definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \
                           \"security-reviewer\"; discover with `cowboy agents list`). Include a \
-                          `reason` and the `expected_artifact`. Returns the worker's final summary. \
-                          Prefer small, well-scoped tasks; emit several calls in one message to run \
-                          them in parallel."
+                          `reason` and the `expected_artifact`. ASYNCHRONOUS: returns a job id \
+                          immediately, NOT the worker's answer — keep working, and the result is \
+                          delivered to you as a message when the job finishes (`jobs` to check, \
+                          `wait` only when you have nothing else to do). Size each task to fit one \
+                          worker's turn grant: split large work (per crate, module, or concern) and \
+                          emit several calls in one message to run them in parallel."
                 .into(),
             parameters: schema_for::<SubagentArgs>(),
+        },
+        ToolDef {
+            name: TOOL_JOBS.into(),
+            description: "List the background subagent jobs you have dispatched: state, how long \
+                          each has been running, and its turn usage (used/granted, and the host \
+                          ceiling it can be granted up to). Read-only — use it to decide whether \
+                          to keep working, `wait`, or grant a worker more turns."
+                .into(),
+            parameters: schema_for::<JobsArgs>(),
+        },
+        ToolDef {
+            name: TOOL_WAIT.into(),
+            description: "Pause until a background subagent job reports — it finishes, or it asks \
+                          for more turns. Use this ONLY when you have nothing else useful to do; \
+                          results are delivered to you automatically either way, so waiting is \
+                          never required to receive them. Returns early on a timeout so you are \
+                          never stuck, and the user can always interrupt you."
+                .into(),
+            parameters: schema_for::<WaitArgs>(),
+        },
+        ToolDef {
+            name: TOOL_JOB_REPLY.into(),
+            description: "Answer a blocked subagent. Use `answer` (with your reply in \
+                          `instructions`) when it asked a question about the work — it is asking \
+                          you because you have the context it lacks. When it has spent its turn \
+                          grant: `grant` gives it more turns, `redirect` gives it turns plus a \
+                          different approach, `wrap_up` makes it write up what it has now, `stop` \
+                          abandons it. For turn requests, judge the measured evidence in its \
+                          report (files read, edits made, commands run, whether anything new \
+                          happened) rather than its own optimism: no new files and no edits means \
+                          more turns will not help."
+                .into(),
+            parameters: schema_for::<JobReplyArgs>(),
+        },
+        ToolDef {
+            name: TOOL_REQUEST_TURNS.into(),
+            description: "Ask your foreman for more turns, because the task is larger than the \
+                          grant you were given. Report honestly: what you have established, what \
+                          is left, the next concrete step, and how many more turns you need. You \
+                          will be paused until the foreman answers — it may grant the turns, \
+                          redirect you, tell you to write up what you have, or stop the work. \
+                          Cowboy attaches measured evidence of your progress to the request, so \
+                          an accurate report is in your interest."
+                .into(),
+            parameters: schema_for::<RequestTurnsArgs>(),
         },
     ]
 }
@@ -510,7 +615,11 @@ mod tests {
                 "propose_scope_change",
                 "final",
                 "ask_user",
-                "subagent"
+                "subagent",
+                "jobs",
+                "wait",
+                "job_reply",
+                "request_turns"
             ]
         );
     }

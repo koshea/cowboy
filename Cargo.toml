@@ -27,6 +27,7 @@ cowboy-tui = { path = "crates/cowboy-tui" }
 
 # cli / runtime
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4.6.11"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 futures = "0.3"

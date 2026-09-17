@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│› review the storage crates                    ││no network activity  │
+│                                               ││yet                  │
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+│                                               ││                     │
+│                                               │╰─────────────────────╯
+│                                               │╭ background ─────────╮
+│                                               ││⟳ review/redb opus 42│
+│                                               ││⋯ review/columnar opu│
+│                                               ││⏸ tests/small cheap w│
+│                                               ││                     │
+╰───────────────────────────────────────────────╯╰─────────────────────╯
+⠷  thinking 0s…                            3 jobs (1 asking)   1 queued
+╭ type to steer · /after <msg> to queue · Ctrl-C interrupts · F1 help ─╮
+│                                                                      │
+╰──────────────────────────────────────────────────────────────────────╯

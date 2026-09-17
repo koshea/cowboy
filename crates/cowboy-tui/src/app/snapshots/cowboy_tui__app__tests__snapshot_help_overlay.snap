@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│›╭ Keys & commands ─────────────────────────────────────────────────╮ │
+│ │Steering a run                                                    │ │
+│ │  Ctrl-C        interrupt the turn                                │ │
+│ │  /after <msg>  queue for after this turn                         │ │
+│ │                                                                  │ │
+│ │Delegated work                                                    │ │
+│ │  Alt-j         what the subagents are doing                      │─╯
+│ │                                                                  │─╮
+│ │                                                                  │t│
+│ │                                                                  │ │
+│ │                                                                  │ │
+│ │                                                                  │ │
+╰─│                                                                  │─╯
+  │                                                                  │
+╭ │Esc closes                                                        │─╮
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+╰──────────────────────────────────────────────────────────────────────╯
