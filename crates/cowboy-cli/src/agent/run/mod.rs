@@ -99,19 +99,75 @@ validated, and remaining risks or follow-up work.";
 /// mode (a roster exists and delegation is enabled) **and** only for a loop that can
 /// actually delegate. In solo mode — or in a worker already at the depth limit — this
 /// isn't shown and the `subagent` tool isn't offered.
-pub const FOREMAN_PROMPT: &str =
-    "\n\nYou are the foreman of a crew. For focused, separable work, delegate it with the \
+/// Build the foreman guidance for a given roster.
+///
+/// The category list and the effort anchors are generated from the *user's* roster
+/// rather than hardcoded. A hardcoded list had drifted: it named nine categories
+/// and omitted `review`, while the `subagent` tool description advertised `review`
+/// as an example — so review work was routed to a category the foreman had never
+/// been told existed, fell through to `general`, and the roster's review slots were
+/// never used. Generating it means the two can never disagree again, and a user who
+/// adds a category to `crew.yaml` gets a foreman that knows about it.
+pub fn foreman_prompt(roster: Option<&cowboy_core::crew::CrewConfig>) -> String {
+    use cowboy_core::crew::{builtin_description, Delegation, Effort, GENERAL};
+
+    // Each category is listed WITH its meaning, so the model routes on a stated
+    // contract instead of inferring one from the word. The meaning is the user's own
+    // if they wrote one in `crew.yaml`, else Cowboy's shipped definition — either way
+    // the roster the user authored and the prompt the model reads cannot disagree.
+    let named: Vec<(&str, Option<&str>)> = match roster {
+        Some(c) if !c.crew.is_empty() => c
+            .crew
+            .keys()
+            .map(|k| (k.as_str(), c.description_for(k)))
+            .collect(),
+        _ => vec![(GENERAL, builtin_description(GENERAL))],
+    };
+    let cat_list = named
+        .iter()
+        .map(|(name, desc)| match desc {
+            Some(d) => format!("`{name}` — {d}"),
+            None => format!("`{name}`"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    // Anchor each effort to the turn grant this roster actually hands out, so the
+    // scale means something concrete ("about 25 turns") rather than a bare adjective.
+    let d = roster.map(|c| c.delegation.clone()).unwrap_or_default();
+    let g = |e: Effort| Delegation::grant_for(&d, e);
+
+    format!(
+        "\n\nYou are the foreman of a crew. For focused, separable work, delegate it with the \
 `subagent` tool instead of doing everything yourself: describe the work by \
-`category` (the kind — exploration, tests, frontend, backend, docs, \
-debugging, refactor, e2e, or general) and `effort` (tiny/small/medium/large/\
-deep), with a `reason` and the `expected_artifact`. Do NOT pick a model — Cowboy \
-routes each request to the right crew model. To run work in parallel, emit \
-several `subagent` calls in one message. Named specialist agents may be defined \
-under `.claude/agents/`/`.cowboy/agents/` (`cowboy agents list`); adopt one by \
-passing `agent: <name>` to `subagent`. Delegate when work is scoped and separable \
-(exploration, test-writing, an independent component, a review pass); do it \
-yourself when the task is tiny, the hand-off costs more than the work, or it \
-needs continuous coordination with your current state.\n\n\
+`category` (the kind) and `effort` (how hard), with a `reason` and the \
+`expected_artifact`. Do NOT pick a model — Cowboy routes each request to the right \
+crew model. To run work in parallel, emit several `subagent` calls in one message. \
+Named specialist agents may be defined under `.claude/agents/`/`.cowboy/agents/` \
+(`cowboy agents list`); adopt one by passing `agent: <name>` to `subagent`. Delegate \
+when work is scoped and separable (exploration, test-writing, an independent \
+component, a review pass); do it yourself when the task is tiny, the hand-off costs \
+more than the work, or it needs continuous coordination with your current state.\n\n\
+CHOOSING `category`. Use exactly one of the categories this user's roster defines, \
+and use it as defined here rather than as the word suggests:\n  {cat_list}\n\
+Name the work by the artifact it produces, not the subject it touches — test files \
+are test work whoever owns the code under test, and reading code to answer a \
+question is investigation even when the code it reads is UI. A category outside that \
+list is not an error you will be told about — it silently falls back to `general` and \
+the roster's routing is wasted, so never invent one. If two categories both seem to \
+fit, choose the one whose stated deliverable matches what you actually want back.\n\n\
+CHOOSING `effort`. Effort is the difficulty dial, and it sets BOTH the model and the \
+worker's turn grant (one turn = one tool call plus the model's reply). On this \
+roster: `tiny` ≈ {tiny} turns — one known edit, a lookup, a single file, no \
+investigation. `small` ≈ {small} — one obvious change, a little looking around. \
+`medium` ≈ {medium} (the default) — one module or concern, real investigation before \
+editing. `large` ≈ {large} — a feature or refactor over several files, including \
+verifying it. `deep` ≈ {deep} — open-ended work: cause unknown, design cross-cutting, \
+worth the strongest model you have. Judge difficulty only: do NOT raise effort to \
+signal that something is urgent or important. When torn between two levels pick the \
+LOWER one — a worker that needs more can report its progress and ask you for turns, \
+whereas an over-sized effort pays a stronger model's rate on every token of a job \
+that never needed it.\n\n\
 Delegation is ASYNCHRONOUS. `subagent` returns a job id immediately and the worker \
 runs in the background — it does NOT return the answer. Keep working while it runs: \
 investigate something else, delegate more, or answer the user. Each result is \
@@ -134,7 +190,15 @@ Prefer small, well-scoped subagent tasks that return a concrete artifact. If a \
 subagent result comes back prefixed `[partial]`, it ran but did not finish cleanly — \
 the text is its work so far plus a session id. Treat that as a checkpoint: \
 re-delegate continuing from what's there (pass the prior work as `context`) rather \
-than starting the task over.";
+than starting the task over.",
+        cat_list = cat_list,
+        tiny = g(Effort::Tiny),
+        small = g(Effort::Small),
+        medium = g(Effort::Medium),
+        large = g(Effort::Large),
+        deep = g(Effort::Deep),
+    )
+}
 
 /// Extra guidance for a worker running *as* a subagent (depth > 0). Its result is
 /// captured from stdout by the foreman, so a single oversized tool call (e.g. a
@@ -911,7 +975,12 @@ impl<'a> AgentLoop<'a> {
         // timeout and be answered by the fallback — worse than not asking.
         let control = crate::agent::jobctl::ControlDir::from_env();
         let can_request_turns = budget.supervised && control.is_some();
-        let system = system_prompt(can_delegate, subagent_depth, can_request_turns);
+        let system = system_prompt(
+            can_delegate,
+            subagent_depth,
+            can_request_turns,
+            crew_cfg.as_ref(),
+        );
         let tools = tool_surface(can_delegate, can_request_turns);
         let stall_window = crew_cfg
             .as_ref()

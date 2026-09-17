@@ -251,6 +251,21 @@ fn list() -> Result<()> {
         }
         println!();
     }
+    // Print the meaning the foreman is actually routing on. Without this the
+    // roster shows *where* work goes but not *what* each slot claims to be for, and
+    // the user's idea of a category can drift from the model's for a long time
+    // before anything looks wrong.
+    println!();
+    println!("what each category means to the agent:");
+    for cat in cfg.crew.keys() {
+        match cfg.description_for(cat) {
+            Some(d) => println!("  {cat:<cat_w$}{d}"),
+            None => println!(
+                "  {cat:<cat_w$}(undefined — the agent will guess from the name; \
+                 set `descriptions.{cat}` in crew.yaml)"
+            ),
+        }
+    }
     Ok(())
 }
 

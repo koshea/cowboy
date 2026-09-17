@@ -62,6 +62,12 @@ provide. Install it on the host and:
   (`MISE_TRUSTED_CONFIG_PATHS=/workspace`), and mise's shims are on `PATH` for
   both the agent's commands and an interactive `cowboy shell`.
 
+- Your own mise store (`~/.local/share/mise`) is shared **copy-on-write**, so a
+  toolchain you already installed is reused instead of downloaded again. The
+  sandbox reads your store and writes to `.cowboy/mise-upper` in the project, so
+  it can install a version you do not have — and your store is never written to.
+  Turn it off with `share_mise_store: false`; it also needs `host_tools`.
+
 Commit a mise config to your repo and the agent gets a consistent, reproducible
 toolchain every session.
 

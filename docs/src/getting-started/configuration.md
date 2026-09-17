@@ -18,6 +18,7 @@ sandbox:
   memory: 8g                     # or `auto` (¼ host RAM, 4g–16g); omit = unlimited
   cpus: 2                        # number or `auto` (½ host cores, 2–8); omit = unlimited
   host_tools: true               # expose ~/.local/bin, ~/.cargo/bin … read-only
+  share_mise_store: true         # reuse your mise toolchains (copy-on-write)
 network_policy:
   default_external: ask          # allow | deny | ask
   allow: { domains: [github.com], cidrs: [], ports: [80, 443] }

@@ -73,6 +73,52 @@ pub const DEFAULT_EFFORT: Effort = Effort::Medium;
 /// The catch-all category every roster must define.
 pub const GENERAL: &str = "general";
 
+/// Shipped meanings for the categories Cowboy suggests by default.
+///
+/// These exist so the foreman routes on a **stated contract** rather than on
+/// whatever it infers from a bare word like `exploration`. Each one is phrased by
+/// what the worker *does* and what it *returns*, because that is what distinguishes
+/// the pairs that actually get confused: `exploration` vs `review` (both read code,
+/// but one answers a question and the other judges a change), and `debugging` vs
+/// `backend` (both edit server code, but one starts from a failure with an unknown
+/// cause). A user who means something different overrides it in `crew.yaml`.
+pub fn builtin_description(category: &str) -> Option<&'static str> {
+    Some(match category {
+        GENERAL => "anything that does not clearly belong to another category; the fallback",
+        "exploration" => {
+            "read-only investigation: find where something lives, how it works, or answer a \
+             question about the codebase. Returns findings; changes no files"
+        }
+        "backend" => "server-side code: APIs, services, data access, business logic, migrations",
+        "frontend" => "user-facing code: components, markup, styling, client state and interaction",
+        "tests" => {
+            "writing or repairing unit/integration tests. The artifact is test files, whatever \
+             subsystem they cover — tests for backend code are `tests`, not `backend`"
+        }
+        "e2e" => {
+            "end-to-end tests that drive the assembled system, plus the harness and fixtures \
+             they need"
+        }
+        "docs" => {
+            "prose written for humans: READMEs, guides, reference pages, changelogs, release \
+             notes"
+        }
+        "debugging" => {
+            "a known failure with an unknown cause: reproduce it, isolate it, explain it, and \
+             normally fix it. Start here when something is broken and you cannot yet say why"
+        }
+        "refactor" => {
+            "restructuring existing code without changing its behaviour; the tests that passed \
+             before must pass after"
+        }
+        "review" => {
+            "reading a finished change and reporting what is wrong with it: correctness, \
+             security, clarity. It reports; it does not fix"
+        }
+        _ => return None,
+    })
+}
+
 /// A per-category effort ramp: either a single model for all efforts, or sparse
 /// floors (effort → model) that fill upward.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +310,16 @@ pub struct CrewConfig {
     /// default — e.g. tests/refactor cooler, exploration warmer.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub temperature: BTreeMap<String, f32>,
+    /// Optional per-category **meaning**, verbatim into the foreman's system prompt.
+    ///
+    /// Categories are free-form strings, so without this the foreman can only infer
+    /// what `exploration` or `deep` work means from the name — and its guess is not
+    /// necessarily the one the user had in mind when they wrote the roster. A
+    /// description makes the user's intent *the* definition the model routes on:
+    /// the same sentence that documents the slot is the sentence the model reads.
+    /// Unset categories fall back to [`builtin_description`], then to the bare name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub descriptions: BTreeMap<String, String>,
     #[serde(default)]
     pub delegation: Delegation,
     /// Accepted and ignored: old `crew.yaml` files carried a `planner:` block, from
@@ -301,6 +357,18 @@ impl CrewConfig {
     /// works solo.
     pub fn enabled(&self) -> bool {
         self.delegation.enabled
+    }
+
+    /// The meaning of a category: the user's own wording when they gave one,
+    /// otherwise the shipped definition for a category Cowboy knows.
+    ///
+    /// The user's text wins so that the roster is self-documenting *and*
+    /// self-enforcing — what they wrote in `crew.yaml` is what the foreman reads.
+    pub fn description_for(&self, category: &str) -> Option<&str> {
+        self.descriptions
+            .get(category)
+            .map(String::as_str)
+            .or_else(|| builtin_description(category))
     }
 
     /// Resolve a delegation request to a model name. Total: always returns a
@@ -475,13 +543,18 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
     crew.insert("frontend".into(), build.clone());
     crew.insert("refactor".into(), build.clone());
     crew.insert("debugging".into(), build.clone());
-    crew.insert("e2e".into(), strong);
+    crew.insert("e2e".into(), strong.clone());
+    // `review` is judgement work, so it is biased strong like e2e. It is also in the
+    // default roster because the `subagent` tool advertises it: a roster without it
+    // sent every review delegation through `general`, which is how it went unnoticed.
+    crew.insert("review".into(), strong);
     crew.insert(GENERAL.into(), build);
 
     CrewConfig {
         version: 1,
         crew,
         temperature: BTreeMap::new(),
+        descriptions: BTreeMap::new(),
         delegation: Delegation::default(),
         legacy_planner: None,
     }
@@ -714,6 +787,7 @@ mod tests {
             version: 1,
             crew,
             temperature: BTreeMap::new(),
+            descriptions: BTreeMap::new(),
             delegation: Delegation::default(),
             legacy_planner: None,
         }

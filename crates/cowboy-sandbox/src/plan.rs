@@ -166,10 +166,41 @@ pub struct ResourceLimits {
     pub jobs: Option<u32>,
 }
 
+/// A host directory exposed **copy-on-write**: readable at `target`, with every
+/// write landing in `upper` instead of the host's copy.
+///
+/// The motivating case is a language-version store (mise). A plain read-only bind
+/// is not enough — the tool must be able to install a version the host lacks, and a
+/// read-only store fails the install outright — while a read-write bind would let
+/// the agent rewrite a binary the user runs on the host afterwards, which is the
+/// one thing [`Bind::ro`] on the toolchain directories exists to prevent.
+///
+/// An overlay keeps both: the host's store is the immutable lower layer, so
+/// everything already installed is reused with nothing to download, and anything
+/// the sandbox installs or modifies is diverted into `upper`, which lives with the
+/// project. The host's copy is never written to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overlay {
+    /// The host directory read through the overlay. Never written to.
+    pub lower: PathBuf,
+    /// Where writes land. Persistent, so an install survives the session.
+    pub upper: PathBuf,
+    /// overlayfs scratch. Must be an empty directory on the same filesystem as
+    /// `upper`, and is managed by the kernel, not by us.
+    pub work: PathBuf,
+    /// Where the merged view appears inside the sandbox.
+    pub target: String,
+    /// Why this overlay exists, for `cowboy sandbox plan`.
+    pub why: String,
+}
+
 /// Everything needed to confine and run one command.
 #[derive(Debug, Clone)]
 pub struct SandboxPlan {
     pub binds: Vec<Bind>,
+    /// Copy-on-write exposures, applied after [`Self::binds`] so an overlay can be
+    /// mounted onto a path a bind created.
+    pub overlays: Vec<Overlay>,
     /// Mount a fresh `procfs` here; a private PID namespace makes it show only
     /// the sandbox's own processes — which is also what hides the relay.
     pub proc_at: String,
@@ -256,6 +287,32 @@ const HOST_TOOL_ENV: &[(&str, &str)] = &[
     ("~/.rustup", "RUSTUP_HOME"),
     ("~/.local/share/pnpm", "PNPM_HOME"),
 ];
+
+/// The host's mise store, shared copy-on-write when `share_mise_store` is on.
+///
+/// Not in [`HOST_USER_TOOL_DIRS`] because a read-only bind is the wrong shape for
+/// it: Cowboy runs `mise install` itself at session start, and against a read-only
+/// store that fails with `Permission denied` the moment a project pins a version
+/// the host does not have. It gets an [`Overlay`] instead — see that type.
+///
+/// Exposed at its **host path**, like every other tool directory, because installs
+/// are full of absolute shebangs and symlinks into their own prefix.
+const HOST_MISE_STORE: &str = "~/.local/share/mise";
+
+/// Where the overlay's write layers live, relative to the project root.
+///
+/// Inside the project rather than the session scratch directory: scratch is
+/// session-scoped, and a store that emptied itself every session would reinstall
+/// every toolchain every time — the exact cost this is here to remove.
+///
+/// Both sit under one parent so it can carry a `.gitignore` of its own (`*`),
+/// which keeps a multi-gigabyte store out of `git status` in every project without
+/// depending on the project's `.gitignore` having been updated. The marker goes on
+/// the parent, never in `upper` itself, because anything in `upper` shows up inside
+/// the merged view — i.e. as a stray file in the user's toolchain store.
+pub const MISE_OVERLAY_DIR: &str = ".cowboy/mise";
+const MISE_UPPER_DIR: &str = ".cowboy/mise/upper";
+const MISE_WORK_DIR: &str = ".cowboy/mise/work";
 
 /// Symlinks recreating a merged-`/usr` layout, so `/bin/sh` and `/lib64/ld.so`
 /// resolve after `pivot_root` onto a fresh root.
@@ -374,6 +431,7 @@ impl SandboxPlan {
         //     not have.
         let mut user_bin_dirs: Vec<String> = Vec::new();
         let mut tool_env: Vec<(String, String)> = Vec::new();
+        let mut overlays: Vec<Overlay> = Vec::new();
         if sec.sandbox.host_tools {
             for (raw, why) in HOST_USER_BIN_DIRS
                 .iter()
@@ -408,6 +466,28 @@ impl SandboxPlan {
                     tool_env.push((var.to_string(), target.clone()));
                 }
                 binds.push(Bind::ro(path, target, why));
+            }
+
+            // The mise store, copy-on-write rather than read-only: see `Overlay`.
+            if sec.sandbox.share_mise_store {
+                if let Some(lower) = probe.expand(HOST_MISE_STORE) {
+                    let denied = denylist.check(&lower).is_some_and(|r| r.blocks_read_only());
+                    if probe.exists(&lower) && !denied {
+                        let target = lower.to_string_lossy().into_owned();
+                        // Exposed at its host path, so `MISE_DATA_DIR` and the
+                        // absolute paths baked into installs agree.
+                        tool_env.push(("MISE_DATA_DIR".to_string(), target.clone()));
+                        overlays.push(Overlay {
+                            lower,
+                            upper: inputs.root.join(MISE_UPPER_DIR),
+                            work: inputs.root.join(MISE_WORK_DIR),
+                            target,
+                            why:
+                                "your mise toolchains (copy-on-write; installs stay in the project)"
+                                    .to_string(),
+                        });
+                    }
+                }
             }
         }
 
@@ -601,6 +681,7 @@ impl SandboxPlan {
 
         Ok(Self {
             binds,
+            overlays,
             proc_at,
             dev_at,
             symlinks: USR_SYMLINKS
@@ -633,6 +714,18 @@ impl SandboxPlan {
                 b.source.display(),
                 b.target,
                 b.why
+            ));
+        }
+        for o in &self.overlays {
+            // Rendered as `cow` rather than ro/rw because it is neither: the source
+            // is readable and never written, the writes go somewhere else, and
+            // conflating it with either would misdescribe the boundary.
+            s.push_str(&format!(
+                "  cow {} -> {}   ({})\n       writes land in {}\n",
+                o.lower.display(),
+                o.target,
+                o.why,
+                o.upper.display()
             ));
         }
         s.push_str(&format!("  proc {}   dev {}\n", self.proc_at, self.dev_at));
@@ -772,6 +865,19 @@ fn build_env(
         ("HOME".to_string(), format!("{workdir}/.cowboy/home")),
         ("COWBOY_SANDBOX".to_string(), "1".to_string()),
         ("PATH".to_string(), sandbox_path(user_bin_dirs)),
+        // mise refuses to parse a config carrying `[env]` or `[tasks]` until it is
+        // trusted, and trust is recorded under $HOME — which is a fresh directory
+        // inside every sandbox, so a `mise trust` on the host never carries in and
+        // the project is untrusted on every run. That made `mise install` (which
+        // Cowboy runs itself on any project with a mise config) fail outright.
+        //
+        // Scoped to the workdir rather than a blanket trust-everything: the prompt
+        // exists to stop a repo running code merely because you cd into it, and
+        // inside the sandbox Cowboy is already deliberately executing this
+        // project's toolchain. It is not part of the boundary — the kernel is —
+        // so nothing is weakened by trusting the one directory the user aimed
+        // Cowboy at, while configs from anywhere else still require a decision.
+        ("MISE_TRUSTED_CONFIG_PATHS".to_string(), workdir.to_string()),
     ];
     env.extend(tool_env);
     if let Some(j) = limits.jobs {
@@ -1010,6 +1116,107 @@ mod tests {
         // Not set when the directory is not there to point at.
         let bare = plan_with(&sec, &[], &host()).unwrap();
         assert_eq!(env_of(&bare, "RUSTUP_HOME"), None);
+    }
+
+    /// mise records trust under $HOME, and the sandbox's $HOME is fresh every run —
+    /// so a project config with `[env]` or `[tasks]` was untrusted on every start and
+    /// the `mise install` Cowboy runs itself failed with "Config files … are not
+    /// trusted". Trust is scoped to the workdir, never granted globally.
+    #[test]
+    fn the_projects_own_mise_config_is_trusted_inside_the_sandbox() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host()).unwrap();
+        let trusted = env_of(&plan, "MISE_TRUSTED_CONFIG_PATHS")
+            .expect("mise config in the workdir must be trusted or `mise install` fails");
+        let home = env_of(&plan, "HOME").unwrap();
+        // It points at the workdir itself (so nested configs are covered too)…
+        assert!(
+            home.starts_with(trusted),
+            "trust path {trusted} should cover the workspace (HOME is {home})"
+        );
+        // …and not at the filesystem root, which would trust every config anywhere.
+        assert_ne!(trusted, "/", "must not trust configs outside the project");
+        assert!(!trusted.is_empty());
+    }
+
+    /// The host's mise store is shared copy-on-write, never as a plain bind.
+    ///
+    /// Read-only would break the `mise install` Cowboy runs at session start the
+    /// moment a project pins a version the host lacks; read-write would let the
+    /// agent rewrite a binary the user later runs on the host. The overlay is the
+    /// only shape that is both usable and safe, so assert it *is* an overlay and
+    /// that the store never appears in the bind list under either mode.
+    #[test]
+    fn the_hosts_mise_store_is_shared_copy_on_write() {
+        let sec = SecurityConfig::default();
+        let host = host().with_existing(["/home/dev/.local/share/mise"]);
+        let plan = plan_with(&sec, &[], &host).unwrap();
+
+        let o = plan
+            .overlays
+            .iter()
+            .find(|o| o.lower == Path::new("/home/dev/.local/share/mise"))
+            .expect("the mise store should be shared");
+        // Exposed at its host path: installs are full of absolute shebangs.
+        assert_eq!(o.target, "/home/dev/.local/share/mise");
+        // Writes must land with the project, not in the user's store…
+        assert!(o.upper.starts_with("/srv/proj"), "upper: {:?}", o.upper);
+        assert!(o.work.starts_with("/srv/proj"), "work: {:?}", o.work);
+        assert_ne!(o.upper, o.work, "overlayfs needs a separate workdir");
+        // Both under one parent, which carries the `.gitignore` that keeps a
+        // multi-gigabyte store out of `git status`.
+        assert_eq!(o.upper.parent(), o.work.parent());
+        assert!(o
+            .upper
+            .starts_with(Path::new("/srv/proj").join(MISE_OVERLAY_DIR)));
+        // …and the store must never be a bind, in either mode.
+        assert!(
+            !plan
+                .binds
+                .iter()
+                .any(|b| b.source == Path::new("/home/dev/.local/share/mise")),
+            "the mise store must be an overlay, never a bind: {:?}",
+            plan.binds
+        );
+        // The tool must be pointed at it, or the overlay is invisible.
+        assert_eq!(
+            env_of(&plan, "MISE_DATA_DIR"),
+            Some("/home/dev/.local/share/mise")
+        );
+    }
+
+    /// Both switches must actually switch it off, and a host without mise must not
+    /// produce an overlay of a directory that is not there.
+    #[test]
+    fn sharing_the_mise_store_can_be_turned_off() {
+        let with_mise = host().with_existing(["/home/dev/.local/share/mise"]);
+
+        let off = SecurityConfig {
+            sandbox: cowboy_core::config::SandboxConfig {
+                share_mise_store: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_with(&off, &[], &with_mise).unwrap();
+        assert!(plan.overlays.is_empty());
+        assert_eq!(env_of(&plan, "MISE_DATA_DIR"), None);
+
+        // `host_tools: false` means the machine's toolchain is not exposed at all,
+        // and the mise store is part of that toolchain.
+        let no_tools = SecurityConfig {
+            sandbox: cowboy_core::config::SandboxConfig {
+                host_tools: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let plan = plan_with(&no_tools, &[], &with_mise).unwrap();
+        assert!(plan.overlays.is_empty(), "host_tools off must cover it too");
+
+        // No mise on the host: nothing to share, and no overlay of a missing dir.
+        let plan = plan_with(&SecurityConfig::default(), &[], &host()).unwrap();
+        assert!(plan.overlays.is_empty());
     }
 
     /// `host_tools: false` is a real off switch, for a sandbox that should see only

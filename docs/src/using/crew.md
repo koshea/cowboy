@@ -115,8 +115,31 @@ model:
 ```
 
 Categories: `general exploration backend frontend tests docs debugging
-refactor e2e` (unknown → `general`). Effort defaults to `medium`. Each routed
-launch is recorded as a `SubagentRouted` lifecycle event.
+refactor e2e review` (unknown → `general`). Effort defaults to `medium`. Each
+routed launch is recorded as a `SubagentRouted` lifecycle event.
+
+### What a category means
+
+A category is a free-form string, so the foreman would otherwise have to infer
+what `exploration` or `review` covers from the word alone — and its guess need not
+match what you meant when you wrote the roster. So the meaning is stated, not
+inferred: Cowboy ships a definition for each category above and injects it into the
+foreman's system prompt alongside the name. Override any of them, or define your
+own category, under `descriptions:` — your wording goes into the prompt verbatim,
+so the sentence that documents the slot *is* the sentence the model routes on.
+
+```yaml
+crew:
+  perf:
+    medium: cheap
+    large: premium
+descriptions:
+  perf: "profiling and optimisation; must show a before/after measurement"
+  review: "read the diff and report problems — never edit, never 'just fix it'"
+```
+
+`cowboy crew list` prints the meaning in force for every category, so you can see
+exactly what the agent is routing on and spot a slot that is still guessing.
 
 `effort` now sizes the worker's **turn grant** as well as its model (see [Turn
 grants](#turn-grants-report-progress-request-more)), so size each delegation to fit

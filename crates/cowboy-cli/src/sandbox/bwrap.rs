@@ -160,6 +160,20 @@ pub fn build_argv(
         a.push(b.target.clone().into());
     }
 
+    // Overlays AFTER the binds: an overlay's target can be a path a bind created
+    // (a tool store under a bound home), and bwrap applies mounts in argument
+    // order. Each `--overlay-src` names a lower layer for the `--overlay` that
+    // follows it; writes land in the upper dir, so the host's copy is read-only in
+    // effect without being read-only in the mount — which is the whole point.
+    for o in &plan.overlays {
+        push!("--overlay-src");
+        a.push(o.lower.clone().into_os_string());
+        push!("--overlay");
+        a.push(o.upper.clone().into_os_string());
+        a.push(o.work.clone().into_os_string());
+        a.push(o.target.clone().into());
+    }
+
     push!("--chdir");
     a.push(plan.workdir.clone().into());
 
@@ -207,6 +221,56 @@ mod tests {
             scratch: Path::new("/scratch"),
         };
         SandboxPlan::build(&inputs, &probe).unwrap()
+    }
+
+    /// An overlay must be applied after the binds (its target can be a path a bind
+    /// created) and before `--remount-ro /`, and `--overlay-src` must immediately
+    /// precede the `--overlay` it feeds — bwrap reads them positionally, so a
+    /// reordering silently changes which lower layer is used.
+    #[test]
+    fn an_overlay_is_applied_after_the_binds_and_reads_its_source_first() {
+        let mut p = plan();
+        p.overlays = vec![cowboy_sandbox::plan::Overlay {
+            lower: "/home/dev/.local/share/mise".into(),
+            upper: "/srv/proj/.cowboy/mise/upper".into(),
+            work: "/srv/proj/.cowboy/mise/work".into(),
+            target: "/home/dev/.local/share/mise".into(),
+            why: "test".into(),
+        }];
+        let out: Vec<String> = build_argv(Path::new("/usr/bin/bwrap"), &p, NetMode::Isolated, &[])
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+
+        let src = out
+            .iter()
+            .position(|a| a == "--overlay-src")
+            .expect("a lower layer");
+        let ovl = out
+            .iter()
+            .position(|a| a == "--overlay")
+            .expect("an overlay");
+        assert_eq!(out[src + 1], "/home/dev/.local/share/mise", "lower layer");
+        assert_eq!(ovl, src + 2, "--overlay must follow its --overlay-src");
+        assert_eq!(
+            out[ovl + 1],
+            "/srv/proj/.cowboy/mise/upper",
+            "writes go to upper"
+        );
+        assert_eq!(out[ovl + 2], "/srv/proj/.cowboy/mise/work");
+        assert_eq!(
+            out[ovl + 3],
+            "/home/dev/.local/share/mise",
+            "merged at the host path"
+        );
+
+        let last_bind = out
+            .iter()
+            .rposition(|a| a.starts_with("--ro-bind") || a.starts_with("--bind"))
+            .expect("some binds");
+        assert!(src > last_bind, "overlays come after every bind");
+        let remount = out.iter().position(|a| a == "--remount-ro").unwrap();
+        assert!(ovl < remount, "and before the root is sealed");
     }
 
     fn argv_strings(net: NetMode) -> Vec<String> {

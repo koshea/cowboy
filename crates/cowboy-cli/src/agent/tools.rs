@@ -67,14 +67,21 @@ pub struct SubagentArgs {
     /// conversation, so include anything it needs to know).
     #[serde(default)]
     pub context: Option<String>,
-    /// The KIND of work, so Cowboy routes it to the right crew model. One of:
-    /// general, exploration, backend, frontend, tests, docs, debugging,
-    /// refactor, e2e. Defaults to `general`. Do NOT name a model — routing is the
-    /// user's crew roster.
+    /// The KIND of work, so Cowboy routes it to the right crew model. Use one of
+    /// the categories listed in your system prompt (they come from the user's
+    /// roster — typically general, exploration, backend, frontend, tests, docs,
+    /// debugging, refactor, e2e, review). Name the work by the artifact it
+    /// produces, not the subject it touches. An unlisted category silently falls
+    /// back to `general`. Defaults to `general`. Do NOT name a model — routing is
+    /// the user's crew roster.
     #[serde(default)]
     pub category: Option<String>,
     /// How hard the task is: tiny, small, medium, large, or deep. Defaults to
-    /// `medium`. Used with `category` to pick the model.
+    /// `medium`. Sets BOTH the model and the worker's turn grant, so it is the
+    /// cost dial — judge difficulty only, never urgency or importance. Your
+    /// system prompt gives the turn count each level buys on this roster. When
+    /// torn between two levels, pick the lower: a worker can ask for more turns,
+    /// but an over-sized effort overpays on every token.
     #[serde(default)]
     pub effort: Option<String>,
     /// Why you're delegating this (one line) — recorded with the routing decision.
@@ -527,10 +534,10 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: TOOL_SUBAGENT.into(),
             description: "Delegate a focused, independent sub-task to a worker that shares this \
-                          workspace/container. Describe the work by `category` (the kind: tests, \
-                          exploration, frontend, review, …) and `effort` (tiny/small/medium/large/\
-                          deep) — Cowboy routes it to the right model from the user's crew roster. \
-                          Do NOT pick a model. Optionally set `agent` to adopt a named specialist \
+                          workspace/container. Describe the work by `category` (the kind of \
+                          work — pick one your system prompt lists) and `effort` (tiny/small/\
+                          medium/large/deep, judged on difficulty alone) — Cowboy routes it to the \
+                          right model from the user's crew roster. Do NOT pick a model. Optionally set `agent` to adopt a named specialist \
                           definition from `.claude/agents/`/`.cowboy/agents/` (e.g. \
                           \"security-reviewer\"; discover with `cowboy agents list`). Include a \
                           `reason` and the `expected_artifact`. ASYNCHRONOUS: returns a job id \

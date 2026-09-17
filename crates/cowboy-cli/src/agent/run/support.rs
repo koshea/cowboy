@@ -97,10 +97,13 @@ pub(super) fn system_prompt(
     delegation_available: bool,
     subagent_depth: usize,
     can_request_turns: bool,
+    roster: Option<&cowboy_core::crew::CrewConfig>,
 ) -> String {
     let mut system = String::from(SYSTEM_PROMPT);
     if delegation_available {
-        system.push_str(FOREMAN_PROMPT);
+        // Built from the roster so the categories the foreman is told about are
+        // exactly the ones that can actually route.
+        system.push_str(&foreman_prompt(roster));
     }
     // A worker spawned as a subagent gets extra guidance to stream large outputs
     // to a file rather than risk losing them to a truncated tool call.
@@ -771,24 +774,93 @@ mod tests {
         // The prompt must agree with the tool surface: telling a worker to delegate
         // with no `subagent` tool is what produced "Delegation isn't available at this
         // depth".
-        let foreman = system_prompt(true, 0, false);
+        let foreman = system_prompt(true, 0, false, None);
         assert!(foreman.contains("foreman of a crew"));
         assert!(!foreman.contains(SUBAGENT_PROMPT));
         assert!(!foreman.contains(TURN_REQUEST_PROMPT));
 
-        let leaf = system_prompt(false, MAX_SUBAGENT_DEPTH, true);
+        let leaf = system_prompt(false, MAX_SUBAGENT_DEPTH, true, None);
         assert!(!leaf.contains("foreman of a crew"));
         // …but it still gets the subagent-specific guidance, since it *is* one.
         assert!(leaf.contains(SUBAGENT_PROMPT));
         assert!(leaf.contains(TURN_REQUEST_PROMPT));
 
         // A worker with a grant but no channel to ask on is not told to ask.
-        let unsupervised_leaf = system_prompt(false, 1, false);
+        let unsupervised_leaf = system_prompt(false, 1, false, None);
         assert!(!unsupervised_leaf.contains(TURN_REQUEST_PROMPT));
 
-        let solo_prompt = system_prompt(false, 0, false);
+        let solo_prompt = system_prompt(false, 0, false, None);
         assert!(!solo_prompt.contains("foreman of a crew"));
         assert!(!solo_prompt.contains(SUBAGENT_PROMPT));
+    }
+
+    /// The foreman must be told about exactly the categories that can route, with a
+    /// stated meaning for each. The bug this guards: a hardcoded list omitted
+    /// `review` while the tool advertised it, so review work silently fell back to
+    /// `general` and the roster's review slots were never used.
+    #[test]
+    fn the_foreman_is_told_every_roster_category_and_what_it_means() {
+        use cowboy_core::crew::{builtin_description, CrewConfig, Ramp};
+        use std::collections::BTreeMap;
+
+        let mut crew = BTreeMap::new();
+        for c in ["general", "review", "exploration", "perf"] {
+            crew.insert(c.to_string(), Ramp::Single("m".into()));
+        }
+        let mut descriptions = BTreeMap::new();
+        // A category Cowboy has never heard of, defined by the user.
+        descriptions.insert(
+            "perf".to_string(),
+            "profiling; show before/after".to_string(),
+        );
+        // …and a shipped meaning the user has deliberately overridden.
+        descriptions.insert(
+            "review".to_string(),
+            "read the diff, never edit".to_string(),
+        );
+        let cfg = CrewConfig {
+            version: 1,
+            crew,
+            temperature: BTreeMap::new(),
+            descriptions,
+            delegation: Default::default(),
+            legacy_planner: None,
+        };
+
+        let p = foreman_prompt(Some(&cfg));
+        // Every category the roster defines is named…
+        for c in ["general", "review", "exploration", "perf"] {
+            assert!(
+                p.contains(&format!("`{c}`")),
+                "category {c} missing from prompt"
+            );
+        }
+        // …the user's own wording wins over the shipped definition…
+        assert!(p.contains("read the diff, never edit"));
+        assert!(p.contains("profiling; show before/after"));
+        // …and a category left undescribed still gets Cowboy's definition.
+        assert!(p.contains(builtin_description("exploration").unwrap()));
+
+        // A category NOT in this roster must not be advertised, or the foreman will
+        // spend delegations on a route that silently degrades to `general`.
+        assert!(!p.contains("`frontend`"));
+    }
+
+    /// Effort is the cost dial, so the prompt must state what each level buys on
+    /// *this* roster rather than leaving the model to read the adjectives.
+    #[test]
+    fn the_foreman_gets_this_rosters_actual_turn_grants() {
+        let p = foreman_prompt(None);
+        let d = cowboy_core::crew::Delegation::default();
+        for e in cowboy_core::crew::Effort::all() {
+            let grant = d.grant_for(e);
+            assert!(
+                p.contains(&format!("{grant} turns")) || p.contains(&format!("≈ {grant}")),
+                "effort {} missing its grant ({grant}) from the prompt",
+                e.as_str()
+            );
+        }
+        assert!(p.contains("difficulty"));
     }
 
     #[test]
