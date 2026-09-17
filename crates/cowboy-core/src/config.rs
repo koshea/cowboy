@@ -96,18 +96,6 @@ pub struct SandboxConfig {
     /// system package manager put on the machine.
     #[serde(default = "default_true")]
     pub host_tools: bool,
-    /// Share the host's mise store (`~/.local/share/mise`) copy-on-write, so the
-    /// sandbox reuses toolchains already installed instead of downloading its own.
-    ///
-    /// The host's copy is the immutable lower layer of an overlay: the agent can
-    /// install versions the host lacks, and those writes land with the project —
-    /// never in the user's store. Requires `host_tools`, and is skipped when the
-    /// host has no mise store or the kernel refuses the overlay mount.
-    ///
-    /// Off means a private store per project: correct, but it re-downloads every
-    /// toolchain the host already has (measured at ~2G for one project).
-    #[serde(default = "default_true")]
-    pub share_mise_store: bool,
 }
 
 /// A CPU limit: an explicit core count, or `auto` (resolved from the host).
@@ -736,7 +724,6 @@ impl Default for SandboxConfig {
             memory: None,
             cpus: None,
             host_tools: true,
-            share_mise_store: true,
         }
     }
 }
@@ -1381,10 +1368,6 @@ sandbox:
   # this off it sees only what your package manager installed — a different
   # `cargo`, and nothing from pipx / uv tool / go install / cargo install.
   host_tools: true
-  # Share the host's mise store copy-on-write: toolchains you already installed are
-  # reused instead of re-downloaded, while anything the agent installs lands with
-  # the project and your own store is never written to. Needs host_tools.
-  share_mise_store: true
   # Resource ceilings, enforced with a cgroup. `cpus` also bounds build
   # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
   # every tool reads the CPU quota. Use `auto` to size from the host

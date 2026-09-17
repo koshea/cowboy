@@ -76,21 +76,6 @@ fn build_command(
     // session is running: `current_exe()` then reads `".../cowboy (deleted)"`.
     // `project::self_exe` resolves that, so this is the backstop, not the fix.
     ensure_shim_is_bound(plan)?;
-    // An overlay whose write layers cannot be created — or a kernel with no
-    // overlayfs — is dropped, not fatal. It is an optimisation (reuse the host's
-    // toolchains instead of downloading our own); losing it costs time, whereas
-    // letting bwrap fail the mount would break every command in the session.
-    let usable = usable_overlays(plan);
-    let filtered;
-    let plan = if usable.len() == plan.overlays.len() {
-        plan
-    } else {
-        filtered = SandboxPlan {
-            overlays: usable,
-            ..plan.clone()
-        };
-        &filtered
-    };
     let shim_argv: Vec<OsString> = vec![cowboy_sandbox::SHIM_PATH.into(), "x-sandbox-shim".into()];
     let argv = bwrap::build_argv(&bwrap_path, plan, net, &shim_argv);
 
@@ -112,69 +97,6 @@ fn build_command(
         deny_raw_sockets: plan.seccomp.deny_raw_sockets,
     };
     Ok((cmd, request))
-}
-
-/// Whether this kernel offers overlayfs at all.
-///
-/// Cheap and cached: the answer cannot change while the machine is up, and this is
-/// on the path of every command.
-fn overlayfs_available() -> bool {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        std::fs::read_to_string("/proc/filesystems")
-            .map(|s| {
-                s.lines()
-                    .any(|l| l.split_whitespace().last() == Some("overlay"))
-            })
-            .unwrap_or(false)
-    })
-}
-
-/// The overlays that can actually be mounted, creating their write layers.
-///
-/// Anything that cannot be prepared is left out rather than raised: see the call
-/// site. `upper` and `work` must be on the same filesystem, which they are — both
-/// live under the project root.
-fn usable_overlays(plan: &SandboxPlan) -> Vec<cowboy_sandbox::plan::Overlay> {
-    if plan.overlays.is_empty() || !overlayfs_available() {
-        return Vec::new();
-    }
-    plan.overlays
-        .iter()
-        .filter(|o| {
-            let made = std::fs::create_dir_all(&o.upper)
-                .and_then(|_| std::fs::create_dir_all(&o.work))
-                .and_then(|_| ignore_marker(o));
-            if let Err(e) = &made {
-                tracing::debug!(
-                    upper = %o.upper.display(),
-                    error = %e,
-                    "overlay write layer could not be created; falling back to a private store"
-                );
-            }
-            made.is_ok() && o.lower.exists()
-        })
-        .cloned()
-        .collect()
-}
-
-/// Keep the overlay's write layers out of `git status`.
-///
-/// A `.gitignore` of `*` in the parent of `upper`/`work`, so a store that grows to
-/// gigabytes never shows up as untracked — and without needing the project's own
-/// `.gitignore` to have been updated, which existing projects would not have.
-///
-/// On the parent rather than inside `upper`: a file in `upper` appears in the
-/// merged view, i.e. as litter inside the user's toolchain store.
-fn ignore_marker(o: &cowboy_sandbox::plan::Overlay) -> std::io::Result<()> {
-    let Some(parent) = o.upper.parent() else {
-        return Ok(());
-    };
-    let marker = parent.join(".gitignore");
-    if marker.exists() {
-        return Ok(());
-    }
-    std::fs::write(marker, "*\n")
 }
 
 /// Refuse to run when the lockdown shim would not be present inside the sandbox.
@@ -512,6 +434,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                mise_store: None,
             },
             &probe,
         )
@@ -547,6 +470,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                mise_store: None,
             },
             &probe,
         )
@@ -580,6 +504,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                mise_store: None,
             },
             &live,
         )

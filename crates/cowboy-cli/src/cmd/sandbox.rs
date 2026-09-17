@@ -172,6 +172,11 @@ fn plan() -> Result<()> {
     // real directory belongs to a running session, keyed to the process that owns it,
     // and inventing one here would leave litter behind for the reaper.
     let scratch = PathBuf::from("<session scratch>");
+    // Resolved, not created — printing the boundary must not have side effects.
+    // Mirrors the executor: no mise config, no toolchain store.
+    let mise_store = crate::project::has_mise_config(&root)
+        .then(|| crate::project::mise_store_path(&root))
+        .flatten();
     let inputs = PlanInputs {
         root: &root,
         security: &security,
@@ -179,6 +184,7 @@ fn plan() -> Result<()> {
         mask_file: &mask,
         relay_port: crate::sandbox::RELAY_PORT,
         scratch: &scratch,
+        mise_store: mise_store.as_deref(),
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
     println!("project {}\n", root.display());

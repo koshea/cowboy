@@ -87,6 +87,55 @@ pub fn project_key_hex(root: &Path) -> String {
     format!("{:016x}", project_hash(root))
 }
 
+/// Whether a project declares a mise toolchain.
+///
+/// One definition, used both by the agent loop (which runs `mise install` at
+/// launch) and by the plan builder (which only provisions a shared toolchain store
+/// for a project that will actually use one).
+pub fn has_mise_config(root: &Path) -> bool {
+    const CONFIGS: &[&str] = &[
+        "mise.toml",
+        ".mise.toml",
+        "mise/config.toml",
+        ".mise/config.toml",
+        ".config/mise/config.toml",
+        ".tool-versions",
+    ];
+    CONFIGS.iter().any(|f| root.join(f).exists())
+}
+
+/// The toolchain store shared by every worktree of one repository, created if
+/// absent.
+///
+/// Host-side and cowboy-owned: the agent writes here, and the user's own
+/// `~/.local/share/mise` is never involved, so nothing the agent installs can reach
+/// a binary the user runs outside the sandbox.
+///
+/// Keyed with [`repo_key`], which is already stable across a repo's worktrees (it
+/// keys the credential overlay for the same reason). Nine `platform` worktrees are
+/// one store, not nine identical copies; an unrelated repo keeps its own.
+///
+/// Under the cache dir rather than `private_dir()`, whose `run` subtree holds
+/// session scratch and is reaped.
+pub fn mise_store_dir(root: &Path) -> Result<PathBuf> {
+    let dir = mise_store_path(root)
+        .context("cannot resolve a cache directory for the shared toolchain store")?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Where [`mise_store_dir`] would put the store, without creating anything.
+///
+/// Split out for `cowboy sandbox plan`, which renders the boundary and must not
+/// have side effects — inventing directories just to print them leaves litter.
+pub fn mise_store_path(root: &Path) -> Option<PathBuf> {
+    Some(
+        config::global_cache_dir()?
+            .join("mise")
+            .join(repo_key(root)),
+    )
+}
+
 /// The name of the scratch directory belonging to *this process's* sandbox for
 /// `session_name`.
 ///
@@ -448,6 +497,27 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The point of the shared store: worktrees of one repo resolve to one path,
+    /// and an unrelated repo does not. Nine `platform` worktrees each downloading
+    /// their own copy of the same toolchain was ~2G apiece.
+    #[test]
+    fn one_toolchain_store_per_repository_not_per_worktree() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let main = tmp.path().join("repo");
+        std::fs::create_dir_all(main.join(".git")).unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+
+        // A normal checkout keys on its own repo…
+        let a = mise_store_path(&main).expect("a cache dir");
+        // …and asking twice is stable (it is a path, not a fresh temp dir).
+        assert_eq!(a, mise_store_path(&main).unwrap());
+        // …while a different repo gets a different store.
+        assert_ne!(a, mise_store_path(&other).unwrap());
+        // It lives under Cowboy's cache, never in the user's own mise store.
+        assert!(a.to_string_lossy().contains("/mise/"));
+    }
     use super::*;
 
     /// A directory tree builder: `tree(&["a/.cowboy", "a/b/c"])` creates those dirs.

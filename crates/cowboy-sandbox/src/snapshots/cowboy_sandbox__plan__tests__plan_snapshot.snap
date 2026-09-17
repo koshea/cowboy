@@ -7,6 +7,7 @@ filesystem
   ro  /usr -> /usr   (host toolchain)
   ro  /etc/ssl -> /etc/ssl   (toolchain configuration)
   ro  /etc/resolv.conf -> /etc/resolv.conf   (toolchain configuration)
+  rw  /cache/cowboy/mise/deadbeef -> /.cowboy-mise   (toolchains shared by this repo's worktrees)
   rw  /scratch/tmp -> /tmp   (session scratch (survives between commands, not between sessions))
   rw  /scratch/run -> /run   (session scratch (survives between commands, not between sessions))
   rw  /scratch/var-tmp -> /var/tmp   (session scratch (survives between commands, not between sessions))
@@ -18,7 +19,7 @@ filesystem
   proc /proc   dev /dev
 
 landlock
-  7 read-only, 7 read-write paths
+  7 read-only, 8 read-write paths
   network: not gated here (port-only rules cannot express it)
   ipc scoping: true
 

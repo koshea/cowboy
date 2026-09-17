@@ -140,6 +140,7 @@ fn plan_for(root: &Path) -> SandboxPlan {
         mask_file: &mask,
         relay_port: 8443,
         scratch: &scratch,
+        mise_store: None,
     };
     SandboxPlan::build(&inputs, &Host).unwrap()
 }
@@ -836,6 +837,7 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
                 mask_file: &mask,
                 relay_port: 8443,
                 scratch: &scratch,
+                mise_store: None,
             },
             probe,
         )

@@ -166,6 +166,18 @@ impl NativeSandbox {
         // process ever writes that path, which is what a machine-global mask could not
         // promise.
         let mask_file = crate::project::mask_file_in(&scratch);
+        // Shared with this repo's other worktrees, and only for a project that
+        // actually uses mise — creating a toolchain store for one that does not is
+        // litter in the user's cache, which every integration-test fixture would
+        // otherwise leave behind. Best-effort: without it the sandbox still runs,
+        // just with a private store under HOME.
+        let mise_store = crate::project::has_mise_config(&self.root)
+            .then(|| {
+                crate::project::mise_store_dir(&self.root)
+                    .map_err(|e| tracing::debug!(error = %e, "no shared toolchain store"))
+                    .ok()
+            })
+            .flatten();
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -173,6 +185,7 @@ impl NativeSandbox {
             mask_file: &mask_file,
             relay_port: super::RELAY_PORT,
             scratch: &scratch,
+            mise_store: mise_store.as_deref(),
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }
@@ -508,15 +521,7 @@ impl Sandbox for NativeSandbox {
     }
 
     fn has_mise_config(&self) -> bool {
-        const CONFIGS: &[&str] = &[
-            "mise.toml",
-            ".mise.toml",
-            "mise/config.toml",
-            ".mise/config.toml",
-            ".config/mise/config.toml",
-            ".tool-versions",
-        ];
-        CONFIGS.iter().any(|f| self.root.join(f).exists())
+        crate::project::has_mise_config(&self.root)
     }
 
     async fn ensure_running(&self) -> Result<()> {
