@@ -211,14 +211,23 @@ The foreman answers with `job_reply`:
 |---|---|
 | `grant` | more turns, clamped host-side to the job's ceiling |
 | `redirect` | more turns plus instructions to do something different |
-| `wrap_up` | stop investigating; a few turns to write up what it has |
+| `wrap_up` | stop investigating; six turns to write up what it has |
 | `stop` | abandon the work; it still reports what it established |
 
 Two bounds are the host's, not the model's. `max_total_iterations` caps the total
 however many turns the foreman grants, and an **unanswered** request takes one
 small automatic extension and then wraps up — so an unattended foreman can neither
 leave a worker running forever nor destroy its work by ignoring it. A worker told
-to wrap up always keeps enough turns to write its answer.
+to wrap up always keeps enough turns to write its answer — six, because writing up
+honestly costs a file write, an `artifact` publish, a `handoff`, and `final`, and an
+earlier allowance of three ran out on the last of those.
+
+If a worker does run out before calling `final`, its result is a `[partial]`
+checkpoint that **leads with what it actually produced** — the artifacts it published
+and the handoff it wrote, as recorded by the host rather than claimed by the worker.
+That matters because a worker generally runs out *before* ticking the last box on its
+plan, so its own plan can say "write the findings" for a document it has already
+written; the plan is still shown, marked as its own possibly-stale account.
 
 ## A worker can ask a question
 

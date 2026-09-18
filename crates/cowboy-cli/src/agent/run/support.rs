@@ -196,6 +196,24 @@ impl IterationBudget {
         self.granted += added;
         added
     }
+
+    /// Extend past the ceiling, on explicit human consent.
+    ///
+    /// The ceiling exists to bound an agent nobody is watching — it is a stand-in for
+    /// human judgement about "is this still worth running?". When a person has actually
+    /// been asked and said yes, that judgement is present, so the ceiling moves with the
+    /// grant rather than silently refusing.
+    ///
+    /// Deliberately a separate method from [`Self::extend`], which clamps: no automated
+    /// path — a foreman granting a worker more turns, an unanswered-request auto-extension
+    /// — can reach this by accident. The only caller is the one that has an answer from a
+    /// human in hand, and the number of times it may be called is capped by its own
+    /// counter.
+    pub fn extend_with_consent(&mut self, n: u32) -> u32 {
+        self.granted += n;
+        self.ceiling = self.ceiling.max(self.granted);
+        n
+    }
 }
 
 /// How close a worker is to spending its grant. Ordered, so the loop can fire each

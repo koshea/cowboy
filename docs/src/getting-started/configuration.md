@@ -131,7 +131,13 @@ commands:
   test: cargo test
 ```
 **Iteration budgets.** `agent.max_iterations` bounds a turn of the session you are
-talking to. A **delegated** worker does not use it: it gets a small grant sized by
+talking to. When it runs out, cowboy **asks whether to keep going** rather than
+stopping silently — answer yes and it gets another `max_iterations` turns and
+carries on in the same turn, up to ten extensions. A run with nobody to ask (piped,
+or no attached client) is never extended: silence is not consent, so it ends the
+turn, and sending a message resumes with the conversation intact either way.
+
+A **delegated** worker does not use it: it gets a small grant sized by
 `effort` and must report progress to earn more, bounded by a host-enforced ceiling.
 Those knobs live in the crew roster — see
 [Turn grants](../using/crew.md#turn-grants-report-progress-request-more).

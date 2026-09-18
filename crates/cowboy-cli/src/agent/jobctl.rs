@@ -98,7 +98,15 @@ impl Verdict {
 
 /// Turns handed to a worker told to wrap up: enough to write a report, not enough to
 /// resume exploring.
-pub const WRAP_UP_TURNS: u32 = 3;
+///
+/// Six, not three. Three was the observed failure: a worker told to wrap up spent one
+/// turn writing its 17.6 KB audit, one publishing it as an artifact, one writing a
+/// handoff — all correct — and hit the ceiling on the turn where it would have called
+/// `final`. The foreman got a checkpoint that looked like nothing had happened and re-ran
+/// the whole review. Writing up honestly costs write + publish + handoff + `final`, so
+/// the floor is four; six leaves room for a split write or a retry without being enough
+/// turns to start investigating again.
+pub const WRAP_UP_TURNS: u32 = 6;
 
 /// A worker's question for whoever is driving.
 ///

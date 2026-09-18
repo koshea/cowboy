@@ -313,6 +313,8 @@ pub struct AgentLoop<'a> {
     control: Option<crate::agent::jobctl::ControlDir>,
     /// How many turn requests this worker has made (the request sequence).
     turn_requests: u32,
+    /// How many times the user has extended *this* message's budget.
+    user_extensions: u32,
     /// How many unanswered requests were resolved by the automatic extension. The
     /// second one wraps up instead: an unattended foreman must not be able to keep a
     /// worker running forever, nor to destroy its work by never answering.
@@ -905,10 +907,32 @@ delegation.";
 /// Turns handed out when a request goes unanswered, once.
 const AUTO_EXTENSION_TURNS: u32 = 10;
 
+/// Whether a free-text answer means "keep going".
+///
+/// Deliberately narrow, and silence is **not** consent: an empty answer is what
+/// `ask_user` returns when nobody can answer (a piped run, no attached client), so
+/// treating it as yes would make a non-interactive session extend itself forever. Only an
+/// explicit affirmative counts; anything else ends the turn, which is recoverable.
+fn is_affirmative(answer: &str) -> bool {
+    matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "yeah" | "yep" | "ok" | "okay" | "sure" | "continue" | "keep going" | "go"
+    )
+}
+
 /// Hard cap on how many times one worker may ask. The ceiling already bounds total
 /// turns; this bounds the *ping-pong*, so a worker and a foreman cannot spend a
 /// session negotiating.
 const MAX_TURN_REQUESTS: u32 = 6;
+
+/// Hard cap on how many times the *user* may be asked to extend one message's budget.
+///
+/// Generous, because a human saying yes is real consent rather than a guess — but not
+/// unbounded: a user who holds down Enter should not be able to turn one message into an
+/// indefinite run, and after this many extensions the honest move is to end the turn and
+/// let them send a fresh message (which starts a clean budget, with the conversation
+/// intact either way).
+const MAX_USER_EXTENSIONS: u32 = 10;
 
 /// How long `wait` parks by default, and the hard cap on what a model can ask for. A
 /// model that asks to wait an hour has misjudged; the ceiling keeps a mistake cheap.
@@ -1019,6 +1043,7 @@ impl<'a> AgentLoop<'a> {
             job_stopper: crate::agent::jobs::JobStopper::default(),
             control: can_request_turns.then_some(control).flatten(),
             turn_requests: 0,
+            user_extensions: 0,
             auto_extensions: 0,
             request_timeout: std::time::Duration::from_secs(
                 delegation.request_timeout_seconds.max(5),
@@ -2190,13 +2215,49 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// Assemble whatever a non-finishing subagent managed to do this turn, as a
-    /// `[partial]` checkpoint the foreman can resume from: the agent's latest
-    /// substantive narration, its plan progress, and the session id (whose
-    /// `.cowboy/sessions/<id>/` dir holds the full transcript, scratchpad,
-    /// published artifacts, and commands for recovery). Returns `None` only when
-    /// there is genuinely nothing to report.
+    /// `[partial]` checkpoint the foreman can resume from: **what it actually
+    /// produced** (host-recorded), its latest substantive narration, its plan
+    /// progress, and the session id (whose `.cowboy/sessions/<id>/` dir holds the
+    /// full transcript, scratchpad, published artifacts, and commands for
+    /// recovery). Returns `None` only when there is genuinely nothing to report.
     fn build_partial_result(&self) -> Option<String> {
         let mut sections: Vec<String> = Vec::new();
+
+        // What it produced, first, because it is the only part that is *measured*
+        // rather than claimed — and because omitting it threw away finished work.
+        //
+        // Observed: a worker told to wrap up spent its whole wrap-up allowance doing
+        // exactly the right things — wrote a 17.6 KB audit, published it as an
+        // artifact, wrote a handoff — and ran out one turn before `final`. The
+        // checkpoint then reported only its stale plan, whose last line was
+        // "[ ] Write prioritized findings artifact" *for the artifact it had just
+        // published*. The foreman read "nothing got done" and re-ran the entire
+        // review from scratch. The outputs were on disk the whole time.
+        if let Some(l) = &self.logger {
+            let dir = l.dir();
+            let mut produced: Vec<String> = cowboy_core::artifact::list_in(dir)
+                .into_iter()
+                .map(|a| {
+                    format!(
+                        "  {:<8} {}  ({})",
+                        a.kind.as_str(),
+                        a.title,
+                        dir.join(&a.path).display()
+                    )
+                })
+                .collect();
+            let handoff = dir.join("handoff.md");
+            if handoff.is_file() {
+                produced.push(format!("  handoff  written  ({})", handoff.display()));
+            }
+            if !produced.is_empty() {
+                sections.push(format!(
+                    "Already produced (recorded by the host, not self-reported — read these \
+                     instead of redoing the work):\n{}",
+                    produced.join("\n")
+                ));
+            }
+        }
 
         // The most recent assistant message with real content — usually where the
         // agent was summarizing its findings before the final emission failed.
@@ -2211,9 +2272,12 @@ impl<'a> AgentLoop<'a> {
         }
 
         // Plan progress: what got done vs. what's left, so resumption can skip
-        // completed steps.
+        // completed steps. Explicitly marked as the worker's own account, because a
+        // worker that ran out of turns generally ran out *before* ticking the last
+        // box — so an unchecked step here is not evidence the work is undone.
         if !self.plan.is_empty() {
-            let mut lines = String::from("Plan progress:");
+            let mut lines =
+                String::from("Plan progress (the worker's own last update — may lag what it did):");
             for (step, status) in &self.plan {
                 let mark = match status.as_str() {
                     "done" => "[x]",
@@ -2263,6 +2327,9 @@ impl<'a> AgentLoop<'a> {
         // before; a delegated worker starts on its grant and may earn extensions.
         self.budget.used = 0;
         self.grant_stage_seen = GrantStage::Fine;
+        // Per *message*, like the budget it guards: a user who extended an earlier message
+        // should not find a later one refusing to ask.
+        self.user_extensions = 0;
 
         // The outer loop exists for the grant-and-request cycle: when the inner loop
         // runs the grant out, a supervised worker reports to its foreman and may be
@@ -3170,7 +3237,8 @@ impl<'a> AgentLoop<'a> {
     /// stopping; returns true when it may keep going (the budget grew).
     async fn extend_or_report(&mut self) -> bool {
         if self.control.is_none() {
-            return false;
+            // No foreman above this session — so ask the person. Same shape, one level up.
+            return self.ask_user_to_continue().await;
         }
         // Already told to finish: it was given turns to write an answer, and asking
         // again would turn "wrap up" into an unbounded extension.
@@ -3193,6 +3261,75 @@ impl<'a> AgentLoop<'a> {
             return false;
         }
         self.budget.granted > before
+    }
+
+    /// The foreman's budget is spent: ask the user whether to keep going.
+    ///
+    /// A delegated worker reports to its foreman and may be granted more turns. The
+    /// foreman has no foreman — and the previous behaviour was to print "reached the
+    /// iteration budget" and end the turn. That is recoverable (typing anything starts a
+    /// new turn with the conversation intact) but nothing says so, so the session looks
+    /// finished when it is merely paused. Observed on a real review: the answer was
+    /// "keep going", which is precisely the question worth asking.
+    ///
+    /// Asking is the right primitive rather than raising the cap, because the cap is doing
+    /// its job — it caught a long run and handed the decision to a human, which is the
+    /// same escalation the worker path makes.
+    ///
+    /// Fails closed in three ways, so nothing can hang or spin:
+    /// - No one to answer (piped run, no attached client) → `ask_user` returns empty →
+    ///   stop, exactly as before.
+    /// - Anything other than an affirmative → stop.
+    /// - Bounded by [`MAX_USER_EXTENSIONS`], so "yes" cannot become an infinite loop.
+    async fn ask_user_to_continue(&mut self) -> bool {
+        if self.cancel.is_cancelled() {
+            return false;
+        }
+        if self.user_extensions >= MAX_USER_EXTENSIONS {
+            self.ui.notice(&format!(
+                "reached the iteration budget ({} turns) and has been extended \
+                 {MAX_USER_EXTENSIONS}× — stopping. Send a message to continue.",
+                self.budget.granted
+            ));
+            return false;
+        }
+        let used = self.budget.used;
+        let question = format!(
+            "The agent has used its {used}-turn budget for this message and is not done. \
+             Keep going?"
+        );
+        let answer = self
+            .ui
+            .ask_user(&question, &["yes".to_string(), "no".to_string()]);
+        if !is_affirmative(&answer) {
+            self.ui.notice(&format!(
+                "reached the iteration budget ({used} turns) — stopping here. \
+                 Send a message to continue.",
+            ));
+            return false;
+        }
+        self.user_extensions += 1;
+        // One more *round*, not double the last one. Extending by the current grant would
+        // double each time (100 → 200 → 400 …), so "yes" would quietly escalate and the
+        // extension cap would bound something enormous. A constant step matches what the
+        // answer means: keep going for another budget's worth.
+        let step = if self.behavior.max_iterations > 0 {
+            self.behavior.max_iterations
+        } else {
+            self.budget.granted.max(1)
+        };
+        let added = self.budget.extend_with_consent(step);
+        self.ui
+            .notice(&format!("▶ continuing with {added} more turns"));
+        self.progress.clear_streak();
+        // Into the conversation, not just the UI: the model needs to know it was extended
+        // and that it is expected to converge, or it resumes as if nothing happened.
+        self.push_user_note(format!(
+            "[user] Granted {added} more turns. Continue from where you are — do not \
+             restart, and do not re-read what you have already read. Converge on an \
+             answer and call `final`."
+        ));
+        true
     }
     /// A one-line description of what is still running, for the `final` refusal.
     fn outstanding_jobs_summary(&self) -> String {
@@ -6040,7 +6177,12 @@ mod tests {
             max_iterations: 3,
             ..Default::default()
         };
-        let mut ui = RecordingUi::default();
+        // Declines the continue prompt, so this still measures the cap itself. The ask is
+        // covered by `the_foreman_asks_the_user_before_giving_up_on_its_budget`.
+        let mut ui = RecordingUi {
+            ask_answer: Some("no".into()),
+            ..Default::default()
+        };
         let mut agent = AgentLoop::new(
             Box::new(looping),
             FakeSandbox::new(),
@@ -6056,6 +6198,164 @@ mod tests {
             .iter()
             .any(|n| n.contains("reached the iteration budget")));
         assert_eq!(ui.commands.len(), 3);
+    }
+
+    /// A model that never finishes, for the budget-extension tests.
+    fn never_finishes(turns: usize) -> ScriptedModel {
+        // Each turn runs a *different* command. Repeating one trips the loop/churn
+        // guards, which abort the run — so the test would stop after a few turns
+        // regardless of the answer, measuring the wrong thing. Distinct words rather
+        // than `cmd-1`/`cmd-2`, because `normalize_shell_command` strips trailing
+        // counters precisely so cosmetic variants collapse to one signature.
+        const WORDS: [&str; 24] = [
+            "alpha", "bravo", "charlie", "delta", "eddy", "foxtrot", "golf", "hotel", "india",
+            "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+            "sierra", "tango", "uniform", "victor", "whiskey", "xray",
+        ];
+        let m = ScriptedModel::new(vec![]);
+        {
+            let mut q = m.responses.lock().unwrap();
+            for i in 0..turns {
+                let w = WORDS[i % WORDS.len()];
+                let suffix = "z".repeat(i / WORDS.len());
+                q.push_back(ChatResponse {
+                    truncated: false,
+                    usage: None,
+                    reasoning: None,
+                    content: None,
+                    tool_calls: vec![tool_call(
+                        &i.to_string(),
+                        "shell",
+                        &format!(r#"{{"command":"cat /tmp/{w}{suffix}"}}"#),
+                    )],
+                });
+            }
+        }
+        m
+    }
+
+    fn budget_agent<'a>(
+        model: ScriptedModel,
+        ui: &'a mut RecordingUi,
+        max_iterations: u32,
+    ) -> AgentLoop<'a> {
+        AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior {
+                max_iterations,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            ui,
+        )
+    }
+
+    /// The foreman asks rather than silently stopping.
+    ///
+    /// A delegated worker reports to its foreman and can be granted more turns; the
+    /// foreman's equivalent is the person. Before this it just printed "reached the
+    /// iteration budget" and ended the turn — recoverable (any message continues, with the
+    /// conversation intact) but nothing said so, so a paused session looked like a
+    /// finished one. Observed on a real review, where the answer was "keep going".
+    #[tokio::test]
+    async fn the_foreman_asks_the_user_before_giving_up_on_its_budget() {
+        let mut ui = RecordingUi {
+            ask_answer: Some("yes".into()),
+            ..Default::default()
+        };
+        let mut agent = budget_agent(never_finishes(20), &mut ui, 3);
+        let _ = agent.run("keep working").await.unwrap();
+
+        assert!(
+            ui.asks.iter().any(|q| q.contains("Keep going?")),
+            "the user should be asked, not just told: {:?}",
+            ui.asks
+        );
+        assert!(
+            ui.notices.iter().any(|n| n.contains("continuing with")),
+            "a yes should visibly extend: {:?}",
+            ui.notices
+        );
+        // It really kept working rather than only saying so.
+        assert!(
+            ui.commands.len() > 3,
+            "expected more than the initial 3 turns, got {}",
+            ui.commands.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn declining_ends_the_turn_and_says_how_to_resume() {
+        let mut ui = RecordingUi {
+            ask_answer: Some("no".into()),
+            ..Default::default()
+        };
+        let mut agent = budget_agent(never_finishes(20), &mut ui, 3);
+        let _ = agent.run("keep working").await.unwrap();
+
+        assert_eq!(ui.commands.len(), 3, "a no must not extend anything");
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("Send a message to continue")),
+            "the way back has to be stated, since that is the whole gap: {:?}",
+            ui.notices
+        );
+    }
+
+    /// Silence is not consent.
+    ///
+    /// `ask_user` returns an empty string when nobody *can* answer — a piped run, or no
+    /// attached client. Reading that as yes would let an unattended session extend itself
+    /// indefinitely, which is the opposite of what the cap is for.
+    #[tokio::test]
+    async fn a_run_with_nobody_to_ask_never_extends_itself() {
+        let mut ui = RecordingUi {
+            ask_answer: Some(String::new()),
+            ..Default::default()
+        };
+        let mut agent = budget_agent(never_finishes(20), &mut ui, 3);
+        let _ = agent.run("keep working").await.unwrap();
+        assert_eq!(ui.commands.len(), 3, "an unanswered ask must stop the turn");
+    }
+
+    /// Yes is bounded: one message cannot become an indefinite run.
+    #[tokio::test]
+    async fn user_extensions_stop_at_the_cap() {
+        let mut ui = RecordingUi {
+            ask_answer: Some("yes".into()),
+            ..Default::default()
+        };
+        // One turn per grant makes the arithmetic exact: 1 initial + MAX_USER_EXTENSIONS.
+        let budget = 1 + MAX_USER_EXTENSIONS;
+        let mut agent = budget_agent(never_finishes(budget as usize * 4), &mut ui, 1);
+        let _ = agent.run("keep working").await.unwrap();
+
+        assert_eq!(
+            ui.commands.len(),
+            budget as usize,
+            "should stop after {MAX_USER_EXTENSIONS} extensions"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains(&format!("extended {MAX_USER_EXTENSIONS}×"))),
+            "the cap should say why it stopped: {:?}",
+            ui.notices
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_yes_continues() {
+        for yes in ["y", "yes", "YES", " ok ", "sure", "continue", "keep going"] {
+            assert!(is_affirmative(yes), "{yes:?} should continue");
+        }
+        // Empty is what `ask_user` returns with nobody to answer — never a yes.
+        for no in ["", "  ", "n", "no", "stop", "later", "maybe", "y e s"] {
+            assert!(!is_affirmative(no), "{no:?} must not continue");
+        }
     }
 
     #[tokio::test]
@@ -6616,8 +6916,11 @@ mod tests {
         // Nobody answers.
         let out = agent.run("wander forever").await.unwrap();
         assert!(out.is_none(), "it ran out of turns rather than finishing");
-        // 2 (grant) + 10 (one automatic extension) + 3 (wrap-up turns).
-        assert_eq!(agent.budget.granted, 15, "bounded, not unbounded");
+        // Derived, not hardcoded: grant + one automatic extension + the wrap-up
+        // allowance. Spelling the total as a literal meant bumping WRAP_UP_TURNS broke
+        // this test for a reason unrelated to what it checks, which is boundedness.
+        let expected = 2 + AUTO_EXTENSION_TURNS + crate::agent::jobctl::WRAP_UP_TURNS;
+        assert_eq!(agent.budget.granted, expected, "bounded, not unbounded");
         assert_eq!(agent.turn_requests, 2, "it asked twice and stopped asking");
         drop(agent);
         assert!(
@@ -9110,6 +9413,76 @@ mod tests {
         assert!(partial.contains("Found 2 real issues"));
         assert!(partial.contains("[x] Review auth"));
         assert!(partial.contains("[ ] Review export"));
+    }
+
+    /// The checkpoint must lead with what the worker *produced*, not its plan.
+    ///
+    /// Observed on a real review: a worker told to wrap up spent its whole allowance
+    /// doing the right things — wrote a 17.6 KB audit, published it as an artifact, wrote
+    /// a handoff — and ran out one turn before `final`. The checkpoint reported only its
+    /// stale plan, whose last line was "[ ] Write prioritized findings artifact" *for the
+    /// artifact it had just published*. The foreman read that as "nothing got done" and
+    /// re-ran the whole review. The outputs were on disk the entire time.
+    #[tokio::test]
+    async fn a_partial_reports_the_artifacts_the_worker_published() {
+        let root = assert_fs::TempDir::new().unwrap();
+        let logger =
+            crate::session::SessionLogger::create_with_id(root.path(), "partial-artifacts")
+                .unwrap();
+        let dir = logger.dir().to_path_buf();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.subagent_depth = 1;
+
+        // What the worker really did, recorded host-side by the artifact/handoff tools.
+        cowboy_core::artifact::add_in(
+            &dir,
+            "partial-artifacts",
+            cowboy_core::artifact::ArtifactKind::Review,
+            "Async/locking performance audit",
+            "## Findings\nthe full 17KB report",
+            None,
+            cowboy_core::time::now_ms(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("handoff.md"), "# Handoff\nwhere I got to").unwrap();
+
+        // …and the misleading self-report it left behind.
+        agent.plan = vec![("Write findings artifact".into(), "pending".into())];
+
+        let partial = agent.build_partial_result().expect("salvageable work");
+        assert!(
+            partial.contains("Already produced"),
+            "the checkpoint must name the outputs: {partial}"
+        );
+        assert!(
+            partial.contains("Async/locking performance audit"),
+            "the published artifact must be named: {partial}"
+        );
+        assert!(
+            partial.contains("handoff"),
+            "the handoff must be mentioned: {partial}"
+        );
+        // The stale plan is still shown, but no longer as if it were authoritative.
+        let produced_at = partial.find("Already produced").unwrap();
+        let plan_at = partial.find("Plan progress").unwrap();
+        assert!(
+            produced_at < plan_at,
+            "outputs must come before the plan that contradicts them: {partial}"
+        );
+        assert!(
+            partial.contains("may lag what it did"),
+            "the plan needs the caveat, or it reads as ground truth: {partial}"
+        );
     }
     // -----------------------------------------------------------------------
     // request_path: the agent asks, the user decides
