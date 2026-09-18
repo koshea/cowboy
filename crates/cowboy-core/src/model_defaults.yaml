@@ -112,6 +112,45 @@ models:
     reasoning_effort: high
     input_cost_per_mtok: 0.9
     output_cost_per_mtok: 2.5
+  # Measured against the provider's own per-request cost breakdown, because the cache
+  # discount is large and varies far more by model than any single default could cover
+  # (3% of the input price here, 19% for GLM 5.3, 10-13% for Kimi K3 / Qwen). For an
+  # agent workload — where nearly every request re-sends a cached prefix — getting this
+  # wrong dominates the cost estimate: omitting it overstated a real session 7.5×.
+  - id: fireworks/accounts/fireworks/models/deepseek-v4p1-flash
+    name: "Fireworks: DeepSeek V4.1 Flash"
+    context_window: 163840
+    max_tokens: 32768
+    temperature: 0.6
+    reasoning_effort: high
+    input_cost_per_mtok: 0.22
+    output_cost_per_mtok: 0.66
+    cached_input_cost_per_mtok: 0.007
+  - id: fireworks/accounts/fireworks/models/glm-5p3
+    name: "Fireworks: GLM 5.3"
+    context_window: 200000
+    max_tokens: 32768
+    temperature: 0.6
+    reasoning_effort: high
+    input_cost_per_mtok: 1.4
+    output_cost_per_mtok: 4.4
+    cached_input_cost_per_mtok: 0.26
+  - id: fireworks/accounts/fireworks/models/kimi-k3
+    name: "Fireworks: Kimi K3"
+    context_window: 262144
+    max_tokens: 32768
+    temperature: 0.6
+    input_cost_per_mtok: 3.0
+    output_cost_per_mtok: 15.0
+    cached_input_cost_per_mtok: 0.3
+  - id: fireworks/accounts/fireworks/models/qwen3p8-max
+    name: "Fireworks: Qwen 3.8 Max"
+    context_window: 262144
+    max_tokens: 32768
+    temperature: 0.6
+    input_cost_per_mtok: 2.0
+    output_cost_per_mtok: 6.0
+    cached_input_cost_per_mtok: 0.25
   - prefix: fireworks/accounts/fireworks/models/gpt-oss
     name: "Fireworks: GPT-OSS"
     context_window: 131072

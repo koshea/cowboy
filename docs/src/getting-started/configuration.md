@@ -228,10 +228,27 @@ would otherwise do the same on the summary and come back empty.
 (`stream_options.include_usage`) and, when the stream carries it, bills the
 session from those counts — the billing ground truth — rather than its local
 tokenizer estimate. Providers that support prompt caching report cache hits
-(`cached_tokens`), which are priced at `cached_input_cost_per_mtok` when set,
-else at the full input price. When a provider reports no usage, Cowboy falls
-back to the local estimate at the full input/output rates, so the display can
-drift from the dashboard — most visibly when the provider caches aggressively.
+(`cached_tokens`), which are priced at `cached_input_cost_per_mtok`.
+
+**Set that rate, or the figure will be far too high.** An agent re-sends a large
+cached prefix on nearly every request, so for a typical session *almost all* input
+tokens are cache reads — 99% is normal. Cache reads are also much cheaper than
+fresh input, and by more than you would guess: measured against one provider's own
+billing, 3% of the input price for DeepSeek V4.1 Flash, 19% for GLM 5.3, 10–13%
+for Kimi K3 and Qwen 3.8 Max. With no rate configured Cowboy falls back to the
+full input price, which never *understates* spend but overstated one real session
+**7.5×** ($18.70 shown against a $2.50 bill).
+
+Cowboy fills the gap two ways. Models in its shipped table get their cache rate
+automatically, even for a `models.yaml` entry written before the rate was known —
+so most users need do nothing. For a model it does not know, it says so once per
+session ("cost is overstated: N% of prompt tokens are cache reads…") rather than
+guessing a discount, because the discount varies too much between models to guess.
+To get the number exactly right, take the cached-input price from your provider's
+pricing page and set `cached_input_cost_per_mtok`.
+
+When a provider reports no usage at all, Cowboy falls back to the local estimate at
+the full input/output rates, so the display can drift from the dashboard.
 
 **`anthropic_cache`** (opt-in): when true, Cowboy adds Anthropic `cache_control`
 markers to the static system prompt and the latest message, so a gateway that

@@ -1297,7 +1297,21 @@ pub fn resolve_model(
         headers,
         input_cost_per_mtok: def.input_cost_per_mtok,
         output_cost_per_mtok: def.output_cost_per_mtok,
-        cached_input_cost_per_mtok: def.cached_input_cost_per_mtok,
+        // Fall back to the shipped table for the *cached* rate only.
+        //
+        // An omitted cached price is an omission, not a decision — nobody means "cache
+        // reads cost exactly the same as fresh input", which is what `None` used to
+        // imply downstream. And because a model added before cowboy knew its cache rate
+        // keeps its own `models.yaml` entry forever, shipping the rate would otherwise
+        // never reach the users who need it. Measured discounts run 3%–19% of the input
+        // price, so treating a cache hit as full price overstated one real session 7.5×.
+        //
+        // Input and output prices are deliberately *not* backfilled this way: those are
+        // set, authoritative, and a silent change to what the user wrote would be a
+        // surprise. This only fills a hole.
+        cached_input_cost_per_mtok: def
+            .cached_input_cost_per_mtok
+            .or_else(|| crate::model_defaults::lookup(&def.model).cached_input_cost_per_mtok),
         anthropic_cache: def.anthropic_cache,
         stream_idle_timeout_seconds: def.stream_idle_timeout_seconds,
     })

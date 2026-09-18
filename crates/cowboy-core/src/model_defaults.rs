@@ -295,6 +295,38 @@ models:
         assert!(!r.is_chat("gemini/imagen-4.0-generate-001"));
     }
 
+    /// Caching models must ship a cached rate, because omitting it is not neutral.
+    ///
+    /// Downstream, a missing cached price falls back to the *full input* price. For an
+    /// agent — where nearly every request re-sends a cached prefix — that overstates
+    /// spend by roughly the cache discount: a real session read $18.70 against a $2.50
+    /// bill. These rates were measured against the provider's own per-request cost
+    /// breakdown, so they are facts rather than estimates; the discounts differ enough
+    /// between models (3% of input for DeepSeek Flash, 19% for GLM 5.3) that no single
+    /// default could stand in.
+    #[test]
+    fn models_known_to_discount_cache_reads_ship_the_rate() {
+        for id in [
+            "fireworks/accounts/fireworks/models/deepseek-v4p1-flash",
+            "fireworks/accounts/fireworks/models/glm-5p3",
+            "fireworks/accounts/fireworks/models/kimi-k3",
+            "fireworks/accounts/fireworks/models/qwen3p8-max",
+        ] {
+            let d = lookup(id);
+            let cached = d
+                .cached_input_cost_per_mtok
+                .unwrap_or_else(|| panic!("{id} has no cached_input_cost_per_mtok"));
+            let input = d
+                .input_cost_per_mtok
+                .unwrap_or_else(|| panic!("{id} has no input_cost_per_mtok"));
+            assert!(
+                cached < input,
+                "{id}: a cache read priced at or above fresh input ({cached} vs {input}) \
+                 defeats the point of recording it"
+            );
+        }
+    }
+
     #[test]
     fn override_entries_win_ties() {
         let mut r = Registry::parse(SAMPLE);

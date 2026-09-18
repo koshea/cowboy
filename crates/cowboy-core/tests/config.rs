@@ -563,3 +563,70 @@ fn tempdir() -> TempDir {
     TempDir(p)
 }
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A model configured before cowboy knew its cache rate still gets the rate.
+///
+/// The bug this closes: `models.yaml` entries are written once and kept, so a user who
+/// added a model early has `cached_input_cost_per_mtok: None` forever. Downstream that
+/// falls back to the *full input* price, and for an agent — where nearly every request
+/// re-sends a cached prefix — that overstates spend by roughly the cache discount. One
+/// real session read $18.70 against a $2.50 bill. Shipping the rate in
+/// `model_defaults.yaml` fixed nothing on its own, because resolution never consulted it.
+#[test]
+fn an_omitted_cached_price_is_backfilled_from_the_shipped_defaults() {
+    let mut providers = ProvidersConfig::default();
+    providers
+        .providers
+        .insert("p".into(), provider("https://api/v1"));
+
+    // As `cowboy models add` wrote it before the rate was known: prices set, cache
+    // rate absent.
+    let mut def = model_def(
+        "p",
+        "fireworks/accounts/fireworks/models/deepseek-v4p1-flash",
+    );
+    def.input_cost_per_mtok = Some(0.22);
+    def.output_cost_per_mtok = Some(0.66);
+    def.cached_input_cost_per_mtok = None;
+
+    let mut user = ModelsConfig::default();
+    user.default = Some("ds".into());
+    user.models.insert("ds".into(), def);
+
+    let r = resolve_model(&providers, Some(&user), None, None).unwrap();
+    let cached = r
+        .cached_input_cost_per_mtok
+        .expect("the shipped rate should fill the hole");
+    assert!(
+        cached < r.input_cost_per_mtok.unwrap(),
+        "a cache read must be cheaper than fresh input, got {cached}"
+    );
+
+    // What the user *did* write is authoritative and untouched — only the hole is filled.
+    assert_eq!(r.input_cost_per_mtok, Some(0.22));
+    assert_eq!(r.output_cost_per_mtok, Some(0.66));
+}
+
+/// An explicit cached price always wins, including one deliberately equal to input.
+#[test]
+fn an_explicit_cached_price_is_never_overridden() {
+    let mut providers = ProvidersConfig::default();
+    providers
+        .providers
+        .insert("p".into(), provider("https://api/v1"));
+
+    let mut def = model_def(
+        "p",
+        "fireworks/accounts/fireworks/models/deepseek-v4p1-flash",
+    );
+    def.input_cost_per_mtok = Some(0.22);
+    def.output_cost_per_mtok = Some(0.66);
+    def.cached_input_cost_per_mtok = Some(0.123);
+
+    let mut user = ModelsConfig::default();
+    user.default = Some("ds".into());
+    user.models.insert("ds".into(), def);
+
+    let r = resolve_model(&providers, Some(&user), None, None).unwrap();
+    assert_eq!(r.cached_input_cost_per_mtok, Some(0.123));
+}

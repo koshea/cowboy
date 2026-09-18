@@ -385,6 +385,8 @@ pub struct AgentLoop<'a> {
     price_out: Option<f64>,
     /// USD per 1M *cached* input tokens; falls back to `price_in` (no discount).
     price_cached_in: Option<f64>,
+    /// Whether the "no cached price, so cost is overstated" notice has been shown.
+    warned_no_cache_price: bool,
     /// Provider-reported token totals, preferred over the local estimate when
     /// the stream carries `usage` (billing ground truth; sees cache hits).
     usage_in: u64,
@@ -1068,6 +1070,7 @@ impl<'a> AgentLoop<'a> {
             price_in: None,
             price_out: None,
             price_cached_in: None,
+            warned_no_cache_price: false,
             usage_in: 0,
             usage_out: 0,
             usage_cached_in: 0,
@@ -1181,6 +1184,30 @@ impl<'a> AgentLoop<'a> {
             } else {
                 (self.tokens_in as f64 / 1e6) * pi + (self.tokens_out as f64 / 1e6) * po
             };
+            // Say so, once, when the number on screen is knowably too high.
+            //
+            // With no cache price the fallback is the full input price, which is the
+            // largest defensible value — it never understates spend, which is the right
+            // bias for a cost display. But for an agent workload it is wrong by a lot:
+            // nearly every request re-sends a cached prefix, and measured discounts run
+            // 3%–19% of the input price. One real session read $18.70 against a $2.50
+            // bill for exactly this reason, and nothing on screen hinted at why.
+            //
+            // A warning rather than an assumed discount, because the discount varies far
+            // too much between models to guess: guessing would trade a knowable
+            // overstatement for an unknowable error in either direction.
+            if self.price_cached_in.is_none()
+                && self.usage_cached_in > 0
+                && !self.warned_no_cache_price
+            {
+                self.warned_no_cache_price = true;
+                let pct = (self.usage_cached_in as f64 / self.usage_in.max(1) as f64) * 100.0;
+                self.ui.notice(&format!(
+                    "cost is overstated: {pct:.0}% of prompt tokens are cache reads, billed at \
+                     the full input rate because this model has no `cached_input_cost_per_mtok`. \
+                     Add it (see your provider's cached-input price) for an accurate figure."
+                ));
+            }
         }
         self.ui.tokens(
             self.tokens_in + self.subagent_tokens_in,
@@ -5204,6 +5231,63 @@ mod tests {
         assert!(
             (got - expected).abs() < 1e-12,
             "no cache discount configured: got {got}, want {expected}"
+        );
+        // …and it says so, because the figure is knowably too high.
+        //
+        // This is the bug that made a real session read $18.70 against a $2.50 bill: 99%
+        // of the prompt tokens were cache reads billed at the full input rate, and
+        // nothing on screen hinted at why. Full price stays the fallback — it never
+        // understates spend, which is the right bias for a cost display, and the
+        // discount varies 3%–19% between models so guessing one would trade a knowable
+        // overstatement for an unknowable error.
+        let warned = ui
+            .notices
+            .iter()
+            .find(|n| n.contains("cost is overstated"))
+            .unwrap_or_else(|| panic!("expected a cache-price warning, got {:?}", ui.notices));
+        assert!(
+            warned.contains("80%"),
+            "should name the cached share: {warned}"
+        );
+        assert!(
+            warned.contains("cached_input_cost_per_mtok"),
+            "should name the fix: {warned}"
+        );
+    }
+
+    /// The warning stays quiet when there is nothing to warn about.
+    #[tokio::test]
+    async fn a_configured_cache_price_produces_no_warning() {
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            usage: Some(cowboy_core::model::Usage {
+                prompt_tokens: 1000,
+                completion_tokens: 0,
+                cached_prompt_tokens: 800,
+            }),
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("1", "final", r#"{"message":"done"}"#)],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_model_pricing(ModelPricing {
+            input: Some(3.0),
+            output: Some(15.0),
+            cached_input: Some(0.3),
+        });
+        agent.run("go").await.unwrap();
+        assert!(
+            !ui.notices.iter().any(|n| n.contains("cost is overstated")),
+            "priced correctly, so nothing to warn about: {:?}",
+            ui.notices
         );
     }
 
