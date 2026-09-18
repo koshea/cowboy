@@ -67,6 +67,18 @@ The web server grants full control of your sessions, so it's locked down:
   non-loopback bind (a LAN IP, `0.0.0.0`) is **refused** unless you pass `--lan`,
   since the token would otherwise travel in cleartext. For anything else, keep the
   loopback bind and tunnel in (`ssh -L 8787:127.0.0.1:8787 …`).
+- **Model output cannot reach the network.** The transcript renders the agent's
+  markdown, and an `<img>` would be fetched by the *browser* the moment it appeared
+  — egress that goes around the sandbox policy entirely, since the request does not
+  come from the sandbox. Images are therefore rendered as click-through links
+  instead, and a `Content-Security-Policy` with `img-src 'self' data:` blocks the
+  fetch even if one ever slips past that.
+- **Response headers.** `Referrer-Policy: no-referrer` (the token is in the URL, so
+  it is not left resting on a browser default), `Cache-Control: no-store`,
+  `nosniff`, `X-Frame-Options: DENY`, and a CSP whose `script-src` carries no
+  `'unsafe-inline'` — the bundle's own loader is allowed by SHA-256 hash, computed
+  from the embedded shell at startup. That way an escaping bug in the markdown
+  renderer cannot become script execution with the token behind it.
 
 This mirrors the rest of cowboy's model: the host owns the boundary, access is
 token-gated and fails closed, and nothing binds beyond localhost by default.

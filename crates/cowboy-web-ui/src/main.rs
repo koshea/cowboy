@@ -589,7 +589,15 @@ fn render_block(b: &Block) -> Html {
 /// to safe schemes — the agent's output is untrusted, so this must not be an XSS
 /// vector into the page that holds the access token.
 fn markdown(src: &str) -> Html {
-    use pulldown_cmark::{html, Event, Options, Parser, Tag};
+    Html::from_html_unchecked(format!("<div class=\"md\">{}</div>", markdown_html(src)).into())
+}
+
+/// Render model markdown to an HTML fragment.
+///
+/// Split from [`markdown`] so the sanitising can be tested without a browser: the yew
+/// `Html` wrapper is untestable here, and this is the part with the security properties.
+fn markdown_html(src: &str) -> String {
+    use pulldown_cmark::{html, Event, Options, Parser, Tag, TagEnd};
     let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
     let events = Parser::new_ext(src, opts).map(|ev| match ev {
         Event::Html(s) | Event::InlineHtml(s) => Event::Text(s),
@@ -611,11 +619,42 @@ fn markdown(src: &str) -> Html {
                 id,
             })
         }
+        // An image becomes a *link*, so nothing is fetched until the user asks.
+        //
+        // SECURITY: `<img src="…">` is fetched the instant the transcript renders, and
+        // the URL is model-controlled. That is an egress beacon which bypasses the
+        // sandbox network policy completely, because the *browser* makes the request,
+        // not the sandbox — the one thing the boundary is supposed to make impossible.
+        // Rendering the alt text as a click-through link keeps the information and
+        // removes the automatic fetch; a click is the user's decision, not the agent's.
+        //
+        // Not merely scheme-checked like a link: a perfectly valid
+        // `https://attacker.example/pixel.gif` is exactly the beacon. The scheme check
+        // still applies on top, so an unsafe URL degrades to a dead `#`.
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            let dest_url = if is_safe_url(&dest_url) {
+                dest_url
+            } else {
+                "#".into()
+            };
+            Event::Start(Tag::Link {
+                link_type,
+                dest_url,
+                title,
+                id,
+            })
+        }
+        Event::End(TagEnd::Image) => Event::End(TagEnd::Link),
         ev => ev,
     });
     let mut body = String::new();
     html::push_html(&mut body, events);
-    Html::from_html_unchecked(format!("<div class=\"md\">{body}</div>").into())
+    body
 }
 
 /// Allow only obviously-safe link schemes (block `javascript:`, `data:`, etc.).
@@ -768,5 +807,70 @@ mod url_tests {
         assert!(!is_safe_url("https://example.com/\n"));
         assert!(!is_safe_url("/path\twith\ttabs"));
         assert!(!is_safe_url("https://exa\u{0}mple.com"));
+    }
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::markdown_html;
+
+    /// Model output must not be able to make the browser fetch anything on its own.
+    ///
+    /// `<img src>` is fetched the moment the transcript renders, so an image in an agent
+    /// answer was an egress beacon that bypassed the sandbox network policy entirely —
+    /// the browser makes the request, not the sandbox. The page also carries the bearer
+    /// token in its URL, so the fetch is a referer risk on top of the egress one.
+    #[test]
+    fn an_image_never_becomes_an_img_tag() {
+        let out = markdown_html("![pixel](https://attacker.example/pixel.gif)");
+        assert!(
+            !out.contains("<img"),
+            "an image must not render as a fetching tag: {out}"
+        );
+        // The information is kept as a click-through, so nothing is silently dropped.
+        assert!(out.contains("<a href=\"https://attacker.example/pixel.gif\""), "{out}");
+        assert!(out.contains("pixel"), "the alt text should survive: {out}");
+    }
+
+    #[test]
+    fn an_unsafe_image_url_is_defused_like_an_unsafe_link() {
+        for src in [
+            "![x](javascript:alert(1))",
+            "![x](data:text/html,<script>alert(1)</script>)",
+        ] {
+            let out = markdown_html(src);
+            assert!(!out.contains("<img"), "{src} -> {out}");
+            assert!(!out.contains("javascript:"), "{src} -> {out}");
+            assert!(!out.contains("data:text/html"), "{src} -> {out}");
+            assert!(out.contains("href=\"#\""), "{src} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_reference_style_image_is_also_covered() {
+        // A different parser path to the same tag — worth pinning, because the fix keys
+        // on the event rather than on the syntax.
+        let out = markdown_html("![alt][ref]\n\n[ref]: https://attacker.example/p.png");
+        assert!(!out.contains("<img"), "{out}");
+        assert!(out.contains("https://attacker.example/p.png"), "{out}");
+    }
+
+    #[test]
+    fn ordinary_markdown_still_renders() {
+        // The sanitising must not have broken the actual feature.
+        let out = markdown_html("**bold** and `code` and [a link](https://example.com)\n\n- item");
+        assert!(out.contains("<strong>bold</strong>"), "{out}");
+        assert!(out.contains("<code>code</code>"), "{out}");
+        assert!(out.contains("<a href=\"https://example.com\">a link</a>"), "{out}");
+        assert!(out.contains("<li>item</li>"), "{out}");
+    }
+
+    #[test]
+    fn inline_html_is_still_neutralised_as_text() {
+        // Pre-existing behaviour, re-pinned next to the new image handling since both
+        // are the same defence.
+        let out = markdown_html("<script>alert(1)</script>");
+        assert!(!out.contains("<script>"), "{out}");
+        assert!(out.contains("&lt;script&gt;"), "{out}");
     }
 }

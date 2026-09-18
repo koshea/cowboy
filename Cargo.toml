@@ -54,6 +54,8 @@ ipnet = { version = "2", features = ["serde"] }
 # model client
 async-openai = { version = "0.41", features = ["chat-completion"] }
 tiktoken-rs = "0.12"
+sha2 = "0.10"          # CSP hashes for the web UI's trunk-injected loader
+base64 = "0.22"
 reqwest = "0.13"  # match async-openai's reqwest so the Client type unifies
 
 # MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess

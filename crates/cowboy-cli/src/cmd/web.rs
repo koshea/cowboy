@@ -200,6 +200,135 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
     Ok(())
 }
 
+/// `'sha256-…'` source expressions for every inline `<script>` in the served shell.
+///
+/// Trunk injects its own inline module loader (the `import init …` that boots the WASM),
+/// so `script-src` cannot be simply `'self'` — and `'unsafe-inline'` would throw away the
+/// reason for having a CSP at all, since this page renders model-controlled markdown as
+/// raw HTML. Hashing what trunk actually emitted keeps the policy strict *and* keeps it
+/// correct across trunk upgrades and `--filehash` changes, neither of which we control.
+///
+/// Computed once from the embedded bundle. An empty list is the right answer when no
+/// bundle was built (the placeholder page has no scripts).
+fn inline_script_hashes() -> &'static [String] {
+    static HASHES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    HASHES.get_or_init(|| {
+        let Some(shell) = WebAssets::get("index.html") else {
+            return Vec::new();
+        };
+        let html = String::from_utf8_lossy(&shell.data).into_owned();
+        hash_inline_scripts(&html)
+    })
+}
+
+/// The pure half of [`inline_script_hashes`], so the parsing is testable.
+fn hash_inline_scripts(html: &str) -> Vec<String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    let mut out = Vec::new();
+    // Comments first: a comment explaining the policy can legitimately contain the very
+    // markup being scanned for, and hashing that would produce a bogus allowance.
+    let code = strip_html_comments(html);
+    let mut rest = code.as_str();
+    while let Some(open) = rest.find("<script") {
+        let after = &rest[open + "<script".len()..];
+        let Some(gt) = after.find('>') else { break };
+        let (attrs, body_and_on) = (&after[..gt], &after[gt + 1..]);
+        let Some(end) = body_and_on.find("</script>") else {
+            break;
+        };
+        let body = &body_and_on[..end];
+        // An external script is covered by `'self'`; only inline bodies need a hash.
+        if !attrs.contains("src=") && !body.trim().is_empty() {
+            let digest = Sha256::digest(body.as_bytes());
+            let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+            out.push(format!("'sha256-{b64}'"));
+        }
+        rest = &body_and_on[end + "</script>".len()..];
+    }
+    out
+}
+
+fn strip_html_comments(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(open) = rest.find("<!--") {
+        out.push_str(&rest[..open]);
+        rest = match rest[open..].find("-->") {
+            Some(close) => &rest[open + close + 3..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The Content-Security-Policy served with every response.
+///
+/// `img-src` is the one that matters most: it means an image that ever slips past the
+/// markdown sanitiser still cannot become an egress beacon. The transcript is injected
+/// with `Html::from_html_unchecked`, so without a CSP the page's safety would rest
+/// entirely on pulldown-cmark never having an escaping bug — with the bearer token behind
+/// it. `connect-src` names `ws:`/`wss:` explicitly because the socket URL is built from
+/// `location`, and not every browser reads `'self'` as covering the WebSocket schemes.
+fn csp() -> &'static str {
+    static POLICY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    POLICY.get_or_init(|| {
+        let mut script = String::from("script-src 'self' 'wasm-unsafe-eval'");
+        for h in inline_script_hashes() {
+            script.push(' ');
+            script.push_str(h);
+        }
+        format!(
+            "default-src 'self'; \
+             img-src 'self' data:; \
+             style-src 'self' 'unsafe-inline'; \
+             {script}; \
+             connect-src 'self' ws: wss:; \
+             object-src 'none'; \
+             base-uri 'none'; \
+             frame-ancestors 'none'"
+        )
+    })
+}
+
+/// Response headers applied to everything the web UI serves.
+///
+/// SECURITY: this page holds the bearer token in its URL query (`?token=…`, and every
+/// WebSocket URL), and it renders **model-controlled markdown** as raw HTML.
+/// `Referrer-Policy: no-referrer` matters because a cross-origin subresource request would
+/// otherwise carry a `Referer`. Browsers default to origin-only for that, which excludes
+/// the query — but a default is a browser policy, not a guarantee, and an extension or a
+/// legacy enterprise setting can widen it back to the full URL. The token is not
+/// something to leave resting on a default.
+fn harden(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    // `insert`, not `append`: one authoritative value, so a handler cannot weaken it by
+    // having set its own.
+    h.insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::X_FRAME_OPTIONS,
+        header::HeaderValue::from_static("DENY"),
+    );
+    // The token rides in the URL, so keep this page out of shared caches entirely.
+    h.insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    if let Ok(v) = header::HeaderValue::from_str(csp()) {
+        h.insert(header::CONTENT_SECURITY_POLICY, v);
+    }
+    resp
+}
+
 /// Build the router (separated from `run` so tests can mount it on an ephemeral
 /// port without the bind guard / token minting).
 fn router(state: Arc<AppState>) -> Router {
@@ -213,6 +342,9 @@ fn router(state: Arc<AppState>) -> Router {
         // inert code; the token still gates every /api route. /api/* and / are
         // matched first as explicit routes.
         .fallback(static_handler)
+        // Applied to every route above, including the fallback and any added later —
+        // a per-handler list would be one `map` away from a gap.
+        .layer(axum::middleware::map_response(|r| async move { harden(r) }))
         .with_state(state)
 }
 
@@ -642,6 +774,144 @@ mod tests {
         assert!(
             serve_asset("index.html").is_some(),
             "index.html is embedded but not servable"
+        );
+    }
+
+    /// Every response carries the security headers, including ones added later.
+    ///
+    /// Served over a real socket rather than by calling `harden` directly: the value of
+    /// putting it in a `layer` is that a route added tomorrow is covered without anyone
+    /// remembering to, and only routing a real request proves that.
+    #[tokio::test]
+    async fn every_route_is_hardened() {
+        let state = Arc::new(AppState {
+            token: "t".into(),
+            resolve: Arc::new(|_| Box::pin(async { None })),
+            resolve_root: Arc::new(|_| Box::pin(async { None })),
+        });
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(tcp, router(state)).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        // The SPA shell, an unauthenticated API route, an authenticated one that will
+        // 401, and the static fallback — the four shapes a response can take.
+        for path in ["/", "/api/health", "/api/sessions", "/does-not-exist.js"] {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}{path}"))
+                .send()
+                .await
+                .expect("request");
+            let h = resp.headers();
+            assert_eq!(
+                h.get(header::REFERRER_POLICY).map(|v| v.to_str().unwrap()),
+                Some("no-referrer"),
+                "{path} must not leak a referer: the token is in the URL"
+            );
+            let csp = h
+                .get(header::CONTENT_SECURITY_POLICY)
+                .map(|v| v.to_str().unwrap())
+                .unwrap_or_default();
+            // The clauses with security meaning, rather than the whole string, so tuning
+            // the policy does not require re-approving a literal.
+            assert!(
+                csp.contains("img-src 'self' data:"),
+                "{path}: the CSP must stop a model-emitted image reaching the network: {csp}"
+            );
+            assert!(
+                csp.contains("script-src 'self' 'wasm-unsafe-eval'"),
+                "{path}: script-src missing: {csp}"
+            );
+            assert!(
+                !csp.contains("'unsafe-inline'")
+                    || !csp
+                        .split("script-src")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .contains("'unsafe-inline'"),
+                "{path}: script-src must stay strict — 'unsafe-inline' defeats it: {csp}"
+            );
+            assert_eq!(
+                h.get(header::X_CONTENT_TYPE_OPTIONS)
+                    .map(|v| v.to_str().unwrap()),
+                Some("nosniff"),
+                "{path}"
+            );
+            assert_eq!(
+                h.get(header::CACHE_CONTROL).map(|v| v.to_str().unwrap()),
+                Some("no-store"),
+                "{path} holds a token in its URL and must not be cached"
+            );
+        }
+    }
+
+    /// The page's only script is a file, not inline.
+    ///
+    /// This is what lets the CSP keep `script-src 'self'`. If the helper moves back
+    /// inline the CSP silently stops it from running — a broken viewport on mobile, with
+    /// nothing failing — so pin the shape rather than trusting the comment in the HTML.
+    /// The CSP allows exactly the inline scripts the served bundle contains.
+    ///
+    /// This is the test that matters, and the one I initially got wrong: I checked the
+    /// *source* `index.html`, which has no inline script — but trunk rewrites the shell
+    /// and injects its own inline module loader, so a `script-src 'self'` policy would
+    /// have blocked the WASM from ever booting. The served file is the only one with a
+    /// vote. Self-skips without a bundle, like the embed test next to it.
+    #[test]
+    fn the_csp_allows_the_bundles_own_loader_without_unsafe_inline() {
+        let Some(shell) = WebAssets::get("index.html") else {
+            eprintln!("skipping: no bundle embedded (empty dist/ — run `trunk build`)");
+            return;
+        };
+        let html = String::from_utf8_lossy(&shell.data).into_owned();
+        let hashes = hash_inline_scripts(&html);
+        let policy = csp();
+
+        // Whatever inline scripts the shell has, each must be individually allowed.
+        assert!(
+            !hashes.is_empty(),
+            "trunk has always injected an inline loader; if that changed, this test should \
+             be relaxed deliberately rather than silently passing"
+        );
+        for h in &hashes {
+            assert!(policy.contains(h.as_str()), "{h} missing from: {policy}");
+        }
+        // And the escape hatch stays shut — with it, the hashes would be ignored and the
+        // whole policy would stop mitigating an escaping bug in the markdown renderer.
+        let script_src = policy
+            .split("script-src")
+            .nth(1)
+            .and_then(|s| s.split(';').next())
+            .unwrap_or_default();
+        assert!(
+            !script_src.contains("'unsafe-inline'"),
+            "script-src must stay strict: {script_src}"
+        );
+    }
+
+    #[test]
+    fn inline_script_hashing_ignores_comments_and_external_scripts() {
+        // A comment explaining the policy legitimately contains the markup it warns
+        // about; hashing that would mint an allowance for text no browser executes.
+        let hashes = hash_inline_scripts(
+            r#"<!-- an inline <script>evil()</script> would need unsafe-inline -->
+               <script src="viewport.js"></script>
+               <script type="module">boot()</script>"#,
+        );
+        assert_eq!(hashes.len(), 1, "only the real inline body: {hashes:?}");
+        // Pinned against a known value so a change in digest or encoding is visible.
+        assert_eq!(
+            hashes[0],
+            format!("'sha256-{}'", {
+                use base64::Engine;
+                use sha2::{Digest, Sha256};
+                base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"boot()"))
+            })
         );
     }
 
