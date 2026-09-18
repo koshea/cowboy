@@ -25,6 +25,10 @@ sandbox:
   # this off it sees only what your package manager installed — a different
   # `cargo`, and nothing from pipx / uv tool / go install / cargo install.
   host_tools: true
+  # Share the host's mise store copy-on-write: toolchains you already installed are
+  # reused instead of re-downloaded, while anything the agent installs lands with
+  # the project and your own store is never written to. Needs host_tools.
+  share_mise_store: true
   # Resource ceilings, enforced with a cgroup. `cpus` also bounds build
   # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
   # every tool reads the CPU quota. Use `auto` to size from the host
