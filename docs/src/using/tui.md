@@ -48,6 +48,26 @@ Selected text is copied to the system clipboard via OSC 52, including through
 your terminal's selection (Shift often bypasses mouse capture for native
 selection).
 
+Mouse tracking is deliberately limited to button-held motion (`?1002`) rather
+than every pointer movement (`?1003`): drag-selection needs the former, and the
+latter turns an idle mouse into a steady stream of input the UI has no use for.
+
+## If the UI stops responding
+
+The TUI logs to `$TMPDIR/cowboy-<pid>.log` (stderr is redirected there so it
+can't scribble over the screen). If input ever seems dead while the display keeps
+updating, look for a line like:
+
+```text
+[input] 2106 byte(s) queued but unreported by crossterm; dropped 2106
+```
+
+That is the loop recovering from terminal input it was never told about — a burst
+larger than crossterm's 1 KiB read buffer can leave bytes in the kernel queue
+that its edge-triggered readiness never reports again. The status line says
+`input recovered` when it happens. `Ctrl-L` forces a full repaint if a frame is
+left with stale cells.
+
 ## Watching a ranch
 
 `cowboy ranch watch <id>` opens a live dashboard for a Ranch Plan — a workstream

@@ -7,7 +7,7 @@
 //! thread on a reply channel — safe because it is not a runtime worker shared
 //! with anything else.
 
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -336,6 +336,18 @@ pub struct SessionCtx {
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// Mouse tracking, enabled by hand rather than with crossterm's
+/// `EnableMouseCapture`. That helper also turns on **any-motion** reporting
+/// (`?1003h`), so every pointer movement across the window becomes ~16 bytes of
+/// input — while [`handle_mouse`] only cares about motion with a button held.
+/// That idle flood is the cheapest way to overrun crossterm's 1 KiB read buffer
+/// and strand input for good (see [`stranded_input_should_drop`]).
+/// `?1002h` reports motion only during a drag, which is all the selection needs.
+const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+/// The inverse, plus `?1003l` in case something else in the stack enabled
+/// any-motion reporting — leaving it on would spam the user's shell.
+const MOUSE_TRACKING_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+
 fn setup_terminal() -> Result<Term> {
     terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -347,9 +359,10 @@ fn setup_terminal() -> Result<Term> {
     execute!(
         stdout,
         terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste
     )?;
+    stdout.write_all(MOUSE_TRACKING_ON.as_bytes())?;
+    stdout.flush()?;
     // Best-effort: the kitty keyboard protocol lets us distinguish Shift+Enter
     // (newline) from Enter (send). Harmless where unsupported.
     if matches!(terminal::supports_keyboard_enhancement(), Ok(true)) {
@@ -371,10 +384,12 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
         );
     }
     terminal::disable_raw_mode()?;
+    terminal
+        .backend_mut()
+        .write_all(MOUSE_TRACKING_OFF.as_bytes())?;
     execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste,
-        crossterm::event::DisableMouseCapture,
         terminal::LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -410,6 +425,75 @@ fn clipboard_copy(out: &mut impl io::Write, text: &str) {
     };
     let _ = out.write_all(seq.as_bytes());
     let _ = out.flush();
+}
+
+/// How many terminal events one iteration will consume before yielding to a
+/// redraw. High enough that a drag-selection or a paste is absorbed in a single
+/// frame, low enough that a runaway input source can't stop the UI updating.
+const INPUT_DRAIN_BUDGET: usize = 512;
+/// Empty polls with bytes still queued before we call the input stranded. Two is
+/// enough: anything that arrived normally re-arms the readiness edge and is read
+/// on the very next iteration, so surviving two polls means no edge is coming.
+const STRANDED_AFTER_EMPTY_POLLS: u32 = 2;
+
+/// Whether queued-but-unreported terminal input should be dropped to get the UI
+/// moving again.
+///
+/// crossterm registers the tty with mio — i.e. **edge-triggered** epoll — and its
+/// read loop returns as soon as its parser yields one event, so it never drains
+/// the fd (it can't: stdin is blocking, so the `WouldBlock` break it relies on is
+/// unreachable). An input burst larger than its 1 KiB buffer therefore leaves
+/// bytes in the kernel queue with no further readiness edge to come, and
+/// `event::poll` reports "no input" *forever* while the render loop keeps
+/// drawing: the UI looks frozen and even Ctrl-C is dead, because raw mode
+/// delivers it as a key event to the loop that cannot read it. Seen in the wild
+/// after a long drag-selection — with mouse motion reporting on, one drag is
+/// easily 3 KiB of complete SGR reports.
+///
+/// Recovery has to come from us, because only *new* bytes re-arm the edge and the
+/// user's keystrokes may not be reaching the pty at all by then. Once the same
+/// queued bytes survive [`STRANDED_AFTER_EMPTY_POLLS`] they are unreachable, so
+/// they get dropped: discarding a backlog the user never saw beats a dead UI.
+/// (crossterm's parser may be holding the head of a sequence whose tail we drop,
+/// which can garble one subsequent event — a cheap price for not wedging.)
+fn stranded_input_should_drop(pending: usize, consecutive_empty_polls: u32) -> bool {
+    pending > 0 && consecutive_empty_polls >= STRANDED_AFTER_EMPTY_POLLS
+}
+
+/// Bytes waiting in the terminal's input queue, or 0 if stdin isn't a tty or the
+/// query fails — this only ever triggers recovery, so failing to 0 is the safe
+/// direction.
+fn tty_pending_bytes() -> usize {
+    let mut queued: libc::c_int = 0;
+    // SAFETY: both calls take stdin's raw fd; FIONREAD writes one `c_int`
+    // through a pointer to a live local.
+    unsafe {
+        if libc::isatty(libc::STDIN_FILENO) != 1 {
+            return 0;
+        }
+        if libc::ioctl(libc::STDIN_FILENO, libc::FIONREAD, &mut queued) != 0 {
+            return 0;
+        }
+    }
+    queued.max(0) as usize
+}
+
+/// Read and discard up to `pending` bytes from stdin, returning how many went.
+/// Called only when the kernel has just reported that many queued, so the reads
+/// cannot block even though stdin is in blocking mode.
+fn drop_tty_input(pending: usize) -> usize {
+    let mut buf = [0u8; 1024];
+    let mut dropped = 0usize;
+    while dropped < pending {
+        let want = (pending - dropped).min(buf.len());
+        // SAFETY: reading into our own buffer, bounded by its length.
+        let n = unsafe { libc::read(libc::STDIN_FILENO, buf.as_mut_ptr().cast(), want) };
+        if n <= 0 {
+            break;
+        }
+        dropped += n as usize;
+    }
+    dropped
 }
 
 /// Minimal standard base64 encoder (avoids a dependency for OSC 52 payloads).
@@ -535,8 +619,10 @@ fn event_loop(
     // watch target changes, so the nested view tails the file across ticks.
     let mut watch_pos: u64 = 0;
     let mut watch_pos_id = String::new();
+    // Consecutive polls that reported no input, for stranded-input detection.
+    let mut empty_polls: u32 = 0;
 
-    loop {
+    'main: loop {
         while let Ok(ev) = events.try_recv() {
             match ev {
                 // TurnDone needs loop-local turn bookkeeping, so it's handled
@@ -655,7 +741,19 @@ fn event_loop(
             app.status = format!("copied {n} chars");
         }
 
-        if event::poll(Duration::from_millis(120))? {
+        // Terminal input. Everything already queued is drained before the next
+        // frame rather than one event per draw: a drag-selection or a multi-KiB
+        // paste arrives as hundreds of events, and one-per-frame turns that into
+        // seconds of visible lag. Bounded so a flood cannot starve the redraw.
+        let mut drained = 0usize;
+        while drained < INPUT_DRAIN_BUDGET
+            && event::poll(if drained == 0 {
+                Duration::from_millis(120)
+            } else {
+                Duration::ZERO
+            })?
+        {
+            drained += 1;
             let ev = event::read()?;
             let input_before = app.input_text();
             match ev {
@@ -690,7 +788,7 @@ fn event_loop(
                         quit_armed: &mut quit_armed,
                     };
                     if handle_key(Event::Key(key), key, &mut app, ctx) {
-                        break;
+                        break 'main;
                     }
                 }
                 Event::Mouse(me) => handle_mouse(me, &mut app),
@@ -714,6 +812,29 @@ fn event_loop(
             } else {
                 app.clear_completions();
             }
+        }
+
+        // Input the terminal has delivered but crossterm will never report (see
+        // `stranded_input_should_drop`): recover instead of sitting frozen.
+        if drained == 0 {
+            empty_polls = empty_polls.saturating_add(1);
+            let pending = if empty_polls >= STRANDED_AFTER_EMPTY_POLLS {
+                tty_pending_bytes()
+            } else {
+                0
+            };
+            if stranded_input_should_drop(pending, empty_polls) {
+                let dropped = drop_tty_input(pending);
+                empty_polls = 0;
+                // Logged as well as shown: the status line is transient, and this
+                // is the fingerprint to look for if a freeze is ever reported again.
+                eprintln!(
+                    "[input] {pending} byte(s) queued but unreported by crossterm; dropped {dropped}"
+                );
+                app.status = format!("input recovered ({dropped} stale bytes dropped)");
+            }
+        } else {
+            empty_polls = 0;
         }
     }
     Ok(())
@@ -2060,5 +2181,49 @@ mod tests {
         assert_eq!(last_answer(&app).as_deref(), Some("thinking out loud"));
         app.push(LineKind::Final, "the answer");
         assert_eq!(last_answer(&app).as_deref(), Some("the answer"));
+    }
+
+    // Stranded input: the difference between "nothing arrived" and "something
+    // arrived that we will never be told about".
+
+    #[test]
+    fn an_empty_input_queue_is_never_dropped() {
+        // The common case by far: an idle UI polling with nothing to read.
+        for polls in [0, 1, 2, 1_000] {
+            assert!(!stranded_input_should_drop(0, polls));
+        }
+    }
+
+    #[test]
+    fn one_quiet_poll_is_not_enough_to_call_input_stranded() {
+        // Bytes that landed between the poll returning and the queue being read
+        // will be delivered on the next iteration — dropping them would eat a
+        // keystroke the user legitimately typed.
+        assert!(!stranded_input_should_drop(3, 1));
+    }
+
+    #[test]
+    fn bytes_surviving_two_quiet_polls_are_dropped_to_unfreeze_the_ui() {
+        // Two empty polls with the queue still occupied means no readiness edge
+        // is coming: without this the loop draws forever and never reads again.
+        assert!(stranded_input_should_drop(3, 2));
+        assert!(stranded_input_should_drop(2_106, 7));
+    }
+
+    #[test]
+    fn mouse_tracking_asks_for_drag_motion_but_not_idle_motion() {
+        // `?1003h` (any-motion) is what floods the input queue; the selection
+        // only needs `?1002h`. Guard the distinction the comment argues for.
+        assert!(MOUSE_TRACKING_ON.contains("?1002h"));
+        assert!(!MOUSE_TRACKING_ON.contains("?1003h"));
+        // SGR encoding is required: without it, columns past 223 can't be reported.
+        assert!(MOUSE_TRACKING_ON.contains("?1006h"));
+        // Everything turned on gets turned off, plus any-motion defensively.
+        for mode in ["1000", "1002", "1006", "1003"] {
+            assert!(
+                MOUSE_TRACKING_OFF.contains(&format!("?{mode}l")),
+                "{mode} left enabled on exit"
+            );
+        }
     }
 }
