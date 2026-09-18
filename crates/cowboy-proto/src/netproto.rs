@@ -92,10 +92,29 @@ pub enum ApprovalScope {
 }
 
 /// Serialize a message as a single newline-terminated JSON line.
+///
+/// **Never panics.** This used to `expect("control message serializes")`, which is true
+/// of every field *except* a path: `serde`'s `impl Serialize for Path` errors on invalid
+/// UTF-8, which is a legal filename on Linux. Several wire types carry a `PathBuf`
+/// (`DaemonReq::{StartSession, ListWorktrees, …}`, `SessionInfo::{root, worker_sock,
+/// journal_path}`, `AttachTarget`), and they are filled from the host filesystem — so a
+/// project directory with a non-UTF-8 byte in its name panicked whichever task was
+/// writing. In the worker's socket writer that aborts the live-event pump for *every*
+/// attached client, from nothing more than a directory name.
+///
+/// An empty string is returned instead, which the readers already tolerate: every one of
+/// them parses per line and skips what does not parse. So the blast radius is one dropped
+/// message rather than a dead connection. Callers who need to know use
+/// [`try_encode_line`].
 pub fn encode_line<T: Serialize>(msg: &T) -> String {
-    let mut s = serde_json::to_string(msg).expect("control message serializes");
+    try_encode_line(msg).unwrap_or_default()
+}
+
+/// [`encode_line`], but surfacing the failure.
+pub fn try_encode_line<T: Serialize>(msg: &T) -> Result<String, serde_json::Error> {
+    let mut s = serde_json::to_string(msg)?;
     s.push('\n');
-    s
+    Ok(s)
 }
 
 #[cfg(test)]
@@ -123,6 +142,42 @@ mod tests {
         // Absent in the JSON entirely -> None, not an error.
         let a: NetworkAttempt = serde_json::from_str(r#"{"protocol":"tls","port":443}"#).unwrap();
         assert_eq!(a.command_pid, None);
+    }
+
+    /// A legal Linux filename must not be able to kill a connection.
+    ///
+    /// `\xff\xfe` is a valid directory name and `canonicalize` does not sanitize it, so it
+    /// reaches `SessionInfo.root` and friends from an ordinary clone. Serializing that
+    /// used to panic inside whichever task was writing — in the worker's socket writer,
+    /// that ends the live-event pump for every attached client.
+    #[test]
+    fn a_non_utf8_path_is_dropped_rather_than_panicking() {
+        use crate::daemonproto::DaemonReq;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/tmp/\xff\xfe-bad"));
+        let msg = DaemonReq::ListWorktrees { repo: bad };
+
+        // The panicking behaviour is what this guards; the returned value is the
+        // consolation prize, and every reader already skips a line it cannot parse.
+        assert_eq!(encode_line(&msg), "");
+        // …and a caller that wants to know, can.
+        assert!(try_encode_line(&msg).is_err());
+    }
+
+    #[test]
+    fn an_encodable_message_is_unaffected() {
+        use crate::daemonproto::DaemonReq;
+        use std::path::PathBuf;
+
+        let msg = DaemonReq::ListWorktrees {
+            repo: PathBuf::from("/home/user/project"),
+        };
+        let line = encode_line(&msg);
+        assert!(line.ends_with('\n'));
+        assert!(line.contains("/home/user/project"), "{line}");
+        assert_eq!(try_encode_line(&msg).unwrap(), line);
     }
 
     #[test]

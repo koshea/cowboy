@@ -42,5 +42,24 @@ pub mod worktree;
 /// running at the root. Every tool a developer already has in their hands (`git`,
 /// `cargo`, `npm`) resolves its project by walking up; this now does too.
 pub fn project_root() -> std::io::Result<std::path::PathBuf> {
-    Ok(crate::project::resolve_root(&std::env::current_dir()?))
+    let root = crate::project::resolve_root(&std::env::current_dir()?);
+    // Refuse a root that cannot be represented on the wire, here, once, with a sentence
+    // that names the problem.
+    //
+    // `PathBuf` is not required to be UTF-8 on Linux, but the daemon protocol is JSON and
+    // serde refuses to serialize a non-UTF-8 path — so such a root would travel fine
+    // through every host-side call and then fail deep inside a socket writer, where the
+    // best available outcome is a silently dropped message. Cowboy cannot support a
+    // project at this path, and saying so at the boundary beats degrading in the middle.
+    if root.to_str().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "project path is not valid UTF-8 ({}) — cowboy cannot address it over the \
+                 daemon protocol; rename the directory",
+                root.display()
+            ),
+        ));
+    }
+    Ok(root)
 }
