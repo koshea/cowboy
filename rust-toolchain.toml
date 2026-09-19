@@ -1,0 +1,16 @@
+# The one compiler this repo is built and tested with. Pinned to an exact patch
+# version rather than `stable`, because a floating channel moves every six weeks
+# and brings clippy's lint set with it: `cargo clippy` must be clean (AGENTS.md),
+# so an upgrade that nobody chose shows up as an unrelated red CI run.
+#
+# `wasm32-unknown-unknown` is listed because `crates/cowboy-web-ui` is not a
+# workspace member and only builds for wasm32 — without the target, the one part
+# of the tree that `--workspace` never compiles also cannot be compiled by hand.
+#
+# Two places name this version: here, and the `dtolnay/rust-toolchain@<version>`
+# refs in `.github/workflows/{ci,release}.yml`. Change them together, and bump
+# `workspace.package.rust-version` in Cargo.toml to match.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

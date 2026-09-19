@@ -21,6 +21,14 @@ the obvious alternatives were tried and rejected for recorded reasons).
 
 ## Build / test / run
 
+The toolchain is pinned in `rust-toolchain.toml` (**1.98.1**) and declared again as
+`workspace.package.rust-version`; rustup honours the pin inside the checkout. The
+same version is named in the `dtolnay/rust-toolchain@<version>` refs in
+`.github/workflows/{ci,release}.yml` — bump all three together, and re-run clippy
+before you push, since a new compiler brings a new lint set and clippy must stay
+clean. Note a distro-packaged `cargo` (not the rustup shim) ignores the pin, so
+`cargo -V` is worth a glance when a lint appears or vanishes unexpectedly.
+
 ```sh
 cargo build                                  # whole workspace
 cargo nextest run                            # unit + integration

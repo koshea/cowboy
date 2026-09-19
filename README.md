@@ -27,7 +27,8 @@ tar xzf cowboy-<version>-x86_64-unknown-linux-gnu.tar.gz
 install -Dm755 cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/
 ```
 
-Or build from source (needs a Rust toolchain):
+Or build from source (needs Rust 1.98.1 or newer; a checkout pins it via
+`rust-toolchain.toml`):
 
 ```sh
 cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli   # installs `cowboy` + `cowboyd`
@@ -61,8 +62,12 @@ installing a prebuilt `trunk` beforehand; with it on `PATH` the build reuses it:
 
 ```sh
 sudo pacman -S trunk     # Arch        (brew install trunk on macOS;
-rustup target add wasm32-unknown-unknown  #  or `cargo binstall trunk` anywhere)
+                         #              or `cargo binstall trunk` anywhere)
 ```
+
+The `wasm32-unknown-unknown` target comes with the pinned toolchain
+(`rust-toolchain.toml` lists it), so there is no `rustup target add` step in a
+checkout.
 
 Already installed at the same version? Add `--force` so cargo actually rebuilds
 (it skips a same-commit reinstall otherwise, and the flag would have no effect).

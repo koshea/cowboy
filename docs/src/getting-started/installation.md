@@ -68,6 +68,13 @@ cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli
 
 This builds and installs `cowboy` (and the `cowboyd` daemon) to `~/.cargo/bin`.
 
+Cowboy is built and tested with **Rust 1.98.1**, pinned in `rust-toolchain.toml`.
+Inside a checkout, rustup reads that file and fetches the right compiler on its
+own. Installing straight from git skips the pin (cargo unpacks the source into its
+own cache), so there the requirement is enforced by `rust-version` instead: an
+older toolchain refuses with "requires rustc 1.98.1" rather than failing somewhere
+inside a dependency. `rustup update` is the fix.
+
 `--locked` is worth keeping: it builds the dependency versions this project actually
 tests, rather than re-resolving to whatever is newest today. Without it, cargo also
 reports a couple of transitive crates as behind their latest release — `matchit` and
