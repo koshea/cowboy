@@ -125,6 +125,27 @@ fn accept(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
 /// tears down the abandoned worktree/branch so the relaunch reuses the canonical
 /// name.
 async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()> {
+    retry_with(root, id, workstream, |sid| async move {
+        session_liveness(&sid).await
+    })
+    .await
+}
+
+/// `retry` with the liveness probe injected, so the three branches that decide
+/// whether a worktree gets destroyed are testable without a daemon. The version
+/// that reaches for the real daemon used to be the only one, which made this
+/// path's test pass or fail on whether the developer happened to have `cowboyd`
+/// running — green here, red on CI.
+async fn retry_with<F, Fut>(
+    root: &std::path::Path,
+    id: &str,
+    workstream: &str,
+    liveness: F,
+) -> Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = SessionLiveness>,
+{
     let _lock = lock_ranch(root, id)?;
     let mut ranch = ranch::load(root, id)?;
     let before = ranch.clone();
@@ -147,7 +168,7 @@ async fn retry(root: &std::path::Path, id: &str, workstream: &str) -> Result<()>
     // CLOSED: if liveness can't be determined (daemon unreachable), do not destroy —
     // a transient socket blip must not be a licence to wipe a possibly-live worktree.
     if let Some(sid) = w.session_id.clone() {
-        match session_liveness(&sid).await {
+        match liveness(sid.clone()).await {
             SessionLiveness::Live => bail!(
                 "workstream `{workstream}` still has a live session ({sid}); end it first \
                  (e.g. `cowboy down`) before retrying"
@@ -1762,8 +1783,10 @@ mod tests {
     async fn retry_resets_failed_workstream_and_rejects_running() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let root = tmp.path();
-        // A failed workstream with a dead session; a dependent is blocked on it.
-        // (No daemon in the test → session_is_live is false → retry proceeds.)
+        // A failed workstream with a session the daemon reports as gone; a dependent
+        // is blocked on it. The liveness probe is injected: reaching for a real
+        // daemon made this test pass only on machines that happened to have one
+        // running, and fail everywhere else.
         let mut r = ranch(vec![
             ws("a", &[], WorkstreamStatus::Failed, Some("dead-sid")),
             ws("b", &["a"], WorkstreamStatus::Blocked, None),
@@ -1771,7 +1794,9 @@ mod tests {
         r.workstream_mut("a").unwrap().worktree_path = Some("/nonexistent/wt".into());
         ranch::save(root, &r).unwrap();
 
-        retry(root, "r", "a").await.unwrap();
+        retry_with(root, "r", "a", |_| async { SessionLiveness::Dead })
+            .await
+            .unwrap();
 
         let r2 = ranch::load(root, "r").unwrap();
         let a = r2.workstream("a").unwrap();
@@ -1786,7 +1811,61 @@ mod tests {
         // A running (non-terminal) workstream can't be retried.
         let running = ranch(vec![ws("a", &[], WorkstreamStatus::Running, Some("s"))]);
         ranch::save(root, &running).unwrap();
-        assert!(retry(root, "r", "a").await.is_err());
+        assert!(
+            retry_with(root, "r", "a", |_| async { SessionLiveness::Dead })
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_refuses_while_the_session_is_still_live() {
+        // `worktree::remove --force` would destroy in-flight work, so a live session
+        // outranks the plan's `Failed` status — and nothing may be forgotten.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut r = ranch(vec![ws("a", &[], WorkstreamStatus::Failed, Some("sid"))]);
+        r.workstream_mut("a").unwrap().worktree_path = Some("/nonexistent/wt".into());
+        ranch::save(root, &r).unwrap();
+
+        let err = retry_with(root, "r", "a", |_| async { SessionLiveness::Live })
+            .await
+            .expect_err("a live session must not be retried");
+        assert!(
+            err.to_string().contains("live session"),
+            "should say why: {err}"
+        );
+        let after = ranch::load(root, "r").unwrap();
+        let a = after.workstream("a").unwrap();
+        assert_eq!(a.status, WorkstreamStatus::Failed, "plan left untouched");
+        assert!(a.session_id.is_some(), "session still recorded");
+        assert!(a.worktree_path.is_some(), "worktree still recorded");
+    }
+
+    #[tokio::test]
+    async fn retry_fails_closed_when_liveness_is_unknown() {
+        // The whole point of the three-way probe: an unreachable daemon is not
+        // evidence the worker is gone, so the destructive path must not run. This is
+        // the branch a daemon-dependent test could never reach.
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut r = ranch(vec![ws("a", &[], WorkstreamStatus::Failed, Some("sid"))]);
+        r.workstream_mut("a").unwrap().worktree_path = Some("/nonexistent/wt".into());
+        ranch::save(root, &r).unwrap();
+
+        let err = retry_with(root, "r", "a", |_| async { SessionLiveness::Unknown })
+            .await
+            .expect_err("indeterminate liveness must refuse");
+        assert!(
+            err.to_string().contains("can't confirm"),
+            "should say why: {err}"
+        );
+        let after = ranch::load(root, "r").unwrap();
+        assert_eq!(
+            after.workstream("a").unwrap().status,
+            WorkstreamStatus::Failed,
+            "plan left untouched"
+        );
     }
 
     #[test]

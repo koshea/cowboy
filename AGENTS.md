@@ -40,6 +40,12 @@ over a unix socket.
 - **Unit tests** live beside code (`#[cfg(test)] mod tests`). Pure logic is made
   unit-testable by **injecting** side effects as closures (see
   `cmd/ranch.rs::reconcile_and_pick`) rather than reaching for a daemon/disk.
+  Reaching for the real daemon is the specific trap: `ranch::retry`'s test called
+  `session_liveness`, which asks `cowboyd` whether a session is alive. It passed on
+  any dev box with a daemon running and failed on every machine without one — CI
+  was red for three commits while `cargo test --workspace` was green locally.
+  `retry_with` now takes the probe as an argument, which also made the two refusal
+  branches (live session, indeterminate) testable at all.
 - **Snapshot tests** use `insta` (e.g. the agent tool surface, TUI rendering).
   Update intentionally: `INSTA_UPDATE=always cargo test …`, then review the diff.
 - **Sandbox suites** (`tests/sandbox_exec.rs`, `sandbox_session.rs`,
