@@ -95,6 +95,7 @@ fn ensure_gitignore(root: &Path) -> Result<()> {
     let wanted = [
         ".env",
         ".cowboy/sessions/",
+        ".cowboy/mise/",
         ".cowboy/ranches/*/events.jsonl",
         ".cowboy/ranches/*/workstreams/",
         "/target",

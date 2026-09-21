@@ -275,6 +275,98 @@ pub(super) fn grant_notice(stage: GrantStage, b: &IterationBudget) -> Option<Str
     }
 }
 
+/// Host-recorded evidence that the project's own checks were run and passed since
+/// the last edit.
+///
+/// The point is that this is *measured*, not self-reported. "I ran the tests and
+/// they pass" in a `final` message is the model's account of itself; this is a
+/// record of which commands actually exited 0, kept by the loop that ran them. The
+/// same distinction `build_partial_result` already draws for artifacts.
+///
+/// Off unless the project nominated commands (`agent.verify`), because a gate
+/// invented by the harness would refuse completion over a check the repo never
+/// asked for.
+#[derive(Debug, Default)]
+pub(super) struct Verification {
+    /// The commands that must pass, as resolved from config. Empty = gate off.
+    required: Vec<String>,
+    /// Required commands observed exiting 0 since the last edit.
+    passed: std::collections::HashSet<String>,
+    /// Whether any file has been changed since the last full pass.
+    dirty: bool,
+}
+
+impl Verification {
+    pub(super) fn new(required: Vec<String>) -> Self {
+        Self {
+            required,
+            ..Default::default()
+        }
+    }
+
+    pub(super) fn is_enabled(&self) -> bool {
+        !self.required.is_empty()
+    }
+
+    /// Record that the workspace changed, which invalidates every earlier pass: a
+    /// test run only vouches for the tree it ran against.
+    pub(super) fn note_edit(&mut self) {
+        self.dirty = true;
+        self.passed.clear();
+    }
+
+    /// Record a finished command. Matching is on the normalized command text, so
+    /// the same check counts whether or not the model added whitespace; a non-zero
+    /// exit deliberately does *not* count, and clears any earlier pass of that same
+    /// command so a passing run followed by a failing one is not treated as verified.
+    pub(super) fn note_command(&mut self, command: &str, exit_code: i32) {
+        let Some(req) = self.match_required(command) else {
+            return;
+        };
+        if exit_code == 0 {
+            self.passed.insert(req);
+        } else {
+            self.passed.remove(&req);
+        }
+    }
+
+    /// The required command `command` counts as, if any.
+    ///
+    /// A command counts when the required text appears within it, so the usual
+    /// wrappers still register: `cd crates/x && cargo test`, or `cargo test 2>&1 |
+    /// tail`. Narrower than matching per-word (which would let `cargo build` satisfy
+    /// a `cargo test` requirement) and looser than equality (which nothing real
+    /// would ever satisfy).
+    fn match_required(&self, command: &str) -> Option<String> {
+        let norm = squeeze_cmd(command);
+        self.required
+            .iter()
+            .find(|r| norm.contains(&squeeze_cmd(r)))
+            .cloned()
+    }
+
+    /// Required commands with no passing run against the current tree.
+    pub(super) fn outstanding(&self) -> Vec<&str> {
+        self.required
+            .iter()
+            .filter(|r| !self.passed.contains(*r))
+            .map(|r| r.as_str())
+            .collect()
+    }
+
+    /// Whether finishing now would leave edits unchecked — the condition the
+    /// `final` gate acts on. Clean sessions (a question, a review, an
+    /// investigation) are never gated, since there is nothing to verify.
+    pub(super) fn has_unverified_edits(&self) -> bool {
+        self.is_enabled() && self.dirty && !self.outstanding().is_empty()
+    }
+}
+
+/// Collapse whitespace so command comparison ignores formatting.
+fn squeeze_cmd(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// What a worker has already seen, so the loop can tell "still working" from "going
 /// in circles" **without asking the model**.
 ///
@@ -582,6 +674,160 @@ pub(super) fn unified_diff(path: &str, before: &str, after: &str, max_lines: usi
     }
 }
 
+/// How a file-op's output is cut down to fit the observation budget.
+///
+/// Not a detail: each of the three tools puts the part the agent cannot do without
+/// in a different place, and one blanket rule loses it for two of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Trim {
+    /// Keep the head. `edit`/`write` produce a line or two, so this never bites.
+    Head,
+    /// Keep both ends. `grep`/`ls` deliberately put their true totals **last**, so
+    /// head-only truncation drops exactly the summary that tells the agent how much
+    /// it did not see — and leaves it believing it saw everything.
+    Ends,
+    /// Keep the head, then say where the cut landed. A `read` window is ordered, so
+    /// the front is what matters; but its "… N more lines, continue with offset=X"
+    /// hint is at the end and goes over the cliff with everything else, leaving a
+    /// window that stops mid-file with no sign that it did.
+    Read,
+}
+
+/// What the agent has seen of a file, so a full overwrite can be checked against it.
+///
+/// Keyed by the path string the agent used, and stores a digest rather than the
+/// content: the point is only to answer "are the bytes on disk still the bytes this
+/// session last observed?", and holding every file read in a long session in memory
+/// to answer it would be wasteful.
+#[derive(Debug, Default)]
+pub(super) struct SeenFiles {
+    digests: std::collections::HashMap<String, u64>,
+}
+
+/// How the current content of a file relates to what the agent last saw of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SeenStatus {
+    /// The file is exactly as the agent last observed it.
+    Match,
+    /// The agent has never observed this file in this session.
+    Unseen,
+    /// Someone else has written to it since.
+    Changed,
+}
+
+impl SeenFiles {
+    /// Record the current content of `path` as observed. `None` (an unreadable or
+    /// non-UTF-8 file) forgets it rather than recording a digest of nothing.
+    pub(super) fn note(&mut self, path: &str, content: &Option<String>) {
+        match content {
+            Some(c) => {
+                self.digests.insert(path.to_string(), digest(c));
+            }
+            None => {
+                self.digests.remove(path);
+            }
+        }
+    }
+
+    pub(super) fn status(&self, path: &str, current: &str) -> SeenStatus {
+        match self.digests.get(path) {
+            None => SeenStatus::Unseen,
+            Some(d) if *d == digest(current) => SeenStatus::Match,
+            Some(_) => SeenStatus::Changed,
+        }
+    }
+}
+
+/// Lines of the applied diff handed back to the *model* after an edit or write.
+///
+/// Much tighter than the UI's cap: this is paid for in context on every edit, and
+/// its job is to confirm placement, not to reproduce the file.
+const MODEL_DIFF_LINES: usize = 32;
+
+/// Report an applied change back to the model as a diff, so it can see what landed
+/// without re-reading the file.
+///
+/// `edit` used to answer "edited x.rs: 1 edit applied, 1 replacement" — true, and
+/// yet it says nothing about *where* the text went or what now surrounds it. A model
+/// that wants to be sure re-reads the file (a whole round trip, for a change it just
+/// made), and one that does not carries on against an assumed result. A few lines of
+/// context are much cheaper than either.
+pub(super) fn applied_change_note(path: &str, before: &str, after: &str) -> Option<String> {
+    let diff = unified_diff(path, before, after, MODEL_DIFF_LINES);
+    if diff.trim().is_empty() {
+        return None;
+    }
+    // Drop the `--- a/x`/`+++ b/x` header: the path is already in the result line
+    // above, and two lines of every edit's budget is worth reclaiming.
+    let body: Vec<&str> = diff
+        .lines()
+        .skip_while(|l| l.starts_with("---") || l.starts_with("+++"))
+        .collect();
+    if body.is_empty() {
+        return None;
+    }
+    Some(format!("applied change:\n{}\n", body.join("\n")))
+}
+
+/// Tell a `read` whose output was cut by the byte cap where it actually got to.
+///
+/// `read` puts its own continuation hint ("… N more lines; read with offset=X") at
+/// the end, which is exactly what head truncation throws away — leaving the model
+/// with a window that stops mid-file and no sign that it did. The last surviving
+/// gutter line says where the cut landed, which is all the hint needs.
+pub(super) fn read_continuation_hint(truncated: &str) -> Option<String> {
+    let last = truncated.lines().rev().find_map(|l| {
+        l.split_once('\t')
+            .and_then(|(n, _)| n.trim().parse::<u64>().ok())
+    })?;
+    Some(format!(
+        "\n[the output cap cut this read at line {last}; continue with offset={}]",
+        last + 1
+    ))
+}
+
+/// A wall-clock duration, for the `[exit code: …]` line.
+///
+/// The model has no clock: without this it cannot tell a 0.2s unit test from a
+/// 9-minute one, which is exactly what it needs to know before choosing a
+/// `timeout_seconds`, deciding whether to re-run the whole suite, or judging whether
+/// a command it just changed got faster.
+pub(super) fn fmt_duration(ms: u128) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        let secs = ms / 1000;
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// What to tell the model about a command that did not simply finish.
+///
+/// A bare `[exit code: 124]` is a puzzle: 124 is indistinguishable from a real
+/// failing exit status, and the two useful reactions — raise the timeout, or stop
+/// running a server in the foreground — are not deducible from it. Naming the
+/// timeout that fired and both options turns a repeat of the same ten-minute hang
+/// into one decision.
+pub(super) fn shell_outcome_note(exit: i32, timeout_secs: u64, ceiling: u64) -> String {
+    match exit {
+        crate::sandbox::EXIT_TIMEOUT => format!(
+            "\n[timed out: the command was killed after {timeout_secs}s and its exit status \
+             is unknown. If it genuinely needs longer, re-run it with a larger \
+             `timeout_seconds` (up to {ceiling}). If it is a server, watcher or REPL that \
+             never exits on its own, do not re-run it in the foreground — start it with \
+             the `proc` tool and then test against it.]"
+        ),
+        crate::sandbox::EXIT_CANCELLED => {
+            "\n[cancelled: the user interrupted this command. Do not simply re-run it — \
+             read what they asked for next.]"
+                .to_string()
+        }
+        _ => String::new(),
+    }
+}
+
 /// A stable signature for a turn's tool calls (name + arguments), order-
 /// independent so parallel calls in a different order still compare equal. Used
 /// by the loop guard to detect an agent re-issuing the identical action.
@@ -689,6 +935,12 @@ fn is_cosmetic_segment(seg: &str) -> bool {
 }
 
 /// Truncate `output` to at most `max_bytes`, on a char boundary, with a marker.
+///
+/// Head-only. Use [`truncate_middle`] for command output, where the tail carries
+/// the result; this stays the predictable structural backstop in
+/// `push_tool_result`, and is right for anything whose front matters most (a
+/// `read` window, which is ordered — see [`read_continuation_hint`] for what
+/// replaces the continuation hint the cut takes with it).
 pub(super) fn truncate(output: &str, max_bytes: usize) -> String {
     if output.len() <= max_bytes {
         return output.to_string();
@@ -703,6 +955,94 @@ pub(super) fn truncate(output: &str, max_bytes: usize) -> String {
         max_bytes
     )
 }
+
+/// Truncate `output` to at most `max_bytes`, keeping **both ends**, with a marker
+/// in the middle naming how much was dropped.
+///
+/// Head-only truncation discards the most valuable part of build and test output:
+/// the last lines, which carry the verdict — `test result: FAILED. 3 passed; 2
+/// failed`, the linker error, the panic, the failing assertion. A verbose
+/// `cargo test` that overran the cap used to hand the model 60k of compile
+/// progress with every failure cut off the end, so the obvious next move was to
+/// re-run the same command to find out what broke — paying for the output twice
+/// and learning nothing the first time.
+///
+/// Split evenly between the ends. The head keeps whatever the caller put in front
+/// (the `[exit code: N]` line) plus the first errors; the tail keeps the summary.
+/// Cuts prefer a nearby line boundary so neither end is a half line, and fall back
+/// to a char boundary when there is no newline to snap to (minified output, one
+/// enormous line).
+///
+/// Degrades to [`truncate`] when `max_bytes` is too small to hold two useful
+/// fragments plus the marker — at that size a single head is the honest answer.
+pub(super) fn truncate_middle(output: &str, max_bytes: usize) -> String {
+    if output.len() <= max_bytes {
+        return output.to_string();
+    }
+    // The marker itself has to fit, and two fragments plus a marker only beat a
+    // single head once there is real room for both.
+    const MIN_SPLIT_BYTES: usize = 512;
+    if max_bytes < MIN_SPLIT_BYTES {
+        return truncate(output, max_bytes);
+    }
+    // Reserve generously for the marker; a slightly smaller body is fine, a body
+    // that pushes the total over `max_bytes` is not (`push_tool_result` would then
+    // head-truncate the result and cut off the tail this exists to preserve).
+    const MARKER_RESERVE: usize = 96;
+    let body = max_bytes.saturating_sub(MARKER_RESERVE);
+    let head_budget = body / 2;
+    let tail_budget = body - head_budget;
+
+    let head_end = snap_back(output, head_budget);
+    let tail_start = snap_forward(output, output.len() - tail_budget);
+    // Snapping moved the cuts; if they crossed or met there is nothing to elide and
+    // a plain head is correct.
+    if tail_start <= head_end {
+        return truncate(output, max_bytes);
+    }
+    let elided = tail_start - head_end;
+    format!(
+        "{}\n[... {} bytes elided ({} of {} shown; the middle was dropped, both ends kept) ...]\n{}",
+        &output[..head_end],
+        elided,
+        output.len() - elided,
+        output.len(),
+        &output[tail_start..]
+    )
+}
+
+/// Largest index `<= at` that is a char boundary, preferring the end of a line
+/// within [`SNAP_SLACK`] bytes so a fragment does not stop mid-line.
+fn snap_back(s: &str, at: usize) -> usize {
+    let mut end = at.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    let floor = end.saturating_sub(SNAP_SLACK);
+    match s[floor..end].rfind('\n') {
+        // +1 keeps the newline with the head, so the marker starts on its own line.
+        Some(i) => floor + i + 1,
+        None => end,
+    }
+}
+
+/// Smallest index `>= at` that is a char boundary, preferring the start of a line
+/// within [`SNAP_SLACK`] bytes so a fragment does not start mid-line.
+fn snap_forward(s: &str, at: usize) -> usize {
+    let mut start = at.min(s.len());
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    let ceil = (start + SNAP_SLACK).min(s.len());
+    match s[start..ceil].find('\n') {
+        Some(i) => start + i + 1,
+        None => start,
+    }
+}
+
+/// How far [`snap_back`]/[`snap_forward`] will travel to find a line boundary.
+/// Bounded so a single enormous line cannot shrink a fragment to nothing.
+const SNAP_SLACK: usize = 4096;
 
 #[cfg(test)]
 mod tests {

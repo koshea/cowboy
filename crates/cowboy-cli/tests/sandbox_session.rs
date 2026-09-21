@@ -221,7 +221,9 @@ while True:
         cwd: "/workspace".to_string(),
         auto_start: false,
     };
-    s.start_process("web", &def).await.unwrap();
+    s.start_process("web", &def.command, Some(&def.cwd))
+        .await
+        .unwrap();
     assert!(
         s.process_is_running("web"),
         "the process should have been started"
@@ -283,6 +285,51 @@ async fn commands_share_the_network_namespace_but_not_the_pid_namespace() {
             "each command must have its own PID namespace, saw: {out}"
         );
     }
+
+    s.stop().await;
+}
+
+/// A background process's output has to land somewhere the agent can read, since it
+/// is not attached to any command's stdout. That "somewhere" is a log file in the
+/// workspace, written by the wrapper the sandbox puts around the command.
+#[tokio::test]
+async fn a_background_process_writes_its_output_to_a_workspace_log() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let s = sandbox(&p.path());
+
+    // Writes to stdout *and* stderr, because both have to be captured: a server's
+    // interesting lines (the port it bound, the traceback) are usually on stderr.
+    s.start_process(
+        "probe",
+        "echo out-line; echo err-line 1>&2; sleep 30",
+        Some("/workspace"),
+    )
+    .await
+    .unwrap();
+
+    let log = p.path().join(".cowboy/proc/probe.log");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut text = String::new();
+    while std::time::Instant::now() < deadline {
+        text = std::fs::read_to_string(&log).unwrap_or_default();
+        if text.contains("out-line") && text.contains("err-line") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        text.contains("out-line"),
+        "stdout must be captured: {text:?}"
+    );
+    assert!(
+        text.contains("err-line"),
+        "stderr must be captured: {text:?}"
+    );
+    assert!(
+        s.running_processes().contains(&"probe".to_string()),
+        "and it is still running"
+    );
 
     s.stop().await;
 }
@@ -399,7 +446,9 @@ async fn a_running_process_is_reported_as_stale_after_a_grant() {
         cwd: "/workspace".to_string(),
         auto_start: false,
     };
-    s.start_process("web", &def).await.unwrap();
+    s.start_process("web", &def.command, Some(&def.cwd))
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let outside = assert_fs::TempDir::new().unwrap();
@@ -443,7 +492,9 @@ async fn stopping_the_session_reaps_background_processes() {
         cwd: "/workspace".to_string(),
         auto_start: false,
     };
-    s.start_process("web", &def).await.unwrap();
+    s.start_process("web", &def.command, Some(&def.cwd))
+        .await
+        .unwrap();
 
     // Poll rather than sleep a fixed 800ms. Bringing a session up (holder,
     // namespaces, Landlock, seccomp, ruleset) and then starting a process can outlast

@@ -36,6 +36,8 @@ pub async fn run(target: String) -> Result<()> {
             current_model: String::new(),
             ranch_id: None,
             workstream_id: None,
+            // Attaching to an existing session: the launchpad is for fresh starts.
+            suggestions: Vec::new(),
         };
         return attach_socket(&p, "cowboy", Vec::new(), ctx);
     }
@@ -60,6 +62,8 @@ pub async fn run(target: String) -> Result<()> {
         current_model: String::new(),
         ranch_id: info.ranch_id.clone(),
         workstream_id: info.workstream_id.clone(),
+        // Attaching to an existing session: the launchpad is for fresh starts.
+        suggestions: Vec::new(),
     };
     let title = title_for(&info);
     match target {
@@ -394,9 +398,9 @@ fn handle_server_msg(
                 let _ = out.send(ClientMsg::AskReply { id, answer });
             });
         }
-        ServerMsg::Approval { id, dest } => {
+        ServerMsg::Approval { id, dest, detail } => {
             let (vtx, vrx) = tokio::sync::oneshot::channel();
-            let _ = ui_tx.send(UiEvent::Approval(dest, vtx));
+            let _ = ui_tx.send(UiEvent::Approval(dest, detail, vtx));
             let out = out_tx.clone();
             tokio::spawn(async move {
                 if let Ok((verdict, scope)) = vrx.await {

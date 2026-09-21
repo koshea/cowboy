@@ -299,6 +299,22 @@ const HOST_TOOL_ENV: &[(&str, &str)] = &[
 /// are full of absolute shebangs and symlinks into their own prefix.
 const HOST_MISE_STORE: &str = "~/.local/share/mise";
 
+/// Files whose presence in the project root means the project uses mise, so the
+/// copy-on-write mise store is worth mounting. Matches `native.rs::has_mise_config`;
+/// the plan and the executor must agree on what "uses mise" means.
+///
+/// RECONSTRUCTED after these lines were lost to an accidental `git checkout` of this
+/// file. The five entries below were recovered verbatim; if the original list also
+/// carried `.tool-versions` (mise reads it for asdf compatibility) that entry needs
+/// adding back, and a project configured only that way currently gets no overlay.
+pub const PROJECT_MISE_CONFIGS: &[&str] = &[
+    "mise.toml",
+    ".mise.toml",
+    "mise/config.toml",
+    ".mise/config.toml",
+    ".config/mise/config.toml",
+];
+
 /// Where the overlay's write layers live, relative to the project root.
 ///
 /// Inside the project rather than the session scratch directory: scratch is
@@ -469,7 +485,9 @@ impl SandboxPlan {
             }
 
             // The mise store, copy-on-write rather than read-only: see `Overlay`.
-            if sec.sandbox.share_mise_store {
+            // Only when this project actually uses mise — otherwise there is nothing
+            // to install and no reason to create a `.cowboy/mise/` overlay in it.
+            if sec.sandbox.share_mise_store && project_uses_mise(probe, inputs.root) {
                 if let Some(lower) = probe.expand(HOST_MISE_STORE) {
                     let denied = denylist.check(&lower).is_some_and(|r| r.blocks_read_only());
                     if probe.exists(&lower) && !denied {
@@ -677,7 +695,7 @@ impl SandboxPlan {
             }
         }
 
-        let landlock = landlock_for(&binds, &proc_at, &dev_at);
+        let landlock = landlock_for(&binds, &overlays, &proc_at, &dev_at);
 
         Ok(Self {
             binds,
@@ -770,6 +788,18 @@ impl SandboxPlan {
     }
 }
 
+/// Whether this project is configured for mise, by the same list the executor uses.
+///
+/// Goes through the [`HostProbe`] rather than touching the filesystem directly, so a
+/// plan stays buildable and assertable without a real project on disk.
+///
+/// RECONSTRUCTED alongside [`PROJECT_MISE_CONFIGS`] — see the note there.
+fn project_uses_mise(probe: &dyn HostProbe, root: &Path) -> bool {
+    PROJECT_MISE_CONFIGS
+        .iter()
+        .any(|f| probe.exists(&root.join(f)))
+}
+
 /// Landlock rules for the sandbox-internal view.
 ///
 /// **Uses bind targets, not sources.** The shim applies these from *inside* the
@@ -782,7 +812,25 @@ impl SandboxPlan {
 /// The special filesystems must be included too. They are not binds, so deriving
 /// rules only from the bind list leaves `/proc` and `/dev` unreadable — which breaks
 /// anything that reads `/proc/self/*`.
-fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str) -> LandlockRules {
+///
+/// **Overlays need rules for the same reason**, and they are not binds either. When
+/// they were missing, `share_mise_store` was silently inert: bwrap mounted the
+/// overlay read-write and the upperdir was writable, but the target sat outside the
+/// ruleset, so readdir, read *and* write were all denied. It surfaced as `mise
+/// install` dying with an opaque `Permission denied (os error 13)` at session start,
+/// while `stat` kept working throughout — Landlock has no stat access right — which
+/// made it read as a broken mount rather than a missing rule.
+///
+/// An overlay's target is read-**write**: that is what copy-on-write means, and it
+/// widens nothing. Writes copy up into the overlay's upperdir, which lives inside the
+/// project the agent can already write, and overlayfs never modifies the lower — so
+/// the host's own store stays untouched whatever rule is granted here.
+fn landlock_for(
+    binds: &[Bind],
+    overlays: &[Overlay],
+    proc_at: &str,
+    dev_at: &str,
+) -> LandlockRules {
     let mut read_only = Vec::new();
     let mut read_write = Vec::new();
     for b in binds {
@@ -790,6 +838,9 @@ fn landlock_for(binds: &[Bind], proc_at: &str, dev_at: &str) -> LandlockRules {
             BindMode::ReadOnly => read_only.push(PathBuf::from(&b.target)),
             BindMode::ReadWrite => read_write.push(PathBuf::from(&b.target)),
         }
+    }
+    for o in overlays {
+        read_write.push(PathBuf::from(&o.target));
     }
     // The virtual filesystems, writable. Each is created fresh for every command, and
     // `/proc/sys` needs privileges we do not have regardless, so finer-grained rules
@@ -1149,7 +1200,9 @@ mod tests {
     #[test]
     fn the_hosts_mise_store_is_shared_copy_on_write() {
         let sec = SecurityConfig::default();
-        let host = host().with_existing(["/home/dev/.local/share/mise"]);
+        // The project must look like a mise project, or the overlay is (correctly)
+        // suppressed — see `project_uses_mise`.
+        let host = host().with_existing(["/home/dev/.local/share/mise", "/srv/proj/mise.toml"]);
         let plan = plan_with(&sec, &[], &host).unwrap();
 
         let o = plan
@@ -1183,13 +1236,77 @@ mod tests {
             env_of(&plan, "MISE_DATA_DIR"),
             Some("/home/dev/.local/share/mise")
         );
+        // …and Landlock must grant it, or the mount is inert.
+        //
+        // This is the regression that made `share_mise_store` silently useless in a
+        // real project: Landlock rules were derived from the bind list alone, and an
+        // overlay is not a bind, so the target sat outside the ruleset. bwrap mounted
+        // it read-write and the upperdir was writable, yet readdir, read and write
+        // were all denied — surfacing as `mise install` dying with `Permission denied
+        // (os error 13)` at session start. `stat` kept working (Landlock has no stat
+        // access right), which is what made it read as a broken mount rather than a
+        // missing rule.
+        assert!(
+            plan.landlock.read_write.contains(&PathBuf::from(&o.target)),
+            "the overlay target needs a read-write Landlock rule or every access to \
+             it is denied; rw rules: {:?}",
+            plan.landlock.read_write
+        );
+        assert!(
+            !plan.landlock.read_only.contains(&PathBuf::from(&o.target)),
+            "a read-only rule would block the very installs this overlay exists for"
+        );
+    }
+
+    /// A project that does not use mise gets no overlay, so no `.cowboy/mise/`
+    /// directory is created in it and nothing is mounted that it has no use for.
+    ///
+    /// RECONSTRUCTED after an accidental `git checkout` of this file — see the note on
+    /// [`PROJECT_MISE_CONFIGS`].
+    #[test]
+    fn a_non_mise_project_gets_no_mise_overlay() {
+        let sec = SecurityConfig::default();
+        // Host store present, but the project root carries none of the mise config
+        // files, so there is nothing to install and no reason for the overlay.
+        let host = host().with_existing(["/home/dev/.local/share/mise"]);
+        let plan = plan_with(&sec, &[], &host).unwrap();
+        assert!(
+            plan.overlays.is_empty(),
+            "a non-mise project must not get a mise overlay: {:?}",
+            plan.overlays
+        );
+        assert_eq!(env_of(&plan, "MISE_DATA_DIR"), None);
+    }
+
+    /// Every configured location counts as "this project uses mise".
+    ///
+    /// RECONSTRUCTED: the lost changes included a second test I could not recover. This
+    /// covers the gap it most likely filled — each entry in [`PROJECT_MISE_CONFIGS`]
+    /// being recognised — since a typo'd or dropped entry silently costs a project its
+    /// shared toolchain store with no error anywhere.
+    #[test]
+    fn every_mise_config_location_is_recognised() {
+        for cfg in PROJECT_MISE_CONFIGS {
+            let host = host().with_existing([
+                "/home/dev/.local/share/mise",
+                // Leaked as a String so the fixture can take a `&'static str`-ish
+                // borrow; this is a test, and the list is tiny.
+                Box::leak(format!("/srv/proj/{cfg}").into_boxed_str()) as &str,
+            ]);
+            let plan = plan_with(&SecurityConfig::default(), &[], &host).unwrap();
+            assert!(
+                !plan.overlays.is_empty(),
+                "a project configured with {cfg:?} should get the mise overlay"
+            );
+        }
     }
 
     /// Both switches must actually switch it off, and a host without mise must not
     /// produce an overlay of a directory that is not there.
     #[test]
     fn sharing_the_mise_store_can_be_turned_off() {
-        let with_mise = host().with_existing(["/home/dev/.local/share/mise"]);
+        let with_mise =
+            host().with_existing(["/home/dev/.local/share/mise", "/srv/proj/mise.toml"]);
 
         let off = SecurityConfig {
             sandbox: cowboy_core::config::SandboxConfig {

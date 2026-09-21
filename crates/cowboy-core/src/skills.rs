@@ -81,6 +81,49 @@ pub fn load(root: &Path, name: &str) -> Option<Skill> {
     discover(root).into_iter().find(|s| s.name == name)
 }
 
+/// Bytes of the skill index worth spending on a pinned prompt block, so a directory
+/// of fifty skills cannot crowd out the conversation.
+const MAX_INDEX_BYTES: usize = 4096;
+
+/// The one-line-per-skill index handed to the agent at the start of a session, or
+/// the empty string when the project has no skills.
+///
+/// Discovery through `cowboy skill list` alone has a cost that is easy to miss: the
+/// agent has to spend a turn to find out whether skills exist, so a prompt that only
+/// says they "may be available" gets that turn spent on most sessions and skipped on
+/// the rest — which is the worst of both. Names and descriptions are small; the
+/// instructions, which are not, still come from `skill show` on demand. This mirrors
+/// the memory index, and for the same reason: the cheap half of the lookup belongs in
+/// the pinned prompt so it survives compaction.
+pub fn index(root: &Path) -> String {
+    index_of(&discover(root))
+}
+
+/// The index for an explicit skill set. Split from [`index`] so it can be tested
+/// without the developer's own global skills (`~/.config/cowboy/skills`,
+/// `~/.claude/skills`) leaking into the assertion — they are legitimately part of
+/// `discover`, and they made the first version of the empty-case test fail on any
+/// machine that had one.
+fn index_of(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "Skills available for this project (read one with `cowboy skill show <name>` \
+         before doing that kind of work, then follow it):\n",
+    );
+    for skill in skills {
+        let scope = if skill.global { " (global)" } else { "" };
+        let line = format!("- {} — {}{scope}\n", skill.name, skill.description.trim());
+        if s.len() + line.len() > MAX_INDEX_BYTES {
+            s.push_str("- … more; run `cowboy skill list` for the full list\n");
+            break;
+        }
+        s.push_str(&line);
+    }
+    s
+}
+
 fn read_dir(dir: &Path, global: bool) -> Vec<Skill> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -204,6 +247,52 @@ mod tests {
         assert!(review.instructions.contains("Run the linter"));
         // A skill dir without frontmatter falls back to its directory name.
         assert!(skills.iter().any(|s| s.name == "noname"));
+    }
+
+    /// The index is what makes skills discoverable without spending a turn on
+    /// `cowboy skill list`: names and descriptions only, and nothing at all when there
+    /// are no skills (an empty header would be pure overhead on every request).
+    #[test]
+    fn the_index_lists_names_and_descriptions_and_is_empty_without_skills() {
+        assert_eq!(index_of(&[]), "");
+
+        let tmp = tempdir();
+        write(
+            tmp.path(),
+            "review",
+            "---\nname: review\ndescription: review code\n---\nRun the linter.\n",
+        );
+        let idx = index(tmp.path());
+        assert!(idx.contains("- review — review code"), "{idx}");
+        assert!(
+            idx.contains("cowboy skill show"),
+            "says how to read one: {idx}"
+        );
+        // The instructions themselves are *not* pinned — that is the expensive half.
+        assert!(!idx.contains("Run the linter"), "{idx}");
+    }
+
+    /// Many skills must not crowd out the conversation the index is meant to help;
+    /// past the budget it says so and points at the CLI.
+    #[test]
+    fn a_huge_skill_directory_is_bounded() {
+        let many: Vec<Skill> = (0..200)
+            .map(|i| Skill {
+                name: format!("skill{i:03}"),
+                description: "a rather wordy description of what this one does ".repeat(3),
+                argument_hint: None,
+                instructions: String::new(),
+                dir: std::path::PathBuf::new(),
+                global: false,
+            })
+            .collect();
+        let idx = index_of(&many);
+        assert!(
+            idx.len() <= MAX_INDEX_BYTES + 128,
+            "got {} bytes",
+            idx.len()
+        );
+        assert!(idx.contains("cowboy skill list"), "{idx}");
     }
 
     #[test]

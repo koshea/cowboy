@@ -147,6 +147,30 @@ pub const SLASH: &[Slash] = &[
         workstream_only: false,
     },
     Slash {
+        name: "fold",
+        args: "",
+        help: "collapse finished turns to one line each (keeps prompts and answers)",
+        group: Group::Inspect,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
+        name: "unfold",
+        args: "",
+        help: "expand every folded turn again",
+        group: Group::Inspect,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
+        name: "boundary",
+        args: "",
+        help: "what the sandbox allows: mounts, syscalls, and egress",
+        group: Group::Inspect,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
         name: "copy",
         args: "",
         help: "copy the last answer to the system clipboard",
@@ -257,6 +281,11 @@ pub const KEYS: &[Hotkey] = &[
         group: Group::Run,
     },
     Hotkey {
+        keys: "Alt-1…9",
+        help: "start with one of the openers offered in the welcome banner",
+        group: Group::Run,
+    },
+    Hotkey {
         keys: "Alt-j",
         help: "what the subagents are doing",
         group: Group::Crew,
@@ -284,6 +313,11 @@ pub const KEYS: &[Hotkey] = &[
     Hotkey {
         keys: "Ctrl-L",
         help: "redraw, if something corrupts the screen",
+        group: Group::Inspect,
+    },
+    Hotkey {
+        keys: "Alt-f",
+        help: "fold / unfold the turns you have already read",
         group: Group::Inspect,
     },
     Hotkey {

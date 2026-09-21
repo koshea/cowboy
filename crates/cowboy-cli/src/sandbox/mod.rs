@@ -37,6 +37,10 @@ pub const RELAY_PORT: u16 = 8443;
 /// Loopback port inside the sandbox where the relay accepts DNS queries.
 pub const DNS_PORT: u16 = 5354;
 
+/// Re-exported so the agent loop can recognise the two outcomes that are not a real
+/// exit status and explain them, instead of handing the model a bare `124`.
+pub(crate) use exec::{EXIT_CANCELLED, EXIT_TIMEOUT};
+
 /// Result of a command execution inside the sandbox.
 ///
 /// Lives here rather than beside the Docker client because it is part of the
@@ -119,6 +123,30 @@ pub trait Sandbox: Send + Sync {
     /// Execute a structured file operation, passing `payload` on stdin so
     /// multi-line content avoids shell quoting entirely.
     async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)>;
+
+    /// Start a long-running background process, confined exactly like any other
+    /// command, with its combined output appended to a log file in the workspace.
+    ///
+    /// Part of the seam because a coding agent cannot do without it: testing a web
+    /// service means starting it and then talking to it, and a `shell` call cannot
+    /// hold a server — each one is a fresh sandbox whose whole process tree is reaped
+    /// when the command returns. (`&` and `setsid` do not escape that: bwrap is PID 1
+    /// of the command's own PID namespace, so the kernel kills everything in it when
+    /// bwrap exits. `cowboy proc start` did exactly this and reported success for a
+    /// process that was already dead.)
+    ///
+    /// The process is owned by the **session**: it shares the session's network
+    /// namespace so later commands reach it on loopback, gets its own PID namespace so
+    /// stopping it reaps precisely its own tree, and dies with the session — which is
+    /// the right lifetime for a dev server, and the reason the caller is the worker
+    /// rather than a short-lived CLI.
+    async fn start_process(&self, name: &str, command: &str, cwd: Option<&str>) -> Result<()>;
+
+    /// Stop one background process.
+    async fn stop_process(&self, name: &str) -> Result<()>;
+
+    /// Names of the background processes believed to be running.
+    fn running_processes(&self) -> Vec<String>;
 
     /// Stop the managed background processes declared in `agent.yaml`.
     async fn stop_all_processes(&self) -> Result<()>;

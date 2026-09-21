@@ -81,6 +81,40 @@ pub enum Verdict {
     Ask,
 }
 
+/// What an approval prompt is asking about, so a client can title it correctly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalKind {
+    /// Egress to a destination.
+    Network,
+    /// Mounting a credential file or injecting a credential env var.
+    Credential,
+}
+
+/// The detail behind an approval prompt, for a client that can lay it out.
+///
+/// Pre-formatted labelled rows rather than the policy's own types: everything the
+/// reader needs (address class, the command that asked, the policy's reason, what is
+/// already approved) lives in different modules on the host, and widening the wire
+/// type every time one of them gains a field would couple every client to all of
+/// them. The worker composes; the client lays out.
+///
+/// **This is display only.** The verdict is computed before any of it is gathered
+/// (see `cmd::worker::control_approver`), so nothing here can reach
+/// `policy::evaluate`. It exists so a human is not asked to decide from a bare
+/// `host:port` — a prompt with no context gets rubber-stamped, which weakens an
+/// `ask` policy without ever changing it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalDetail {
+    pub kind: ApprovalKind,
+    /// `(label, value)` in display order.
+    pub rows: Vec<(String, String)>,
+    /// Standing context shown under the rows — e.g. what this project has already
+    /// approved. Never a recommendation: the decision is the user's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// How long an approval persists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

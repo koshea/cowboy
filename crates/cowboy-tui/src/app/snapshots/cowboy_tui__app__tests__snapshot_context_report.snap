@@ -1,5 +1,6 @@
 ---
 source: crates/cowboy-tui/src/app/mod.rs
+assertion_line: 2046
 expression: render(&app)
 ---
 ╭ ~/dev/cowboy  ⎇ main ─────────────────────────╮╭ network ────────────╮
@@ -16,7 +17,7 @@ expression: render(&app)
 │                                               ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   ready — ready
+   ready — ready                                       ctx ▰▰▰▰▱▱▱▱ 52%
 ╭ Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

@@ -555,8 +555,18 @@ pub enum ServerMsg {
         #[serde(default)]
         options: Vec<String>,
     },
-    /// A pending network approval; reply with [`ClientMsg::ApprovalReply`].
-    Approval { id: u64, dest: String },
+    /// A pending approval; reply with [`ClientMsg::ApprovalReply`].
+    ///
+    /// `dest` stays the flat one-line summary every client can render. `detail` is
+    /// the structured form for clients that can lay it out, and is `None` from an
+    /// older worker or for a prompt with nothing to add — so a client must render
+    /// from `dest` alone when it is absent.
+    Approval {
+        id: u64,
+        dest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<crate::netproto::ApprovalDetail>,
+    },
     /// A previously broadcast `Approval` has been decided (by another client or
     /// on timeout); clients should dismiss its modal.
     ApprovalResolved { id: u64 },
@@ -746,6 +756,18 @@ mod tests {
         roundtrip(&ServerMsg::Approval {
             id: 2,
             dest: "example.com:443".into(),
+            detail: None,
+        });
+        // With detail: `detail` is `#[serde(default)]` so an older client still parses
+        // the enriched message, and an older worker's message still parses here.
+        roundtrip(&ServerMsg::Approval {
+            id: 3,
+            dest: "example.com:443".into(),
+            detail: Some(crate::netproto::ApprovalDetail {
+                kind: crate::netproto::ApprovalKind::Network,
+                rows: vec![("destination".into(), "example.com:443".into())],
+                note: Some("nothing saved yet".into()),
+            }),
         });
         roundtrip(&ServerMsg::ApprovalResolved { id: 2 });
         roundtrip(&ClientMsg::Accept {

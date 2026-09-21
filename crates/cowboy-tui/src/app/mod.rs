@@ -22,6 +22,11 @@ use render::{transcript_lines, LinkHit};
 pub enum LineKind {
     /// Welcome / project-info banner shown at startup.
     Banner,
+    /// Coloured ASCII art — the session intro. Rendered through the ANSI parser with
+    /// no prefix so the art carries its own colour per cell; a `Banner` line is
+    /// styled uniformly and could not. Lives in the transcript like any other line,
+    /// so it scrolls away with the rest of the welcome instead of pinning a header.
+    Art,
     User,
     Agent,
     Command,
@@ -36,11 +41,37 @@ pub enum LineKind {
     Error,
 }
 
+/// The session-intro animation.
+///
+/// Holds the pre-rendered frames and the slice of the transcript they occupy; each
+/// tick rewrites those lines in place and invalidates the line cache. That is cheap
+/// here and nowhere else: at session start the transcript is the welcome block and
+/// nothing more, so re-rendering it ~20 times costs less than one turn of output.
+#[derive(Debug, Clone)]
+struct Intro {
+    /// Frames in order. Every frame must have the same number of rows.
+    frames: Vec<Vec<String>>,
+    /// Index of the first art line in `transcript`, and how many rows it spans.
+    at: usize,
+    rows: usize,
+    started_ms: u64,
+    interval_ms: u64,
+    /// Which frame is currently written, so an unchanged tick does no work.
+    shown: usize,
+}
+
 /// One line in the conversation transcript.
 #[derive(Debug, Clone)]
 pub struct TranscriptLine {
     pub kind: LineKind,
     pub text: String,
+    /// Which conversation turn this line belongs to. Incremented on each user
+    /// message, so `0` is everything before the first one (the welcome banner).
+    ///
+    /// A turn *id* rather than a transcript index because the transcript is trimmed
+    /// from the front when it grows past its cap — an index-keyed fold would quietly
+    /// come to mean a different turn.
+    pub turn: u64,
 }
 
 /// Interaction mode.
@@ -322,6 +353,23 @@ pub struct CrewMember {
     pub requested: u32,
 }
 
+/// The detail behind a pending approval, laid out as labelled rows.
+///
+/// A view mirror of `netproto::ApprovalDetail` rather than the wire type itself, so
+/// `cowboy-tui` stays free of the proto crate — the same reason `ContextSnapshot`
+/// mirrors `ContextUsage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApprovalView {
+    /// Modal title: what is being asked for.
+    pub title: String,
+    /// `(label, value)` in display order.
+    pub rows: Vec<(String, String)>,
+    /// Standing context under the rows. Never a recommendation.
+    pub note: Option<String>,
+    /// The flat one-line summary, shown when there are no rows.
+    pub summary: String,
+}
+
 /// What the live prompt costs, as last reported by the agent loop.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextSnapshot {
@@ -348,6 +396,10 @@ pub struct App {
     pub status: String,
     /// Working-tree diff summary for the status bar (e.g. `Δ 2 files +30 -4`).
     pub diff: String,
+    /// A one-line boundary summary for the status bar (e.g. `🔒 egress ask`), set
+    /// once when the client attaches. Empty means "unknown", and nothing is shown —
+    /// the product's central claim is worth surfacing, but not worth guessing at.
+    pub boundary: String,
     /// Running session token estimate (input/prompt, output/completion).
     pub tokens_in: u64,
     pub tokens_out: u64,
@@ -357,6 +409,13 @@ pub struct App {
     /// Running estimated session spend in USD (0.0 when pricing is unknown).
     pub cost_usd: f64,
     pub transcript: Vec<TranscriptLine>,
+    /// The running session-intro animation, if it has not settled yet.
+    intro: Option<Intro>,
+    /// The turn number being appended to (see [`TranscriptLine::turn`]).
+    cur_turn: u64,
+    /// Turns whose mechanics are collapsed away, by turn id. The prompt, the answer
+    /// and any error still render — folding hides the work, not the conversation.
+    folded: std::collections::HashSet<u64>,
     /// In-progress streamed agent text (not yet committed to the transcript).
     pub streaming: String,
     /// In-progress streamed "thinking" (reasoning), shown dimmed and cleared
@@ -404,6 +463,16 @@ pub struct App {
     /// instead of a silent spinner. Managed by `tick_turn`.
     turn_started_ms: Option<u64>,
     turn_elapsed_secs: u64,
+    /// Wall-clock start of the current wait on a human (a question, a choice, a
+    /// network approval, a job asking for turns) and the seconds elapsed. An
+    /// unnoticed prompt then reads as a wait rather than as a stalled agent.
+    /// Managed by `tick_attention`.
+    attention_since_ms: Option<u64>,
+    attention_elapsed_secs: u64,
+    /// A one-shot "the session needs you" notification, queued on the rising edge
+    /// of needing a human and drained by the event loop *after* the frame through
+    /// ratatui's own backend — same constraint as [`App::pending_copy`].
+    pending_notify: Option<String>,
     /// When true, the transcript follows the tail (newest output). When false,
     /// it stays anchored at `scroll_top` so new output doesn't move the view.
     pub follow: bool,
@@ -442,6 +511,10 @@ pub struct App {
     pub model_form: Option<ModelForm>,
     /// Pending multiple-choice question (set while `mode == AwaitingChoice`).
     pub choice: Option<Choice>,
+    /// Structured detail for the pending approval, when the worker sent any. `None`
+    /// falls the modal back to rendering `Mode::Approval`'s flat label, which is what
+    /// an older worker (or a prompt with nothing to add) produces.
+    pub approval: Option<ApprovalView>,
     /// Keys/commands reference (set while `mode == Help`).
     pub help: Option<HelpView>,
     /// Slash-command autocomplete popup (set while the input is `/<partial>`).
@@ -502,11 +575,15 @@ impl App {
             title: title.into(),
             status: "ready".into(),
             diff: String::new(),
+            boundary: String::new(),
             tokens_in: 0,
             tokens_out: 0,
             context: None,
             cost_usd: 0.0,
             transcript: Vec::new(),
+            intro: None,
+            cur_turn: 0,
+            folded: std::collections::HashSet::new(),
             streaming: String::new(),
             reasoning: String::new(),
             activity: Vec::new(),
@@ -526,6 +603,9 @@ impl App {
             plan_mode: false,
             turn_started_ms: None,
             turn_elapsed_secs: 0,
+            attention_since_ms: None,
+            attention_elapsed_secs: 0,
+            pending_notify: None,
             follow: true,
             scroll_top: 0,
             max_scroll: std::cell::Cell::new(0),
@@ -540,6 +620,7 @@ impl App {
             model_picker: None,
             model_form: None,
             choice: None,
+            approval: None,
             help: None,
             completion: None,
             pending_copy: None,
@@ -819,9 +900,15 @@ impl App {
         if kind != LineKind::Output {
             self.last_output_transient = false;
         }
+        // A user message opens a new turn; everything after it belongs to that turn
+        // until the next one.
+        if kind == LineKind::User {
+            self.cur_turn += 1;
+        }
         self.transcript.push(TranscriptLine {
             kind,
             text: text.into(),
+            turn: self.cur_turn,
         });
         // Bound the scrollback: every frame re-wraps and re-parses the whole
         // transcript, so an unbounded buffer (e.g. a noisy command) tanks
@@ -834,6 +921,153 @@ impl App {
             let excess = self.transcript.len() - TRANSCRIPT_CAP;
             self.transcript.drain(0..excess);
         }
+    }
+
+    /// Open the approval modal with structured detail.
+    pub fn begin_approval(&mut self, summary: String, view: Option<ApprovalView>) {
+        self.approval = view;
+        self.mode = Mode::Approval(summary);
+    }
+
+    /// Dismiss the approval modal's detail (the mode is restored by the caller).
+    pub fn end_approval(&mut self) {
+        self.approval = None;
+    }
+
+    /// Whether `turn`'s mechanics are currently collapsed.
+    pub fn is_folded(&self, turn: u64) -> bool {
+        self.folded.contains(&turn)
+    }
+
+    /// Whether anything is currently folded (drives the Alt-f toggle's direction).
+    pub fn has_folds(&self) -> bool {
+        !self.folded.is_empty()
+    }
+
+    /// Collapse every finished turn, leaving the newest one open.
+    ///
+    /// The turn in progress is excluded deliberately: it is the one you are reading,
+    /// and having it disappear under you is not a useful response to a keystroke.
+    /// Turn 0 (the welcome banner, before any message) has no mechanics to hide.
+    pub fn fold_completed_turns(&mut self) -> usize {
+        self.touch();
+        self.folded.clear();
+        for t in 1..self.cur_turn {
+            self.folded.insert(t);
+        }
+        self.folded.len()
+    }
+
+    /// Expand everything.
+    pub fn unfold_all(&mut self) -> usize {
+        self.touch();
+        let n = self.folded.len();
+        self.folded.clear();
+        n
+    }
+
+    /// Toggle folding, and report what happened for the status line. Folding is
+    /// one key rather than a per-turn cursor: the transcript has no caret to hang a
+    /// selection off, and "collapse the history I have already read" is the request
+    /// almost every time.
+    pub fn toggle_folds(&mut self) -> String {
+        if self.has_folds() {
+            let n = self.unfold_all();
+            format!("expanded {n} turn{}", if n == 1 { "" } else { "s" })
+        } else {
+            let n = self.fold_completed_turns();
+            if n == 0 {
+                "nothing to fold yet".to_string()
+            } else {
+                format!("folded {n} earlier turn{}", if n == 1 { "" } else { "s" })
+            }
+        }
+    }
+
+    /// Start the session-intro animation at the current end of the transcript.
+    ///
+    /// The frames are supplied by the caller (the CLI owns the art, so this crate
+    /// stays free of it). Each frame is a list of rows, all frames the same length.
+    /// Does nothing when there is nothing to play.
+    pub fn begin_intro(&mut self, frames: Vec<Vec<String>>, interval_ms: u64, now_ms: u64) {
+        let Some(first) = frames.first() else { return };
+        let rows = first.len();
+        if rows == 0 || frames.iter().any(|f| f.len() != rows) {
+            // A ragged frame set would make the in-place rewrite write outside its
+            // own lines; refuse it rather than corrupt the transcript.
+            return;
+        }
+        let at = self.transcript.len();
+        for row in first.clone() {
+            self.push(LineKind::Art, row);
+        }
+        self.intro = Some(Intro {
+            frames,
+            at,
+            rows,
+            started_ms: now_ms,
+            interval_ms: interval_ms.max(1),
+            shown: 0,
+        });
+    }
+
+    /// Advance the intro animation. Called once per frame; a no-op when nothing is
+    /// playing or when the elapsed time has not reached the next frame.
+    ///
+    /// Frame selection is computed from elapsed time rather than incremented per
+    /// tick, so the intro takes the same wall-clock time regardless of how often the
+    /// event loop happens to come round.
+    pub fn tick_intro(&mut self, now_ms: u64) {
+        let Some(intro) = &self.intro else { return };
+        let elapsed = now_ms.saturating_sub(intro.started_ms);
+        let target = (elapsed / intro.interval_ms) as usize;
+        if target >= intro.frames.len() {
+            self.finish_intro();
+            return;
+        }
+        if target == intro.shown {
+            return;
+        }
+        self.write_intro_frame(target);
+        if let Some(intro) = &mut self.intro {
+            intro.shown = target;
+        }
+    }
+
+    /// Settle the intro immediately on its last frame — used when it runs out and
+    /// when the user presses a key. A half-branded wordmark is not a thing to leave
+    /// on someone's screen.
+    pub fn finish_intro(&mut self) {
+        let Some(intro) = &self.intro else { return };
+        let last = intro.frames.len().saturating_sub(1);
+        self.write_intro_frame(last);
+        self.intro = None;
+    }
+
+    /// Whether the intro is still animating (the event loop raises its frame rate
+    /// while it is).
+    pub fn intro_active(&self) -> bool {
+        self.intro.is_some()
+    }
+
+    /// Rewrite the intro's transcript lines to frame `idx`.
+    fn write_intro_frame(&mut self, idx: usize) {
+        let Some(intro) = &self.intro else { return };
+        let (at, rows) = (intro.at, intro.rows);
+        // The transcript only grows during the intro, and its cap is thousands of
+        // lines away — but a bounds check is cheaper than the corruption if that ever
+        // stops being true.
+        if at + rows > self.transcript.len() {
+            self.intro = None;
+            return;
+        }
+        let Some(frame) = intro.frames.get(idx).cloned() else {
+            return;
+        };
+        for (i, row) in frame.into_iter().enumerate() {
+            self.transcript[at + i].text = row;
+        }
+        self.touch();
     }
 
     /// Mark the start of a streamed shell command (for the live indicator).
@@ -1059,6 +1293,76 @@ impl App {
         self.turn_elapsed_secs
     }
 
+    /// Whether the session itself is parked on a human — a question, a choice, or an
+    /// approval — as opposed to merely having a background job that wants something.
+    ///
+    /// The distinction matters in the status bar: when a subagent asks for turns the
+    /// main turn is still *running*, and replacing its "thinking Ns" heartbeat with
+    /// "waiting on you" would misreport what the session is doing. The jobs segment
+    /// already carries "(N asking)".
+    pub fn parked_on_user(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::AwaitingInput(_) | Mode::AwaitingChoice | Mode::Approval(_)
+        )
+    }
+
+    /// Why the session needs a human right now, if it does — phrased for a desktop
+    /// notification. `None` means the agent is working (or idle) with nothing parked
+    /// on the user.
+    ///
+    /// Broader than [`Self::parked_on_user`] on purpose: a job asking for turns does
+    /// need you, and is worth a notification, even though the session keeps working.
+    ///
+    /// These are deliberate "over to you" pauses, and a default-`ask` policy with no
+    /// answer fails closed, so a prompt nobody notices is a stalled session rather
+    /// than a slow one.
+    pub fn attention_reason(&self) -> Option<&'static str> {
+        match &self.mode {
+            Mode::AwaitingInput(_) => Some("the agent asked you a question"),
+            Mode::AwaitingChoice => Some("the agent needs you to choose"),
+            Mode::Approval(_) => Some("a network request needs your approval"),
+            _ if self.crew.iter().any(|m| m.status == CrewStatus::Asking) => {
+                Some("a background job wants more turns")
+            }
+            _ => None,
+        }
+    }
+
+    /// Track how long the session has been parked on a human, and queue exactly one
+    /// notification on the rising edge. Called once per frame.
+    pub fn tick_attention(&mut self, now_ms: u64) {
+        match self.attention_reason() {
+            Some(reason) => match self.attention_since_ms {
+                // Rising edge: notify once. Re-arming every frame would ring the
+                // terminal bell ~8×/s for as long as the prompt stands.
+                None => {
+                    self.attention_since_ms = Some(now_ms);
+                    self.attention_elapsed_secs = 0;
+                    self.pending_notify = Some(reason.to_string());
+                }
+                Some(start) => {
+                    self.attention_elapsed_secs = now_ms.saturating_sub(start) / 1000;
+                }
+            },
+            None => {
+                self.attention_since_ms = None;
+                self.attention_elapsed_secs = 0;
+            }
+        }
+    }
+
+    /// Seconds the session has been waiting on the user (0 when it isn't).
+    pub fn attention_elapsed_secs(&self) -> u64 {
+        self.attention_elapsed_secs
+    }
+
+    /// Take the queued "needs you" notification, if one is pending (called by the
+    /// event loop, after the frame).
+    pub fn take_pending_notify(&mut self) -> Option<String> {
+        self.pending_notify.take()
+    }
+
     /// Append (or, for a transient carriage-return update, overwrite-in-place) a
     /// line of streamed command output, and update the live tail.
     ///
@@ -1108,6 +1412,7 @@ impl App {
                         TranscriptLine {
                             kind: LineKind::Notice,
                             text: marker,
+                            turn: self.cur_turn,
                         },
                     );
                     self.cmd_out_marker = true;
@@ -1517,19 +1822,127 @@ mod tests {
     #[test]
     fn snapshot_welcome_screen() {
         let mut app = App::new("cowboy · 20260614-abcd");
+        // The settled intro art, as `banner::intro_frames` produces it: ANSI-coloured
+        // rows pushed as `LineKind::Art`, carrying the tagline the banner text used to
+        // open with. Trimmed to the wordmark and tagline so the whole welcome block
+        // fits this 72×18 backend — the full seven-row scene is covered by
+        // `banner::tests`, and the real UI skips the art on a pane this short.
         for l in [
-            "Welcome to cowboy — the agent runs in a sandbox built from your machine.",
+            "  \x1b[38;5;214m╔═╗╔═╗╦ ╦╔╗ ╔═╗╦ ╦\x1b[0m",
+            "  \x1b[38;5;214m║  ║ ║║║║╠╩╗║ ║╚╦╝\x1b[0m",
+            "  \x1b[38;5;214m╚═╝╚═╝╚╩╝╚═╝╚═╝ ╩ \x1b[0m",
+            "  \x1b[38;5;240mthe agent runs in a sandbox\x1b[0m",
+        ] {
+            app.push(LineKind::Art, l);
+        }
+        for l in [
             "workspace  /home/dev/myproject",
-            "model      anthropic/claude-sonnet-4-6  (gw.local)",
-            "branch     main",
+            "model      claude-sonnet-4-6  (gw.local)",
             "",
-            "Type a message to begin · Enter sends · Ctrl-C menu",
+            "or start with one of these:",
+            "  Alt-1  Review my uncommitted changes.",
+            "",
+            "Type a message to begin · Enter sends",
         ] {
             app.push(LineKind::Banner, l);
         }
         app.mode = Mode::Idle;
         app.status = "ready".into();
         insta::assert_snapshot!(render(&app));
+    }
+
+    /// Art lines carry their own colour and get **no** prefix — the two-space prefix
+    /// `Output` gets would shift every row of the wordmark and break its alignment.
+    #[test]
+    fn art_lines_render_ansi_colour_without_a_prefix() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::Art, "\x1b[38;5;214m╔═╗╔═╗\x1b[0m");
+        app.mode = Mode::Idle;
+        let out = render(&app);
+        assert!(out.contains("╔═╗╔═╗"), "art missing:\n{out}");
+        // The ANSI was parsed into styles, not passed through as literal bytes.
+        assert!(
+            !out.contains('\x1b'),
+            "raw escapes leaked into the buffer:\n{out}"
+        );
+        let row = out.lines().nth(1).unwrap_or_default();
+        assert!(row.starts_with("│╔═╗╔═╗"), "unexpected prefix: {row:?}");
+    }
+
+    /// The intro rewrites its own lines in place, driven by elapsed time, and leaves
+    /// everything pushed after it alone.
+    #[test]
+    fn the_intro_animates_in_place_and_settles_on_its_last_frame() {
+        let mut app = App::new("cowboy");
+        let frames = vec![
+            vec!["a1".to_string(), "a2".to_string()],
+            vec!["b1".to_string(), "b2".to_string()],
+            vec!["c1".to_string(), "c2".to_string()],
+        ];
+        app.begin_intro(frames, 50, 1_000);
+        app.push(LineKind::Banner, "workspace  /srv/proj");
+        assert!(app.intro_active());
+        // Frame 0 is on screen as soon as it begins — no blank gap.
+        assert_eq!(app.transcript[0].text, "a1");
+
+        // Frames come from elapsed time, not from the number of ticks: the event loop's
+        // cadence varies, and the intro should still take the same wall-clock time.
+        app.tick_intro(1_010);
+        assert_eq!(app.transcript[0].text, "a1");
+        app.tick_intro(1_060);
+        assert_eq!(app.transcript[0].text, "b1");
+
+        // Past the last frame it settles and stops.
+        app.tick_intro(9_000);
+        assert_eq!(app.transcript[0].text, "c1");
+        assert_eq!(app.transcript[1].text, "c2");
+        assert!(!app.intro_active());
+        // The welcome lines pushed after the art were never touched.
+        assert_eq!(app.transcript[2].text, "workspace  /srv/proj");
+    }
+
+    /// A keypress skips the intro, and must land on the finished frame — a
+    /// half-branded wordmark is not a thing to leave on someone's screen.
+    #[test]
+    fn skipping_the_intro_lands_on_the_finished_frame() {
+        let mut app = App::new("cowboy");
+        app.begin_intro(
+            vec![
+                vec!["partial".to_string()],
+                vec!["nearly".to_string()],
+                vec!["done".to_string()],
+            ],
+            50,
+            0,
+        );
+        app.finish_intro();
+        assert_eq!(app.transcript[0].text, "done");
+        assert!(!app.intro_active());
+        // Settling twice is harmless (a key during the final frame).
+        app.finish_intro();
+        assert_eq!(app.transcript.len(), 1);
+    }
+
+    /// A ragged frame set is refused outright: the animation replaces a fixed slice of
+    /// transcript lines, so a frame of a different height would write over lines that
+    /// are not the art's.
+    #[test]
+    fn a_ragged_intro_is_refused_rather_than_written_partially() {
+        let mut app = App::new("cowboy");
+        app.begin_intro(
+            vec![
+                vec!["a".to_string()],
+                vec!["b".to_string(), "c".to_string()],
+            ],
+            50,
+            0,
+        );
+        assert!(!app.intro_active());
+        assert!(app.transcript.is_empty(), "{:?}", app.transcript);
+        // And an empty set is simply no intro.
+        app.begin_intro(Vec::new(), 50, 0);
+        assert!(!app.intro_active());
+        assert!(app.transcript.is_empty());
     }
 
     #[test]
@@ -1559,10 +1972,83 @@ mod tests {
     fn snapshot_approval_modal_names_the_command_that_asked() {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "build the project");
-        app.mode = Mode::Approval(
-            "crates.io:443\n\nrequested by:  cargo test --workspace --all-targets".into(),
+        // The enriched path: labelled rows the reader can scan, rather than one line
+        // with the reason and the command concatenated into it.
+        app.begin_approval(
+            "crates.io:443".into(),
+            Some(ApprovalView {
+                title: "Network request".into(),
+                rows: vec![
+                    ("destination".into(), "crates.io:443".into()),
+                    ("protocol".into(), "TLS".into()),
+                    ("address".into(), "13.226.34.10 — external".into()),
+                    (
+                        "requested by".into(),
+                        "cargo test --workspace --all-targets".into(),
+                    ),
+                    (
+                        "why you're asked".into(),
+                        "no rule matches; default for external is ask".into(),
+                    ),
+                ],
+                note: Some("3 endpoints are already saved for this project".into()),
+                summary: String::new(),
+            }),
         );
         insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_approval_modal_for_a_credential_is_not_titled_as_a_network_request() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "run the deploy script");
+        app.begin_approval(
+            "credential: mount ~/.netrc".into(),
+            Some(ApprovalView {
+                title: "Credential access".into(),
+                rows: vec![
+                    ("mount".into(), "~/.netrc".into()),
+                    ("as".into(), "/root/.netrc".into()),
+                    ("access".into(), "read-only".into()),
+                ],
+                note: Some("declared in this project's security.yaml".into()),
+                summary: String::new(),
+            }),
+        );
+        insta::assert_snapshot!(render(&app));
+    }
+
+    /// The scope legend must survive a value too long for the modal.
+    ///
+    /// This is the regression the modal's own renderer exists for: while values
+    /// wrapped, a long command line grew the body until the
+    /// once/session/project/global legend was pushed off the bottom, leaving a prompt
+    /// whose options could not be read. Values truncate now, so the keys always fit.
+    #[test]
+    fn a_very_long_value_cannot_push_the_scope_legend_out_of_the_approval_modal() {
+        let mut app = App::new("cowboy");
+        app.begin_approval(
+            "example.com:443".into(),
+            Some(ApprovalView {
+                title: "Network request".into(),
+                rows: vec![
+                    ("destination".into(), "example.com:443".into()),
+                    ("requested by".into(), "x ".repeat(400)),
+                ],
+                note: Some("y ".repeat(400)),
+                summary: String::new(),
+            }),
+        );
+        let out = render(&app);
+        for key in [
+            "o  once",
+            "s  session",
+            "p  project",
+            "g  global",
+            "d  deny",
+        ] {
+            assert!(out.contains(key), "legend lost {key:?} in:\n{out}");
+        }
     }
 
     #[test]
@@ -1985,6 +2471,173 @@ mod tests {
             found,
             "an OSC 8 escape with the URL is present in the buffer"
         );
+    }
+
+    /// The context meter is the status bar's early warning that compaction is coming.
+    /// It must track the reported percentage and escalate, but never overrun its track.
+    #[test]
+    fn the_context_meter_fills_and_escalates_with_usage() {
+        let meter = |used: u64, budget: u64, top: &str| {
+            let mut app = App::new("cowboy");
+            app.mode = Mode::Idle;
+            app.context = Some(ContextSnapshot {
+                used,
+                budget,
+                window: budget + 1000,
+                reserve: 1000,
+                top: vec![(top.to_string(), used)],
+            });
+            render(&app)
+        };
+        // Comfortable: partly filled, no consumer named — nothing to act on yet.
+        let low = meter(2_000, 10_000, "transcript");
+        assert!(low.contains("ctx ▰▱▱▱▱▱▱▱ 20%"), "{low}");
+        assert!(
+            !low.contains("transcript"),
+            "named a consumer too early:\n{low}"
+        );
+        // Warning on: the largest consumer becomes the useful next question.
+        let warn = meter(7_500, 10_000, "transcript");
+        assert!(warn.contains("ctx ▰▰▰▰▰▰▱▱ 75% transcript"), "{warn}");
+        // Overrun: the track saturates rather than growing past its width and
+        // wrecking the layout, while the number still tells the truth.
+        let over = meter(30_000, 10_000, "tool schemas");
+        assert!(over.contains("ctx ▰▰▰▰▰▰▰▰ 300%"), "{over}");
+    }
+
+    /// A background job asking for turns needs a human, but it does not stop the
+    /// turn — so it must notify without overwriting the turn's own heartbeat.
+    #[test]
+    fn an_asking_job_notifies_without_claiming_the_session_is_parked() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Running;
+        app.apply_jobs(vec![CrewMember {
+            id: "sub0".into(),
+            label: "impl".into(),
+            model: "m".into(),
+            status: CrewStatus::Asking,
+            started_ms: 0,
+            elapsed_secs: 3,
+            used: 8,
+            granted: 8,
+            ceiling: 20,
+            requested: 5,
+        }]);
+        // Worth a notification…
+        assert_eq!(
+            app.attention_reason(),
+            Some("a background job wants more turns")
+        );
+        // …but the session itself is not the thing waiting.
+        assert!(!app.parked_on_user());
+        let out = render(&app);
+        assert!(out.contains("thinking"), "lost the turn heartbeat:\n{out}");
+        assert!(out.contains("asking"), "lost the asking count:\n{out}");
+    }
+
+    /// One notification per wait, not one per frame — the bell would otherwise ring
+    /// ~8×/s for as long as the prompt stood.
+    #[test]
+    fn the_attention_notification_fires_once_per_wait_and_rearms_after_it_clears() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Approval("example.com:443".into());
+        app.tick_attention(1_000);
+        assert_eq!(
+            app.take_pending_notify().as_deref(),
+            Some("a network request needs your approval")
+        );
+        // Subsequent frames only advance the clock.
+        app.tick_attention(1_500);
+        app.tick_attention(4_000);
+        assert!(app.take_pending_notify().is_none());
+        assert_eq!(app.attention_elapsed_secs(), 3);
+        // Answered: the counter resets, and the next wait notifies again.
+        app.mode = Mode::Idle;
+        app.tick_attention(4_100);
+        assert_eq!(app.attention_elapsed_secs(), 0);
+        app.mode = Mode::AwaitingChoice;
+        app.tick_attention(5_000);
+        assert!(app.take_pending_notify().is_some());
+    }
+
+    /// Folding hides the mechanics and keeps the conversation — and must never hide
+    /// an error, or a collapsed turn could swallow the reason it failed.
+    #[test]
+    fn folding_hides_the_work_but_keeps_prompts_answers_and_errors() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "first question");
+        app.push(LineKind::Command, "cargo build");
+        app.push(LineKind::Output, "compiling");
+        app.push(LineKind::Error, "something went wrong");
+        app.push(LineKind::Final, "first answer");
+        app.push(LineKind::User, "second question");
+        app.push(LineKind::Command, "cargo test");
+        app.mode = Mode::Idle;
+
+        assert_eq!(app.fold_completed_turns(), 1, "only finished turns fold");
+        let out = render(&app);
+        assert!(out.contains("first question"), "lost the prompt:\n{out}");
+        assert!(out.contains("first answer"), "lost the answer:\n{out}");
+        assert!(out.contains("something went wrong"), "hid an error:\n{out}");
+        assert!(!out.contains("cargo build"), "kept hidden work:\n{out}");
+        assert!(out.contains("▸ folded"), "no placeholder:\n{out}");
+        assert!(
+            out.contains("1 command"),
+            "placeholder lost its tally:\n{out}"
+        );
+        // The live turn is untouched — it is the one you are reading.
+        assert!(out.contains("cargo test"), "folded the live turn:\n{out}");
+
+        app.unfold_all();
+        assert!(render(&app).contains("cargo build"));
+    }
+
+    /// Folding changes what is rendered, so it must invalidate the line cache —
+    /// otherwise a fold would appear only when some other content happened to change.
+    #[test]
+    fn folding_invalidates_the_memoized_lines() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "q");
+        app.push(LineKind::Command, "ls");
+        app.push(LineKind::User, "q2");
+        let before = app.content_ver.get();
+        app.fold_completed_turns();
+        assert_ne!(
+            app.content_ver.get(),
+            before,
+            "fold did not touch the cache"
+        );
+    }
+
+    /// Turn ids must survive transcript trimming: an index-keyed fold would come to
+    /// mean a different turn once the buffer wrapped.
+    #[test]
+    fn turn_ids_are_stable_across_transcript_trimming() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::User, "first");
+        for i in 0..6000 {
+            app.push(LineKind::Output, format!("line {i}"));
+        }
+        app.push(LineKind::User, "second");
+        // Turn 1's lines are long gone, but the survivors still name their own turn
+        // and the newest line is in the newest turn rather than a reused number.
+        assert_eq!(app.transcript.last().map(|l| l.turn), Some(2));
+        assert!(app.transcript.iter().any(|l| l.turn == 2));
+    }
+
+    /// The boundary indicator is the one status segment about confinement, and it
+    /// shows only when the client actually established what the boundary is.
+    #[test]
+    fn the_boundary_indicator_appears_only_when_known() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        assert!(!render(&app).contains("egress"));
+        app.boundary = "🔒 egress ask".into();
+        let out = render(&app);
+        // Asserted in parts: the lock is double-width, so the test backend holds a
+        // blank continuation cell after it and the extracted row reads `🔒  egress`.
+        assert!(out.contains('🔒'), "{out}");
+        assert!(out.contains("egress ask"), "{out}");
     }
 
     #[test]

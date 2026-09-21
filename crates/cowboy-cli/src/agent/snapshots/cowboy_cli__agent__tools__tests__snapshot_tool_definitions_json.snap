@@ -4,21 +4,31 @@ expression: defs
 ---
 [
   {
-    "description": "Run a shell command inside the sandbox and observe its output. Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. For reading or editing files, prefer the `read`/`edit`/`write` tools.",
+    "description": "Run a shell command inside the sandbox and observe its output. Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. Each call is a FRESH shell: `cd` and `export` do not persist to the next call — pass `cwd`, or chain with `&&`. The filesystem and any listening server do persist. For reading, searching or editing files, prefer the `read`/`grep`/`ls`/`edit`/`write` tools.",
     "name": "shell",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `shell` tool.",
       "properties": {
         "command": {
-          "description": "The shell command to run inside the container (executed with `sh -lc`).",
+          "description": "The shell command to run in the sandbox, executed with `/bin/sh -c` — which\nis dash on Debian/Ubuntu, so keep it POSIX (no `[[`, no `<(…)`, no\n`exec -a`). **Every call is a fresh shell in a fresh process**, so a `cd` or\nan `export` does not carry over to the next call; the filesystem and any\nserver left listening do. To run somewhere else, pass `cwd` or chain it:\n`cd sub && cargo test`.",
           "type": "string"
         },
         "cwd": {
           "default": null,
-          "description": "Optional working directory (defaults to the container workdir).",
+          "description": "Optional working directory for this command (defaults to the workspace root).\nThis is how to run in a subdirectory, since `cd` does not persist.",
           "type": [
             "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "default": null,
+          "description": "Optional timeout in seconds for this command. Raise it for a long test or\nbuild suite; lower it for a command you expect to be quick so a hang is cut\nshort. Omit to use the session default. The host clamps it to a ceiling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
             "null"
           ]
         }
@@ -70,19 +80,54 @@ expression: defs
     }
   },
   {
-    "description": "Replace an exact span of text in a file. `old` must match exactly and be unique unless `replace_all` is set. Prefer this over `sed`/heredocs for edits — it is precise and fails loudly if `old` is missing or ambiguous.",
+    "description": "Replace an exact span of text in a file. `old` must match exactly and be unique unless `replace_all` is set. To change a file in several places, pass `edits` — they apply in order and all-or-nothing, so a failure leaves the file untouched. Copy `old` from `read` output without the line-number gutter. Prefer this over `sed`/heredocs — it is precise and fails loudly if `old` is missing or ambiguous.",
     "name": "edit",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `edit` tool.",
       "properties": {
+        "edits": {
+          "description": "Several edits to the same file, applied in order and **all-or-nothing**:\nif any one fails, the file is left untouched. Use instead of `old`/`new`\nwhen changing a file in more than one place.",
+          "items": {
+            "description": "One find/replace within a single file, as an entry in `edits`.",
+            "properties": {
+              "new": {
+                "description": "Replacement text.",
+                "type": "string"
+              },
+              "old": {
+                "description": "Exact text to replace. Must match a unique span unless `replace_all`.",
+                "type": "string"
+              },
+              "replace_all": {
+                "default": false,
+                "description": "Replace every occurrence instead of requiring a unique match.",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "old",
+              "new"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "new": {
-          "description": "Replacement text.",
-          "type": "string"
+          "default": null,
+          "description": "Replacement text. Omit when using `edits`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "old": {
-          "description": "Exact text to replace. Must match a unique span unless `replace_all`.",
-          "type": "string"
+          "default": null,
+          "description": "Exact text to replace. Must match a unique span unless `replace_all`.\nOmit when using `edits`.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "path": {
           "description": "Path to the file to edit (workspace-relative).",
@@ -95,16 +140,137 @@ expression: defs
         }
       },
       "required": [
-        "path",
-        "old",
-        "new"
+        "path"
       ],
       "title": "EditArgs",
       "type": "object"
     }
   },
   {
-    "description": "Create a new file or overwrite an existing one with the given content. Parent directories are created. Prefer this over `echo >`/heredocs.",
+    "description": "Search the workspace for a regex, reporting `path:line:text`. Use this to find where something lives instead of `grep -r`/`rg` via `shell`: it skips build output, dependency directories (`target`, `node_modules`, `.git`, …), anything `.gitignore` excludes, and binary files; it caps the matches it prints, and always reports the true total so you can tell when to narrow the pattern. Set `context` for surrounding lines (like `grep -C`), `files_only` to list just the matching file paths, or `include_ignored` to search generated output too. Available in plan mode.",
+    "name": "grep",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `grep` tool.",
+      "properties": {
+        "case_insensitive": {
+          "default": false,
+          "description": "Case-insensitive matching.",
+          "type": "boolean"
+        },
+        "context": {
+          "default": null,
+          "description": "Lines of surrounding context to show on each side of a match (like\n`grep -C`). Match lines use `path:line:`, context lines `path:line-`.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "files_only": {
+          "default": false,
+          "description": "Report only the paths of files that contain a match, not the lines (like\n`grep -l`). Cheaper when you only need to know *where* something is.",
+          "type": "boolean"
+        },
+        "glob": {
+          "default": null,
+          "description": "Only search files whose name or workspace-relative path matches this glob,\ne.g. `*.rs` or `src/**/mod.rs`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "include_ignored": {
+          "default": false,
+          "description": "Also search files and directories `.gitignore` excludes (build output,\ngenerated code, vendored dependencies). Off by default; the result says when\nsomething was hidden.",
+          "type": "boolean"
+        },
+        "literal": {
+          "default": false,
+          "description": "Treat `pattern` as plain text rather than a regex.",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": null,
+          "description": "Maximum matches to report (default 200). Totals are reported regardless.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "Limit the search to this file or directory (workspace-relative).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pattern": {
+          "description": "Regular expression to search for (Rust regex syntax).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern"
+      ],
+      "title": "GrepArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "List the entries of a workspace directory, one workspace-relative path per line (directories suffixed with `/`). Use this instead of `ls`/`find` via `shell`: it skips build output, dependency directories (`target`, `node_modules`, …) and anything `.gitignore` excludes, caps the listing, and reports the true total. Pass `recursive` to walk the whole tree, `glob` to filter files, `path` to list a subdirectory, or `include_ignored` to include generated output. Available in plan mode.",
+    "name": "ls",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `ls` tool.",
+      "properties": {
+        "glob": {
+          "default": null,
+          "description": "Only list files whose name or workspace-relative path matches this glob,\ne.g. `*.rs` or `src/**/mod.rs`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "include_ignored": {
+          "default": false,
+          "description": "Also list files and directories `.gitignore` excludes. Off by default; the\nresult says when something was hidden.",
+          "type": "boolean"
+        },
+        "max_results": {
+          "default": null,
+          "description": "Maximum entries to report (default 500). The true total is reported regardless.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "default": null,
+          "description": "Directory to list (workspace-relative). Defaults to the workspace root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recursive": {
+          "default": false,
+          "description": "Walk the whole tree beneath `path` instead of just one level. Build and\ndependency directories (`target`, `node_modules`, …) are always skipped.",
+          "type": "boolean"
+        }
+      },
+      "title": "LsArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Create a new file or overwrite an existing one with the given content. Parent directories are created. Prefer this over `echo >`/heredocs. Overwriting a file you have not `read` in this session is refused, as is one that changed on disk since you read it — `read` it first, or use `edit` to change only the part you mean to.",
     "name": "write",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -124,6 +290,59 @@ expression: defs
         "content"
       ],
       "title": "WriteArgs",
+      "type": "object"
+    }
+  },
+  {
+    "description": "Run a long-lived process in the background — a dev server, an API you need to send requests to, a watcher. Use this instead of `shell` for anything that does not exit on its own: a `shell` command gets its own sandbox whose whole process tree is reaped when it returns, so `&` or `nohup` there leaves you nothing, and running it in the foreground just burns the timeout. `start` (with `name`, plus `command` unless the name is defined in agent.yaml's `processes:`), then keep working — it stays reachable on localhost from your later `shell` commands. `logs` shows its recent output (it is also a file: `.cowboy/proc/<name>.log`), `list` shows what is running, `stop`/`restart` control it. Processes end with the session.",
+    "name": "proc",
+    "parameters": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Arguments for the `proc` tool.",
+      "properties": {
+        "action": {
+          "description": "\"start\", \"stop\", \"restart\", \"list\" or \"logs\".",
+          "type": "string"
+        },
+        "command": {
+          "default": null,
+          "description": "For `start`/`restart` of an ad-hoc process: the command to run.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "cwd": {
+          "default": null,
+          "description": "For `start`/`restart`: the working directory (defaults to the workspace root).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "lines": {
+          "default": null,
+          "description": "For `logs`: how many trailing lines to show (default 80).",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "name": {
+          "default": null,
+          "description": "The process name — required for everything but `list`. Either a name from\n`.cowboy/agent.yaml`'s `processes:` (whose command is already defined) or one\nyou choose for an ad-hoc process, in which case pass `command` too.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "title": "ProcArgs",
       "type": "object"
     }
   },

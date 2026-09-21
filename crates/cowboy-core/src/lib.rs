@@ -8,6 +8,7 @@ pub mod crew;
 pub mod decision;
 pub mod error;
 pub mod fs;
+pub mod instructions;
 pub mod lifecycle;
 pub mod mcp;
 pub mod memory;

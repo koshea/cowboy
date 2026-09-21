@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{ClientMsg, ServerMsg, SessionInfo, UiEventMsg};
-use cowboy_core::netproto::{encode_line, ApprovalScope, Verdict};
+use cowboy_core::netproto::{encode_line, ApprovalDetail, ApprovalScope, Verdict};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
@@ -267,7 +267,14 @@ impl SocketUi {
     /// parked gateway connection never hangs. With clients, the first
     /// [`ClientMsg::ApprovalReply`] wins; a follow-up `ApprovalResolved` tells
     /// the others to dismiss their modal.
-    pub async fn request_approval(&self, dest: String) -> (Verdict, ApprovalScope) {
+    ///
+    /// `detail` is display-only structure for the modal (see
+    /// [`cowboy_core::netproto::ApprovalDetail`]); it never affects the verdict.
+    pub async fn request_approval(
+        &self,
+        dest: String,
+        detail: Option<ApprovalDetail>,
+    ) -> (Verdict, ApprovalScope) {
         if self.attached() == 0 {
             return (Verdict::Deny, ApprovalScope::Once);
         }
@@ -281,6 +288,7 @@ impl SocketUi {
         let _ = self.inner.live.send(ServerMsg::Approval {
             id,
             dest: dest.clone(),
+            detail,
         });
 
         let verdict = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
@@ -965,7 +973,7 @@ mod tests {
         .unwrap();
         // No client attached -> fail closed immediately.
         assert_eq!(
-            ui.request_approval("example.com:443".into()).await,
+            ui.request_approval("example.com:443".into(), None).await,
             (Verdict::Deny, ApprovalScope::Once)
         );
     }
@@ -982,10 +990,11 @@ mod tests {
 
         // Ask for approval in the background; the client answers Allow/Session.
         let ask_ui = ui.clone();
-        let verdict = tokio::spawn(async move { ask_ui.request_approval("h:443".into()).await });
+        let verdict =
+            tokio::spawn(async move { ask_ui.request_approval("h:443".into(), None).await });
 
         let id = match read_msg(&mut reader).await {
-            ServerMsg::Approval { id, dest } => {
+            ServerMsg::Approval { id, dest, .. } => {
                 assert_eq!(dest, "h:443");
                 id
             }

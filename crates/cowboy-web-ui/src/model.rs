@@ -47,6 +47,13 @@ pub struct Ask {
 pub struct Approval {
     pub id: u64,
     pub dest: String,
+    /// Modal title from the prompt's kind, so a credential prompt is not labelled
+    /// as a network one.
+    pub title: String,
+    /// `(label, value)` detail rows; empty when the worker sent none, in which case
+    /// `dest` is all there is to show.
+    pub rows: Vec<(String, String)>,
+    pub note: Option<String>,
 }
 
 /// A crew subagent shown in the session view; click it to watch its live output.
@@ -134,8 +141,26 @@ impl Model {
                     options,
                 });
             }
-            ServerMsg::Approval { id, dest } => {
-                self.approval = Some(Approval { id, dest });
+            ServerMsg::Approval { id, dest, detail } => {
+                use cowboy_proto::netproto::ApprovalKind;
+                let (title, rows, note) = match detail {
+                    Some(d) => (
+                        match d.kind {
+                            ApprovalKind::Network => "Network request",
+                            ApprovalKind::Credential => "Credential access",
+                        },
+                        d.rows,
+                        d.note,
+                    ),
+                    None => ("Approval", Vec::new(), None),
+                };
+                self.approval = Some(Approval {
+                    id,
+                    dest,
+                    title: title.to_string(),
+                    rows,
+                    note,
+                });
             }
             ServerMsg::ApprovalResolved { id } => {
                 if self.approval.as_ref().is_some_and(|a| a.id == id) {

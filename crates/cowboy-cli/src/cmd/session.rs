@@ -92,6 +92,16 @@ pub async fn run(
         // thin client that starts (or reuses) the session and attaches.
         let (model_names, current_model) = models_and_default(&user_models, &project_models);
         daemon::ensure_running().await?;
+        // Openers for the welcome banner. Only for a session that started without a
+        // task — when you already said what you wanted, suggestions are noise. The
+        // worker loads `agent.yaml` for itself; this is the client's own read of it,
+        // and a missing or broken file degrades to the generic list.
+        let suggestions = if task.is_none() {
+            let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
+            launchpad(&root, &agent_cfg)
+        } else {
+            Vec::new()
+        };
         // A direct `cowboy` session is never a ranch workstream (those are launched
         // by `cowboy ranch start` and picked up via `cowboy ranch attach`).
         let ctx_for = |root: PathBuf| SessionCtx {
@@ -100,6 +110,7 @@ pub async fn run(
             current_model: current_model.clone(),
             ranch_id: None,
             workstream_id: None,
+            suggestions: suggestions.clone(),
         };
         let mut root = root;
         let mut force = flags.force;
@@ -117,7 +128,7 @@ pub async fn run(
             .context("starting session via cowboyd")?;
             match resp {
                 DaemonResp::Started { id, worker_sock } => {
-                    let intro = welcome_lines(&root, &resolved, Some(&id));
+                    let intro = welcome_lines(&root, &resolved, Some(&id), &suggestions);
                     let title = context_title(&root);
                     return crate::cmd::attach::attach_socket(
                         &worker_sock,
@@ -200,6 +211,12 @@ pub async fn run(
         };
 
         let memory_ctx = cowboy_core::memory::index(&crate::project::project_key_hex(&root));
+        // Pinned project context: what skills exist, and the repo's own conventions.
+        // Both are cheap and static, and both were previously a turn the agent had to
+        // spend before it could start work.
+        let skills_index = cowboy_core::skills::index(&root);
+        let project_instructions =
+            cowboy_core::instructions::block(&root, agent_cfg.agent.project_instruction_bytes);
         // Continue a prior session if asked (load its transcript as history).
         let history = match &resume_id {
             Some(id) => crate::session::load_history(&root, id).unwrap_or_else(|e| {
@@ -231,6 +248,16 @@ pub async fn run(
             (true, Some(p)) => Box::new(JournalUi::new(p)),
             _ => Box::new(ConsoleUi::new()),
         };
+        // Extracted before `agent_cfg.agent` is moved into the loop.
+        let project_commands = agent_cfg.commands.clone();
+        let project_processes = agent_cfg.processes.clone();
+        let verify = agent_cfg.verify_commands();
+        for name in agent_cfg.unknown_verify_names() {
+            crate::ui::warn(&format!(
+                "agent.verify names `{name}`, which is not a key in `commands:` — \
+                 it will be run as a literal command"
+            ));
+        }
         let mut agent = AgentLoop::new(
             Box::new(model),
             runtime,
@@ -241,6 +268,9 @@ pub async fn run(
         )
         .with_logger(logger)
         .with_memory_context(memory_ctx)
+        .with_project_commands(&project_commands, verify)
+        .with_project_context(&skills_index, &project_instructions)
+        .with_processes(project_processes)
         .with_history(history)
         .with_model_pricing(ModelPricing {
             input: resolved.input_cost_per_mtok,
@@ -531,11 +561,18 @@ fn models_and_default(
 }
 
 /// Build the welcome-banner lines shown at the top of the TUI: project + model
-/// context so a fresh session is oriented without a pre-prompt.
+/// context so a fresh session is oriented without a pre-prompt, then the launchpad
+/// — a few openers derived from what this repo already declares, so the first
+/// interaction is a keystroke instead of a blank prompt.
+///
+/// The old opening line ("Welcome to cowboy — the agent runs in a sandbox built from
+/// your machine") is not here: it is the intro art's tagline now, and saying it twice
+/// would just be two lines of banner to scroll past.
 fn welcome_lines(
     root: &std::path::Path,
     model: &cowboy_core::config::ResolvedModel,
     session_id: Option<&str>,
+    suggestions: &[String],
 ) -> Vec<String> {
     let host = model
         .base_url
@@ -546,7 +583,6 @@ fn welcome_lines(
         .next()
         .unwrap_or("");
     let mut lines = vec![
-        "Welcome to cowboy — the agent runs in a sandbox built from your machine.".to_string(),
         format!("workspace  {}", root.display()),
         format!("model      {}  ({host})", model.model),
     ];
@@ -560,10 +596,56 @@ fn welcome_lines(
         ));
     }
     lines.push(String::new());
+    if !suggestions.is_empty() {
+        lines.push("or start with one of these:".to_string());
+        for (i, s) in suggestions.iter().enumerate() {
+            lines.push(format!("  Alt-{}  {s}", i + 1));
+        }
+        lines.push(String::new());
+    }
     lines.push(
         "Type a message to begin · Enter sends · PgUp/wheel scroll · Ctrl-C menu".to_string(),
     );
     lines
+}
+
+/// Suggested opening prompts for a fresh session.
+///
+/// Derived only from what the repo already declares — `commands`/`verify` in
+/// `agent.yaml`, a root `AGENTS.md`, uncommitted work — so a project that declares
+/// nothing gets a short generic list rather than a wrong specific one. Capped at
+/// [`MAX_SUGGESTIONS`] because these are a launchpad, not a menu, and every line
+/// here is banner the user has to read past.
+fn launchpad(root: &std::path::Path, agent: &AgentConfig) -> Vec<String> {
+    /// Alt-1…Alt-9 is the key space, but three is what fits the banner without
+    /// pushing the prompt hint off a short terminal.
+    const MAX_SUGGESTIONS: usize = 3;
+    let mut out: Vec<String> = Vec::new();
+
+    // Uncommitted work is the most likely thing you opened the session about.
+    if crate::net::worktree::is_dirty(root) {
+        out.push("Review my uncommitted changes and flag anything risky.".to_string());
+    }
+    // The project's own checks, by the names it gave them.
+    let verify = agent.verify_commands();
+    if !verify.is_empty() {
+        let names = agent.agent.verify.join(", ");
+        out.push(format!(
+            "Run this project's checks ({names}) and fix whatever fails."
+        ));
+    } else if let Some(name) = agent.commands.keys().next() {
+        out.push(format!("Run `{name}` and fix whatever it reports."));
+    }
+    // A repo that documents itself can be summarised from what it says.
+    if root.join("AGENTS.md").exists() {
+        out.push(
+            "Give me a tour of this codebase: the entry points and how they fit together."
+                .to_string(),
+        );
+    }
+    out.push("What's worth working on next here?".to_string());
+    out.truncate(MAX_SUGGESTIONS);
+    out
 }
 
 /// Persistent transcript title: the working directory (home-relative) plus the

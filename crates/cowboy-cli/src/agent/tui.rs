@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_core::daemonproto::UiEventMsg;
-use cowboy_core::netproto::{ApprovalScope, Verdict};
+use cowboy_core::netproto::{ApprovalDetail, ApprovalKind, ApprovalScope, Verdict};
 use cowboy_tui::{
     draw, App, CrewMember, CrewStatus, LineKind, Mode, ModelChoice, ModelForm, ModelPicker,
     REASONING_OPTS,
@@ -70,9 +70,11 @@ pub enum UiEvent {
     /// A question for the user: prompt, suggested options (possibly empty), and
     /// the reply channel.
     Ask(String, Vec<String>, Sender<String>),
-    /// A network approval request: destination label + a reply channel.
+    /// An approval request: the flat destination label, the structured detail for the
+    /// modal (absent when there is none), and a reply channel.
     Approval(
         String,
+        Option<ApprovalDetail>,
         tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>,
     ),
     /// A pending approval was decided elsewhere (another client / timeout);
@@ -319,6 +321,23 @@ pub fn run_event_loop(
     result
 }
 
+/// Map the wire's approval detail onto the view type.
+///
+/// The title comes from the *kind* rather than from a string on the wire, so a
+/// credential prompt cannot end up titled "Network request" — which is exactly what
+/// it was titled while the modal had only a destination label to work from.
+fn approval_view(d: ApprovalDetail) -> cowboy_tui::ApprovalView {
+    cowboy_tui::ApprovalView {
+        title: match d.kind {
+            ApprovalKind::Network => "Network request".to_string(),
+            ApprovalKind::Credential => "Credential access".to_string(),
+        },
+        rows: d.rows,
+        note: d.note,
+        summary: String::new(),
+    }
+}
+
 /// Static session context the slash commands need.
 #[derive(Clone)]
 pub struct SessionCtx {
@@ -332,6 +351,10 @@ pub struct SessionCtx {
     pub ranch_id: Option<String>,
     /// The workstream id within the ranch, if any.
     pub workstream_id: Option<String>,
+    /// Suggested opening prompts for a fresh session, offered in the welcome banner
+    /// and submittable with Alt-1…Alt-9. Empty on attach and whenever the session
+    /// already started with a task.
+    pub suggestions: Vec<String>,
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -347,6 +370,12 @@ const MOUSE_TRACKING_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 /// The inverse, plus `?1003l` in case something else in the stack enabled
 /// any-motion reporting — leaving it on would spam the user's shell.
 const MOUSE_TRACKING_OFF: &str = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
+/// Save/restore the window title on the terminal's own title stack (XTWINOPS
+/// 22/23). We rename the window while a session is waiting on the user, and this
+/// is what makes that reversible — without it, quitting would leave the terminal
+/// stuck with our title.
+const TITLE_PUSH: &str = "\x1b[22;0t";
+const TITLE_POP: &str = "\x1b[23;0t";
 
 fn setup_terminal() -> Result<Term> {
     terminal::enable_raw_mode()?;
@@ -362,6 +391,7 @@ fn setup_terminal() -> Result<Term> {
         crossterm::event::EnableBracketedPaste
     )?;
     stdout.write_all(MOUSE_TRACKING_ON.as_bytes())?;
+    stdout.write_all(TITLE_PUSH.as_bytes())?;
     stdout.flush()?;
     // Best-effort: the kitty keyboard protocol lets us distinguish Shift+Enter
     // (newline) from Enter (send). Harmless where unsupported.
@@ -387,6 +417,8 @@ fn restore_terminal(terminal: &mut Term) -> Result<()> {
     terminal
         .backend_mut()
         .write_all(MOUSE_TRACKING_OFF.as_bytes())?;
+    // Give the window its original title back (see `TITLE_PUSH`).
+    terminal.backend_mut().write_all(TITLE_POP.as_bytes())?;
     execute!(
         terminal.backend_mut(),
         crossterm::event::DisableBracketedPaste,
@@ -412,9 +444,18 @@ fn clipboard_copy(out: &mut impl io::Write, text: &str) {
     // OSC 52: ask the terminal to set the system clipboard. Works over SSH and
     // in most modern terminals (the terminal must allow clipboard writes).
     let osc = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
-    // Inside tmux/screen the sequence must be wrapped in DCS passthrough or it
-    // never reaches the outer terminal (a very common "copy doesn't work" cause).
-    let seq = if std::env::var_os("TMUX").is_some() {
+    let seq = multiplexer_passthrough(osc);
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// Wrap an OSC sequence so it survives a terminal multiplexer.
+///
+/// Inside tmux/screen an OSC must be wrapped in DCS passthrough or it never
+/// reaches the outer terminal — a very common "copy doesn't work" cause, and the
+/// same applies to a notification or a window-title write.
+fn multiplexer_passthrough(osc: String) -> String {
+    if std::env::var_os("TMUX").is_some() {
         // tmux: wrap in `\ePtmux;…\e\\` with inner ESCs doubled.
         format!("\x1bPtmux;{}\x1b\\", osc.replace('\x1b', "\x1b\x1b"))
     } else if std::env::var_os("STY").is_some() {
@@ -422,8 +463,59 @@ fn clipboard_copy(out: &mut impl io::Write, text: &str) {
         format!("\x1bP{osc}\x1b\\")
     } else {
         osc
+    }
+}
+
+/// Whether out-of-band attention signals (bell, desktop notification, window
+/// title) are wanted. On by default; `COWBOY_NOTIFY=0|off|false|""` turns them off
+/// for anyone whose terminal or window manager makes them obnoxious.
+fn notifications_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("COWBOY_NOTIFY") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false"
+        ),
+        Err(_) => true,
+    })
+}
+
+/// Tell the user out of band that the session has parked on them.
+///
+/// The status bar already says so, which is no help when the window isn't
+/// focused — and these pauses fail closed, so an unnoticed prompt is a stalled
+/// session rather than a slow one. Two signals, both cheap and both ignored by
+/// terminals that don't implement them: BEL (near-universal, usually an urgency
+/// hint to the window manager) and OSC 9 (a real desktop notification in
+/// WezTerm/iTerm2/Windows Terminal/foot).
+///
+/// Same writer constraint as [`clipboard_copy`]: this must go through ratatui's
+/// backend after the frame has flushed.
+fn notify_attention(out: &mut impl io::Write, reason: &str) {
+    if !notifications_enabled() {
+        return;
+    }
+    let osc = format!("\x1b]9;cowboy — {reason}\x07");
+    let _ = out.write_all(multiplexer_passthrough(osc).as_bytes());
+    let _ = out.write_all(b"\x07");
+    let _ = out.flush();
+}
+
+/// Set the window title, so a background session that needs you is visible in the
+/// taskbar / tab strip. Reversible: `setup_terminal` pushes the original onto the
+/// terminal's title stack and `restore_terminal` pops it, so we never leave a
+/// terminal renamed after exit.
+fn set_window_title(out: &mut impl io::Write, context: &str, waiting: bool) {
+    if !notifications_enabled() {
+        return;
+    }
+    let text = if waiting {
+        format!("⏳ cowboy needs you — {context}")
+    } else {
+        format!("cowboy — {context}")
     };
-    let _ = out.write_all(seq.as_bytes());
+    let osc = format!("\x1b]2;{text}\x07");
+    let _ = out.write_all(multiplexer_passthrough(osc).as_bytes());
     let _ = out.flush();
 }
 
@@ -581,6 +673,9 @@ fn event_loop(
     let mut quit_armed = false;
     // Whether the one-shot steering tip has been considered this session.
     let mut steering_tip_done = false;
+    // Whether the window title currently carries the "needs you" marker, so it is
+    // written only on a change rather than every frame.
+    let mut title_marked_waiting = false;
     // Outstanding messages sent to the agent but not yet acknowledged (TurnDone).
     let mut pending_turns: usize = 0;
     let mut task_tx = Some(task_tx);
@@ -591,9 +686,27 @@ fn event_loop(
     // computed once: skills rarely change mid-session.
     let completion_catalog = build_completion_catalog(&session);
 
-    // Welcome banner (project info) at the top of the transcript.
+    // Welcome banner (project info) at the top of the transcript. The intro art goes
+    // first, so it sits above the project lines and scrolls away with them.
+    if !intro.is_empty() {
+        // Sized to the transcript pane (the left 68% of the screen, less its borders
+        // and the status/input rows), not the terminal: the art must fit its own pane
+        // without wrapping, and must not be pushed straight off the top by the
+        // welcome lines that follow it.
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((0, 0));
+        let pane_w = (u32::from(cols) * 68 / 100).saturating_sub(2) as u16;
+        // status bar (1) + input box (3) + the transcript's own borders (2).
+        let pane_h = rows.saturating_sub(6);
+        let frames = crate::banner::intro_frames(&session.root, pane_w, pane_h);
+        app.begin_intro(frames, crate::banner::FRAME_MS, now_ms());
+    }
     for line in intro {
         app.push(LineKind::Banner, line);
+    }
+    // Boundary indicator: read once here rather than per frame — it comes from
+    // host-owned config that cannot change under a running session.
+    if let Some(s) = crate::cmd::sandbox::summary(&session.root) {
+        app.boundary = s;
     }
 
     // Seed the first turn, or start idle awaiting the first message.
@@ -646,11 +759,11 @@ fn event_loop(
                     }
                     pending_reply = Some(reply);
                 }
-                UiEvent::Approval(dest, reply) => {
+                UiEvent::Approval(dest, detail, reply) => {
                     if !matches!(app.mode, Mode::Approval(_) | Mode::Help) {
                         mode_before_overlay = app.mode.clone();
                     }
-                    app.mode = Mode::Approval(dest);
+                    app.begin_approval(dest, detail.map(approval_view));
                     pending_approval = Some(reply);
                 }
                 UiEvent::ApprovalResolved => {
@@ -658,6 +771,7 @@ fn event_loop(
                     // mode. (If we were the decider we've already moved on.)
                     if matches!(app.mode, Mode::Approval(_)) {
                         pending_approval = None;
+                        app.end_approval();
                         app.mode = mode_before_overlay.clone();
                     }
                 }
@@ -689,6 +803,8 @@ fn event_loop(
         app.tick_command(now_ms());
         app.tick_crew(now_ms());
         app.tick_turn(now_ms());
+        app.tick_attention(now_ms());
+        app.tick_intro(now_ms());
         // Tail the watched subagent's journal into its nested view (poll on the
         // tick; the file is small and local).
         if app.mode == Mode::WatchingSubagent {
@@ -741,6 +857,20 @@ fn event_loop(
             app.status = format!("copied {n} chars");
         }
 
+        // Out-of-band attention signals, same after-the-frame writer constraint as
+        // the clipboard above. The bell/notification is edge-triggered inside
+        // `tick_attention`; the window title is level-triggered here, because it
+        // has to be *taken back off* once the wait ends.
+        if let Some(reason) = app.take_pending_notify() {
+            notify_attention(terminal.backend_mut(), &reason);
+        }
+        let waiting = app.attention_reason().is_some();
+        if waiting != title_marked_waiting {
+            title_marked_waiting = waiting;
+            let context = app.title.clone();
+            set_window_title(terminal.backend_mut(), &context, waiting);
+        }
+
         // Terminal input. Everything already queued is drained before the next
         // frame rather than one event per draw: a drag-selection or a multi-KiB
         // paste arrives as hundreds of events, and one-per-frame turns that into
@@ -748,13 +878,25 @@ fn event_loop(
         let mut drained = 0usize;
         while drained < INPUT_DRAIN_BUDGET
             && event::poll(if drained == 0 {
-                Duration::from_millis(120)
+                // The idle cadence is 120 ms; while the intro animates we poll at its
+                // frame interval instead, so the animation is smooth without paying
+                // for a faster loop for the rest of the session.
+                if app.intro_active() {
+                    Duration::from_millis(crate::banner::FRAME_MS)
+                } else {
+                    Duration::from_millis(120)
+                }
             } else {
                 Duration::ZERO
             })?
         {
             drained += 1;
             let ev = event::read()?;
+            // Any key or click settles the intro immediately — nobody should have to
+            // watch an animation to get to their prompt.
+            if app.intro_active() && !matches!(ev, Event::Resize(_, _)) {
+                app.finish_intro();
+            }
             let input_before = app.input_text();
             match ev {
                 // Ctrl-L: force a full repaint — escape hatch for terminal render
@@ -1237,11 +1379,27 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 app.status = "detaching…".into();
                 return true; // exit the event loop; the worker keeps running
             }
+            // Launchpad: start with one of the suggested openers from the welcome
+            // banner. Alt- rather than a bare digit because a bare digit is the
+            // first character of plenty of real messages.
+            KeyCode::Char(c @ '1'..='9') => {
+                let i = c as usize - '1' as usize;
+                match ctx.session.suggestions.get(i).cloned() {
+                    Some(prompt) => send_message(app, &mut ctx, prompt),
+                    None => app.status = format!("no suggestion {c}"),
+                }
+                return false;
+            }
+            // Fold/unfold the turns you have already read.
+            KeyCode::Char('f') => {
+                app.status = app.toggle_folds();
+                return false;
+            }
             _ => {}
         }
     }
 
-    // Network approval modal.
+    // Approval modal (network egress, or a credential mount/injection).
     if let Mode::Approval(_) = &app.mode {
         let decision = match key.code {
             KeyCode::Char('o') => Some((Verdict::Allow, ApprovalScope::Once)),
@@ -1255,6 +1413,7 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             if let Some(reply) = ctx.pending_approval.take() {
                 let _ = reply.send(d);
             }
+            app.end_approval();
             app.mode = ctx.mode_before_overlay.clone();
         }
         return false;
@@ -1345,14 +1504,8 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 if handle_command(rest, app, &mut ctx) {
                     return true;
                 }
-            } else if let Some(tx) = ctx.task_tx {
-                app.push(LineKind::User, msg.clone());
-                ctx.history.push(msg.clone());
-                *ctx.hist_pos = None;
-                let _ = tx.send(AgentCmd::Message(msg));
-                *ctx.pending_turns += 1;
-                app.mode = Mode::Running;
-                app.status = "running".into();
+            } else {
+                send_message(app, &mut ctx, msg);
             }
         }
         // Everything else is text input for the editor.
@@ -1361,8 +1514,46 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
     false
 }
 
+/// Send `msg` to the agent as a user turn: echo it, record it in history, and mark a
+/// turn in flight. Shared by Enter-to-submit and the launchpad hotkeys so the two
+/// cannot drift.
+fn send_message(app: &mut App, ctx: &mut KeyCtx, msg: String) {
+    let Some(tx) = ctx.task_tx.as_ref() else {
+        return;
+    };
+    app.push(LineKind::User, msg.clone());
+    ctx.history.push(msg.clone());
+    *ctx.hist_pos = None;
+    let _ = tx.send(AgentCmd::Message(msg));
+    *ctx.pending_turns += 1;
+    app.mode = Mode::Running;
+    app.status = "running".into();
+}
+
 /// `/mcp`: list the configured MCP servers (host + this repo's trust-gated
 /// `.mcp.json`) as notices. Read-only — manage servers with the `cowboy mcp` CLI.
+/// `/boundary`: what the sandbox actually allows — mounts, Landlock, seccomp, the
+/// never-grantable paths, and the egress policy in force.
+///
+/// Read-only, and built from the same code path as `cowboy sandbox plan` so the two
+/// cannot disagree. This is the one thing the UI was not showing about the product's
+/// central claim: the status bar carried tokens, cost and diff, but nothing about
+/// confinement.
+fn boundary_command(app: &mut App, root: &std::path::Path) {
+    match crate::cmd::sandbox::describe(root) {
+        Ok(report) => {
+            app.push(LineKind::Notice, format!("boundary for {}", root.display()));
+            for line in report.lines() {
+                app.push(LineKind::Notice, line.to_string());
+            }
+        }
+        Err(e) => app.push(
+            LineKind::Error,
+            format!("cannot describe the boundary: {e}"),
+        ),
+    }
+}
+
 /// Render the latest context-window snapshot.
 ///
 /// Reads state the agent loop already reports every turn rather than asking the worker
@@ -1765,6 +1956,21 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         },
         "mcp" => mcp_command(app, &ctx.session.root),
         "context" => context_command(app),
+        // Collapse the mechanics of turns you have already read, so a long session
+        // can be scanned as a conversation rather than scrolled through as a log.
+        "fold" => {
+            let n = app.fold_completed_turns();
+            app.status = if n == 0 {
+                "nothing to fold yet".into()
+            } else {
+                format!("folded {n} earlier turn{}", if n == 1 { "" } else { "s" })
+            };
+        }
+        "unfold" => {
+            let n = app.unfold_all();
+            app.status = format!("expanded {n} turn{}", if n == 1 { "" } else { "s" });
+        }
+        "boundary" => boundary_command(app, &ctx.session.root),
         "quit" | "exit" | "q" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {

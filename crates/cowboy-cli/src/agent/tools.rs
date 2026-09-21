@@ -18,6 +18,9 @@ pub const TOOL_REQUEST_TURNS: &str = "request_turns";
 pub const TOOL_READ: &str = "read";
 pub const TOOL_EDIT: &str = "edit";
 pub const TOOL_WRITE: &str = "write";
+pub const TOOL_GREP: &str = "grep";
+pub const TOOL_LS: &str = "ls";
+pub const TOOL_PROC: &str = "proc";
 pub const TOOL_MEMORY: &str = "memory";
 pub const TOOL_PLAN: &str = "plan";
 pub const TOOL_ARTIFACT: &str = "artifact";
@@ -30,14 +33,59 @@ pub const TOOL_PROPOSE_SCOPE_CHANGE: &str = "propose_scope_change";
 /// Conditional: added only when ≥1 MCP server is enabled (see [`mcp_definition`]).
 pub const TOOL_MCP: &str = "mcp";
 
+/// The only tools a worker may call once it has been told to wrap up.
+///
+/// Wrapping up means the turn budget is spent and the worker has just enough left to
+/// *report*. Before this list existed the directive was advisory, and a worker that
+/// ignored it kept full access: one real subagent spent its entire wrap-up extension
+/// on fourteen more `grep`s, was stopped, and lost seventy turns of investigation
+/// because it had written nothing down. Telling a model to stop investigating is not
+/// the same as stopping it.
+///
+/// Reporting, recording and *collecting* are allowed; investigating and mutating are
+/// not. `jobs`/`wait`/`job_reply` are in the list deliberately: a foreman may enter
+/// wrap-up with subagents still in flight, and `final` refuses while they are — so
+/// denying it the means to collect them would deadlock the very path this protects.
+pub const WRAP_UP_ALLOWED: &[&str] = &[
+    // The report itself, and the durable forms of it.
+    TOOL_FINAL,
+    TOOL_ARTIFACT,
+    TOOL_HANDOFF,
+    TOOL_DECISION,
+    TOOL_MEMORY,
+    // Reporting that the work could not be finished is a legitimate outcome.
+    TOOL_BLOCKED,
+    TOOL_UNBLOCK,
+    // Collecting delegated work so there is something to report.
+    TOOL_JOBS,
+    TOOL_WAIT,
+    TOOL_JOB_REPLY,
+];
+
+/// Whether `name` may still be called while wrapping up. See [`WRAP_UP_ALLOWED`].
+pub fn allowed_when_wrapping_up(name: &str) -> bool {
+    WRAP_UP_ALLOWED.contains(&name)
+}
+
 /// Arguments for the `shell` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShellArgs {
-    /// The shell command to run inside the container (executed with `sh -lc`).
+    /// The shell command to run in the sandbox, executed with `/bin/sh -c` — which
+    /// is dash on Debian/Ubuntu, so keep it POSIX (no `[[`, no `<(…)`, no
+    /// `exec -a`). **Every call is a fresh shell in a fresh process**, so a `cd` or
+    /// an `export` does not carry over to the next call; the filesystem and any
+    /// server left listening do. To run somewhere else, pass `cwd` or chain it:
+    /// `cd sub && cargo test`.
     pub command: String,
-    /// Optional working directory (defaults to the container workdir).
+    /// Optional working directory for this command (defaults to the workspace root).
+    /// This is how to run in a subdirectory, since `cd` does not persist.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Optional timeout in seconds for this command. Raise it for a long test or
+    /// build suite; lower it for a command you expect to be quick so a hang is cut
+    /// short. Omit to use the session default. The host clamps it to a ceiling.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 /// Arguments for the `final` tool.
@@ -164,11 +212,9 @@ pub struct ReadArgs {
     pub limit: Option<usize>,
 }
 
-/// Arguments for the `edit` tool.
+/// One find/replace within a single file, as an entry in `edits`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct EditArgs {
-    /// Path to the file to edit (workspace-relative).
-    pub path: String,
+pub struct EditSpecArgs {
     /// Exact text to replace. Must match a unique span unless `replace_all`.
     pub old: String,
     /// Replacement text.
@@ -178,6 +224,28 @@ pub struct EditArgs {
     pub replace_all: bool,
 }
 
+/// Arguments for the `edit` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct EditArgs {
+    /// Path to the file to edit (workspace-relative).
+    pub path: String,
+    /// Exact text to replace. Must match a unique span unless `replace_all`.
+    /// Omit when using `edits`.
+    #[serde(default)]
+    pub old: Option<String>,
+    /// Replacement text. Omit when using `edits`.
+    #[serde(default)]
+    pub new: Option<String>,
+    /// Replace every occurrence instead of requiring a unique match.
+    #[serde(default)]
+    pub replace_all: bool,
+    /// Several edits to the same file, applied in order and **all-or-nothing**:
+    /// if any one fails, the file is left untouched. Use instead of `old`/`new`
+    /// when changing a file in more than one place.
+    #[serde(default)]
+    pub edits: Vec<EditSpecArgs>,
+}
+
 /// Arguments for the `write` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct WriteArgs {
@@ -185,6 +253,86 @@ pub struct WriteArgs {
     pub path: String,
     /// Full file contents (overwrites any existing file).
     pub content: String,
+}
+
+/// Arguments for the `grep` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct GrepArgs {
+    /// Regular expression to search for (Rust regex syntax).
+    pub pattern: String,
+    /// Limit the search to this file or directory (workspace-relative).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Only search files whose name or workspace-relative path matches this glob,
+    /// e.g. `*.rs` or `src/**/mod.rs`.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Treat `pattern` as plain text rather than a regex.
+    #[serde(default)]
+    pub literal: bool,
+    /// Case-insensitive matching.
+    #[serde(default)]
+    pub case_insensitive: bool,
+    /// Maximum matches to report (default 200). Totals are reported regardless.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Lines of surrounding context to show on each side of a match (like
+    /// `grep -C`). Match lines use `path:line:`, context lines `path:line-`.
+    #[serde(default)]
+    pub context: Option<usize>,
+    /// Report only the paths of files that contain a match, not the lines (like
+    /// `grep -l`). Cheaper when you only need to know *where* something is.
+    #[serde(default)]
+    pub files_only: bool,
+    /// Also search files and directories `.gitignore` excludes (build output,
+    /// generated code, vendored dependencies). Off by default; the result says when
+    /// something was hidden.
+    #[serde(default)]
+    pub include_ignored: bool,
+}
+
+/// Arguments for the `ls` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct LsArgs {
+    /// Directory to list (workspace-relative). Defaults to the workspace root.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Only list files whose name or workspace-relative path matches this glob,
+    /// e.g. `*.rs` or `src/**/mod.rs`.
+    #[serde(default)]
+    pub glob: Option<String>,
+    /// Walk the whole tree beneath `path` instead of just one level. Build and
+    /// dependency directories (`target`, `node_modules`, …) are always skipped.
+    #[serde(default)]
+    pub recursive: bool,
+    /// Maximum entries to report (default 500). The true total is reported regardless.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Also list files and directories `.gitignore` excludes. Off by default; the
+    /// result says when something was hidden.
+    #[serde(default)]
+    pub include_ignored: bool,
+}
+
+/// Arguments for the `proc` tool.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct ProcArgs {
+    /// "start", "stop", "restart", "list" or "logs".
+    pub action: String,
+    /// The process name — required for everything but `list`. Either a name from
+    /// `.cowboy/agent.yaml`'s `processes:` (whose command is already defined) or one
+    /// you choose for an ad-hoc process, in which case pass `command` too.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// For `start`/`restart` of an ad-hoc process: the command to run.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// For `start`/`restart`: the working directory (defaults to the workspace root).
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// For `logs`: how many trailing lines to show (default 80).
+    #[serde(default)]
+    pub lines: Option<usize>,
 }
 
 /// Arguments for the `memory` tool.
@@ -395,7 +543,10 @@ pub fn definitions() -> Vec<ToolDef> {
             name: TOOL_SHELL.into(),
             description: "Run a shell command inside the sandbox and observe its output. \
                           Use this for builds, tests, git, and cowboy CLIs like `cowboy patch`. \
-                          For reading or editing files, prefer the `read`/`edit`/`write` tools."
+                          Each call is a FRESH shell: `cd` and `export` do not persist to the \
+                          next call — pass `cwd`, or chain with `&&`. The filesystem and any \
+                          listening server do persist. For reading, searching or editing files, \
+                          prefer the `read`/`grep`/`ls`/`edit`/`write` tools."
                 .into(),
             parameters: schema_for::<ShellArgs>(),
         },
@@ -409,18 +560,64 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: TOOL_EDIT.into(),
             description: "Replace an exact span of text in a file. `old` must match exactly and \
-                          be unique unless `replace_all` is set. Prefer this over `sed`/heredocs \
-                          for edits — it is precise and fails loudly if `old` is missing or \
-                          ambiguous."
+                          be unique unless `replace_all` is set. To change a file in several \
+                          places, pass `edits` — they apply in order and all-or-nothing, so a \
+                          failure leaves the file untouched. Copy `old` from `read` output \
+                          without the line-number gutter. Prefer this over `sed`/heredocs — it \
+                          is precise and fails loudly if `old` is missing or ambiguous."
                 .into(),
             parameters: schema_for::<EditArgs>(),
         },
         ToolDef {
+            name: TOOL_GREP.into(),
+            description: "Search the workspace for a regex, reporting `path:line:text`. Use this \
+                          to find where something lives instead of `grep -r`/`rg` via `shell`: it \
+                          skips build output, dependency directories (`target`, `node_modules`, \
+                          `.git`, …), anything `.gitignore` excludes, and binary files; it caps \
+                          the matches it prints, and always reports the true total so you can \
+                          tell when to narrow the pattern. Set `context` for surrounding lines \
+                          (like `grep -C`), `files_only` to list just the matching file paths, or \
+                          `include_ignored` to search generated output too. Available in plan mode."
+                .into(),
+            parameters: schema_for::<GrepArgs>(),
+        },
+        ToolDef {
+            name: TOOL_LS.into(),
+            description: "List the entries of a workspace directory, one workspace-relative path \
+                          per line (directories suffixed with `/`). Use this instead of `ls`/\
+                          `find` via `shell`: it skips build output, dependency directories \
+                          (`target`, `node_modules`, …) and anything `.gitignore` excludes, caps \
+                          the listing, and reports the true total. Pass `recursive` to walk the \
+                          whole tree, `glob` to filter files, `path` to list a subdirectory, or \
+                          `include_ignored` to include generated output. Available in plan mode."
+                .into(),
+            parameters: schema_for::<LsArgs>(),
+        },
+        ToolDef {
             name: TOOL_WRITE.into(),
             description: "Create a new file or overwrite an existing one with the given content. \
-                          Parent directories are created. Prefer this over `echo >`/heredocs."
+                          Parent directories are created. Prefer this over `echo >`/heredocs. \
+                          Overwriting a file you have not `read` in this session is refused, as \
+                          is one that changed on disk since you read it — `read` it first, or use \
+                          `edit` to change only the part you mean to."
                 .into(),
             parameters: schema_for::<WriteArgs>(),
+        },
+        ToolDef {
+            name: TOOL_PROC.into(),
+            description: "Run a long-lived process in the background — a dev server, an API you \
+                          need to send requests to, a watcher. Use this instead of `shell` for \
+                          anything that does not exit on its own: a `shell` command gets its own \
+                          sandbox whose whole process tree is reaped when it returns, so `&` or \
+                          `nohup` there leaves you nothing, and running it in the foreground just \
+                          burns the timeout. `start` (with `name`, plus `command` unless the name \
+                          is defined in agent.yaml's `processes:`), then keep working — it stays \
+                          reachable on localhost from your later `shell` commands. `logs` shows \
+                          its recent output (it is also a file: `.cowboy/proc/<name>.log`), \
+                          `list` shows what is running, `stop`/`restart` control it. Processes \
+                          end with the session."
+                .into(),
+            parameters: schema_for::<ProcArgs>(),
         },
         ToolDef {
             name: TOOL_MEMORY.into(),
@@ -610,7 +807,10 @@ mod tests {
                 "shell",
                 "read",
                 "edit",
+                "grep",
+                "ls",
                 "write",
+                "proc",
                 "memory",
                 "plan",
                 "artifact",
@@ -635,22 +835,39 @@ mod tests {
     fn nested_arg_schemas_are_inlined_not_ref() {
         // Models behind some OpenAI-compatible gateways (minimax-m3 on Fireworks)
         // don't resolve `$ref`/`$defs`, so nested array-of-object params must be
-        // inlined or the model emits empty placeholders. `plan` (Vec<PlanStep>) is
-        // the only tool left with nested struct args — the heavier `propose_ranch`
-        // decomposition now goes through the `cowboy ranch draft` CLI instead.
-        let plan = definitions()
+        // inlined or the model emits empty placeholders. Two tools have nested
+        // struct args: `plan` (Vec<PlanStep>) and `edit` (Vec<EditSpecArgs>, the
+        // batch form) — a batch edit that arrived as empty placeholders would be a
+        // silent no-op, so both are checked.
+        for (tool, fields) in [("plan", ["step", "status"]), ("edit", ["old", "new"])] {
+            let schema = definitions()
+                .into_iter()
+                .find(|d| d.name == tool)
+                .unwrap_or_else(|| panic!("{tool} tool present"))
+                .parameters
+                .to_string();
+            assert!(
+                !schema.contains("$ref") && !schema.contains("$defs"),
+                "{tool} schema must be inlined, got: {schema}"
+            );
+            for f in fields {
+                assert!(
+                    schema.contains(&format!("\"{f}\"")),
+                    "{tool} must expose the concrete `{f}` field: {schema}"
+                );
+            }
+        }
+        // And the batch array really is an array of objects, not of strings.
+        let edit = definitions()
             .into_iter()
-            .find(|d| d.name == "plan")
-            .expect("plan tool present")
-            .parameters
-            .to_string();
-        assert!(
-            !plan.contains("$ref") && !plan.contains("$defs"),
-            "plan schema must be inlined, got: {plan}"
+            .find(|d| d.name == "edit")
+            .expect("edit tool present")
+            .parameters;
+        let items = &edit["properties"]["edits"]["items"];
+        assert_eq!(
+            items["type"], "object",
+            "edits must be an array of objects, got: {items}"
         );
-        // The inlined `plan` schema exposes the concrete step shape.
-        assert!(plan.contains("\"step\""), "plan step field inlined");
-        assert!(plan.contains("\"status\""), "plan status field inlined");
     }
 
     #[test]
@@ -683,6 +900,46 @@ mod tests {
         let schema = schema_for::<ShellArgs>();
         let s = schema.to_string();
         assert!(s.contains("command"));
+    }
+
+    /// Every name in the wrap-up allowlist must be a real tool.
+    ///
+    /// A typo here fails in the worst possible direction: the name silently does not
+    /// match, the tool is denied, and if it were `final` every wrap-up would deadlock
+    /// — the worker told to report would have no way to report. Cheap to pin.
+    #[test]
+    fn the_wrap_up_allowlist_names_only_real_tools() {
+        let names: Vec<String> = definitions().into_iter().map(|d| d.name).collect();
+        for allowed in WRAP_UP_ALLOWED {
+            assert!(
+                names.iter().any(|n| n == allowed),
+                "{allowed:?} is in WRAP_UP_ALLOWED but is not a tool"
+            );
+        }
+        // The point of the gate: a worker out of budget reports, it does not keep
+        // digging or editing.
+        for denied in [
+            TOOL_SHELL,
+            TOOL_READ,
+            TOOL_GREP,
+            TOOL_LS,
+            TOOL_EDIT,
+            TOOL_WRITE,
+            TOOL_SUBAGENT,
+            TOOL_REQUEST_TURNS,
+            TOOL_ASK_USER,
+        ] {
+            assert!(
+                !allowed_when_wrapping_up(denied),
+                "{denied:?} must not be callable while wrapping up"
+            );
+        }
+        // And the report itself must be, or the gate is a deadlock.
+        assert!(allowed_when_wrapping_up(TOOL_FINAL));
+        // A foreman can still collect subagents it is waiting on; `final` refuses
+        // while jobs are in flight, so denying these would wedge that path.
+        assert!(allowed_when_wrapping_up(TOOL_WAIT));
+        assert!(allowed_when_wrapping_up(TOOL_JOBS));
     }
 
     #[test]

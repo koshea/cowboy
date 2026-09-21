@@ -222,12 +222,29 @@ to wrap up always keeps enough turns to write its answer — six, because writin
 honestly costs a file write, an `artifact` publish, a `handoff`, and `final`, and an
 earlier allowance of three ran out on the last of those.
 
+**Wrapping up is enforced, not requested.** Once a worker is in wrap-up the host
+narrows its tool surface to the reporting tools — `final`, `artifact`, `handoff`,
+`decision`, `memory`, `blocked`/`unblock`, and the `jobs`/`wait`/`job_reply` it may
+need to collect delegated work — and refuses anything else it calls anyway, since
+its own history is full of earlier `shell` and `read` calls to reach for. "Stop
+investigating" as advice does not work: a real worker answered it with fourteen more
+`grep`s, hit its ceiling, was stopped, and lost seventy turns of investigation
+because it had written none of it down. `jobs`/`wait` stay available deliberately —
+`final` refuses while delegated work is in flight, so a foreman denied the means to
+collect it would have no legal move left.
+
 If a worker does run out before calling `final`, its result is a `[partial]`
 checkpoint that **leads with what it actually produced** — the artifacts it published
 and the handoff it wrote, as recorded by the host rather than claimed by the worker.
 That matters because a worker generally runs out *before* ticking the last box on its
 plan, so its own plan can say "write the findings" for a document it has already
 written; the plan is still shown, marked as its own possibly-stale account.
+
+Which is the case for writing things down *as you go*. A worker that narrates its
+findings turn by turn survives being stopped; one that only accumulates tool results
+has nothing to salvage, because the conclusions were never anywhere but the model's
+head. Cowboy can force the report at the end, but it cannot reconstruct reasoning
+that was never written.
 
 ## A worker can ask a question
 

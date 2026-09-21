@@ -9,6 +9,9 @@ use super::*;
 pub(super) fn style_for(kind: LineKind) -> (&'static str, Style) {
     match kind {
         LineKind::Banner => ("", Style::default().fg(Color::DarkGray)),
+        // The art carries its own per-cell colour as ANSI; a style here would be
+        // overridden by it anyway, and a prefix would shift every row.
+        LineKind::Art => ("", Style::default()),
         LineKind::User => (
             "› ",
             Style::default()
@@ -93,6 +96,7 @@ pub(super) fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
             | LineKind::Agent
             | LineKind::Diff
     ) && prev != LineKind::Banner
+        && prev != LineKind::Art
 }
 
 /// Draw the whole UI.
@@ -160,20 +164,17 @@ pub fn draw(f: &mut Frame, app: &App) {
                 draw_choice(f, area, c, &app.input_text());
             }
         }
-        Mode::Approval(p) => draw_modal(
-            f,
-            area,
-            "Network request",
-            &format!(
-                "{p}\n\n\
-                 o  once — just this request\n\
-                 s  session — every request here until this session ends\n\
-                 p  project — always allow here (saved for this repo)\n\
-                 g  global — always allow everywhere\n\
-                 d  deny",
-            ),
-            "press a key  ·  Esc = deny",
-        ),
+        Mode::Approval(p) => {
+            // Structured detail when the worker sent it; otherwise the flat label,
+            // which is all an older worker provides.
+            let view = app.approval.clone().unwrap_or_else(|| ApprovalView {
+                title: "Approval".to_string(),
+                rows: Vec::new(),
+                note: None,
+                summary: p.clone(),
+            });
+            draw_approval(f, area, &view);
+        }
         Mode::Help => {
             if let Some(h) = &app.help {
                 draw_help(f, area, h);
@@ -550,18 +551,113 @@ pub(super) fn trunc(s: &str, max: usize) -> String {
     }
 }
 
+/// Which line kinds survive a fold: the prompt that opened the turn, the answer it
+/// closed with, and anything that went wrong. The mechanics in between — commands,
+/// their output, file actions, diffs — are what folding is for. An error is never
+/// hidden: a collapsed turn must not be able to swallow the reason it failed.
+fn survives_fold(kind: LineKind) -> bool {
+    matches!(
+        kind,
+        LineKind::User | LineKind::Final | LineKind::Error | LineKind::Banner | LineKind::Art
+    )
+}
+
+/// What a folded turn is hiding.
+#[derive(Default, Clone, Copy)]
+struct FoldTally {
+    lines: usize,
+    commands: usize,
+    actions: usize,
+}
+
+/// Tally the hidden lines per folded turn, so the placeholder can say what it stands
+/// in for. A placeholder that only said "folded" would make a turn that ran twenty
+/// commands look the same as one that ran none.
+fn fold_tallies(app: &App) -> std::collections::HashMap<u64, FoldTally> {
+    let mut out: std::collections::HashMap<u64, FoldTally> = std::collections::HashMap::new();
+    for e in &app.transcript {
+        if survives_fold(e.kind) || !app.is_folded(e.turn) {
+            continue;
+        }
+        let t = out.entry(e.turn).or_default();
+        t.lines += 1;
+        match e.kind {
+            LineKind::Command => t.commands += 1,
+            LineKind::Tool => t.actions += 1,
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The one line a folded turn collapses to. `▸` is the closed-disclosure cue, and
+/// the counts are the part that tells you whether it is worth opening.
+fn fold_placeholder(t: &FoldTally) -> Line<'static> {
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    let mut parts: Vec<String> = Vec::new();
+    if t.commands > 0 {
+        parts.push(format!("{} command{}", t.commands, plural(t.commands)));
+    }
+    if t.actions > 0 {
+        parts.push(format!("{} file action{}", t.actions, plural(t.actions)));
+    }
+    let detail = if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{} · ", parts.join(", "))
+    };
+    Line::from(Span::styled(
+        format!(
+            "▸ folded — {detail}{} line{} hidden · /unfold or Alt-f",
+            t.lines,
+            plural(t.lines)
+        ),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
 /// Build the transcript as a flat list of (unwrapped) lines, exactly as
 /// rendered. Shared by `draw_transcript` and the off-screen selection
 /// extraction so both wrap identically.
 pub(super) fn build_transcript_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut prev: Option<LineKind> = None;
+    let tallies = fold_tallies(app);
+    // Turns whose placeholder has already been emitted, so it appears once — in the
+    // position of the first line it replaces.
+    let mut placed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for entry in &app.transcript {
+        if app.is_folded(entry.turn) && !survives_fold(entry.kind) {
+            if placed.insert(entry.turn) {
+                if let Some(t) = tallies.get(&entry.turn) {
+                    if spacer_before(prev, LineKind::Notice) {
+                        lines.push(Line::from(""));
+                    }
+                    prev = Some(LineKind::Notice);
+                    lines.push(fold_placeholder(t));
+                }
+            }
+            continue;
+        }
         if spacer_before(prev, entry.kind) {
             lines.push(Line::from(""));
         }
         prev = Some(entry.kind);
         let (prefix, style) = style_for(entry.kind);
+        // A deliberate blank line. `"".lines()` yields *nothing*, so without this the
+        // spacers the welcome block pushes between its sections were silently dropped
+        // and the whole banner ran together as one paragraph.
+        if entry.text.is_empty() {
+            lines.push(Line::from(""));
+            continue;
+        }
+        // Coloured ASCII art: parse the ANSI and keep it, with no prefix.
+        if entry.kind == LineKind::Art {
+            if let Ok(text) = entry.text.clone().into_text() {
+                lines.extend(text.lines);
+                continue;
+            }
+        }
         // Render command output through the ANSI parser (preserves colors).
         if entry.kind == LineKind::Output {
             if let Ok(text) = entry.text.clone().into_text() {
@@ -1057,9 +1153,16 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     }
     let bar = Style::default().bg(Color::Blue).fg(Color::White);
     // Right side: a blocked flag, the running token estimate, then the diff.
-    let mut segs: Vec<String> = Vec::new();
+    // Each segment carries an optional accent colour so the context meter can
+    // warn (amber/red) without recolouring the whole bar.
+    let mut segs: Vec<(String, Option<Color>)> = Vec::new();
+    // The boundary first: it is the one fact here that does not change all session,
+    // and the one the whole design rests on.
+    if !app.boundary.is_empty() {
+        segs.push((app.boundary.clone(), None));
+    }
     if app.blocked.is_some() {
-        segs.push("⏸ blocked".to_string());
+        segs.push(("⏸ blocked".to_string(), None));
     }
     // Background work and deferred input, so neither is invisible: a session with three
     // subagents running looks identical to an idle one without this.
@@ -1070,14 +1173,23 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         .count();
     let live = app.live_jobs();
     if live > 0 {
-        segs.push(if asking > 0 {
-            format!("{live} jobs ({asking} asking)")
-        } else {
-            format!("{live} jobs")
-        });
+        segs.push((
+            if asking > 0 {
+                format!("{live} jobs ({asking} asking)")
+            } else {
+                format!("{live} jobs")
+            },
+            None,
+        ));
     }
     if !app.queued.is_empty() {
-        segs.push(format!("{} queued", app.queued.len()));
+        segs.push((format!("{} queued", app.queued.len()), None));
+    }
+    // The context meter sits before the token counters: tokens are what the session
+    // has spent, this is how much room the *next* request has left.
+    if let Some(c) = &app.context {
+        let (text, accent) = context_meter(c);
+        segs.push((text, Some(accent)));
     }
     if app.tokens_in > 0 || app.tokens_out > 0 {
         let mut seg = format!(
@@ -1088,16 +1200,24 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         if app.cost_usd > 0.0 {
             seg.push_str(&format!(" ${}", fmt_cost(app.cost_usd)));
         }
-        segs.push(seg);
+        segs.push((seg, None));
     }
     if !app.diff.is_empty() {
-        segs.push(app.diff.clone());
+        segs.push((app.diff.clone(), None));
     }
-    let right_text = segs.join("   ");
-    let (left, right) = if right_text.is_empty() {
+    // Width of the joined segments (three spaces between each) plus a trailing pad.
+    // Display width, not `chars().count()`: the boundary segment leads with a
+    // double-width glyph, and undercounting it shifts the whole right-hand block
+    // left by a column and clips its last character.
+    let right_w: usize = segs
+        .iter()
+        .map(|(s, _)| unicode_width::UnicodeWidthStr::width(s.as_str()))
+        .sum::<usize>()
+        + 3 * segs.len().saturating_sub(1);
+    let (left, right) = if segs.is_empty() {
         (cols[1], None)
     } else {
-        let w = right_text.chars().count() as u16 + 1;
+        let w = right_w as u16 + 1;
         let s = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(0), Constraint::Length(w)])
@@ -1106,34 +1226,93 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     };
     // While a shell command runs, the left segment becomes a live tail:
     // elapsed time + the latest output line (the spinner is in cols[0]).
-    let text = match &app.running {
-        // A shell command is running: live tail (elapsed + latest output line).
-        Some(r) => {
-            let tail = r.last.trim();
-            let body = if tail.is_empty() { &r.cmd } else { tail };
-            format!(" exec {}s › {body}", r.elapsed_secs)
+    //
+    // Being parked on a human outranks all of it: an approval prompt typically
+    // fires *while* a command is running, and which of the two you need to act on
+    // is not a close call. The mode label already says what is wanted, so this
+    // adds only how long it has been waiting. Note this is `parked_on_user`, not
+    // `attention_reason` — a background job asking for turns does not stop the
+    // current turn, so it must not overwrite the turn's own heartbeat.
+    let text = if app.parked_on_user() {
+        format!(" ⏳ {mode} · waiting {}s", app.attention_elapsed_secs())
+    } else {
+        match &app.running {
+            // A shell command is running: live tail (elapsed + latest output line).
+            Some(r) => {
+                let tail = r.last.trim();
+                let body = if tail.is_empty() { &r.cmd } else { tail };
+                format!(" exec {}s › {body}", r.elapsed_secs)
+            }
+            // Plan mode: keep "edits are blocked, /go to execute" visible the whole
+            // time you're planning, not just right after /plan.
+            None if app.plan_mode && app.mode == Mode::Running => {
+                format!(" 🧭 planning {}s… (edits blocked)", app.turn_elapsed_secs())
+            }
+            None if app.plan_mode => " 🧭 plan mode — review, then /go to execute".to_string(),
+            // Model turn in flight with no command: a "thinking Ns" heartbeat so the
+            // wait never feels like dead air.
+            None if app.mode == Mode::Running => {
+                format!(" thinking {}s…", app.turn_elapsed_secs())
+            }
+            // Idle with uncommitted changes: quietly hand the user their next move.
+            None if app.mode == Mode::Idle && !app.diff.is_empty() => {
+                " ready · /diff to review, then commit".to_string()
+            }
+            None => format!(" {mode} — {}", app.status),
         }
-        // Plan mode: keep "edits are blocked, /go to execute" visible the whole
-        // time you're planning, not just right after /plan.
-        None if app.plan_mode && app.mode == Mode::Running => {
-            format!(" 🧭 planning {}s… (edits blocked)", app.turn_elapsed_secs())
-        }
-        None if app.plan_mode => " 🧭 plan mode — review, then /go to execute".to_string(),
-        // Model turn in flight with no command: a "thinking Ns" heartbeat so the
-        // wait never feels like dead air.
-        None if app.mode == Mode::Running => {
-            format!(" thinking {}s…", app.turn_elapsed_secs())
-        }
-        // Idle with uncommitted changes: quietly hand the user their next move.
-        None if app.mode == Mode::Idle && !app.diff.is_empty() => {
-            " ready · /diff to review, then commit".to_string()
-        }
-        None => format!(" {mode} — {}", app.status),
     };
     f.render_widget(Paragraph::new(text).style(bar), left);
     if let Some(right) = right {
-        f.render_widget(Paragraph::new(format!("{right_text} ")).style(bar), right);
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, (text, accent)) in segs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("   ", bar));
+            }
+            let style = match accent {
+                Some(c) => bar.fg(*c),
+                None => bar,
+            };
+            spans.push(Span::styled(text.clone(), style));
+        }
+        spans.push(Span::styled(" ", bar));
+        f.render_widget(Paragraph::new(Line::from(spans)).style(bar), right);
     }
+}
+
+/// Cells in the context meter's track.
+const CTX_METER_CELLS: usize = 8;
+/// Percent of the conversation budget at which the meter turns amber, then red.
+/// Red is deliberately below 100: compaction starts dropping older turns before
+/// the budget is literally exhausted, so 100% would warn only after the loss.
+const CTX_WARN_PCT: u64 = 70;
+const CTX_CRIT_PCT: u64 = 90;
+
+/// A compact context-budget meter for the status bar — `ctx ▰▰▰▰▱▱▱▱ 52%` — so a
+/// filling window is visible *before* compaction starts folding away old turns,
+/// rather than only on demand via `/context`. From the warning threshold on it also
+/// names the largest consumer, which is the question you ask next.
+fn context_meter(c: &ContextSnapshot) -> (String, Color) {
+    let pct = c.percent();
+    // `percent()` saturates at 999 and can exceed 100 when the budget is already
+    // overrun; the track must not grow past its width either way.
+    let filled = (pct.min(100) as usize * CTX_METER_CELLS / 100).min(CTX_METER_CELLS);
+    let track: String = "▰".repeat(filled) + &"▱".repeat(CTX_METER_CELLS - filled);
+    let color = if pct >= CTX_CRIT_PCT {
+        Color::LightRed
+    } else if pct >= CTX_WARN_PCT {
+        Color::Yellow
+    } else {
+        Color::White
+    };
+    let mut text = format!("ctx {track} {pct}%");
+    if pct >= CTX_WARN_PCT {
+        if let Some((name, _)) = c.top.first() {
+            let name: String = name.chars().take(12).collect();
+            text.push(' ');
+            text.push_str(&name);
+        }
+    }
+    (text, color)
 }
 
 /// Compact human count: `980`, `12.3k`, `45k`, `1.2M`.
@@ -1250,6 +1429,117 @@ pub(super) fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
     f.render_widget(&app.textarea, inner);
+}
+
+/// The approval modal, laid out as labelled rows.
+///
+/// Its own renderer rather than `draw_modal` with a formatted string, because the
+/// labels want to recede and the values want to stand out — and because values are
+/// **truncated, never wrapped**. A wrapped command line used to push the
+/// once/session/project/global legend off the bottom of the modal, leaving a prompt
+/// whose options were invisible. The thing you must be able to read is what you are
+/// agreeing to *and* what the keys do.
+pub(super) fn draw_approval(f: &mut Frame, area: Rect, view: &ApprovalView) {
+    /// The scope legend. Kept here beside the layout that has to fit it.
+    const LEGEND: [(&str, &str); 5] = [
+        ("o", "once — just this request"),
+        ("s", "session — every request here until this session ends"),
+        ("p", "project — always allow here (saved for this repo)"),
+        ("g", "global — always allow everywhere"),
+        ("d", "deny"),
+    ];
+
+    let w = area.width.saturating_sub(6).min(78);
+    let inner_w = w.saturating_sub(2) as usize;
+    // Labels are right-padded to a common width so the values form a column.
+    let label_w = view
+        .rows
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(18);
+    let value_w = inner_w.saturating_sub(label_w + 3).max(8);
+
+    let dim = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(Color::White);
+    let mut body: Vec<Line> = Vec::new();
+    if view.rows.is_empty() {
+        // No structure to show: fall back to the flat summary.
+        for l in wrap_words(&view.summary, inner_w.max(1)) {
+            body.push(Line::from(Span::styled(l, value_style)));
+        }
+    } else {
+        for (label, value) in &view.rows {
+            body.push(Line::from(vec![
+                Span::styled(format!(" {label:<label_w$}  "), dim),
+                Span::styled(trunc(value, value_w), value_style),
+            ]));
+        }
+    }
+    if let Some(note) = &view.note {
+        body.push(Line::from(""));
+        for l in wrap_words(note, inner_w.saturating_sub(1).max(1)) {
+            body.push(Line::from(Span::styled(format!(" {l}"), dim)));
+        }
+    }
+
+    let legend: Vec<Line> = LEGEND
+        .iter()
+        .map(|(key, what)| {
+            Line::from(vec![
+                Span::styled(
+                    format!(" {key}  "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(trunc(what, inner_w.saturating_sub(4)), dim),
+            ])
+        })
+        .collect();
+
+    // The legend's rows are *reserved* before the body is allowed any: with a short
+    // terminal and a long note, sizing the modal to the body and clamping to the
+    // screen silently cuts the bottom off — and the bottom is where the keys are. A
+    // truncated body with visible options beats a complete body you cannot answer.
+    let reserve = legend.len() + 1; // legend + its blank separator
+    let max_body = (area.height as usize)
+        .saturating_sub(2) // borders
+        .saturating_sub(reserve);
+    let clipped = body.len() > max_body;
+    if clipped {
+        body.truncate(max_body.saturating_sub(1));
+        body.push(Line::from(Span::styled(
+            " ⋯ truncated — the full destination is in the session log".to_string(),
+            dim,
+        )));
+    }
+
+    let mut lines = body;
+    lines.push(Line::from(""));
+    lines.extend(legend);
+
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let rect = Rect::new(x, y, w, h);
+    f.render_widget(Clear, rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            format!(" {} ", view.title),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            " press a key · Esc = deny ",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .style(Style::default().fg(Color::Magenta));
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// A multiple-choice question: the prompt, a selectable option list, and a

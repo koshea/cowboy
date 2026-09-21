@@ -3,6 +3,7 @@
 //! loop, sandbox, session, and daemon code).
 
 pub mod agent;
+pub mod banner;
 pub mod cli;
 pub mod cmd;
 pub mod localsock;

@@ -90,6 +90,12 @@ syntect = { version = "5", default-features = false, features = ["default-fancy"
 similar = "3"
 # Display-width of strings (wide CJK / emoji) for aligning Markdown table columns.
 unicode-width = "0.2"
+# The `grep` tool's engine, in-process rather than shelling out: the sandbox
+# inherits the host's /usr, so `rg` is present only if the user happens to have
+# installed it, and a search tool that silently degrades is worse than none.
+# Both were already in the lock file transitively.
+regex = "1.13.1"
+walkdir = "2.5.0"
 
 # Note: no `process-wrap`/`portable-pty`. Each command runs under its own bwrap in a
 # private PID namespace, so one signal to bwrap reaps the whole tree, and the

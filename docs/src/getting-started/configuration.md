@@ -123,13 +123,44 @@ agent:
   idle_sandbox_timeout_seconds: 1800   # tear down an idle detached session's sandbox (0 = off)
   max_iterations: 100                    # turns per turn for THIS session (see note)
   max_command_output_bytes: 60000
+  project_instruction_bytes: 12000       # bytes of AGENTS.md pinned into the prompt (0 = off)
   setup:                                 # repo setup, run once per worktree (after mise install)
     - mise run sync
-processes:
+  verify:                                # checks that must pass before `final` (empty = no gate)
+    - test
+processes:                               # background processes the agent can start with `proc`
   web: { command: "npm run dev", cwd: /workspace, auto_start: false }
-commands:
+commands:                                # named shortcuts; shown to the agent
   test: cargo test
+  lint: cargo clippy
 ```
+
+**Project commands and verification.** `commands` is a map of named shortcuts. The
+agent is shown it, so it runs *your* test and lint invocations rather than guessing
+one from the language. `agent.verify` lists the checks that must have passed — each
+entry is either a `commands` key or a literal command — before the agent may finish
+a session that changed files; unverified edits get `final` refused with the exact
+command to run. Evidence comes from real exit codes recorded host-side, and any
+later edit invalidates it. Empty by default, which means no gate. It is a quality
+mechanism, not a security control: it yields after a couple of refusals rather than
+wedge a session whose checks cannot run. See
+[Verification](../using/agent-and-tools.md#verification).
+
+**Project instructions.** `agent.project_instruction_bytes` is how much of the repo's
+root `AGENTS.md` (or `CLAUDE.md`) is pinned into the agent's system message, so it
+starts knowing your conventions instead of spending a turn reading them — and still
+knows them after compaction. Bounded because it is paid for on every request of every
+session, subagents included; a longer file is clipped with a note to read the rest.
+Set `0` to turn it off. See
+[what the agent starts a session knowing](../using/agent-and-tools.md#what-the-agent-starts-a-session-knowing).
+
+**Background processes.** `processes` names the long-running things a session may
+need — a dev server, a watcher. The agent starts one with its `proc` tool (`proc
+start web`, no command needed), `auto_start: true` brings it up before the first
+turn, and output goes to `.cowboy/proc/<name>.log`. A process belongs to the session
+and is reaped with it. See
+[Background processes](../using/agent-and-tools.md#background-processes).
+
 **Iteration budgets.** `agent.max_iterations` bounds a turn of the session you are
 talking to. When it runs out, cowboy **asks whether to keep going** rather than
 stopping silently — answer yes and it gets another `max_iterations` turns and

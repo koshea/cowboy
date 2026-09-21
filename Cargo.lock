@@ -635,6 +635,7 @@ dependencies = [
  "predicates",
  "qrcode",
  "ratatui",
+ "regex",
  "reqwest",
  "rmcp",
  "rpassword",
@@ -652,6 +653,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

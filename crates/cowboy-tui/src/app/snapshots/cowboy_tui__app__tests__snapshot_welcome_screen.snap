@@ -1,19 +1,20 @@
 ---
 source: crates/cowboy-tui/src/app/mod.rs
+assertion_line: 1851
 expression: render(&app)
 ---
 ╭ cowboy · 20260614-abcd ───────────────────────╮╭ network ────────────╮
-│Welcome to cowboy — the agent runs in a sandbox││no network activity  │
-│built from your machine.                       ││yet                  │
+│  ╔═╗╔═╗╦ ╦╔╗ ╔═╗╦ ╦                           ││no network activity  │
+│  ║  ║ ║║║║╠╩╗║ ║╚╦╝                           ││yet                  │
+│  ╚═╝╚═╝╚╩╝╚═╝╚═╝ ╩                            ││                     │
+│  the agent runs in a sandbox                  ││                     │
 │workspace  /home/dev/myproject                 ││                     │
-│model      anthropic/claude-sonnet-4-6         ││                     │
-│(gw.local)                                     ││                     │
-│branch     main                                ││                     │
-│Type a message to begin · Enter sends · Ctrl-C │╰─────────────────────╯
-│menu                                           │╭ background ─────────╮
-│                                               ││no background activit│
+│model      claude-sonnet-4-6  (gw.local)       ││                     │
+│                                               │╰─────────────────────╯
+│or start with one of these:                    │╭ background ─────────╮
+│  Alt-1  Review my uncommitted changes.        ││no background activit│
 │                                               ││                     │
-│                                               ││                     │
+│Type a message to begin · Enter sends          ││                     │
 │                                               ││                     │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    ready — ready

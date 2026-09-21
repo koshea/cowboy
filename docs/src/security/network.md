@@ -155,9 +155,11 @@ destination alone rarely settles the question: `cargo test` reaching crates.io i
 different proposition from a `curl` in a script the agent just wrote.
 
 ```text
-crates.io:443
-
-requested by:  cargo test --workspace
+ destination       crates.io:443
+ protocol          TLS
+ address           13.226.34.10 — external
+ requested by      cargo test --workspace
+ why you're asked  no rule matches; default for external is ask
 ```
 
 That attribution is host-derived and display-only. The command string is recorded when
@@ -165,7 +167,24 @@ the *host* spawns the sandbox, before the command can run, and the pid is matche
 by walking `/proc` ancestry — the kernel's answer, not the agent's. It is attached
 **after** the verdict is computed, so it cannot reach the policy engine, and a pid that
 cannot be resolved falls back to a destination-only prompt rather than to a different
-decision.
+decision. The same holds for every other row: all of it is gathered after the fact,
+and the whole payload is display structure a client lays out
+([`ApprovalDetail`](../using/tui.md#approvals)), never an input to the decision.
+
+The **address class** is shown for a specific reason: a hostname can hide it. A public
+name that resolves to a private or loopback address is what a DNS rebind looks like
+from the prompt's side, and the class is also part of the decision cache key so a
+rebind from public to private cannot reuse an earlier approval.
+
+Showing more in the prompt is a security property, not a convenience. A prompt that
+offers only `host:port` gets rubber-stamped, and an `ask` policy that is always
+approved without being read is an `allow` policy that merely takes longer.
+
+`/boundary` in the TUI prints the policy in force at any time — the defaults per
+address class, the allow and deny rule sets, how many endpoints are saved for this
+project, and the DNS posture — alongside the filesystem and syscall halves of the
+boundary. It is the same code path as `cowboy sandbox plan`, so the two cannot
+describe different boundaries.
 
 **An approval grants exactly what the prompt showed**: that host (or that address) on
 that port. Not other ports on the same host, not other hosts on that port, and not

@@ -16,6 +16,10 @@ agent:
   idle_sandbox_timeout_seconds: 1800
   max_iterations: 100
   max_command_output_bytes: 60000
+  # Bytes of this repo's AGENTS.md (or CLAUDE.md) pinned into the agent's system
+  # message, so it starts every session knowing your conventions instead of
+  # spending a turn reading them — and still knows them after compaction. 0 = off.
+  # project_instruction_bytes: 12000
   # Optional usage budgets (0 = no limit). The session stops once a budget is
   # reached, with a soft warning at 80%. The cost estimate uses the model's
   # per-token pricing (see `cowboy models` / model-defaults).
@@ -27,16 +31,29 @@ agent:
   # .cowboy/sessions/.worktree-setup to force a re-run).
   # setup:
   #   - mise run sync
+  # Checks that must pass before the agent may finish a session that changed
+  # files. Each entry is either a `commands:` key (below) or a literal command.
+  # Empty = no gate. The agent is told to run these, and `final` is refused (a
+  # couple of times, then it yields) while edits are unverified.
+  # verify:
+  #   - test
+  #   - lint
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md
 
 processes: {}
+  # Long-running processes (dev servers, watchers). The agent starts one with its
+  # `proc` tool — `proc start web` needs no command once it is named here — and
+  # `auto_start: true` brings it up before the first turn. A process is owned by the
+  # session and reaped with it; output goes to .cowboy/proc/<name>.log.
   # web:
   #   command: npm run dev
   #   cwd: /workspace
   #   auto_start: false
 
+# Named command shortcuts for this project. The agent is shown this list so it
+# runs your checks rather than guessing, and `agent.verify` refers to them by name.
 commands: {}
   # test: cargo test
   # lint: cargo clippy

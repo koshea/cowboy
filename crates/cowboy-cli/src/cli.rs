@@ -270,7 +270,7 @@ The workspace is bind-mounted, so the agent's edits are already in your real wor
 tree — commit them with plain git.")]
     Patch(PatchArgs),
 
-    /// Managed long-running process commands.
+    /// Inspect the session's long-running processes (the agent starts them).
     Proc(ProcArgs),
 
     /// Configure model providers (home-owned) and models.
@@ -1131,9 +1131,10 @@ pub enum AgentsCommand {
 pub enum ProcCommand {
     /// List configured processes and their status.
     List,
-    /// Start a process by name.
+    /// Explain why a process cannot be started from here (they are session-owned).
     Start { name: String },
-    /// Stop a process by name.
+    /// Stop a process by name (only reaches a stale one; session processes end with
+    /// the session).
     Stop { name: String },
     /// Restart a process by name.
     Restart { name: String },

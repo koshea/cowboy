@@ -103,29 +103,44 @@ Three things to try while it works, because none of them are guessable:
 - **`/diff`.** Shows the working tree. The workspace is bind-mounted, so the agent's
   edits are already in your real files.
 
+Two things in the status bar are worth a glance: `🔒 egress ask` is the boundary in
+force (`/boundary` prints all of it), and `ctx ▰▰▰▰▱▱▱▱ 52%` is how full the model's
+context is getting — it goes amber, then red, before compaction starts dropping
+older turns. Once the session gets long, `/fold` collapses the turns you have
+already read down to one line each.
+
 ## 6. When it asks for the network
 
 Egress is denied by default, so the first time the agent reaches somewhere new you
 get a prompt:
 
 ```text
-╭ Network request ─────────────────────────────────────────────╮
-│crates.io:443                                                 │
-│                                                              │
-│requested by:  cargo test --workspace                         │
-│                                                              │
-│o  once — just this request                                   │
-│s  session — every request here until this session ends       │
-│p  project — always allow here (saved for this repo)          │
-│g  global — always allow everywhere                           │
-│d  deny                                                       │
-╰──────────────────────────────────────────────────────────────╯
+╭ Network request ───────────────────────────────────────────────╮
+│ destination       crates.io:443                                │
+│ protocol          TLS                                          │
+│ address           13.226.34.10 — external                      │
+│ requested by      cargo test --workspace                       │
+│ why you're asked  no rule matches; default for external is ask │
+│                                                                │
+│ nothing is saved for this project yet — `p` would be the first  │
+│                                                                │
+│ o  once — just this request                                    │
+│ s  session — every request here until this session ends        │
+│ p  project — always allow here (saved for this repo)           │
+│ g  global — always allow everywhere                            │
+│ d  deny                                                        │
+╰ press a key · Esc = deny ──────────────────────────────────────╯
 ```
 
 It names the command that wants the destination, not just the destination — that is
-usually what decides it. An approval grants **exactly** what the prompt showed: that
-host, that port. Nothing broader. Project and global choices are saved host-side, so a
-repository cannot widen its own access by writing a file.
+usually what decides it — along with the address class, which a hostname can hide.
+An approval grants **exactly** what the prompt showed: that host, that port. Nothing
+broader. Project and global choices are saved host-side, so a repository cannot widen
+its own access by writing a file.
+
+Everything in that modal is display only, gathered after the verdict was already
+computed; it cannot influence the decision. `/boundary` shows the whole boundary at
+any time.
 
 Common dev registries (npm, PyPI, crates.io, Go, RubyGems, Debian, GitHub) are
 allowed by the default policy, so package installs work without any of this.

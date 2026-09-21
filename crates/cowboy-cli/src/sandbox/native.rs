@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use cowboy_core::config::{ProcessDef, SecurityConfig};
+use cowboy_core::config::SecurityConfig;
 use cowboy_gateway::state::GatewayState;
 use cowboy_sandbox::plan::{Grant, PlanInputs, SandboxPlan};
 use cowboy_sandbox::{Denylist, HostProbe};
@@ -403,14 +403,22 @@ impl NativeSandbox {
         exec::run_streaming(req, cancel, chunks).await
     }
 
-    /// Start a background process from `agent.yaml`.
+    /// Start a background process in this session.
     ///
     /// It shares the session's network namespace, so later commands can reach it on
     /// loopback, but gets its own PID namespace so stopping it reaps exactly its own
-    /// processes.
-    pub async fn start_process(&self, name: &str, def: &ProcessDef) -> Result<()> {
+    /// processes. `bwrap` stays a child of this (long-lived) process, so
+    /// `--die-with-parent` gives the process the session's lifetime — no pid file to
+    /// trust, and nothing left running after teardown.
+    ///
+    /// Output goes to `.cowboy/proc/<name>.log` in the workspace rather than into the
+    /// agent's transcript: a dev server's chatter would swamp it, and a file is
+    /// `read`-able (and `grep`-able) when something actually goes wrong.
+    pub async fn start_process(&self, name: &str, command: &str, cwd: Option<&str>) -> Result<()> {
         if self.process_is_running(name) {
-            anyhow::bail!("process {name} is already running");
+            anyhow::bail!(
+                "process {name} is already running; stop it first (or use a different name)"
+            );
         }
         let plan = self.plan()?;
         let guard = self.session().await?;
@@ -419,8 +427,8 @@ impl NativeSandbox {
 
         let child = exec::spawn_detached(
             &plan,
-            &def.command,
-            Some(&def.cwd),
+            &background_script(&plan.workdir, name, command),
+            cwd,
             NetMode::Inherit,
             Some(session),
         )
@@ -473,6 +481,40 @@ impl NativeSandbox {
     }
 }
 
+/// Workspace-relative directory holding one log file per background process.
+pub const PROC_LOG_DIR: &str = ".cowboy/proc";
+
+/// The workspace-relative log path for a background process.
+pub fn proc_log_path(name: &str) -> String {
+    format!("{PROC_LOG_DIR}/{name}.log")
+}
+
+/// Wrap `command` so its combined output lands in the process's log file.
+///
+/// `exec >file 2>&1` redirects the shell's own descriptors, so everything the command
+/// (and anything it spawns) writes is captured without wrapping the command itself —
+/// which matters because `command` is an arbitrary shell string, not an argv, and may
+/// be a pipeline or a `&&` chain that `exec`ing directly would break.
+///
+/// The log is truncated on start rather than appended to: the agent reads it to find
+/// out why *this* attempt failed, and a growing file of previous attempts is the same
+/// trap as un-truncated command output.
+fn background_script(workdir: &str, name: &str, command: &str) -> String {
+    let log = format!("{workdir}/{}", proc_log_path(name));
+    let dir = format!("{workdir}/{PROC_LOG_DIR}");
+    format!(
+        "mkdir -p {dir} || exit 1\nexec >{log} 2>&1\n{command}\n",
+        dir = shell_single_quote(&dir),
+        log = shell_single_quote(&log),
+    )
+}
+
+/// Single-quote a path for `/bin/sh`, so a workspace path with a space or a quote in
+/// it cannot become extra words (or a command) in the generated script.
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 #[async_trait]
 impl Sandbox for NativeSandbox {
     fn add_grant(
@@ -508,15 +550,11 @@ impl Sandbox for NativeSandbox {
     }
 
     fn has_mise_config(&self) -> bool {
-        const CONFIGS: &[&str] = &[
-            "mise.toml",
-            ".mise.toml",
-            "mise/config.toml",
-            ".mise/config.toml",
-            ".config/mise/config.toml",
-            ".tool-versions",
-        ];
-        CONFIGS.iter().any(|f| self.root.join(f).exists())
+        // Single source of truth with the plan, which uses the same list to decide
+        // whether to mount the mise overlay at all.
+        cowboy_sandbox::plan::PROJECT_MISE_CONFIGS
+            .iter()
+            .any(|f| self.root.join(f).exists())
     }
 
     async fn ensure_running(&self) -> Result<()> {
@@ -603,12 +641,54 @@ impl Sandbox for NativeSandbox {
         }
         Ok(())
     }
+
+    async fn start_process(&self, name: &str, command: &str, cwd: Option<&str>) -> Result<()> {
+        NativeSandbox::start_process(self, name, command, cwd).await
+    }
+
+    async fn stop_process(&self, name: &str) -> Result<()> {
+        NativeSandbox::stop_process(self, name).await
+    }
+
+    fn running_processes(&self) -> Vec<String> {
+        NativeSandbox::running_processes(self)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cowboy_sandbox::probe::FakeHost;
+
+    /// The background wrapper must capture *everything* the process writes into its
+    /// own log, and must not let a workspace path with a quote in it turn into shell
+    /// syntax. `command` is left untouched, since it is an arbitrary shell string (a
+    /// pipeline, an `&&` chain) and not an argv.
+    #[test]
+    fn a_background_script_redirects_into_the_log_and_quotes_its_paths() {
+        let script = background_script("/workspace", "web", "npm run dev | tee x");
+        assert!(
+            script.contains("mkdir -p '/workspace/.cowboy/proc'"),
+            "{script}"
+        );
+        assert!(
+            script.contains("exec >'/workspace/.cowboy/proc/web.log' 2>&1"),
+            "stdout and stderr both go to the log: {script}"
+        );
+        assert!(
+            script.trim_end().ends_with("npm run dev | tee x"),
+            "the command is run as given: {script}"
+        );
+
+        let odd = background_script("/work'space", "web", "true");
+        assert!(odd.contains(r"'/work'\''space/.cowboy/proc'"), "{odd}");
+    }
+
+    #[test]
+    fn the_log_path_is_workspace_relative_and_per_process() {
+        assert_eq!(proc_log_path("web"), ".cowboy/proc/web.log");
+        assert_eq!(proc_log_path("api"), ".cowboy/proc/api.log");
+    }
 
     /// A sandbox whose grant store is a fresh temp directory.
     ///

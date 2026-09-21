@@ -154,15 +154,27 @@ impl HostProbe for RealHost {
 fn plan() -> Result<()> {
     let root = crate::cmd::project_root()?;
     let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let security = load(&root)?;
+    println!("project {}\n", root.display());
+    print!("{}", describe(&root)?);
+    Ok(())
+}
+
+/// Render the boundary as text: the filesystem/syscall plan a command runs under,
+/// and the egress policy in force.
+///
+/// Shared by `cowboy sandbox plan` and the TUI's `/boundary` so the two can never
+/// describe different boundaries. Read-only and side-effect free — it must not
+/// create the mask file or a scratch dir, which belong to a running session.
+pub(crate) fn describe(root: &Path) -> Result<String> {
+    let security = load(root)?;
 
     let probe = RealHost;
-    let denylist = Denylist::build(&probe, &root);
+    let denylist = Denylist::build(&probe, root);
     // Include saved grants, and drop any the denylist now refuses — exactly what
     // `NativeSandbox::plan` does per command. Rendering `&[]` here would make this
-    // command describe a narrower boundary than the one commands actually run in,
-    // which is the one thing it must never do.
-    let grants: Vec<_> = crate::sandbox::grants::load_in(&crate::sandbox::grants::dir(), &root)
+    // describe a narrower boundary than the one commands actually run in, which is
+    // the one thing it must never do.
+    let grants: Vec<_> = crate::sandbox::grants::load_in(&crate::sandbox::grants::dir(), root)
         .into_iter()
         .filter(|g| denylist.check(&g.path).is_none())
         .collect();
@@ -173,7 +185,7 @@ fn plan() -> Result<()> {
     // and inventing one here would leave litter behind for the reaper.
     let scratch = PathBuf::from("<session scratch>");
     let inputs = PlanInputs {
-        root: &root,
+        root,
         security: &security,
         grants: &grants,
         mask_file: &mask,
@@ -181,18 +193,112 @@ fn plan() -> Result<()> {
         scratch: &scratch,
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
-    println!("project {}\n", root.display());
-    print!("{}", plan.render(&denylist));
+    let mut out = plan.render(&denylist);
     // The plan describes what a command *gets*; a configured ceiling this host cannot
     // apply would otherwise be printed as though it were in force.
     let configured = plan.limits.memory_mib.is_some()
         || plan.limits.cpus.is_some()
         || plan.limits.pids.is_some();
     if configured && !crate::sandbox::cgroup::available() {
-        println!(
+        out.push_str(
             "  NOT ENFORCED: no delegated cgroup v2 subtree on this host. \
-             Run `cowboy doctor` for what to change."
+             Run `cowboy doctor` for what to change.\n",
         );
     }
-    Ok(())
+    out.push_str(&egress_section(root, &security));
+    Ok(out)
+}
+
+/// A one-segment summary of the boundary for the status bar.
+///
+/// Deliberately states the *policy default* rather than asserting that enforcement
+/// is live: this runs in the client, which cannot observe the worker's namespaces,
+/// and a status bar that claimed "landlock on" without checking would be exactly the
+/// kind of security theatre the rest of the design avoids. `None` when the config
+/// cannot be read, so the indicator is absent rather than wrong.
+pub(crate) fn summary(root: &Path) -> Option<String> {
+    use cowboy_core::config::DefaultVerdict;
+    let security = load(root).ok()?;
+    let default = match security.network_policy.default_external {
+        DefaultVerdict::Allow => "open",
+        DefaultVerdict::Deny => "deny",
+        DefaultVerdict::Ask => "ask",
+    };
+    Some(format!("🔒 egress {default}"))
+}
+
+/// The egress half of the boundary.
+///
+/// Deliberately a separate section from the plan: the plan is filesystem and
+/// syscalls, and the only network fact in it is that the relay port is the sole
+/// reachable TCP destination. What may leave the host is decided by the policy
+/// engine against this config plus the persisted approvals, so that is what gets
+/// rendered — merged the same way a session merges it, rather than re-derived.
+fn egress_section(root: &Path, security: &SecurityConfig) -> String {
+    use std::fmt::Write as _;
+
+    let mut policy = security.network_policy.clone();
+    let approvals = crate::net::approvals::load(root);
+    let approved_count = approvals.len();
+    crate::net::approvals::merge_into(&mut policy, &approvals);
+
+    let mut s = String::from("\negress\n");
+    let verdict = |v: cowboy_core::config::DefaultVerdict| match v {
+        cowboy_core::config::DefaultVerdict::Allow => "allow",
+        cowboy_core::config::DefaultVerdict::Deny => "deny",
+        cowboy_core::config::DefaultVerdict::Ask => "ask (prompts you; denies with no answer)",
+    };
+    let _ = writeln!(s, "  external      {}", verdict(policy.default_external));
+    let _ = writeln!(s, "  private lan   {}", verdict(policy.default_private_lan));
+    let _ = writeln!(s, "  host          {}", verdict(policy.default_host));
+    let rules = |label: &str, r: &cowboy_core::config::RuleSet, s: &mut String| {
+        if r.domains.is_empty() && r.cidrs.is_empty() && r.ports.is_empty() {
+            return;
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !r.domains.is_empty() {
+            parts.push(format!("{} domain(s)", r.domains.len()));
+        }
+        if !r.cidrs.is_empty() {
+            parts.push(format!("{} cidr(s)", r.cidrs.len()));
+        }
+        if !r.ports.is_empty() {
+            parts.push(format!("ports {:?}", r.ports));
+        }
+        let _ = writeln!(s, "  {label:<13} {}", parts.join(" · "));
+        for d in r.domains.iter().take(12) {
+            let _ = writeln!(s, "                  {d}");
+        }
+        if r.domains.len() > 12 {
+            let _ = writeln!(s, "                  … {} more", r.domains.len() - 12);
+        }
+    };
+    rules("deny", &policy.deny, &mut s);
+    rules("allow", &policy.allow, &mut s);
+    let _ = writeln!(
+        s,
+        "  approved      {approved_count} endpoint(s) you allowed for this project"
+    );
+    let _ = writeln!(
+        s,
+        "  dns           {} · qtypes {}{}",
+        if policy.dns.enforce {
+            "allowlist enforced"
+        } else {
+            "deny-list + tunnel detection only"
+        },
+        policy.dns.allowed_qtypes.join(","),
+        if policy.dns.tunnel_detection {
+            " · tunnel detection on"
+        } else {
+            ""
+        }
+    );
+    // The property that makes the rest of this a policy question rather than a
+    // containment one, and the reason a failed transport install is safe.
+    s.push_str(
+        "  the session netns holds no host-connected device: egress exists only\n  \
+         through the relay, so a transport that fails to install leaves no egress\n",
+    );
+    s
 }

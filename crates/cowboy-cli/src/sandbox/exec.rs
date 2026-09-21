@@ -29,9 +29,9 @@ use super::ExecResult;
 
 /// Exit code reported for a command stopped by its timeout, matching the
 /// shell convention the Docker path used.
-const EXIT_TIMEOUT: i32 = 124;
+pub(crate) const EXIT_TIMEOUT: i32 = 124;
 /// Exit code reported for a command the user interrupted.
-const EXIT_CANCELLED: i32 = 130;
+pub(crate) const EXIT_CANCELLED: i32 = 130;
 /// How long a command gets to exit after `SIGTERM` before `SIGKILL`.
 const GRACE: Duration = Duration::from_secs(2);
 

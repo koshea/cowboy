@@ -396,6 +396,13 @@ pub struct AgentConfig {
     pub session: SessionConfig,
     #[serde(default)]
     pub processes: BTreeMap<String, ProcessDef>,
+    /// Named command shortcuts for this project — `test: cargo nextest run`,
+    /// `lint: cargo clippy --workspace`.
+    ///
+    /// Two consumers: they are listed to the agent so it runs *this* project's
+    /// checks instead of guessing at one (guessing is how a Rust repo with a
+    /// `Makefile` wrapper gets `cargo test` run directly and a pre-test codegen
+    /// step skipped), and [`AgentBehavior::verify`] refers to them by name.
     #[serde(default)]
     pub commands: BTreeMap<String, String>,
 }
@@ -426,6 +433,17 @@ pub struct AgentBehavior {
     pub max_iterations: u32,
     #[serde(default = "default_max_output")]
     pub max_command_output_bytes: usize,
+    /// How many bytes of the repo's own `AGENTS.md`/`CLAUDE.md` to pin into the
+    /// agent's system message (0 = don't).
+    ///
+    /// Pinned rather than left for the agent to read: it is told the file is
+    /// authoritative, so the alternative is spending a turn on it at the start of
+    /// every session and then losing it to compaction halfway through a long one.
+    /// Budgeted rather than unbounded because it is paid for on every request of
+    /// every session, including each parallel subagent's — a 60 KB conventions
+    /// document is not worth that, and the agent can still `read` the rest.
+    #[serde(default = "default_project_instruction_bytes")]
+    pub project_instruction_bytes: usize,
     /// Stop the session once total (input+output) tokens reach this many
     /// (0 = no limit). A soft warning fires at 80%.
     #[serde(default)]
@@ -441,6 +459,21 @@ pub struct AgentBehavior {
     /// `.cowboy/sessions/.worktree-setup` to force a re-run).
     #[serde(default)]
     pub setup: Vec<String>,
+    /// Commands that must pass before the agent is allowed to call `final` on a
+    /// session that changed files — the project's definition of "checked".
+    ///
+    /// Each entry is either a key in [`AgentConfig::commands`] (`"test"`) or a
+    /// literal command (`"cargo clippy -- -D warnings"`); see
+    /// [`AgentConfig::verify_commands`].
+    ///
+    /// Empty by default, which leaves the gate off: a project that has not said
+    /// what "checked" means here gets no gate, because inventing one would refuse
+    /// completion over a command the repo never nominated. The gate is a
+    /// *quality* mechanism and deliberately soft — it is not part of the security
+    /// boundary, and like the outstanding-subagent gate it yields after a bounded
+    /// number of refusals rather than risk wedging a session.
+    #[serde(default)]
+    pub verify: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -679,6 +712,12 @@ fn default_max_iterations() -> u32 {
 fn default_max_output() -> usize {
     60_000
 }
+/// Enough for a thorough conventions document (~3k tokens) and not enough for a
+/// small book. A repo whose AGENTS.md exceeds it gets the head plus a note saying
+/// to read the rest.
+fn default_project_instruction_bytes() -> usize {
+    12_000
+}
 fn default_scratchpad() -> String {
     ".cowboy/sessions/current/scratchpad.md".to_string()
 }
@@ -775,9 +814,11 @@ impl Default for AgentBehavior {
             idle_sandbox_timeout_seconds: default_idle_sandbox_timeout(),
             max_iterations: default_max_iterations(),
             max_command_output_bytes: default_max_output(),
+            project_instruction_bytes: default_project_instruction_bytes(),
             token_budget: 0,
             cost_budget_usd: 0.0,
             setup: Vec::new(),
+            verify: Vec::new(),
         }
     }
 }
@@ -1005,6 +1046,40 @@ fn home_dir() -> Option<PathBuf> {
 impl AgentConfig {
     pub fn load(path: &Path) -> Result<Self> {
         read_yaml(path)
+    }
+
+    /// The shell commands [`AgentBehavior::verify`] names, resolved against
+    /// [`Self::commands`].
+    ///
+    /// An entry that matches a `commands` key resolves to that command; anything
+    /// else is taken literally, so `verify` works whether or not the project
+    /// bothered to name its checks. Unknown *names* cannot be distinguished from
+    /// literal commands — `test` with no `commands.test` is simply run as the
+    /// command `test` — which is why [`Self::unknown_verify_names`] exists to warn
+    /// about the likely typo separately rather than guessing here.
+    pub fn verify_commands(&self) -> Vec<String> {
+        self.agent
+            .verify
+            .iter()
+            .map(|v| self.commands.get(v).cloned().unwrap_or_else(|| v.clone()))
+            .collect()
+    }
+
+    /// `verify` entries that look like a `commands` key but are not one: a single
+    /// bare word with no shell metacharacters or arguments. Almost always a typo
+    /// (`tests` for `test`), and left as a warning rather than a hard error because
+    /// a one-word command (`make`, `just`) is perfectly legitimate.
+    pub fn unknown_verify_names(&self) -> Vec<&str> {
+        self.agent
+            .verify
+            .iter()
+            .filter(|v| {
+                !self.commands.contains_key(*v)
+                    && !v.contains(char::is_whitespace)
+                    && !v.contains(['/', '.', '-'])
+            })
+            .map(|v| v.as_str())
+            .collect()
     }
 }
 
@@ -1481,6 +1556,10 @@ agent:
   idle_sandbox_timeout_seconds: 1800
   max_iterations: 100
   max_command_output_bytes: 60000
+  # Bytes of this repo's AGENTS.md (or CLAUDE.md) pinned into the agent's system
+  # message, so it starts every session knowing your conventions instead of
+  # spending a turn reading them — and still knows them after compaction. 0 = off.
+  # project_instruction_bytes: 12000
   # Optional usage budgets (0 = no limit). The session stops once a budget is
   # reached, with a soft warning at 80%. The cost estimate uses the model's
   # per-token pricing (see `cowboy models` / model-defaults).
@@ -1492,16 +1571,29 @@ agent:
   # .cowboy/sessions/.worktree-setup to force a re-run).
   # setup:
   #   - mise run sync
+  # Checks that must pass before the agent may finish a session that changed
+  # files. Each entry is either a `commands:` key (below) or a literal command.
+  # Empty = no gate. The agent is told to run these, and `final` is refused (a
+  # couple of times, then it yields) while edits are unverified.
+  # verify:
+  #   - test
+  #   - lint
 
 session:
   scratchpad: .cowboy/sessions/current/scratchpad.md
 
 processes: {}
+  # Long-running processes (dev servers, watchers). The agent starts one with its
+  # `proc` tool — `proc start web` needs no command once it is named here — and
+  # `auto_start: true` brings it up before the first turn. A process is owned by the
+  # session and reaped with it; output goes to .cowboy/proc/<name>.log.
   # web:
   #   command: npm run dev
   #   cwd: /workspace
   #   auto_start: false
 
+# Named command shortcuts for this project. The agent is shown this list so it
+# runs your checks rather than guessing, and `agent.verify` refers to them by name.
 commands: {}
   # test: cargo test
   # lint: cargo clippy

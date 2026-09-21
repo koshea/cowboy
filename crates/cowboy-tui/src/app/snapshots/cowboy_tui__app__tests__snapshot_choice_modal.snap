@@ -1,5 +1,6 @@
 ---
 source: crates/cowboy-tui/src/app/mod.rs
+assertion_line: 1570
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
@@ -16,7 +17,7 @@ expression: render(&app)
 │   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
 │   ╰──────────────────────────────────────────────────────────────╯   │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
-   your turn — pick above — ready
+   ⏳  your turn — pick above · waiting 0s
 ╭ Enter send · Shift+Enter newline · F1 help ──────────────────────────╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

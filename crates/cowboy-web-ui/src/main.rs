@@ -735,11 +735,29 @@ fn render_approval(ap: &model::Approval, send: impl Fn(ClientMsg) + Clone + 'sta
             })
         })
     };
+    // Detail rows when the worker sent them; the flat destination is the fallback,
+    // and stays as the heading either way so the answer to "to what?" is never
+    // further away than the buttons.
+    let rows: Html = ap
+        .rows
+        .iter()
+        .map(|(label, value)| {
+            html! {
+                <div class="approval-row">
+                    <span class="approval-label">{ label.clone() }</span>
+                    <span class="approval-value">{ value.clone() }</span>
+                </div>
+            }
+        })
+        .collect();
+    let note = ap.note.clone().map(|n| html! { <p class="note">{ n }</p> });
     html! {
         <div class="modal">
             <div class="modal-card">
-                <p class="q">{ "Allow network access to" }</p>
+                <p class="q">{ ap.title.clone() }</p>
                 <p class="dest">{ ap.dest.clone() }</p>
+                { rows }
+                { note.unwrap_or_default() }
                 <div class="opts">
                     <button class="allow" onclick={allow}>{ "Allow (session)" }</button>
                     <button class="deny" onclick={deny}>{ "Deny" }</button>

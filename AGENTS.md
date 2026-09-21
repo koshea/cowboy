@@ -145,16 +145,43 @@ commands*, not the loop.
   ignoring it would drop every mount under it without saying so. In non-security
   config (`agent.yaml`) a serde `alias` is the friendlier choice, since a silent
   default there costs a timeout rather than a boundary.
+- **What is pinned into the system prompt is a cost paid on every request** of every
+  session, subagents included. The memory index, the skill index, `commands`/`verify`,
+  the declared `processes` and (bounded by `agent.project_instruction_bytes`) the
+  repo's root `AGENTS.md` all live there because they are small, static, and otherwise
+  cost a turn to fetch and get folded away by compaction. Anything that scales with
+  the repo does not belong there — nested `AGENTS.md` files and skill *bodies* are
+  fetched on demand for exactly that reason.
 - **Timestamps:** `u64` milliseconds since epoch via a local `now_ms()`. **No
   `chrono`.**
 - **Errors:** `anyhow::Result` in `cowboy-cli`; `cowboy_core::error::{Error,Result}`
   in `cowboy-core`.
-- **Adding a host-handled agent tool** (the `memory`/`blocked`/`artifact` pattern):
+- **Adding a host-handled agent tool** (the `memory`/`blocked`/`artifact`/`proc` pattern):
   1. `TOOL_*` const + an `…Args` struct (derive `Deserialize, JsonSchema`) in
      `agent/tools.rs`; 2. a `ToolDef` in `definitions()`; 3. a dispatch arm in
      `AgentLoop::handle_tool_calls` (`agent/run.rs`); 4. a `run_*` handler.
   This changes the tool-surface snapshot and the `definitions_cover_the_tool_surface`
   list — update both.
+- **Adding a structured file operation** (`read`/`edit`/`write`/`grep`/`ls`): a
+  `FileOp` variant in `cmd/fileop.rs` (it runs *inside* the sandbox), an arm in
+  `apply`, the `…Args` above, and the payload in the loop's dispatch arm. `apply` is
+  the seam the loop tests drive through `FakeSandbox` — keep it, rather than letting
+  a fake grow its own version of an operation the tests are checking.
+- **Anything long-running belongs to the session, not to a command or a CLI.** Each
+  command is its own bwrap in its own PID namespace, so `&`/`nohup`/`setsid` inside
+  one is reaped the moment it returns — `cowboy proc start` did exactly that and
+  reported success for a dead process. Background processes go through
+  `Sandbox::start_process`, parented by the (long-lived) worker so `--die-with-parent`
+  gives them the session's lifetime. A pid file in the workspace is **not** an option:
+  the workspace is agent-writable, so a host-side `kill` of a pid read from there
+  would be a primitive the agent controls.
+- **Search skips what the repo says is generated.** `grep`/`ls` prune the fixed
+  `SKIP_DIRS` list *and* `.gitignore` (`cmd/fileop.rs`), and report when they hid
+  something — a filter the agent cannot see is indistinguishable from an empty result.
+- **`write` is guarded against lost updates**, not just against bad paths: an
+  overwrite of a file this session has not observed (or that changed since) is refused
+  host-side (`stale_write_refusal`). Subagents share one workspace, so concurrent
+  edits to a file are ordinary here.
 - **UI:** anything user-facing goes through the `AgentUi` trait (`agent/ui.rs`),
   impl'd by `ConsoleUi`, `TuiUi`, `SocketUi`, and `RecordingUi` (tests) — don't
   `println!` from the loop.
@@ -240,6 +267,11 @@ Two guards keep it honest (both run under `cargo test`):
   and kills it. Use `pkill -x cowboyd` / `pgrep -x cowboyd`. Same trap applies to
   `pgrep -f` in tests: count processes by reading `/proc` instead.
 - Per-project teardown: `cowboy down`.
+- **A "started" message is not evidence a process is running.** Verify a background
+  process by observing it from a *later* command (its log file, or a connection to its
+  port), never by the fact that the spawn returned 0 — that is how a broken
+  `cowboy proc start` survived: it reported success and `proc list` said "stopped" a
+  second later.
 - The daemon persists state to `$XDG_STATE_HOME/cowboy/daemon/state.json`; sockets
   live under `$XDG_RUNTIME_DIR/cowboy`.
 - **Linux only**, and currently targeted at one host: a current kernel with

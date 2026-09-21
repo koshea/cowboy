@@ -501,7 +501,7 @@ Display the current git diff
 
 ## `cowboy proc`
 
-Managed long-running process commands
+Inspect the session's long-running processes (the agent starts them)
 
 
 ### `cowboy proc list`
@@ -529,7 +529,7 @@ Restart a process by name
 
 ### `cowboy proc start`
 
-Start a process by name
+Explain why a process cannot be started from here (they are session-owned)
 
 | Arg | Description |
 |-----|-------------|
@@ -538,7 +538,7 @@ Start a process by name
 
 ### `cowboy proc stop`
 
-Stop a process by name
+Stop a process by name (only reaches a stale one; session processes end with the session)
 
 | Arg | Description |
 |-----|-------------|

@@ -135,40 +135,42 @@ impl Proc {
 
     async fn start(&self, name: &str) -> Result<()> {
         let def = self.def(name)?.clone();
-        if self.is_running(name).await {
-            println!("{name} is already running");
-            return Ok(());
-        }
-        let log = self.log_file(name);
-        let pid = self.pid_file(name);
-        // Create the proc dir, then launch a detached process group whose
-        // leader pid we record for later signaling.
-        let script = format!(
-            "mkdir -p {dir}; cd {cwd}; setsid sh -c {cmd} > {log} 2>&1 & echo $! > {pid}",
-            dir = self.proc_dir,
-            cwd = shell_quote(&def.cwd),
-            cmd = shell_quote(&def.command),
-            log = log,
-            pid = pid,
-        );
-        let (res, out) = self
-            .runtime
-            .run_capture(&script, None, CONTROL_TIMEOUT)
-            .await?;
-        if res.exit_code != 0 {
-            bail!("failed to start {name}: {}", out.trim());
-        }
-        self.log_event(name, "start");
-        println!("started {name}: {}", def.command);
-        Ok(())
+        // This used to run `setsid sh -c '<cmd>' &` inside a one-off sandbox and
+        // print "started". It never worked: bwrap is PID 1 of that command's own PID
+        // namespace, so when the command returned the kernel reaped everything in the
+        // namespace — `setsid` included. The process was dead before this printed, and
+        // `list` would show it "stopped" a second later.
+        //
+        // A background process has to be owned by something that outlives a single
+        // command, and a CLI invocation is not that. The session's worker is: it holds
+        // the sandbox for the whole session, so `--die-with-parent` gives the process
+        // the session's lifetime and teardown reaps it. That is where starting one
+        // lives now — the agent's `proc` tool — and there is no honest way to do it
+        // from here.
+        bail!(
+            "`cowboy proc start` cannot start {name}: a background process is owned by the \
+             session that starts it (it has to be, or nothing reaps it), and this command \
+             exits immediately.\n\
+             \n\
+             - In a session, ask the agent to start it — it has a `proc` tool, and \
+               {name} is already defined in agent.yaml: `{}`\n\
+             - To run it yourself, use `cowboy shell` and start it there.\n\
+             \n\
+             `cowboy proc list` and `cowboy proc logs {name}` still work.",
+            def.command
+        )
     }
 
     async fn stop(&self, name: &str) -> Result<()> {
         self.def(name)?;
         let pid = self.pid_file(name);
-        // SIGTERM the whole group, wait briefly, then SIGKILL.
+        // Kept for the stale pid files an older cowboy may have left behind: SIGTERM
+        // the whole group, wait briefly, then SIGKILL. A process started by the current
+        // code is the worker's child and ends with the session, so there is normally
+        // nothing here to stop.
         let script = format!(
-            "p=$(cat {pid} 2>/dev/null); [ -n \"$p\" ] || {{ echo 'not running'; exit 0; }}; \
+            "p=$(cat {pid} 2>/dev/null); [ -n \"$p\" ] || {{ echo 'not running (processes \
+             started in a session end with it)'; exit 0; }}; \
              kill -TERM -\"$p\" 2>/dev/null; sleep 2; kill -KILL -\"$p\" 2>/dev/null; \
              rm -f {pid}; echo stopped",
             pid = pid
@@ -203,21 +205,5 @@ impl Proc {
             .with_context(|| format!("tailing logs for {name}"))?;
         let _ = &self.workdir; // workdir retained for future use
         Ok(())
-    }
-}
-
-/// Quote a string as a single POSIX shell word.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shell_quote_escapes_single_quotes() {
-        assert_eq!(shell_quote("npm run dev"), "'npm run dev'");
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
     }
 }

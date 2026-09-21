@@ -6,7 +6,7 @@
 //! testing). Not for interactive use.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{
@@ -27,7 +27,7 @@ use crate::cmd::session::{
 use crate::net::approvals;
 use crate::project::session_name_for;
 use crate::sandbox::policy::ChannelApprover;
-use cowboy_core::netproto::{ApprovalScope, Verdict};
+use cowboy_core::netproto::{ApprovalDetail, ApprovalKind, ApprovalScope, Verdict};
 
 /// Args for the worker subcommand.
 #[derive(Debug, Clone)]
@@ -255,6 +255,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let session_name = crate::sandbox::Sandbox::session_name(&runtime).to_string();
 
     let memory_ctx = cowboy_core::memory::index(&crate::project::project_key_hex(&root));
+    // Pinned project context: what skills exist, and the repo's own conventions.
+    // Both are cheap and static, and both were previously a turn the agent had to
+    // spend before it could start work.
+    let skills_index = cowboy_core::skills::index(&root);
+    let project_instructions =
+        cowboy_core::instructions::block(&root, agent_cfg.agent.project_instruction_bytes);
     // Continue a prior session if asked (load its transcript as history).
     let history = match &args.resume {
         Some(id) => match crate::session::load_history(&root, id) {
@@ -310,6 +316,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         .or_else(|| user_models.as_ref().and_then(|m| m.default.clone()));
     let fallback_name = default_model_name.filter(|d| Some(d) != model_override.as_ref());
 
+    // Extracted before `agent_cfg.agent` is moved into the loop.
+    let project_commands = agent_cfg.commands.clone();
+    let project_processes = agent_cfg.processes.clone();
+    let verify = agent_cfg.verify_commands();
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
@@ -321,6 +331,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     .with_logger(logger)
     .with_summarizer(summarizer)
     .with_memory_context(memory_ctx)
+    .with_project_commands(&project_commands, verify)
+    .with_project_context(&skills_index, &project_instructions)
+    .with_processes(project_processes)
     .with_history(history)
     .with_model_pricing(pricing_of(&resolved));
 
@@ -956,7 +969,20 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
                 "credential: inject env {} (from ${}) into the sandbox?",
                 e.name, e.source_env
             );
-            let (verdict, _scope) = ui.request_approval(prompt).await;
+            // Tagged `Credential` so the modal does not title a credential prompt
+            // "Network request", which is what it did while `dest` was the only field.
+            let detail = ApprovalDetail {
+                kind: ApprovalKind::Credential,
+                rows: vec![
+                    ("inject env".into(), e.name.clone()),
+                    ("from".into(), format!("${}", e.source_env)),
+                ],
+                note: Some(
+                    "the value is read host-side and passed into the sandbox for this session"
+                        .into(),
+                ),
+            };
+            let (verdict, _scope) = ui.request_approval(prompt, Some(detail)).await;
             if verdict == Verdict::Allow {
                 kept_env.push(e);
             } else {
@@ -979,7 +1005,18 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
                 "credential: mount {} → {} ({mode}) into the sandbox?",
                 f.source, f.target
             );
-            let (verdict, _scope) = ui.request_approval(prompt).await;
+            let detail = ApprovalDetail {
+                kind: ApprovalKind::Credential,
+                rows: vec![
+                    ("mount".into(), f.source.clone()),
+                    ("as".into(), f.target.clone()),
+                    ("access".into(), mode.to_string()),
+                ],
+                note: Some(
+                    "declared in this project's security.yaml; denying leaves it unmounted".into(),
+                ),
+            };
+            let (verdict, _scope) = ui.request_approval(prompt, Some(detail)).await;
             if verdict == Verdict::Allow {
                 kept_files.push(f);
             } else {
@@ -1075,13 +1112,18 @@ fn control_approver(
             // appended after the verdict was computed, exactly as the pid already was, so
             // it cannot reach `policy::evaluate`. An unresolvable pid falls back to the pid
             // and then to nothing, rather than to a different decision.
+            let command = req
+                .attempt
+                .command_pid
+                .and_then(crate::sandbox::attribution::command_for);
             if let Some(pid) = req.attempt.command_pid {
-                match crate::sandbox::attribution::command_for(pid) {
+                match &command {
                     Some(cmd) => prompt.push_str(&format!("\n\nrequested by:  {cmd}")),
                     None => prompt.push_str(&format!(" [command {pid}]")),
                 }
             }
-            let (verdict, scope) = ui.request_approval(prompt).await;
+            let detail = network_detail(&root, &req.attempt, req.reason.as_deref(), command);
+            let (verdict, scope) = ui.request_approval(prompt, Some(detail)).await;
             if verdict == Verdict::Allow
                 && matches!(scope, ApprovalScope::Project | ApprovalScope::Global)
             {
@@ -1099,6 +1141,66 @@ fn control_approver(
     });
 
     std::sync::Arc::new(ChannelApprover::new(approvals_tx, events_tx))
+}
+
+/// Compose the display detail for a network approval prompt.
+///
+/// Everything here is **display only** and gathered *after* the verdict was
+/// computed, exactly as the command pid already was, so none of it can reach
+/// `policy::evaluate`. The point is that a bare `host:port` is not enough to decide
+/// from: a prompt without the requesting command, the address class, and the
+/// policy's own reason gets approved reflexively, and a reflexively approved `ask`
+/// policy is an `allow` policy that merely takes longer.
+fn network_detail(
+    root: &Path,
+    attempt: &cowboy_core::netproto::NetworkAttempt,
+    reason: Option<&str>,
+    command: Option<String>,
+) -> ApprovalDetail {
+    use cowboy_core::policy::{classify, DestClass};
+
+    let mut rows: Vec<(String, String)> = vec![("destination".into(), attempt.label())];
+    rows.push((
+        "protocol".into(),
+        match attempt.protocol {
+            cowboy_core::netproto::Protocol::Tls => "TLS".into(),
+            cowboy_core::netproto::Protocol::Http => "HTTP (cleartext)".into(),
+            cowboy_core::netproto::Protocol::Tcp => "raw TCP".into(),
+            cowboy_core::netproto::Protocol::Dns => "DNS".into(),
+        },
+    ));
+    // The address class is the part a hostname can hide: a public name resolving to a
+    // private address is how a rebind looks from here, and it is worth seeing.
+    if let Some(ip) = attempt.ip {
+        let class = match classify(Some(ip)) {
+            DestClass::External => "external",
+            DestClass::PrivateLan => "private LAN — not the internet",
+            DestClass::Host => "loopback / this host",
+        };
+        rows.push(("address".into(), format!("{ip} — {class}")));
+    }
+    if let Some(cmd) = command {
+        rows.push(("requested by".into(), cmd));
+    } else if let Some(pid) = attempt.command_pid {
+        rows.push(("requested by".into(), format!("pid {pid} (exited)")));
+    }
+    if let Some(r) = reason {
+        rows.push(("why you're asked".into(), r.to_string()));
+    }
+    // What this project has already been told to allow. Standing context, not a
+    // recommendation — "you approved 12 things" is a reason to look closer, not a
+    // reason to approve a thirteenth.
+    let saved = crate::net::approvals::load(root).len();
+    let note = Some(match saved {
+        0 => "nothing is saved for this project yet — `p` would be the first".to_string(),
+        1 => "1 endpoint is already saved for this project (`cowboy net list`)".to_string(),
+        n => format!("{n} endpoints are already saved for this project (`cowboy net list`)"),
+    });
+    ApprovalDetail {
+        kind: ApprovalKind::Network,
+        rows,
+        note,
+    }
 }
 
 /// The pricing triple for a resolved model (cached-input rate included).
@@ -1250,7 +1352,8 @@ mod tests {
         for _ in 0..2 {
             let (id, dest) = loop {
                 let line = read_line(&mut creader).await;
-                if let Ok(ServerMsg::Approval { id, dest }) = serde_json::from_str(line.trim()) {
+                if let Ok(ServerMsg::Approval { id, dest, .. }) = serde_json::from_str(line.trim())
+                {
                     break (id, dest);
                 }
             };

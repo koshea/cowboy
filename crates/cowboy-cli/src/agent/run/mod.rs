@@ -8,9 +8,9 @@ use cowboy_core::model::{ChatResponse, Delta, Message, ModelClient, Role, ToolDe
 use tokio_util::sync::CancellationToken;
 
 use super::tools::{
-    self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, HandoffArgs,
-    McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, RequestPathArgs, ShellArgs,
-    SubagentArgs, WriteArgs,
+    self, ArtifactArgs, AskUserArgs, BlockedArgs, DecisionArgs, EditArgs, FinalArgs, GrepArgs,
+    HandoffArgs, McpArgs, MemoryArgs, PlanArgs, ProposeScopeChangeArgs, ReadArgs, RequestPathArgs,
+    ShellArgs, SubagentArgs, WriteArgs,
 };
 use super::ui::{AgentUi, ContextUsage};
 use crate::sandbox::{ExecResult, Sandbox};
@@ -23,36 +23,47 @@ static SUBAGENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 mod handlers;
 mod support;
 use support::{
+    applied_change_note, fmt_duration, read_continuation_hint, shell_outcome_note, SeenFiles,
+    SeenStatus, Trim,
+};
+use support::{
     delegation_available, effective_max_depth, emit_delta, fileop_summary, grant_notice,
     grant_stage, is_coordination_only, parse_args, process_is_gone, raw_tool_signature,
     render_plan, render_transcript, reread_notice, self_exe, system_prompt, tool_signature,
-    tool_surface, truncate, unified_diff, GrantStage, IterationBudget, ProgressTracker,
+    tool_surface, truncate, truncate_middle, unified_diff, GrantStage, IterationBudget,
+    ProgressTracker, Verification,
 };
 
 /// Default agent system prompt (see plan §10.3).
 pub const SYSTEM_PROMPT: &str = "\
-You are Cowboy, an autonomous coding agent running inside a Docker container.
+You are Cowboy, an autonomous coding agent running inside a locked-down sandbox \
+on the user's machine.
 
 The project is mounted at /workspace. You may freely inspect, edit, build, test, \
-and run code inside the container. Use `shell` for builds, tests, git, and other \
+and run code inside the sandbox. Use `shell` for builds, tests, git, and other \
 commands. For files, prefer the structured tools: `read` (with line numbers), \
-`edit` (exact unique-string replacement), and `write` (create/overwrite) — they \
-are more reliable and cheaper than `cat`/`sed`/heredocs.
+`grep` (search the workspace for a regex — use it instead of `grep -r`/`rg`, \
+which may not be installed and will drown you in build output), `edit` (exact \
+unique-string replacement, or a batch of `edits` applied all-or-nothing), and \
+`write` (create/overwrite) — they are more reliable and cheaper than \
+`cat`/`sed`/heredocs.
 
 Cowboy-specific helpers are CLIs you invoke through `shell`, e.g. `cowboy patch \
-show` and `cowboy proc start <name>`. You do not need to ask before ordinary \
-development actions inside the container.
+show`. You do not need to ask before ordinary development actions inside the \
+sandbox. Each `shell` call is a fresh process: `cd` and `export` do not carry to \
+the next one — pass `cwd` or chain with `&&`. A server or watcher that never \
+exits must NOT be run in the foreground; start it with `proc` and test against it.
 
-Reusable skills may be available: run `cowboy skill list` to see them and \
-`cowboy skill show <name>` to read a skill's instructions, then follow them \
-(skills are discovered from `.cowboy/skills/` and `.claude/skills/`).
+Reusable skills are listed below when this project has any; read one with `cowboy \
+skill show <name>` before doing that kind of work and then follow it (skills are \
+discovered from `.cowboy/skills/` and `.claude/skills/`).
 
-Project conventions may live in AGENTS.md (or CLAUDE.md) files, which are \
-authoritative. Before working in an area, `read` the repo-root AGENTS.md and the \
-nearest AGENTS.md on the path to the files you're touching (the nearest one \
-wins). When you establish — or the user tells you — a durable project convention \
-(build/test commands, style rules, layout), record it in the appropriate \
-AGENTS.md with `edit`/`write` so it persists for everyone.
+Project conventions live in AGENTS.md (or CLAUDE.md) files, which are \
+authoritative. The repo-root one is included below when present; when you work in \
+a subtree, also `read` the nearest AGENTS.md on the path to the files you're \
+touching (the nearest one wins). When you establish — or the user tells you — a \
+durable project convention (build/test commands, style rules, layout), record it \
+in the appropriate AGENTS.md with `edit`/`write` so it persists for everyone.
 
 You also have a private cross-session `memory` (stored on the host, not the \
 repo). The index of what you've saved is shown below when present; `recall` a \
@@ -287,6 +298,16 @@ pub struct AgentLoop<'a> {
     /// What this session has actually read, edited and run — the host's own measure of
     /// whether the worker is making progress, independent of what it claims.
     progress: ProgressTracker,
+    /// Host-recorded evidence that the project's checks passed since the last edit.
+    /// Inert unless `agent.verify` nominates commands.
+    verification: Verification,
+    /// What this session has actually seen of each file it touched, so a full-file
+    /// `write` over content the agent never read — or that changed under it — is
+    /// refused instead of silently winning.
+    seen_files: SeenFiles,
+    /// Background processes declared in `agent.yaml`, so the `proc` tool can start one
+    /// by name without the agent restating its command.
+    processes: std::collections::BTreeMap<String, cowboy_core::config::ProcessDef>,
     /// Iterations of zero novelty that trigger a stall intervention (0 = off), from
     /// the roster's `delegation.stall_window`.
     stall_window: u32,
@@ -656,6 +677,12 @@ async fn watch_turn_requests(
 /// How often each side polls the control directory. Short enough that a foreman's
 /// answer feels immediate, long enough to be free.
 const REQUEST_POLL: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Ceiling on a per-call `shell` timeout. A single command may raise the timeout
+/// (a slow test suite is legitimate) but not without bound: an accidental
+/// multi-hour value would pin the worker until the turn's cancel or the session
+/// ends. One hour is comfortably above any real build/test yet still finite.
+const MAX_SHELL_TIMEOUT_SECONDS: u64 = 3600;
 
 /// Spend + token estimates rolled up from one finished subagent.
 #[derive(Default, Clone, Copy)]
@@ -1032,6 +1059,9 @@ impl<'a> AgentLoop<'a> {
             budget,
             grant_stage_seen: GrantStage::Fine,
             progress: ProgressTracker::default(),
+            verification: Verification::default(),
+            seen_files: SeenFiles::default(),
+            processes: std::collections::BTreeMap::new(),
             stall_window,
             stall_count: 0,
             jobs: crate::agent::jobs::JobRegistry::new(
@@ -1875,6 +1905,131 @@ impl<'a> AgentLoop<'a> {
         self
     }
 
+    /// Give the loop this project's named commands and its verification gate.
+    ///
+    /// Both halves come from `agent.yaml`: `commands` is appended to the system
+    /// message so the agent runs *this* project's checks rather than guessing one
+    /// from the language, and `verify` arms the `final` gate. The list goes into the
+    /// pinned system message (like the memory index) so it survives compaction —
+    /// knowing how to test the project is not something to lose on turn 30.
+    pub fn with_project_commands(
+        mut self,
+        commands: &std::collections::BTreeMap<String, String>,
+        verify: Vec<String>,
+    ) -> Self {
+        let mut block = String::new();
+        if !commands.is_empty() {
+            let list = commands
+                .iter()
+                .map(|(k, v)| format!("- {k}: `{v}`"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            block.push_str(&format!(
+                "\n\nProject commands (from .cowboy/agent.yaml) — prefer these over \
+                 guessing a build or test invocation:\n{list}"
+            ));
+        }
+        // Stated even when `commands` is empty: `verify` entries may be literal
+        // commands, and the gate must never fire on something the agent was not told
+        // about.
+        if !verify.is_empty() {
+            block.push_str(&format!(
+                "\n\nBefore calling `final` on a session that changed files, these must \
+                 have been run and passed: {}. Run them with `shell`.",
+                verify
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if !block.is_empty() {
+            if let Some(sys) = self.messages.first_mut() {
+                sys.content.push_str(&block);
+            }
+        }
+        self.verification = Verification::new(verify);
+        self
+    }
+
+    /// Pin the project's own context into the system message: what skills exist, and
+    /// what the repo's `AGENTS.md`/`CLAUDE.md` says.
+    ///
+    /// Both were previously things the agent had to go and fetch — `cowboy skill list`
+    /// to find out whether skills existed at all, and a `read` of AGENTS.md to learn
+    /// the conventions it is told are authoritative. That is a turn each, on every
+    /// session, for information that is small and does not change mid-task; and
+    /// because it arrived as a tool result it sat in the compactable middle of the
+    /// conversation, so a long session would lose the conventions exactly when it had
+    /// accumulated the most code to keep consistent with them. The skill
+    /// *instructions* are still fetched on demand — only the index is pinned.
+    pub fn with_project_context(mut self, skills_index: &str, instructions: &str) -> Self {
+        let mut block = String::new();
+        if !skills_index.trim().is_empty() {
+            block.push_str("\n\n");
+            block.push_str(skills_index.trim_end());
+        }
+        block.push_str(instructions);
+        if !block.is_empty() {
+            if let Some(sys) = self.messages.first_mut() {
+                sys.content.push_str(&block);
+            }
+        }
+        self
+    }
+
+    /// Give the loop the project's declared background processes, so `proc start
+    /// <name>` needs no command and the process list is nameable.
+    ///
+    /// Those marked `auto_start` are started when the session's first turn begins —
+    /// honouring a flag that, until the `proc` tool existed, nothing read.
+    pub fn with_processes(
+        mut self,
+        processes: std::collections::BTreeMap<String, cowboy_core::config::ProcessDef>,
+    ) -> Self {
+        if !processes.is_empty() {
+            let list = processes
+                .iter()
+                .map(|(k, v)| format!("- {k}: `{}`", v.command))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(sys) = self.messages.first_mut() {
+                sys.content.push_str(&format!(
+                    "\n\nBackground processes this project defines (start one with the `proc` \
+                     tool by name; no `command` needed):\n{list}"
+                ));
+            }
+        }
+        self.processes = processes;
+        self
+    }
+
+    /// Start every `auto_start` process. Best-effort and reported, not fatal: a dev
+    /// server that will not come up is something to tell the agent about, not a reason
+    /// to refuse the session.
+    async fn start_auto_processes(&mut self) {
+        let auto: Vec<(String, String, Option<String>)> = self
+            .processes
+            .iter()
+            .filter(|(_, d)| d.auto_start)
+            .map(|(n, d)| (n.clone(), d.command.clone(), Some(d.cwd.clone())))
+            .collect();
+        for (name, command, cwd) in auto {
+            match self
+                .runtime
+                .start_process(&name, &command, cwd.as_deref())
+                .await
+            {
+                Ok(()) => self
+                    .ui
+                    .notice(&format!("started background process {name} (auto_start)")),
+                Err(e) => self
+                    .ui
+                    .notice(&format!("could not auto-start {name}: {e:#}")),
+            }
+        }
+    }
+
     /// Seed the conversation with a prior session's history (for resume/
     /// continue), inserted right after the always-kept system message. The new
     /// session keeps its own system prompt; `history` should be system-free
@@ -2046,6 +2201,25 @@ impl<'a> AgentLoop<'a> {
         self.planning = on;
     }
 
+    /// Enter wrap-up: the budget is spent, and all that is left is reporting.
+    ///
+    /// Narrowing the tool surface is the whole point. The directive that goes with
+    /// this used to be advisory, and a worker that ignored it kept every tool — one
+    /// real subagent answered "stop investigating and report" with fourteen more
+    /// `grep`s, was stopped at the ceiling, and lost seventy turns of work because it
+    /// had never written anything down. So the surface is narrowed here rather than
+    /// asked for in a note.
+    ///
+    /// Wrap-up is a one-way door (nothing clears `wrapping_up`), so the tool list is
+    /// mutated once instead of filtered per request. This is the single place that
+    /// happens: six call sites set this state, and a seventh that forgot to narrow
+    /// the surface would silently restore the old behaviour.
+    fn enter_wrap_up(&mut self) {
+        self.wrapping_up = true;
+        self.tools
+            .retain(|t| tools::allowed_when_wrapping_up(&t.name));
+    }
+
     /// Set the cancellation token used by in-container commands. The worker uses
     /// this so the eager startup setup (`run_session_setup`) is interruptible
     /// before any turn token exists. `run_turn` sets it per turn.
@@ -2175,6 +2349,7 @@ impl<'a> AgentLoop<'a> {
         let args = ShellArgs {
             command: command.to_string(),
             cwd: None,
+            timeout_seconds: None,
         };
         self.ui.command_start(command);
         match self.run_shell_streaming(&args).await {
@@ -2342,6 +2517,9 @@ impl<'a> AgentLoop<'a> {
         if !self.lifecycle_started {
             self.lifecycle_started = true;
             self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::SessionStarted);
+            // Once per session, and only here: `auto_start` means "have this running
+            // before the agent starts work", and a later message must not restart it.
+            self.start_auto_processes().await;
         }
         let user_msg = Message::user(task);
         if let Some(l) = &mut self.logger {
@@ -3070,7 +3248,7 @@ impl<'a> AgentLoop<'a> {
         if self.turn_requests >= MAX_TURN_REQUESTS {
             self.ui
                 .notice("turn-request limit reached — wrapping up with what we have");
-            self.wrapping_up = true;
+            self.enter_wrap_up();
             self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
             return RequestOutcome::WrapUp;
         }
@@ -3139,7 +3317,7 @@ impl<'a> AgentLoop<'a> {
                         "the foreman granted more turns but the host ceiling is reached — \
                          wrapping up",
                     );
-                    self.wrapping_up = true;
+                    self.enter_wrap_up();
                     self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
                     return RequestOutcome::WrapUp;
                 }
@@ -3167,7 +3345,7 @@ impl<'a> AgentLoop<'a> {
                      instead:\n\n{instructions}"
                 ));
                 if added == 0 {
-                    self.wrapping_up = true;
+                    self.enter_wrap_up();
                     self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
                     return RequestOutcome::WrapUp;
                 }
@@ -3177,14 +3355,14 @@ impl<'a> AgentLoop<'a> {
                 let added = self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
                 self.ui
                     .notice(&format!("▣ told to wrap up ({added} turns to write it up)"));
-                self.wrapping_up = true;
+                self.enter_wrap_up();
                 self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
                 RequestOutcome::WrapUp
             }
             Some(Verdict::Stop { reason, .. }) => {
                 self.ui
                     .notice(&format!("✋ the foreman stopped this: {reason}"));
-                self.wrapping_up = true;
+                self.enter_wrap_up();
                 self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
                 self.push_user_note(format!(
                     "[foreman] Stop this work now: {reason}\n\nDo not investigate or change \
@@ -3220,7 +3398,7 @@ impl<'a> AgentLoop<'a> {
                 }
                 self.ui
                     .notice("no answer from the foreman — wrapping up with what we have");
-                self.wrapping_up = true;
+                self.enter_wrap_up();
                 self.budget.extend(crate::agent::jobctl::WRAP_UP_TURNS);
                 self.push_user_note(WRAP_UP_DIRECTIVE.to_string());
                 RequestOutcome::WrapUp
@@ -3561,7 +3739,23 @@ impl<'a> AgentLoop<'a> {
                     "blocked: plan mode is on — do not modify files, run commands, or \
                      delegate work yet. Present your plan (use the `plan` tool to list \
                      the steps), then stop; the user will approve with /go before you \
-                     make changes. Use `read`/`grep`-style tools to investigate.",
+                     make changes. Use `read`, `grep`, and `ls` to investigate.",
+                );
+                continue;
+            }
+            // Wrap-up gate: the budget is spent and the only thing left is to report,
+            // so investigation and mutation are refused here as well as removed from
+            // the offered surface. Both layers are needed — the conversation history
+            // is full of earlier `shell`/`read` calls, and a model will reach for a
+            // tool it used ten turns ago whether or not it is still on offer.
+            if self.wrapping_up && !tools::allowed_when_wrapping_up(call.name.as_str()) {
+                self.push_tool_result(
+                    &call.id,
+                    "blocked: you are out of turns and this is the wrap-up. No more \
+                     investigating or editing — everything you can still report is \
+                     already in this conversation. Call `final` now with what you \
+                     established, what you did not get to, and what the next worker \
+                     needs. An unreported result is a wasted delegation.",
                 );
                 continue;
             }
@@ -3608,14 +3802,55 @@ impl<'a> AgentLoop<'a> {
                             );
                         }
                     }
+                    // The project nominated checks (`agent.verify`) and this session
+                    // changed files without them passing. Refuse, naming exactly what
+                    // to run — the evidence is host-recorded, so this cannot be
+                    // satisfied by asserting it in the summary.
+                    //
+                    // Bounded like the gate above, and for the same reason: quality
+                    // pressure must not be able to wedge a session. A check that is
+                    // genuinely broken (no network, missing toolchain) would otherwise
+                    // trap the agent in a loop it cannot exit.
+                    if self.verification.has_unverified_edits() {
+                        if self.final_refusals < MAX_FINAL_REFUSALS {
+                            self.final_refusals += 1;
+                            let outstanding = self
+                                .verification
+                                .outstanding()
+                                .iter()
+                                .map(|c| format!("`{c}`"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            self.push_tool_result(
+                                &call.id,
+                                &format!(
+                                    "blocked: this session changed files but {outstanding} \
+                                     has not passed against the current tree. Run it with \
+                                     `shell` and fix what it reports, then call `final`. If \
+                                     it cannot run here, say so in your `final` message and \
+                                     call `final` again."
+                                ),
+                            );
+                            self.answer_unrun(
+                                &response.tool_calls[i + 1..],
+                                "not run: `final` was refused while edits are unverified",
+                            );
+                            continue;
+                        }
+                        // Budget spent: accept, but record that the work is unchecked
+                        // rather than letting it look verified.
+                        self.ui.notice(&format!(
+                            "finishing with unverified edits — {} did not pass",
+                            self.verification.outstanding().join(", ")
+                        ));
+                    }
                     if let Some(l) = &self.logger {
                         l.write_final(&args.message);
                     }
-                    self.ui.final_message(&args.message);
-                    // Answer this call and any the model batched after it. An
-                    // assistant turn whose tool calls aren't all answered is
-                    // rejected by strict providers on the NEXT turn (this history
-                    // persists across turns), which would brick the session.
+                    self.ui.final_message(&args.message); // Answer this call and any the model batched after it. An
+                                                          // assistant turn whose tool calls aren't all answered is
+                                                          // rejected by strict providers on the NEXT turn (this history
+                                                          // persists across turns), which would brick the session.
                     self.push_tool_result(&call.id, "final answer recorded.");
                     self.answer_unrun(
                         &response.tool_calls[i + 1..],
@@ -3629,6 +3864,7 @@ impl<'a> AgentLoop<'a> {
                     };
                     self.ui.command_start(&args.command);
                     let started = std::time::Instant::now();
+                    let timeout_secs = self.shell_timeout(&args);
                     // A container/exec failure must NOT propagate with `?`: that
                     // would return from the turn leaving this call unanswered and
                     // corrupt the conversation for every later turn. Report it to
@@ -3650,8 +3886,38 @@ impl<'a> AgentLoop<'a> {
                     if let Some(l) = &mut self.logger {
                         l.log_command(&args.command, result.exit_code, duration_ms, &output);
                     }
-                    let truncated = truncate(&output, self.behavior.max_command_output_bytes);
-                    let observation = format!("[exit code: {}]\n{}", result.exit_code, truncated);
+                    // Host-recorded verification evidence: the loop notes what ran and
+                    // how it exited, so the `final` gate measures rather than trusting
+                    // the model's account of what it checked.
+                    self.verification
+                        .note_command(&args.command, result.exit_code);
+                    // A timeout or a cancel is not a real exit status, and neither is
+                    // actionable as a bare number. The note goes *after* truncation and
+                    // its length comes out of the budget, so the cap cannot shear off
+                    // the one part of the observation that says what to do next.
+                    let note = shell_outcome_note(
+                        result.exit_code,
+                        timeout_secs,
+                        MAX_SHELL_TIMEOUT_SECONDS,
+                    );
+                    // Truncate the assembled observation, not just the output: the
+                    // `[exit code]` prefix has to be inside the budget or
+                    // `push_tool_result` truncates again — head-only — and cuts off
+                    // the tail `truncate_middle` just preserved. The prefix is at the
+                    // head, which middle truncation always keeps.
+                    let observation = format!(
+                        "[exit code: {} · {}]\n{}",
+                        result.exit_code,
+                        fmt_duration(duration_ms),
+                        output
+                    );
+                    let mut observation = truncate_middle(
+                        &observation,
+                        self.behavior
+                            .max_command_output_bytes
+                            .saturating_sub(note.len()),
+                    );
+                    observation.push_str(&note);
                     self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_READ => {
@@ -3669,7 +3935,8 @@ impl<'a> AgentLoop<'a> {
                     // an identical re-read is answered with a pointer to the earlier
                     // one instead of a second copy. The read still happens: that is
                     // what proves it is unchanged.
-                    let (code, output, observation) = self.fileop_observation(&payload).await;
+                    let (code, output, observation) =
+                        self.fileop_observation(&payload, Trim::Read).await;
                     let observation = if code == 0 {
                         let key = ProgressTracker::read_key(&args.path, args.offset, args.limit);
                         match self.progress.note_read(&key, &output, self.budget.used) {
@@ -3685,6 +3952,12 @@ impl<'a> AgentLoop<'a> {
                     } else {
                         observation
                     };
+                    // The host now knows this file's content as the agent saw it, which
+                    // is what makes a later blind overwrite detectable.
+                    if code == 0 {
+                        self.seen_files
+                            .note(&args.path, &self.read_workspace_file(&args.path));
+                    }
                     self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_EDIT => {
@@ -3695,28 +3968,92 @@ impl<'a> AgentLoop<'a> {
                     let payload = serde_json::json!({
                         "op": "edit", "path": args.path,
                         "old": args.old, "new": args.new, "replace_all": args.replace_all,
+                        "edits": args.edits.iter().map(|e| serde_json::json!({
+                            "old": e.old, "new": e.new, "replace_all": e.replace_all,
+                        })).collect::<Vec<_>>(),
                     });
-                    let (exit, out) = self.run_fileop(&call.id, &payload).await?;
+                    let (exit, out, observation) =
+                        self.fileop_observation(&payload, Trim::Head).await;
                     self.ui
                         .tool_use(&fileop_summary("edit", &args.path, exit, &out));
-                    if exit == 0 {
-                        self.emit_file_diff(&args.path, before.as_deref());
-                    }
+                    let observation = self.after_file_change(&args.path, before, exit, observation);
+                    self.push_tool_result(&call.id, &observation);
                 }
                 tools::TOOL_WRITE => {
                     let Some(args) = self.parse_or_report::<WriteArgs>(call) else {
                         continue;
                     };
                     let before = self.read_workspace_file(&args.path);
+                    // A full-file overwrite destroys whatever is there; refuse when
+                    // what is there is not what the agent last saw.
+                    if let Some(refusal) = self.stale_write_refusal(&args.path, before.as_deref()) {
+                        self.ui.tool_use(&format!("write {} — refused", args.path));
+                        self.push_tool_result(&call.id, &refusal);
+                        continue;
+                    }
                     let payload = serde_json::json!({
                         "op": "write", "path": args.path, "content": args.content,
                     });
-                    let (exit, out) = self.run_fileop(&call.id, &payload).await?;
+                    let (exit, out, observation) =
+                        self.fileop_observation(&payload, Trim::Head).await;
                     self.ui
                         .tool_use(&fileop_summary("write", &args.path, exit, &out));
-                    if exit == 0 {
-                        self.emit_file_diff(&args.path, before.as_deref());
-                    }
+                    let observation = self.after_file_change(&args.path, before, exit, observation);
+                    self.push_tool_result(&call.id, &observation);
+                }
+                tools::TOOL_PROC => {
+                    let Some(args) = self.parse_or_report::<tools::ProcArgs>(call) else {
+                        continue;
+                    };
+                    let out = self.run_proc(&args).await;
+                    self.ui.tool_use(&format!(
+                        "proc {}{}",
+                        args.action,
+                        args.name
+                            .as_deref()
+                            .map(|n| format!(" {n}"))
+                            .unwrap_or_default()
+                    ));
+                    self.push_tool_result(&call.id, &out);
+                }
+                tools::TOOL_GREP => {
+                    let Some(args) = self.parse_or_report::<GrepArgs>(call) else {
+                        continue;
+                    };
+                    let payload = serde_json::json!({
+                        "op": "grep", "pattern": args.pattern, "path": args.path,
+                        "glob": args.glob, "literal": args.literal,
+                        "case_insensitive": args.case_insensitive,
+                        "max_results": args.max_results,
+                        "context": args.context, "files_only": args.files_only,
+                        "include_ignored": args.include_ignored,
+                    });
+                    let summary = match (&args.path, &args.glob) {
+                        (Some(p), Some(g)) => format!("grep {:?} in {p} ({g})", args.pattern),
+                        (Some(p), None) => format!("grep {:?} in {p}", args.pattern),
+                        (None, Some(g)) => format!("grep {:?} ({g})", args.pattern),
+                        (None, None) => format!("grep {:?}", args.pattern),
+                    };
+                    self.ui.tool_use(&summary);
+                    let _ = self.run_fileop(&call.id, &payload).await?;
+                }
+                tools::TOOL_LS => {
+                    let Some(args) = self.parse_or_report::<tools::LsArgs>(call) else {
+                        continue;
+                    };
+                    let payload = serde_json::json!({
+                        "op": "list", "path": args.path, "glob": args.glob,
+                        "recursive": args.recursive, "max_results": args.max_results,
+                        "include_ignored": args.include_ignored,
+                    });
+                    let summary = match (&args.path, &args.glob) {
+                        (Some(p), Some(g)) => format!("ls {p} ({g})"),
+                        (Some(p), None) => format!("ls {p}"),
+                        (None, Some(g)) => format!("ls ({g})"),
+                        (None, None) => "ls".to_string(),
+                    };
+                    self.ui.tool_use(&summary);
+                    let _ = self.run_fileop(&call.id, &payload).await?;
                 }
                 tools::TOOL_MEMORY => {
                     let Some(args) = self.parse_or_report::<MemoryArgs>(call) else {
@@ -3896,16 +4233,14 @@ impl<'a> AgentLoop<'a> {
 
     /// Compute a unified diff of a just-edited file (host-side) and report it to
     /// the UI for +/- rendering. Best-effort: skips binary/oversized changes.
-    fn emit_file_diff(&mut self, path: &str, before: Option<&str>) {
-        let after = self.read_workspace_file(path).unwrap_or_default();
-        let before = before.unwrap_or("");
+    fn emit_file_diff(&mut self, path: &str, before: &str, after: &str) {
         if before == after {
             return;
         }
         // Cap the rendered diff so a huge file rewrite doesn't flood the pane;
         // the full change is still in the session log / on disk.
         const MAX_DIFF_LINES: usize = 200;
-        let diff = unified_diff(path, before, &after, MAX_DIFF_LINES);
+        let diff = unified_diff(path, before, after, MAX_DIFF_LINES);
         if !diff.is_empty() {
             self.ui.file_diff(path, &diff);
         }
@@ -3916,7 +4251,9 @@ impl<'a> AgentLoop<'a> {
         call_id: &str,
         payload: &serde_json::Value,
     ) -> Result<(i32, String)> {
-        let (code, output, observation) = self.fileop_observation(payload).await;
+        // `grep`/`ls` deliberately put their true totals last, so they are the ones
+        // that must not lose their tail to the cap.
+        let (code, output, observation) = self.fileop_observation(payload, Trim::Ends).await;
         self.push_tool_result(call_id, &observation);
         Ok((code, output))
     }
@@ -3925,7 +4262,11 @@ impl<'a> AgentLoop<'a> {
     /// conversation. Split from [`Self::run_fileop`] for the read arm, which may
     /// replace the observation with a pointer to an identical earlier read before it
     /// lands in the context. Returns `(exit code, raw output, observation)`.
-    async fn fileop_observation(&mut self, payload: &serde_json::Value) -> (i32, String, String) {
+    async fn fileop_observation(
+        &mut self,
+        payload: &serde_json::Value,
+        trim: Trim,
+    ) -> (i32, String, String) {
         let outcome = self.runtime.fileop(&payload.to_string()).await;
         // A fileop can trigger container bring-up too (e.g. after an idle stop);
         // surface any status lines it queued, even though only after the fact.
@@ -3941,18 +4282,245 @@ impl<'a> AgentLoop<'a> {
         };
         // `push_tool_result` applies the same cap; truncating here as well keeps the
         // `[exit code: N]` prefix outside the truncated region.
-        let observation = truncate(&observation, self.behavior.max_command_output_bytes);
+        let cap = self.behavior.max_command_output_bytes;
+        let observation = match trim {
+            Trim::Head => truncate(&observation, cap),
+            Trim::Ends => truncate_middle(&observation, cap),
+            Trim::Read => {
+                // Reserve room for the hint *and* for `truncate`'s own marker, which it
+                // appends on top of the limit: appending the hint after cutting to the
+                // full cap would push the result over, and `push_tool_result`'s
+                // head-only backstop would then shear off the hint itself — the one
+                // part that says the window is partial.
+                const HINT_RESERVE: usize = 192;
+                let cut = truncate(&observation, cap.saturating_sub(HINT_RESERVE));
+                match read_continuation_hint(&cut).filter(|_| cut.len() < observation.len()) {
+                    Some(hint) => format!("{cut}{hint}"),
+                    None => cut,
+                }
+            }
+        };
         (result.exit_code, output, observation)
+    }
+
+    /// Bookkeeping common to a successful `edit` or `write`: render the change, hand
+    /// a bounded diff back to the model, and invalidate the verification record.
+    /// Returns the observation to record.
+    fn after_file_change(
+        &mut self,
+        path: &str,
+        before: Option<String>,
+        exit: i32,
+        mut observation: String,
+    ) -> String {
+        if exit != 0 {
+            return observation;
+        }
+        let after = self.read_workspace_file(path);
+        // One read, two renderings: the UI gets a generous diff, the model a tight one.
+        let before_str = before.as_deref().unwrap_or("");
+        let after_str = after.as_deref().unwrap_or("");
+        self.emit_file_diff(path, before_str, after_str);
+        if let Some(note) = applied_change_note(path, before_str, after_str) {
+            observation.push('\n');
+            observation.push_str(&note);
+        }
+        // The agent has now seen this file's current content, so a later overwrite of
+        // it is not blind.
+        self.seen_files.note(path, &after);
+        // The tree changed, so any earlier passing check no longer vouches for it.
+        self.verification.note_edit();
+        observation
+    }
+
+    /// Refuse a `write` that would destroy content the agent has not seen, naming
+    /// what to do about it. `None` means go ahead.
+    ///
+    /// `write` is a full-file overwrite with no `old` to guard it, so unlike `edit` it
+    /// cannot fail on a stale assumption — it silently wins. Two ways that loses work
+    /// in this harness specifically: subagents are dispatched **in parallel into the
+    /// same workspace**, so two workers editing one file is an ordinary occurrence;
+    /// and a build, codegen step or formatter the agent itself started rewrites files
+    /// under it. Requiring that the current bytes are the bytes the agent last
+    /// observed turns both into a refusal it can recover from with one `read`, instead
+    /// of a lost update nobody notices.
+    ///
+    /// Creating a new file is never blocked, and neither is overwriting a file the
+    /// agent read or wrote and which has not changed since.
+    fn stale_write_refusal(&self, path: &str, current: Option<&str>) -> Option<String> {
+        let current = current?; // a new file — nothing to lose
+        match self.seen_files.status(path, current) {
+            SeenStatus::Match => None,
+            SeenStatus::Unseen => Some(format!(
+                "blocked: {path} already exists ({} bytes) and you have not read it in this \
+                 session, so `write` would overwrite content you have not seen. `read` it \
+                 first, then `write` (or `edit` the part you meant to change).",
+                current.len()
+            )),
+            SeenStatus::Changed => Some(format!(
+                "blocked: {path} has changed on disk since you last read it — something else \
+                 (a parallel worker, a build, a formatter, the user) wrote to it, and this \
+                 `write` would discard that. `read` it again and re-apply your change on top \
+                 of what is there now; prefer `edit` so you only touch your part.",
+            )),
+        }
+    }
+
+    /// The timeout this `shell` call will get: its own, clamped to the host ceiling,
+    /// else the session default. Enforcement is still the sandbox's — this only picks
+    /// the bound to hand it, and the observation quotes the same number.
+    fn shell_timeout(&self, args: &ShellArgs) -> u64 {
+        match args.timeout_seconds {
+            Some(t) => t.min(MAX_SHELL_TIMEOUT_SECONDS),
+            None => self.behavior.command_timeout_seconds,
+        }
+    }
+
+    /// The `proc` tool: background processes for the session.
+    ///
+    /// Host-handled rather than a CLI the agent shells out to, because the process has
+    /// to be owned by something that outlives a single command. A `shell` call is a
+    /// whole sandbox whose PID namespace is torn down when the command returns, so a
+    /// backgrounded server there is dead before the next tool call — which is exactly
+    /// what `cowboy proc start` used to do while reporting success. Here the worker
+    /// owns it, so it lives as long as the session and is reaped with it.
+    async fn run_proc(&mut self, args: &tools::ProcArgs) -> String {
+        let action = args.action.trim().to_ascii_lowercase();
+        if action == "list" {
+            let running = self.runtime.running_processes();
+            let mut out = if running.is_empty() {
+                "no background processes running\n".to_string()
+            } else {
+                let mut s = String::from("running:\n");
+                for name in &running {
+                    s.push_str(&format!(
+                        "- {name} (log: {})\n",
+                        crate::sandbox::native::proc_log_path(name)
+                    ));
+                }
+                s
+            };
+            if !self.processes.is_empty() {
+                out.push_str("defined in agent.yaml (start by name, no `command` needed):\n");
+                for (name, def) in &self.processes {
+                    out.push_str(&format!("- {name}: `{}`\n", def.command));
+                }
+            }
+            return out;
+        }
+        let Some(name) = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        else {
+            return format!("error: `name` is required for proc action {action:?}");
+        };
+        // A name becomes a filename and a registry key; keep it boring so it cannot
+        // escape the log directory or collide with shell syntax.
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+            || name.starts_with('.')
+        {
+            return format!(
+                "error: process name {name:?} must be letters, digits, `-`, `_` or `.` \
+                 (it names a log file)"
+            );
+        }
+        match action.as_str() {
+            "start" | "restart" => {
+                if action == "restart" {
+                    let _ = self.runtime.stop_process(name).await;
+                }
+                // A configured process supplies its own command and cwd; an ad-hoc one
+                // must bring a command.
+                let def = self.processes.get(name).cloned();
+                let command = match args
+                    .command
+                    .as_deref()
+                    .or(def.as_ref().map(|d| d.command.as_str()))
+                {
+                    Some(c) if !c.trim().is_empty() => c.to_string(),
+                    _ => {
+                        return format!(
+                            "error: {name} is not defined in agent.yaml's `processes:`, so \
+                             `command` is required"
+                        )
+                    }
+                };
+                let cwd = args
+                    .cwd
+                    .clone()
+                    .or_else(|| def.as_ref().map(|d| d.cwd.clone()));
+                match self
+                    .runtime
+                    .start_process(name, &command, cwd.as_deref())
+                    .await
+                {
+                    Ok(()) => {
+                        let log = crate::sandbox::native::proc_log_path(name);
+                        self.ui
+                            .notice(&format!("started background process {name}"));
+                        format!(
+                            "started {name}: `{command}`\nIt is running in the background and \
+                             reachable on localhost from your `shell` commands. Output goes to \
+                             {log} — give it a moment, then check `proc` logs (or wait for the \
+                             port) before assuming it is up. It stops when the session ends.\n"
+                        )
+                    }
+                    Err(e) => format!("error: could not start {name}: {e:#}"),
+                }
+            }
+            "stop" => match self.runtime.stop_process(name).await {
+                Ok(()) => format!("stopped {name}\n"),
+                Err(e) => format!("error: {e:#}"),
+            },
+            "logs" => {
+                let lines = args.lines.unwrap_or(80).clamp(1, 2000);
+                let path = crate::sandbox::native::proc_log_path(name);
+                match self.read_workspace_file(&path) {
+                    Some(text) if !text.is_empty() => {
+                        let all: Vec<&str> = text.lines().collect();
+                        let from = all.len().saturating_sub(lines);
+                        let body = all[from..].join("\n");
+                        let head = if from > 0 {
+                            format!(
+                                "{path} (last {} of {} lines):\n",
+                                all.len() - from,
+                                all.len()
+                            )
+                        } else {
+                            format!("{path} ({} lines):\n", all.len())
+                        };
+                        truncate_middle(
+                            &format!("{head}{body}\n"),
+                            self.behavior.max_command_output_bytes,
+                        )
+                    }
+                    Some(_) => {
+                        format!("{path} is empty — the process has produced no output yet\n")
+                    }
+                    None => format!(
+                        "no log for {name} at {path} — it has not been started in this session\n"
+                    ),
+                }
+            }
+            other => format!(
+                "error: unknown proc action {other:?}; use start, stop, restart, list or logs"
+            ),
+        }
     }
 
     /// Run a shell command with live streaming to the UI (interruptible via the
     /// turn's cancel token). Returns (exit, full output).
     async fn run_shell_streaming(&mut self, args: &ShellArgs) -> Result<(ExecResult, String)> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let timeout_secs = self.shell_timeout(args);
         let fut = self.runtime.exec_stream(
             &args.command,
             args.cwd.as_deref(),
-            self.behavior.command_timeout_seconds,
+            timeout_secs,
             self.cancel.clone(),
             tx,
         );
@@ -4333,7 +4901,9 @@ impl<'a> AgentLoop<'a> {
                     // A user message, not a tool result: the `subagent` call that
                     // started this job was already answered with its dispatch id, and a
                     // second result for a settled call id is a malformed conversation.
-                    let capped = truncate(&result, self.behavior.max_command_output_bytes);
+                    // Middle truncation, not head: a worker's result ends with its
+                    // conclusion and handoff, which is the part the foreman needs.
+                    let capped = truncate_middle(&result, self.behavior.max_command_output_bytes);
                     let body = format!("[subagent {label} · job {id}] finished:\n{capped}");
                     self.push_user_note(body);
                 }
@@ -4796,6 +5366,9 @@ mod tests {
         /// When set, the output changes per call instead of being fixed.
         counting: bool,
         calls: std::sync::atomic::AtomicUsize,
+        /// Background processes, as name → the command it was started with. Enough to
+        /// test the `proc` tool's bookkeeping without a real namespace.
+        procs: Mutex<std::collections::BTreeMap<String, String>>,
     }
 
     impl FakeSandbox {
@@ -4813,6 +5386,7 @@ mod tests {
                 status: Mutex::new(None),
                 counting: false,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                procs: Mutex::new(std::collections::BTreeMap::new()),
             }
         }
 
@@ -4856,6 +5430,22 @@ mod tests {
         /// sandbox has moved into the loop.
         fn log(&self) -> Arc<Mutex<Vec<String>>> {
             self.ran.clone()
+        }
+
+        /// Put a real file in the workspace. The file ops are the real ones, so a test
+        /// that edits or reads something needs it to exist.
+        fn with_file(self, rel: &str, content: &str) -> Self {
+            let p = self.root.join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(p, content).unwrap();
+            self
+        }
+
+        /// The workspace root, for asserting on what actually reached disk.
+        fn root_path(&self) -> PathBuf {
+            self.root.clone()
         }
 
         fn record(&self, command: &str) -> (ExecResult, String) {
@@ -4924,10 +5514,38 @@ mod tests {
             Ok(ExecResult { exit_code: 0 })
         }
         async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)> {
-            Ok(self.record(payload))
+            self.ran.lock().unwrap().push(payload.to_string());
+            // The real implementation, against this fake's root. A fake that
+            // reimplemented read/edit/write would be a second version of exactly the
+            // behaviour these tests are checking the loop against.
+            Ok(match crate::cmd::fileop::apply(&self.root, payload) {
+                Ok(out) => (ExecResult { exit_code: 0 }, out),
+                Err(e) => (ExecResult { exit_code: 1 }, format!("Error: {e:#}")),
+            })
         }
         async fn stop_all_processes(&self) -> Result<()> {
+            self.procs.lock().unwrap().clear();
             Ok(())
+        }
+
+        async fn start_process(&self, name: &str, command: &str, _cwd: Option<&str>) -> Result<()> {
+            let mut procs = self.procs.lock().unwrap();
+            if procs.contains_key(name) {
+                anyhow::bail!("process {name} is already running");
+            }
+            procs.insert(name.to_string(), command.to_string());
+            Ok(())
+        }
+
+        async fn stop_process(&self, name: &str) -> Result<()> {
+            if self.procs.lock().unwrap().remove(name).is_none() {
+                anyhow::bail!("process {name} is not running");
+            }
+            Ok(())
+        }
+
+        fn running_processes(&self) -> Vec<String> {
+            self.procs.lock().unwrap().keys().cloned().collect()
         }
         fn add_grant(
             &self,
@@ -5960,6 +6578,102 @@ mod tests {
         );
     }
 
+    /// The wrap-up directive must be enforced, not merely requested.
+    ///
+    /// Regression test for a real loss: a subagent that had spent 70 turns without
+    /// writing anything answered "stop investigating and report" with fourteen more
+    /// `grep`s, was stopped at the ceiling, and its entire investigation was
+    /// unrecoverable. A worker in wrap-up must not be able to keep digging.
+    #[tokio::test]
+    async fn wrapping_up_refuses_investigation_and_leaves_only_reporting_tools() {
+        let m = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![
+                tool_call("g", "grep", r#"{"pattern":"MCP-0"}"#),
+                tool_call("s", "shell", r#"{"command":"sed -n '1,40p' SPEC.md"}"#),
+                tool_call("r", "read", r#"{"path":"SPEC.md"}"#),
+                tool_call("e", "edit", r#"{"path":"a","old":"x","new":"y"}"#),
+            ],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(m),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.enter_wrap_up();
+
+        // The surface the model is offered no longer contains the tools it must stop
+        // using, and still contains the one it has to use.
+        let offered: Vec<&str> = agent.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(offered.contains(&"final"), "no way to report: {offered:?}");
+        for gone in ["shell", "read", "grep", "ls", "edit", "write", "subagent"] {
+            assert!(
+                !offered.contains(&gone),
+                "{gone} is still offered during wrap-up: {offered:?}"
+            );
+        }
+
+        let _ = agent.run("review the MCP surface").await;
+        let answered: Vec<String> = agent
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .collect();
+        drop(agent);
+
+        // And if it calls one anyway — which it will, because the history is full of
+        // earlier `shell` calls — every one is refused, and none of them ran.
+        assert!(ui.commands.is_empty(), "a command ran during wrap-up");
+        assert_eq!(answered.len(), 4, "every call answered: {answered:?}");
+        assert!(
+            answered
+                .iter()
+                .all(|c| c.starts_with("blocked: you are out of turns")),
+            "all four must be refused: {answered:?}"
+        );
+        assert!(
+            answered[0].contains("Call `final` now"),
+            "the refusal must say what to do instead: {:?}",
+            answered[0]
+        );
+    }
+
+    /// The gate must not deadlock a foreman: `final` already refuses while delegated
+    /// work is in flight, so a foreman in wrap-up needs the means to collect it.
+    #[tokio::test]
+    async fn wrapping_up_still_allows_collecting_delegated_work() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.enter_wrap_up();
+        for needed in ["final", "artifact", "handoff"] {
+            assert!(tools::allowed_when_wrapping_up(needed), "{needed}");
+        }
+        // Not offered unless delegation is available, but never denied *by the
+        // wrap-up gate* — otherwise `final`'s in-flight refusal and this gate would
+        // between them leave the foreman no legal move.
+        for collecting in ["jobs", "wait", "job_reply"] {
+            assert!(
+                tools::allowed_when_wrapping_up(collecting),
+                "{collecting} must survive wrap-up or a foreman deadlocks"
+            );
+        }
+    }
+
     /// Plan mode is HOST-enforced: while planning, the agent must not be able to
     /// mutate the workspace via `shell`, nor escape the gate by delegating to a
     /// subagent (which is not itself in plan mode).
@@ -6143,9 +6857,236 @@ mod tests {
     }
 
     #[tokio::test]
+    /// The gate is host-measured: a session that edited a file and never ran the
+    /// project's check is refused, told exactly what to run, and accepted once the
+    /// check actually exits 0.
+    async fn final_is_refused_until_the_projects_check_passes() {
+        let sandbox = FakeSandbox::printing("ok\n").with_file("main.rs", "foo\n");
+        let model = ScriptedModel::new(vec![
+            // 1. Edit a file.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "edit",
+                    r#"{"path":"main.rs","old":"foo","new":"bar"}"#,
+                )],
+            },
+            // 2. Claim done without checking — must be refused.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"all good"}"#)],
+            },
+            // 3. Run the check.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("3", "shell", r#"{"command":"cargo test"}"#)],
+            },
+            // 4. Now finishing is allowed.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("4", "final", r#"{"message":"done, tests pass"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let commands =
+            std::collections::BTreeMap::from([("test".to_string(), "cargo test".to_string())]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_project_commands(&commands, vec!["cargo test".to_string()]);
+
+        let final_msg = agent.run("edit then finish").await.unwrap();
+        assert_eq!(final_msg.as_deref(), Some("done, tests pass"));
+        // The first `final` was refused, naming the command to run.
+        let refusal = agent
+            .messages
+            .iter()
+            .map(|m| m.content.clone())
+            .find(|c| c.contains("blocked: this session changed files"))
+            .expect("the unverified `final` should have been refused");
+        assert!(
+            refusal.contains("cargo test"),
+            "must name the check: {refusal}"
+        );
+        // And the check really ran.
+        assert!(ui.commands.iter().any(|c| c == "cargo test"));
+    }
+
+    /// A session that changed nothing has nothing to verify, so the gate must stay
+    /// out of the way — otherwise every question and code review would be refused.
+    #[tokio::test]
+    async fn a_read_only_session_is_never_gated() {
+        let sandbox = FakeSandbox::printing("     1\tfn main() {}\n");
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "read", r#"{"path":"main.rs"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"it is fine"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_project_commands(&Default::default(), vec!["cargo test".to_string()]);
+
+        assert_eq!(
+            agent.run("review this").await.unwrap().as_deref(),
+            Some("it is fine"),
+            "a session with no edits must finish without running checks"
+        );
+    }
+
+    /// Quality pressure must never wedge a session: a check that cannot pass (broken
+    /// toolchain, no network) is refused a bounded number of times and then yields,
+    /// mirroring the outstanding-subagent gate.
+    #[tokio::test]
+    async fn the_verification_gate_yields_rather_than_wedging() {
+        // The edit must succeed (so there is something to verify); the point of this
+        // test is that the agent never runs the check and insists on finishing.
+        let sandbox = FakeSandbox::printing("ok\n").with_file("main.rs", "foo\n");
+        let mut script = vec![ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call(
+                "1",
+                "edit",
+                r#"{"path":"main.rs","old":"foo","new":"bar"}"#,
+            )],
+        }];
+        // Insist on finishing more times than the refusal budget allows.
+        for i in 0..6 {
+            script.push(ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    &format!("f{i}"),
+                    "final",
+                    r#"{"message":"cannot run the tests here"}"#,
+                )],
+            });
+        }
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(script)),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_project_commands(&Default::default(), vec!["cargo test".to_string()]);
+
+        assert_eq!(
+            agent.run("edit then insist").await.unwrap().as_deref(),
+            Some("cannot run the tests here"),
+            "the gate must yield after its refusal budget"
+        );
+        assert!(
+            ui.notices
+                .iter()
+                .any(|n| n.contains("finishing with unverified edits")),
+            "yielding must be said out loud, not silent: {:?}",
+            ui.notices
+        );
+    }
+
+    /// A failing check must not count as verification, and must invalidate an earlier
+    /// pass of the same command.
+    #[test]
+    fn verification_only_counts_a_passing_run_against_the_current_tree() {
+        let mut v = Verification::new(vec!["cargo test".to_string()]);
+        assert!(
+            !v.has_unverified_edits(),
+            "no edits yet, so nothing to verify"
+        );
+
+        v.note_edit();
+        assert!(v.has_unverified_edits());
+
+        // A failing run is not evidence.
+        v.note_command("cargo test", 1);
+        assert!(v.has_unverified_edits());
+
+        // A passing run is, and a wrapper around it still counts.
+        v.note_command("cd . && cargo test 2>&1 | tail -20", 0);
+        assert!(!v.has_unverified_edits());
+
+        // A later edit invalidates it again.
+        v.note_edit();
+        assert!(v.has_unverified_edits());
+
+        // A pass followed by a failure is not verified.
+        v.note_command("cargo test", 0);
+        assert!(!v.has_unverified_edits());
+        v.note_command("cargo test", 1);
+        assert!(v.has_unverified_edits());
+
+        // An unrelated command is ignored entirely.
+        let mut v = Verification::new(vec!["cargo test".to_string()]);
+        v.note_edit();
+        v.note_command("cargo build", 0);
+        assert!(
+            v.has_unverified_edits(),
+            "a different command must not satisfy the requirement"
+        );
+        assert_eq!(v.outstanding(), vec!["cargo test"]);
+    }
+
+    /// With no `verify` configured there is no gate at all — the default for every
+    /// existing project.
+    #[test]
+    fn verification_is_inert_by_default() {
+        let mut v = Verification::default();
+        assert!(!v.is_enabled());
+        v.note_edit();
+        assert!(
+            !v.has_unverified_edits(),
+            "an unconfigured project must never be gated"
+        );
+    }
+
+    #[tokio::test]
     async fn runs_edit_via_fileop_then_final() {
-        let sandbox = FakeSandbox::printing("edited main.rs: 1 replacement\n");
+        let sandbox = FakeSandbox::printing("").with_file("main.rs", "let x = foo;\n");
         let fileops = sandbox.log();
+        let root = sandbox.root_path();
         let model = ScriptedModel::new(vec![
             ChatResponse {
                 truncated: false,
@@ -6178,14 +7119,463 @@ mod tests {
         let final_msg = agent.run("edit then finish").await.unwrap();
         assert_eq!(final_msg.as_deref(), Some("done"));
         // The UI showed the helper's status line for the edit.
-        assert_eq!(ui.tool_uses, vec!["edited main.rs: 1 replacement"]);
+        assert_eq!(
+            ui.tool_uses,
+            vec!["edited main.rs: 1 edit applied, 1 replacement"]
+        );
         // And the edit really went through the structured file-op path, carrying the
-        // op and the path — not through a shell command.
+        // op and the path — not through a shell command — and reached the file.
         let sent = fileops.lock().unwrap().join("\n");
         assert!(
             sent.contains("\"op\":\"edit\"") && sent.contains("main.rs"),
             "the edit should reach the file-op helper: {sent}"
         );
+        assert_eq!(
+            std::fs::read_to_string(root.join("main.rs")).unwrap(),
+            "let x = bar;\n"
+        );
+    }
+
+    /// A full-file `write` over a file the agent never read is refused: there is no
+    /// `old` to guard it, so without this it silently wins over whatever is there.
+    #[tokio::test]
+    async fn a_write_over_an_unread_file_is_refused_until_it_is_read() {
+        let sandbox = FakeSandbox::printing("").with_file("cfg.toml", "keep = true\n");
+        let root = sandbox.root_path();
+        let model = ScriptedModel::new(vec![
+            // 1. Blind overwrite — refused.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "write",
+                    r#"{"path":"cfg.toml","content":"mine = 1\n"}"#,
+                )],
+            },
+            // 2. Read it…
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "read", r#"{"path":"cfg.toml"}"#)],
+            },
+            // 3. …and now the same write is allowed.
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "3",
+                    "write",
+                    r#"{"path":"cfg.toml","content":"mine = 1\n"}"#,
+                )],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("4", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("overwrite it").await.unwrap();
+
+        let refusal = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.contains("blocked"))
+            .map(|m| m.content.clone())
+            .expect("the blind write should have been refused");
+        assert!(refusal.contains("have not read it"), "{refusal}");
+        assert!(
+            refusal.contains("`read` it first"),
+            "must say how: {refusal}"
+        );
+        // The refusal is recoverable: after the read, the write landed.
+        assert_eq!(
+            std::fs::read_to_string(root.join("cfg.toml")).unwrap(),
+            "mine = 1\n"
+        );
+    }
+
+    /// And a file that changed *since* the agent read it is refused too — the case
+    /// that matters when parallel subagents share one workspace.
+    #[tokio::test]
+    async fn a_write_over_a_file_that_changed_since_the_read_is_refused() {
+        let sandbox = FakeSandbox::printing("").with_file("shared.rs", "// original\n");
+        let root = sandbox.root_path();
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "read", r#"{"path":"shared.rs"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"read it"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        // Stand in for the other worker: the loop has read the file, and now something
+        // else writes to it before an overwrite arrives.
+        agent.run("read then overwrite").await.unwrap();
+        let theirs = "// someone else's work\n";
+        std::fs::write(root.join("shared.rs"), theirs).unwrap();
+        let refusal = agent
+            .stale_write_refusal("shared.rs", Some(theirs))
+            .expect("a file that changed since the read must be refused");
+        assert!(refusal.contains("changed on disk"), "{refusal}");
+        assert!(refusal.contains("prefer `edit`"), "{refusal}");
+
+        // Unchanged since the read goes straight through, and so does creating a file
+        // that does not exist yet — the guard must only bite on a real lost update.
+        assert!(agent
+            .stale_write_refusal("shared.rs", Some("// original\n"))
+            .is_none());
+        assert!(agent.stale_write_refusal("brand-new.rs", None).is_none());
+    }
+
+    /// An applied edit reports the diff back to the model, so it can see where the
+    /// change landed without spending a turn re-reading the file.
+    #[tokio::test]
+    async fn an_applied_edit_reports_its_diff_to_the_model() {
+        let sandbox =
+            FakeSandbox::printing("").with_file("m.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "edit",
+                    r#"{"path":"m.rs","old":"fn b() {}","new":"fn beta() {}"}"#,
+                )],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("rename b").await.unwrap();
+
+        let result = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.contains("edited m.rs"))
+            .map(|m| m.content.clone())
+            .expect("the edit result");
+        assert!(result.contains("applied change:"), "{result}");
+        assert!(result.contains("-fn b() {}"), "{result}");
+        assert!(result.contains("+fn beta() {}"), "{result}");
+        // Surrounding context is the point — it is what confirms placement.
+        assert!(result.contains(" fn a() {}"), "{result}");
+    }
+
+    /// A timed-out command must not reach the model as a bare `124`: it is
+    /// indistinguishable from a real failing status, and the two useful reactions are
+    /// not deducible from it.
+    #[tokio::test]
+    async fn a_timed_out_command_is_explained_with_both_ways_out() {
+        let sandbox = FakeSandbox::failing(crate::sandbox::EXIT_TIMEOUT, "listening on :3000\n");
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"npm run dev"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior {
+                command_timeout_seconds: 42,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("start the server").await.unwrap();
+
+        let obs = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.contains("exit code"))
+            .map(|m| m.content.clone())
+            .expect("the shell result");
+        assert!(obs.contains("timed out"), "{obs}");
+        assert!(
+            obs.contains("42s"),
+            "must quote the timeout that fired: {obs}"
+        );
+        assert!(obs.contains("timeout_seconds"), "the first way out: {obs}");
+        assert!(obs.contains("`proc` tool"), "the second way out: {obs}");
+        // And every command reports how long it took, timeout or not.
+        assert!(obs.contains("exit code: 124 · "), "{obs}");
+    }
+
+    /// The `proc` tool is the answer to "run a server, then talk to it": starting one
+    /// registers it, `list` and `logs` can see it, and `stop` ends it.
+    #[tokio::test]
+    async fn the_proc_tool_starts_lists_and_stops_a_background_process() {
+        let sandbox = FakeSandbox::printing("");
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let proc = |action: &str, name: Option<&str>, command: Option<&str>| tools::ProcArgs {
+            action: action.into(),
+            name: name.map(str::to_string),
+            command: command.map(str::to_string),
+            cwd: None,
+            lines: None,
+        };
+
+        let out = agent
+            .run_proc(&proc("start", Some("web"), Some("npm run dev")))
+            .await;
+        assert!(out.contains("started web"), "{out}");
+        assert!(out.contains(".cowboy/proc/web.log"), "names the log: {out}");
+
+        let listed = agent.run_proc(&proc("list", None, None)).await;
+        assert!(listed.contains("web"), "{listed}");
+
+        // An ad-hoc process with no command is refused rather than started empty.
+        let bad = agent.run_proc(&proc("start", Some("other"), None)).await;
+        assert!(bad.contains("`command` is required"), "{bad}");
+
+        // A name that would escape the log directory is refused.
+        let evil = agent
+            .run_proc(&proc("start", Some("../../etc/x"), Some("true")))
+            .await;
+        assert!(evil.contains("must be letters"), "{evil}");
+
+        let stopped = agent.run_proc(&proc("stop", Some("web"), None)).await;
+        assert!(stopped.contains("stopped web"), "{stopped}");
+        assert!(agent
+            .run_proc(&proc("list", None, None))
+            .await
+            .contains("no background"));
+    }
+
+    /// `auto_start` was a config field nothing read. Now the session honours it once,
+    /// before the agent's first turn.
+    #[tokio::test]
+    async fn auto_start_processes_are_running_before_the_first_turn() {
+        let sandbox = FakeSandbox::printing("");
+        let model = ScriptedModel::new(vec![ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("1", "final", r#"{"message":"done"}"#)],
+        }]);
+        let mut ui = RecordingUi::default();
+        let processes = std::collections::BTreeMap::from([
+            (
+                "web".to_string(),
+                cowboy_core::config::ProcessDef {
+                    command: "npm run dev".into(),
+                    cwd: "/workspace".into(),
+                    auto_start: true,
+                },
+            ),
+            (
+                "worker".to_string(),
+                cowboy_core::config::ProcessDef {
+                    command: "cargo run --bin worker".into(),
+                    cwd: "/workspace".into(),
+                    auto_start: false,
+                },
+            ),
+        ]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_processes(processes);
+        agent.run("do something").await.unwrap();
+
+        assert_eq!(agent.runtime.running_processes(), vec!["web".to_string()]);
+        // The declared processes are named in the prompt, so `proc start web` needs no
+        // command.
+        assert!(agent
+            .messages
+            .first()
+            .is_some_and(|m| m.content.contains("worker: `cargo run --bin worker`")));
+        drop(agent);
+        assert!(
+            ui.notices.iter().any(|n| n.contains("auto_start")),
+            "and it is reported: {:?}",
+            ui.notices
+        );
+    }
+
+    /// `grep`/`ls` put their true totals last, so their observation must be truncated
+    /// from the middle — head-only truncation drops exactly the line that says how
+    /// much was not shown.
+    #[tokio::test]
+    async fn a_capped_grep_result_keeps_the_line_that_says_how_much_was_missed() {
+        let sandbox = FakeSandbox::printing("").with_file(
+            "big.txt",
+            &(0..4000)
+                .map(|i| format!("needle {i}\n"))
+                .collect::<String>(),
+        );
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "grep",
+                    r#"{"pattern":"needle","max_results":2000}"#,
+                )],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior {
+                // Small enough that the result is certainly capped.
+                max_command_output_bytes: 4000,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("find the needles").await.unwrap();
+
+        let obs = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.contains("needle 0"))
+            .map(|m| m.content.clone())
+            .expect("the grep result");
+        assert!(obs.contains("bytes elided"), "must be middle-cut: {obs}");
+        assert!(
+            obs.contains("4000 matches"),
+            "the true total must survive the cap: {obs}"
+        );
+    }
+
+    /// A `read` whose window is cut by the byte cap has to say where it got to: the
+    /// hint fileop puts at the end goes over the cliff with everything else.
+    #[tokio::test]
+    async fn a_truncated_read_says_which_line_to_continue_from() {
+        let sandbox = FakeSandbox::printing("").with_file(
+            "long.rs",
+            &(0..3000).map(|i| format!("line {i}\n")).collect::<String>(),
+        );
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "read", r#"{"path":"long.rs"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            sandbox,
+            cowboy_core::config::AgentBehavior {
+                max_command_output_bytes: 2000,
+                ..Default::default()
+            },
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("read it").await.unwrap();
+
+        let obs = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.contains("line 0"))
+            .map(|m| m.content.clone())
+            .expect("the read result");
+        assert!(obs.contains("output cap cut this read at line"), "{obs}");
+        assert!(obs.contains("continue with offset="), "{obs}");
     }
 
     #[tokio::test]
@@ -6465,7 +7855,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(responses)),
-            FakeSandbox::printing("FILE CONTENTS HERE"),
+            FakeSandbox::printing("").with_file("src/main.rs", "FILE CONTENTS HERE\n"),
             cowboy_core::config::AgentBehavior {
                 max_iterations: 3,
                 ..Default::default()
@@ -9412,6 +10802,66 @@ mod tests {
         let t = truncate(&big, 100);
         assert!(t.starts_with(&"x".repeat(100)));
         assert!(t.contains("truncated"));
+    }
+
+    /// The whole point: a build/test run that overruns the cap must still show its
+    /// verdict. Head-only truncation hid it, so the model re-ran the command to find
+    /// out what broke.
+    #[test]
+    fn middle_truncation_keeps_the_failure_summary_at_the_tail() {
+        let mut out = String::from("[exit code: 101]\nerror[E0308]: mismatched types\n");
+        for i in 0..5000 {
+            out.push_str(&format!("   Compiling crate-{i} v0.1.0\n"));
+        }
+        out.push_str("test result: FAILED. 3 passed; 2 failed\n");
+
+        let t = truncate_middle(&out, 4096);
+        assert!(t.len() <= 4096, "must respect the cap: {}", t.len());
+        // The head survives, including the caller's exit-code prefix…
+        assert!(
+            t.starts_with("[exit code: 101]\n"),
+            "exit code must survive"
+        );
+        assert!(t.contains("error[E0308]"), "first error must survive");
+        // …and so does the verdict, which head-only truncation threw away.
+        assert!(
+            t.contains("test result: FAILED. 3 passed; 2 failed"),
+            "the tail carries the verdict and must survive"
+        );
+        assert!(t.contains("bytes elided"), "must say what it dropped");
+        // Old behavior, for contrast: the verdict is gone.
+        assert!(!truncate(&out, 4096).contains("test result: FAILED"));
+    }
+
+    #[test]
+    fn middle_truncation_leaves_short_output_alone() {
+        assert_eq!(truncate_middle("hello", 100), "hello");
+        // Exactly at the cap is not truncation.
+        let exact = "y".repeat(100);
+        assert_eq!(truncate_middle(&exact, 100), exact);
+    }
+
+    /// No newline to snap to, and a cap too small to split, must still be safe and
+    /// within budget — including on multibyte boundaries.
+    #[test]
+    fn middle_truncation_handles_degenerate_input() {
+        // One enormous line: no line boundary anywhere.
+        let minified = "a".repeat(10_000);
+        let t = truncate_middle(&minified, 1000);
+        assert!(t.len() <= 1000, "len {}", t.len());
+
+        // Too small to split into two useful halves — falls back to head-only.
+        let t = truncate_middle(&minified, 200);
+        assert!(
+            t.contains("output truncated at"),
+            "should degrade to head: {t}"
+        );
+
+        // Multibyte characters must not be split.
+        let wide = "日本語テキスト".repeat(500);
+        let t = truncate_middle(&wide, 1024);
+        assert!(t.len() <= 1024);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
     }
 
     #[test]
