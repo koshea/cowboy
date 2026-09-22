@@ -208,6 +208,37 @@ pub fn mask_file_in(scratch: &Path) -> PathBuf {
     scratch.join("mask-empty")
 }
 
+/// The sandboxed agent's `HOME` on the host, created if absent.
+///
+/// `~/.cache/cowboy/home/<project-key>`, bound into the sandbox at
+/// [`cowboy_sandbox::plan::AGENT_HOME`]. Deliberately **not** inside the workspace,
+/// where it used to live as `.cowboy/home`: tool caches (and, on a real project, a
+/// dev-secrets cache the project's own tooling wrote under `~`) then sat in the repo
+/// as untracked files one `git add -A` from being committed, vanished on
+/// `git clean -fdx`, and were cold in every new worktree.
+///
+/// Per-project rather than per-session — the opposite of [`ensure_scratch_dir`] — and
+/// under the *cache* dir rather than state: a warm cache is the point, and losing it
+/// costs time and nothing else. Keyed by the repo, so all of a repo's worktrees share
+/// one warm cache.
+pub fn ensure_agent_home(root: &Path) -> Result<PathBuf> {
+    let dir = config::global_cache_dir()
+        .context("cannot resolve a cache directory for the agent's home")?
+        .join("home")
+        .join(repo_key(root));
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the agent home {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The agent writes here, and whatever its tooling caches under `~` lands here
+        // — a dev-secrets cache, in the case that prompted moving it. Owner-only.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {} to owner-only", dir.display()))?;
+    }
+    Ok(dir)
+}
+
 /// Remove scratch directories whose owning process is gone. Best-effort throughout:
 /// a directory we cannot classify is left alone rather than guessed at.
 fn reap_abandoned_scratch(base: &Path, keep: &str) {
@@ -545,6 +576,39 @@ mod tests {
         );
         // With the same tree but a different home, the marker is a legitimate root.
         assert_eq!(resolve_root_within(&deep, None), fake_home);
+    }
+
+    /// The agent's HOME must live outside the workspace. It used to be
+    /// `.cowboy/home`, which put tool caches — and on a real project a dev-secrets
+    /// cache the project's own tooling wrote under `~` — inside the repo, untracked and
+    /// one `git add -A` from a commit.
+    #[test]
+    fn the_agent_home_is_outside_the_workspace() {
+        let t = tree(&[".cowboy"]);
+        let root = t.path();
+        let home = ensure_agent_home(root).unwrap();
+
+        assert!(
+            !home.starts_with(root),
+            "the agent home must not be inside the project: {}",
+            home.display()
+        );
+        assert!(home.is_dir());
+        // Keyed per project, under the cache dir.
+        assert!(
+            home.parent().is_some_and(|p| p.ends_with("cowboy/home")),
+            "{}",
+            home.display()
+        );
+        // Idempotent: a second call reuses the same warm directory.
+        assert_eq!(ensure_agent_home(root).unwrap(), home);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&home).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "the agent's home is owner-only");
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// The same project always yields the same session name — the daemon registry

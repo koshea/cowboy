@@ -133,6 +133,7 @@ fn plan_for(root: &Path) -> SandboxPlan {
         "sandbox-exec-test",
     ))
     .unwrap();
+    let agent_home = cowboy_cli::project::ensure_agent_home(root).unwrap();
     let inputs = PlanInputs {
         root,
         security: &sec,
@@ -140,6 +141,7 @@ fn plan_for(root: &Path) -> SandboxPlan {
         mask_file: &mask,
         relay_port: 8443,
         scratch: &scratch,
+        agent_home: &agent_home,
     };
     SandboxPlan::build(&inputs, &Host).unwrap()
 }
@@ -836,6 +838,7 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
                 mask_file: &mask,
                 relay_port: 8443,
                 scratch: &scratch,
+                agent_home: &scratch,
             },
             probe,
         )

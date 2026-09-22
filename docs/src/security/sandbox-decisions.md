@@ -335,6 +335,41 @@ on one project are two independent sessions. Sharing one directory meant
 deleted it on the way out. A directory whose owner is gone is reaped on the next
 start, since `SIGKILL` leaves nothing a chance to clean up after itself.
 
+## The agent's HOME does not belong in the workspace
+
+`HOME` was `{workdir}/.cowboy/home` — inside the project, on the reasoning that a
+confined home should live with the thing it is confined to. It cost more than it
+bought.
+
+What ends up in `$HOME` is whatever the project's tooling caches there, and that is
+not always innocuous: on a real repository it included a `dev-secrets-v11` file (mode
+`0600`) written by the project's own mise task. So the practical result was a
+directory of caches — and a secrets cache — sitting *in a git working tree*, untracked
+and one `git add -A` away from being committed. It was also absent from
+`cowboy init`'s `.gitignore` list, so it showed up as untracked noise in `git status`;
+adding the entry would have fixed the noise while leaving the actual hazard in place.
+
+Two further costs, both mundane: `git clean -fdx` — a normal thing to run on a dirty
+checkout — wiped the caches, and because the path was per-worktree, every worktree of
+a repo started cold.
+
+`HOME` is now `/home/agent`, outside the workdir, backed by
+`~/.cache/cowboy/home/<repo-key>` on the host. Keyed by the **repository** rather than
+the worktree, so a repo's worktrees share one warm cache; under the *cache* directory
+rather than state because losing it costs time and nothing else; and `0700`, since
+whatever lands there is at least as sensitive as that secrets cache was.
+
+Nothing about the boundary changes: it is a read-write bind like scratch, and the
+Landlock write rule is derived from the bind's mode rather than stated separately, so
+the two cannot drift apart. What changes is that nothing the agent writes to `~` can
+reach the repository, and `.cowboy/` in the workspace holds only committed config
+again.
+
+This is also why the parent↔subagent control channel lives under
+`$XDG_STATE_HOME` and not in `.cowboy/`: that directory is writable from inside the
+sandbox, so a verdict file there could be written by sandboxed content and then steer
+another agent's context.
+
 ## The user's tools have to come along, at their host paths
 
 `/usr` and `/opt` alone are not "the machine's toolchain". They are what the package

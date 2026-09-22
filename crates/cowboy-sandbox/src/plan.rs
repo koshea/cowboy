@@ -266,7 +266,8 @@ const HOST_USER_TOOL_DIRS: &[&str] = &[
 ];
 
 /// Environment variables that point a tool at its data directory, for tools that
-/// would otherwise look under `$HOME` — which the sandbox redirects into the project.
+/// would otherwise look under `$HOME` — which the sandbox redirects to
+/// [`AGENT_HOME`].
 ///
 /// Without `RUSTUP_HOME`, binding `~/.cargo/bin` gets you a rustup shim that resolves
 /// on `PATH` and then refuses to run: *"could not choose a version of cargo to run,
@@ -396,6 +397,10 @@ pub struct PlanInputs<'a> {
     /// cannot mount there). The tradeoff is that scratch is now disk-backed, so a
     /// runaway write fills the disk instead of being stopped by the memory ceiling.
     pub scratch: &'a Path,
+    /// Host directory bound at [`AGENT_HOME`] as the agent's `HOME`. Per-project and
+    /// persistent (under the user's cache dir), so caches survive between sessions —
+    /// unlike `scratch`, which is reaped with the session.
+    pub agent_home: &'a Path,
 }
 
 /// Where the sandbox's scratch filesystems are rooted inside `scratch`, and the
@@ -405,6 +410,19 @@ pub struct PlanInputs<'a> {
 /// socket or a build's intermediate output must still be there for the next command.
 pub const SCRATCH_DIRS: &[(&str, &str)] =
     &[("tmp", "/tmp"), ("run", "/run"), ("var-tmp", "/var/tmp")];
+
+/// The sandboxed agent's `HOME`, deliberately **outside the workdir**.
+///
+/// It used to be `{workdir}/.cowboy/home`, i.e. inside the project. That put a
+/// directory nothing should ever commit inside the repo: tool caches, and — observed
+/// on a real project — a dev-secrets cache its own tooling wrote under `~`. It also
+/// showed up as untracked in `git status`, was erased by `git clean -fdx`, and gave
+/// every worktree of a repo its own cold copy.
+///
+/// The host side is per-project and lives under the user's cache directory, so it
+/// persists between sessions (a warm cache is the whole point) while staying out of
+/// the workspace the agent can write and the user can commit.
+pub const AGENT_HOME: &str = "/home/agent";
 
 impl SandboxPlan {
     /// Build the plan, or fail if configuration or a grant would breach the
@@ -520,6 +538,15 @@ impl SandboxPlan {
                 "session scratch (survives between commands, not between sessions)",
             ));
         }
+
+        //    The agent's HOME, alongside scratch because it is the same class of thing
+        //    — a writable directory the agent owns — and differs only in living outside
+        //    the workspace and outliving the session.
+        binds.push(Bind::rw(
+            inputs.agent_home.to_path_buf(),
+            AGENT_HOME,
+            "the agent's HOME (per-project, persists between sessions)",
+        ));
 
         // 3. The project and any other configured mounts. The default config
         //    mounts `.` at the workdir, so the project arrives through here rather
@@ -913,7 +940,7 @@ fn build_env(
     tool_env: Vec<(String, String)>,
 ) -> Vec<(String, String)> {
     let mut env = vec![
-        ("HOME".to_string(), format!("{workdir}/.cowboy/home")),
+        ("HOME".to_string(), AGENT_HOME.to_string()),
         ("COWBOY_SANDBOX".to_string(), "1".to_string()),
         ("PATH".to_string(), sandbox_path(user_bin_dirs)),
         // mise refuses to parse a config carrying `[env]` or `[tasks]` until it is
@@ -1051,6 +1078,7 @@ mod tests {
             mask_file: mask,
             relay_port: 8443,
             scratch: Path::new("/scratch"),
+            agent_home: Path::new("/cache/cowboy/home/proj"),
         }
     }
 
@@ -1179,15 +1207,51 @@ mod tests {
         let plan = plan_with(&sec, &[], &host()).unwrap();
         let trusted = env_of(&plan, "MISE_TRUSTED_CONFIG_PATHS")
             .expect("mise config in the workdir must be trusted or `mise install` fails");
-        let home = env_of(&plan, "HOME").unwrap();
-        // It points at the workdir itself (so nested configs are covered too)…
-        assert!(
-            home.starts_with(trusted),
-            "trust path {trusted} should cover the workspace (HOME is {home})"
+        // It is the workdir itself, so nested configs are covered too. Asserted against
+        // the workdir directly: this used to check that `HOME` started with the trust
+        // path, which only worked while `HOME` lived *inside* the workspace and said
+        // nothing about the project's config once it moved out.
+        assert_eq!(
+            trusted, plan.workdir,
+            "the workdir itself must be the trust path"
         );
-        // …and not at the filesystem root, which would trust every config anywhere.
+        // …and not the filesystem root, which would trust every config anywhere.
         assert_ne!(trusted, "/", "must not trust configs outside the project");
         assert!(!trusted.is_empty());
+    }
+
+    /// The agent's `HOME` must live outside the workdir.
+    ///
+    /// It was `{workdir}/.cowboy/home`, which wrote tool caches — and on a real project
+    /// a dev-secrets cache the project's own tooling put under `~` — into the repo,
+    /// where they showed up as untracked files and could be committed. Nothing the agent
+    /// writes to `$HOME` may land in the workspace.
+    #[test]
+    fn the_agent_home_is_outside_the_workspace() {
+        let sec = SecurityConfig::default();
+        let plan = plan_with(&sec, &[], &host()).unwrap();
+
+        let home = env_of(&plan, "HOME").expect("the sandbox must set HOME");
+        assert_eq!(home, AGENT_HOME);
+        assert!(
+            !Path::new(home).starts_with(&plan.workdir),
+            "HOME {home} must not be inside the workdir {}",
+            plan.workdir
+        );
+
+        // It is writable, and backed by the host directory the caller supplied.
+        let bind = plan
+            .binds
+            .iter()
+            .find(|b| b.target == AGENT_HOME)
+            .expect("HOME must be bound");
+        assert_eq!(bind.mode, BindMode::ReadWrite);
+        assert_eq!(bind.source, Path::new("/cache/cowboy/home/proj"));
+        // Landlock is derived from the bind, so the write rule follows it.
+        assert!(plan
+            .landlock
+            .read_write
+            .contains(&PathBuf::from(AGENT_HOME)));
     }
 
     /// The host's mise store is shared copy-on-write, never as a plain bind.

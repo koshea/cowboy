@@ -1012,9 +1012,10 @@ fn mount_targets_host_secret(source: &str) -> bool {
 
     // A `.cowboy` component names a *project* config dir. Scan for it, but only
     // *below* the user's home directory: a `.cowboy` that appears merely because
-    // `$HOME` itself sits under one (e.g. `HOME=/…/.cowboy/home`, as in a sandboxed
-    // dev container) is not a project config dir, and refusing it would reject every
-    // ordinary `~/…` grant. The home cowboy config dir is covered separately below.
+    // `$HOME` itself sits under one is not a project config dir, and refusing it would
+    // reject every ordinary `~/…` grant. (Cowboy's own sandbox no longer arranges this
+    // — its `HOME` is outside the workspace — but a dev container may.) The home cowboy
+    // config dir is covered separately below.
     let below_home = home_dir()
         .and_then(|h| std::fs::canonicalize(&h).ok().or(Some(h)))
         .and_then(|h| resolved.strip_prefix(&h).ok().map(Path::to_path_buf));

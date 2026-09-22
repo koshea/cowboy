@@ -166,6 +166,11 @@ impl NativeSandbox {
         // process ever writes that path, which is what a machine-global mask could not
         // promise.
         let mask_file = crate::project::mask_file_in(&scratch);
+        // The agent's HOME. Created here for the same reason as the scratch dir: bwrap
+        // refuses to bind a missing source, and this is the one path every command goes
+        // through. Fatal, unlike the old in-workspace directory — there is no HOME to
+        // fall back to, and a silently missing one would fail the bind instead.
+        let agent_home = crate::project::ensure_agent_home(&self.root)?;
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -173,6 +178,7 @@ impl NativeSandbox {
             mask_file: &mask_file,
             relay_port: super::RELAY_PORT,
             scratch: &scratch,
+            agent_home: &agent_home,
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }

@@ -184,6 +184,9 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
     // real directory belongs to a running session, keyed to the process that owns it,
     // and inventing one here would leave litter behind for the reaper.
     let scratch = PathBuf::from("<session scratch>");
+    // The agent's real HOME is `~/.cache/cowboy/home/<project-key>`; naming it here
+    // would be accurate but printing the boundary still must not create it.
+    let agent_home = PathBuf::from("<agent home: ~/.cache/cowboy/home/…>");
     let inputs = PlanInputs {
         root,
         security: &security,
@@ -191,6 +194,7 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
         mask_file: &mask,
         relay_port: crate::sandbox::RELAY_PORT,
         scratch: &scratch,
+        agent_home: &agent_home,
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
     let mut out = plan.render(&denylist);

@@ -8,12 +8,12 @@
 //!
 //! **Why this lives outside the workspace.** The obvious home would be the child's
 //! session directory, next to its journal. But `.cowboy/` is inside the workspace bind
-//! and *writable from inside the sandbox* — the agent's `HOME` is
-//! `{workdir}/.cowboy/home` — so a verdict file there could be written by sandboxed
-//! content and would then steer another agent's context. That is prompt injection with
-//! a file for a mouth. Host-side state under `$XDG_STATE_HOME` instead, the same
-//! reasoning that puts runtime grants and network approvals there rather than in the
-//! project.
+//! and *writable from inside the sandbox*, so a verdict file there could be written by
+//! sandboxed content and would then steer another agent's context. That is prompt
+//! injection with a file for a mouth. Host-side state under `$XDG_STATE_HOME` instead,
+//! the same reasoning that puts runtime grants and network approvals there rather than
+//! in the project — and that moved the agent's own `HOME` out of `.cowboy/home` to
+//! `~/.cache/cowboy/home/<repo-key>`.
 //!
 //! Both ends are host-side processes — the agent loop runs on the host and only its
 //! shell commands are sandboxed — so nothing is lost by keeping this off the workspace.

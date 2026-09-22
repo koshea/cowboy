@@ -10,6 +10,7 @@ filesystem
   rw  /scratch/tmp -> /tmp   (session scratch (survives between commands, not between sessions))
   rw  /scratch/run -> /run   (session scratch (survives between commands, not between sessions))
   rw  /scratch/var-tmp -> /var/tmp   (session scratch (survives between commands, not between sessions))
+  rw  /cache/cowboy/home/proj -> /home/agent   (the agent's HOME (per-project, persists between sessions))
   rw  /srv/proj -> /workspace   (the project)
   rw  /srv/main/.git/worktrees/wt -> /srv/main/.git/worktrees/wt   (shared git dir (linked worktree))
   ro  /srv/other-repo -> /srv/other-repo   (runtime grant (approved by the user))
@@ -18,7 +19,7 @@ filesystem
   proc /proc   dev /dev
 
 landlock
-  7 read-only, 7 read-write paths
+  7 read-only, 8 read-write paths
   network: not gated here (port-only rules cannot express it)
   ipc scoping: true
 

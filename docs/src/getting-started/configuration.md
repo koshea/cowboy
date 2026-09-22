@@ -48,11 +48,15 @@ prefer `cowboy grant <path>` or let the agent ask with `request_path` — both t
 effect on the next command with no restart, so `security.yaml` stays a statement of
 intent rather than a scratchpad.
 
-The sandbox's `HOME` is `{workdir}/.cowboy/home`, an ordinary confined home. To
-reuse your host package-manager caches instead of re-downloading, mount them onto
-the XDG paths under it — e.g.
-`~/.local/share/pnpm → /workspace/.cowboy/home/.local/share/pnpm` (rw, so new
-packages cache back).
+The sandbox's `HOME` is `/home/agent`, an ordinary confined home. It is **not** in
+the workspace: it is backed by `~/.cache/cowboy/home/<project-key>` on the host, so
+caches stay warm between sessions without putting anything in your repo — and
+nothing the agent writes to `~` can be committed by accident. It is keyed by the
+repository, so every worktree shares one warm cache.
+
+To reuse your host package-manager caches instead of re-downloading, mount them
+onto the XDG paths under it — e.g. `~/.local/share/pnpm → /home/agent/.local/share/pnpm`
+(rw, so new packages cache back).
 
 **Paths that can never be mounted or granted.** Credential stores (`~/.aws`,
 `~/.ssh`, `~/.gnupg`, browser profiles, keyrings, …), `providers.yaml`, and the

@@ -512,6 +512,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                agent_home: Path::new("/cache/cowboy/home/proj"),
             },
             &probe,
         )
@@ -547,6 +548,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                agent_home: Path::new("/cache/cowboy/home/proj"),
             },
             &probe,
         )
@@ -580,6 +582,7 @@ mod tests {
                 mask_file: Path::new("/run/mask"),
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
+                agent_home: Path::new("/cache/cowboy/home/proj"),
             },
             &live,
         )

@@ -219,6 +219,7 @@ mod tests {
             mask_file: Path::new("/run/mask"),
             relay_port: 8443,
             scratch: Path::new("/scratch"),
+            agent_home: Path::new("/cache/cowboy/home/proj"),
         };
         SandboxPlan::build(&inputs, &probe).unwrap()
     }
