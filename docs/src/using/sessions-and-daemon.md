@@ -37,7 +37,12 @@ x-session-worker`). The daemon:
 - mediates a small **message bus** between sessions.
 
 It listens on a per-user Unix socket under `$XDG_RUNTIME_DIR/cowboy` and persists
-state to `$XDG_STATE_HOME/cowboy/daemon/state.json`.
+state to `$XDG_STATE_HOME/cowboy/daemon/state.json`. Registry writes are serialized
+as whole-state snapshots. A request that mutates the registry receives a success
+response only after the newest staged snapshot has been written, the file and its
+parent directory have been flushed, and the atomic replacement is durable. If that
+persistence fails, the request reports an error instead of acknowledging the
+in-memory mutation; the snapshot remains pending for a later retry.
 
 ### It exits on its own
 
@@ -108,6 +113,18 @@ default (the lease is held). Flags choose what happens instead:
 - Attaching streams the live journal; detaching leaves the session running.
 - `cowboy logs` lists past sessions; `cowboy replay <id>` replays one from its
   recorded journal.
+
+Journaled UI events are fully appended and flushed before Cowboy assigns their
+sequence number or broadcasts them. A newly attached client replays the committed
+range before switching to live delivery; if it later misses sequence numbers because
+its live receiver lagged, Cowboy fills the durable gap from the journal and discards
+any overlapping queued events. Malformed or incomplete journal records are reported
+instead of being skipped, because skipping one would create an unrecoverable sequence
+hole.
+
+Interactive prompts such as user questions and network approvals are deliberately
+not journaled or sequenced. They are ephemeral live control messages: a client that
+was not attached, or lagged past one, cannot recover it through replay.
 
 A session's worker socket accepts **multiple simultaneous clients**, so the same
 session can be driven from more than one place at once — including a browser. See

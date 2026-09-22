@@ -105,6 +105,32 @@ impl ArtifactRef {
     }
 }
 
+/// Parse a complete artifact index, rejecting malformed records and unsafe paths.
+///
+/// Promotion uses this strict parser so a tampered index cannot publish a partial
+/// snapshot. Best-effort artifact discovery remains available through [`list_in`].
+pub fn parse_index(text: &str) -> Result<Vec<ArtifactRef>> {
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            let line_number = index + 1;
+            let artifact = serde_json::from_str::<ArtifactRef>(line).map_err(|error| {
+                Error::Invalid(format!(
+                    "parsing artifact index line {line_number}: {error}"
+                ))
+            })?;
+            if !artifact.has_safe_path() {
+                return Err(Error::Invalid(format!(
+                    "artifact index line {line_number} has unsafe path {:?}",
+                    artifact.path
+                )));
+            }
+            Ok(artifact)
+        })
+        .collect()
+}
+
 fn index_path(session_dir: &Path) -> PathBuf {
     session_dir.join("artifacts.jsonl")
 }
@@ -112,11 +138,10 @@ fn index_path(session_dir: &Path) -> PathBuf {
 /// All artifacts recorded for a session, in publish order (absent/empty → []).
 ///
 /// Entries whose `path` is not a safe session-relative path are dropped: the index
-/// is a jsonl file inside the (agent-writable) session dir, and both `get_in` and
-/// ranch `promote_artifacts` `join` `path` onto the session dir and read it. A ref
-/// with `../…` or an absolute path would otherwise read/copy a host file outside the
-/// session — an exfiltration primitive when a workstream's artifacts are promoted
-/// into the committed ranch store. Filtering here protects every consumer at once.
+/// is a jsonl file inside the (agent-writable) session dir, and `get_in` joins `path`
+/// onto that directory. A ref with `../…` or an absolute path would otherwise read a
+/// host file outside the session. Ranch promotion instead uses [`parse_index`] so any
+/// malformed or unsafe record fails the complete snapshot rather than narrowing it.
 pub fn list_in(session_dir: &Path) -> Vec<ArtifactRef> {
     let Ok(text) = std::fs::read_to_string(index_path(session_dir)) else {
         return Vec::new();
@@ -321,5 +346,24 @@ mod tests {
         // And the earlier artifact's file/body is intact (not overwritten).
         let (_, body) = get_in(&dir, "a0002").unwrap();
         assert_eq!(body, "2");
+    }
+
+    #[test]
+    fn strict_index_parser_rejects_malformed_records_and_unsafe_paths() {
+        let malformed = parse_index("{not json\n").unwrap_err();
+        assert!(malformed.to_string().contains("artifact index line 1"));
+
+        let unsafe_ref = ArtifactRef {
+            id: "a0001".into(),
+            session_id: "s".into(),
+            kind: ArtifactKind::Other,
+            title: "escape".into(),
+            path: PathBuf::from("../outside"),
+            summary: None,
+            created_ms: 1,
+        };
+        let text = serde_json::to_string(&unsafe_ref).unwrap();
+        let unsafe_path = parse_index(&text).unwrap_err();
+        assert!(unsafe_path.to_string().contains("unsafe path"));
     }
 }

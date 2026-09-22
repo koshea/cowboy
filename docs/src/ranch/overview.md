@@ -29,13 +29,20 @@ promotes outputs, advances the plan, and pauses for your sign-off where it matte
   branches, worktrees) is the coordinator's job and it writes that continuously.
   The split is enforced in code, not just stated here: progress writes are refused
   if the scope fingerprint changed.
-- **Artifacts are promoted, not shared ad hoc.** A finished workstream's published
-  artifacts (+ handoff) are copied into the committed ranch store at
-  `.cowboy/ranches/<id>/artifacts/<workstream>/`, and injected into the prompts of
-  dependents.
-- **Acceptance gates pause for humans.** A workstream that declares acceptance
-  criteria (or didn't publish its expected artifacts) waits for your
-  [sign-off](acceptance-gates.md) instead of auto-completing.
+- **Artifacts are promoted, not shared ad hoc.** A finished workstream's selected
+  artifacts (+ handoff) are staged and atomically installed as one directory snapshot
+  in the committed ranch store at
+  `.cowboy/ranches/<id>/artifacts/<workstream>/`, then injected into the prompts of
+  dependents. Publication is all-or-nothing at the directory boundary: failures
+  before installation preserve the previous snapshot, and a partial snapshot is
+  never exposed.
+- **Host-side Ranch I/O does not follow repository-controlled symlinks.** Plan,
+  lock, and promoted-artifact operations open each store component relative to a
+  pinned directory and reject symlink traversal rather than reading or writing
+  outside `.cowboy/ranches/<id>/`.
+- **Acceptance gates pause for humans.** Every finished workstream waits for your
+  [sign-off](acceptance-gates.md) instead of auto-completing, regardless of whether
+  it declares acceptance criteria or expected artifacts.
 
 ## What lives where
 

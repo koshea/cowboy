@@ -74,6 +74,58 @@ pub struct TranscriptLine {
     pub turn: u64,
 }
 
+/// Persistent session capability. Unlike [`Mode`], this survives transient
+/// overlays and worker state changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// A normal client that may drive and end the session.
+    Interactive,
+    /// A live observer that cannot mutate the session.
+    ReadOnlyLive,
+    /// A completed on-disk journal being browsed locally.
+    Replay,
+}
+
+impl Access {
+    pub fn is_read_only(self) -> bool {
+        !matches!(self, Self::Interactive)
+    }
+}
+
+/// State of the terminal's transport to a live worker. This is deliberately
+/// independent from the worker's lifecycle: a running session can be reconnecting,
+/// and a disconnected terminal does not know that the session ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionState {
+    /// In-process TUI or on-disk replay; no worker transport is involved.
+    Local,
+    Connecting,
+    Live,
+    Reconnecting {
+        attempt: u32,
+    },
+    /// The reconnect window elapsed without an authoritative terminal message.
+    Unavailable,
+    /// The worker explicitly sent its terminal reason.
+    Ended {
+        reason: String,
+    },
+}
+
+impl ConnectionState {
+    pub fn label(&self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::Connecting => "connecting".into(),
+            Self::Live => "live".into(),
+            Self::Reconnecting { attempt } => format!("reconnecting (attempt {attempt})"),
+            Self::Unavailable => "unavailable (state unknown)".into(),
+            Self::Ended { reason } if reason.is_empty() => "ended".into(),
+            Self::Ended { reason } => format!("ended: {reason}"),
+        }
+    }
+}
+
 /// Interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -393,7 +445,13 @@ impl ContextSnapshot {
 
 pub struct App {
     pub title: String,
+    /// Short-lived UI feedback (for example "copied" or "stopping subagents").
     pub status: String,
+    /// Terminal transport state, independent from the worker lifecycle below.
+    pub connection: ConnectionState,
+    /// Last authoritative worker lifecycle status. Kept as display text so this
+    /// rendering-only crate does not depend on the wire protocol crate.
+    pub lifecycle: Option<String>,
     /// Working-tree diff summary for the status bar (e.g. `Δ 2 files +30 -4`).
     pub diff: String,
     /// A one-line boundary summary for the status bar (e.g. `🔒 egress ask`), set
@@ -452,6 +510,8 @@ pub struct App {
     cmd_out_marker: bool,
     /// Input editor (multi-line, cursor) via ratatui-textarea.
     pub textarea: TextArea<'static>,
+    /// Persistent capability, independent from the transient interaction mode.
+    pub access: Access,
     pub mode: Mode,
     pub throbber: ThrobberState,
     /// Plan mode is engaged (set by `/plan`, cleared by `/go`): the agent is
@@ -571,9 +631,15 @@ impl Selection {
 
 impl App {
     pub fn new(title: impl Into<String>) -> Self {
+        Self::new_with_access(title, Access::Interactive)
+    }
+
+    pub fn new_with_access(title: impl Into<String>, access: Access) -> Self {
         Self {
             title: title.into(),
             status: "ready".into(),
+            connection: ConnectionState::Local,
+            lifecycle: None,
             diff: String::new(),
             boundary: String::new(),
             tokens_in: 0,
@@ -598,6 +664,7 @@ impl App {
             cmd_out_hidden: 0,
             cmd_out_marker: false,
             textarea: TextArea::default(),
+            access,
             mode: Mode::Running,
             throbber: ThrobberState::default(),
             plan_mode: false,
@@ -635,7 +702,7 @@ impl App {
     pub fn watch_subagent(&mut self, id: impl Into<String>, label: impl Into<String>) {
         self.watch_label = label.into();
         self.watch_id = id.into();
-        let mut sub = Box::new(App::new(self.watch_label.clone()));
+        let mut sub = Box::new(App::new_with_access(self.watch_label.clone(), self.access));
         sub.mode = Mode::Running;
         self.watching = Some(sub);
         self.mode = Mode::WatchingSubagent;
@@ -1641,6 +1708,45 @@ mod tests {
                 frame.contains(&format!("line {i}")),
                 "input should show {i} lines:\n{frame}"
             );
+        }
+    }
+
+    #[test]
+    fn connection_and_lifecycle_are_rendered_as_separate_state() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.connection = ConnectionState::Reconnecting { attempt: 3 };
+        app.lifecycle = Some("awaiting input".into());
+        let frame = render(&app);
+        assert!(frame.contains("reconnecting (attempt 3)"), "{frame}");
+        assert!(frame.contains("session awaiting input"), "{frame}");
+
+        app.connection = ConnectionState::Unavailable;
+        let frame = render(&app);
+        assert!(frame.contains("unavailable (state unknown)"), "{frame}");
+        assert!(frame.contains("session awaiting input"), "{frame}");
+
+        app.connection = ConnectionState::Ended {
+            reason: "worker exited".into(),
+        };
+        let frame = render(&app);
+        assert!(frame.contains("ended: worker exited"), "{frame}");
+    }
+
+    #[test]
+    fn read_only_access_is_persistent_across_modes_and_has_an_explicit_footer() {
+        for access in [Access::ReadOnlyLive, Access::Replay] {
+            let mut app = App::new_with_access("cowboy", access);
+            for mode in [Mode::Running, Mode::Idle, Mode::Done] {
+                app.mode = mode;
+                let frame = render(&app);
+                assert!(
+                    frame.to_lowercase().contains("read-only"),
+                    "missing read-only marker:\n{frame}"
+                );
+                assert!(frame.contains("q/Esc exits"), "missing exit hint:\n{frame}");
+                assert_eq!(app.access, access);
+            }
         }
     }
 

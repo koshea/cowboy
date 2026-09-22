@@ -14,18 +14,22 @@ use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
 use gloo_net::http::Request;
 use gloo_net::websocket::{futures::WebSocket, Message as WsMessage};
+use web_sys::wasm_bindgen::JsCast;
 use web_sys::{Event, HtmlTextAreaElement, KeyboardEvent};
 use yew::prelude::*;
 
 use model::{Block, Model};
 
 /// Reducer actions for the session [`Model`].
+#[allow(clippy::large_enum_variant)] // one per wire message, dispatched and dropped
 pub enum Action {
     Server(ServerMsg),
     /// Optimistic local echo of a message the user just sent.
     User(String),
     /// A fresh WebSocket opened.
     Connected,
+    /// Reconnect attempts are currently unavailable, without claiming the session ended.
+    Unavailable,
     /// The WebSocket dropped (transient) — retrying.
     Disconnected,
 }
@@ -38,6 +42,7 @@ impl Reducible for Model {
             Action::Server(msg) => m.apply(msg),
             Action::User(text) => m.push_user(text),
             Action::Connected => m.set_live(),
+            Action::Unavailable => m.set_unavailable(),
             Action::Disconnected => m.set_reconnecting(),
         }
         Rc::new(m)
@@ -247,16 +252,11 @@ fn session(props: &SessionProps) -> Html {
                     let mut next_seq: Option<u64> = None;
                     let mut attempt: u32 = 0;
                     // Consecutive connections that opened but delivered no message
-                    // (e.g. a gone/unreachable session). Bail after a few so we
-                    // don't flash "reconnecting…" forever.
+                    // (e.g. a gone/unreachable session). After a few, say the session
+                    // is unavailable — but keep retrying at the capped backoff: only
+                    // a worker's `Ended` means it is really over.
                     let mut dead: u32 = 0;
                     'reconnect: loop {
-                        if dead >= 3 {
-                            model.dispatch(Action::Server(ServerMsg::Ended {
-                                reason: "could not connect to this session".into(),
-                            }));
-                            break;
-                        }
                         let url = match &parent {
                             Some(p) => subagent_ws_url(p, &id, &token, next_seq),
                             None => ws_url(&id, &token, next_seq),
@@ -265,11 +265,13 @@ fn session(props: &SessionProps) -> Html {
                             Ok(ws) => ws,
                             Err(_) => {
                                 dead += 1;
+                                if dead >= 3 {
+                                    model.dispatch(Action::Unavailable);
+                                }
                                 backoff(&mut attempt).await;
                                 continue;
                             }
                         };
-                        attempt = 0;
                         let (mut write, mut read) = ws.split();
                         let mut terminal = false;
                         let mut got_msg = false;
@@ -277,23 +279,39 @@ fn session(props: &SessionProps) -> Html {
                             futures::select! {
                                 incoming = read.next().fuse() => match incoming {
                                     Some(Ok(WsMessage::Text(txt))) => {
-                                        if let Ok(msg) = serde_json::from_str::<ServerMsg>(&txt) {
-                                            // Clear "reconnecting" only once a real
-                                            // message arrives — a connection that
-                                            // opens then dies sends nothing, so we
-                                            // never flash Connected for it.
-                                            if !got_msg {
-                                                model.dispatch(Action::Connected);
+                                        let Ok(msg) = serde_json::from_str::<ServerMsg>(&txt) else {
+                                            break;
+                                        };
+                                        // The journal is stateful. Never apply a duplicate,
+                                        // regression, or forward gap; reconnect at the last
+                                        // contiguous boundary instead.
+                                        match &msg {
+                                            ServerMsg::Snapshot { journal_len, .. } => {
+                                                if next_seq.is_some_and(|seq| seq > *journal_len) {
+                                                    break;
+                                                }
                                             }
-                                            got_msg = true;
-                                            if let ServerMsg::Event { seq, .. } = &msg {
-                                                next_seq = Some(seq + 1);
+                                            ServerMsg::Event { seq, .. } => {
+                                                let expected = next_seq.unwrap_or(0);
+                                                if *seq != expected {
+                                                    break;
+                                                }
+                                                next_seq = Some(expected + 1);
                                             }
-                                            if matches!(msg, ServerMsg::Ended { .. }) {
-                                                terminal = true;
-                                            }
-                                            model.dispatch(Action::Server(msg));
+                                            _ => {}
                                         }
+                                        if !got_msg {
+                                            // Only a connection that actually speaks
+                                            // resets the backoff; `open` succeeding
+                                            // says nothing about the session.
+                                            attempt = 0;
+                                            model.dispatch(Action::Connected);
+                                        }
+                                        got_msg = true;
+                                        if matches!(msg, ServerMsg::Ended { .. }) {
+                                            terminal = true;
+                                        }
+                                        model.dispatch(Action::Server(msg));
                                     }
                                     _ => break, // socket closed/errored
                                 },
@@ -315,7 +333,11 @@ fn session(props: &SessionProps) -> Html {
                         // A real drop (we'd received data) resets the counter; a
                         // connection that never spoke counts toward giving up.
                         dead = if got_msg { 0 } else { dead + 1 };
-                        model.dispatch(Action::Disconnected);
+                        model.dispatch(if dead >= 3 {
+                            Action::Unavailable
+                        } else {
+                            Action::Disconnected
+                        });
                         backoff(&mut attempt).await;
                     }
                 });
@@ -384,6 +406,9 @@ fn session(props: &SessionProps) -> Html {
                     { title(&model) }
                 </span>
                 <span class="muted stats">
+                    if let Some(status) = model.status {
+                        { format!("{} · ", status_label(&status)) }
+                    }
                     { format!("{} in · {} out", model.tokens_in, model.tokens_out) }
                     if let Some((used, budget)) = model.context {
                         // How full the conversation is, which is what you actually want
@@ -543,11 +568,15 @@ async fn backoff(attempt: &mut u32) {
 fn conn_banner(conn: &model::ConnState) -> Html {
     use model::ConnState::*;
     match conn {
+        Connecting => html! { <div class="banner reconnecting">{ "connecting…" }</div> },
         Reconnecting => html! { <div class="banner reconnecting">{ "reconnecting…" }</div> },
+        Unavailable => {
+            html! { <div class="banner reconnecting">{ "session unavailable; retrying…" }</div> }
+        }
         Ended(reason) => {
             html! { <div class="banner ended">{ format!("session ended: {reason}") }</div> }
         }
-        Connecting | Live => html! {},
+        Live => html! {},
     }
 }
 
@@ -691,6 +720,25 @@ fn diff_line(line: &str) -> Html {
 }
 
 fn render_ask(ask: &model::Ask, send: impl Fn(ClientMsg) + Clone + 'static) -> Html {
+    let input_id = format!("ask-reply-{}", ask.id);
+    let submit = {
+        let id = ask.id;
+        let input_id = input_id.clone();
+        let send = send.clone();
+        Callback::from(move |_| {
+            let Some(input) = web_sys::window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(&input_id))
+                .and_then(|e| e.dyn_into::<HtmlTextAreaElement>().ok())
+            else {
+                return;
+            };
+            let answer = input.value().trim().to_string();
+            if !answer.is_empty() {
+                send(ClientMsg::AskReply { id, answer });
+            }
+        })
+    };
     let opts = ask.options.iter().map(|o| {
         let id = ask.id;
         let o2 = o.clone();
@@ -708,6 +756,8 @@ fn render_ask(ask: &model::Ask, send: impl Fn(ClientMsg) + Clone + 'static) -> H
             <div class="modal-card">
                 <p class="q">{ ask.question.clone() }</p>
                 <div class="opts">{ for opts }</div>
+                <textarea id={input_id} placeholder="Type another answer…" rows="2" />
+                <div class="opts"><button onclick={submit}>{ "Reply" }</button></div>
             </div>
         </div>
     }
@@ -846,7 +896,10 @@ mod markdown_tests {
             "an image must not render as a fetching tag: {out}"
         );
         // The information is kept as a click-through, so nothing is silently dropped.
-        assert!(out.contains("<a href=\"https://attacker.example/pixel.gif\""), "{out}");
+        assert!(
+            out.contains("<a href=\"https://attacker.example/pixel.gif\""),
+            "{out}"
+        );
         assert!(out.contains("pixel"), "the alt text should survive: {out}");
     }
 
@@ -879,7 +932,10 @@ mod markdown_tests {
         let out = markdown_html("**bold** and `code` and [a link](https://example.com)\n\n- item");
         assert!(out.contains("<strong>bold</strong>"), "{out}");
         assert!(out.contains("<code>code</code>"), "{out}");
-        assert!(out.contains("<a href=\"https://example.com\">a link</a>"), "{out}");
+        assert!(
+            out.contains("<a href=\"https://example.com\">a link</a>"),
+            "{out}"
+        );
         assert!(out.contains("<li>item</li>"), "{out}");
     }
 

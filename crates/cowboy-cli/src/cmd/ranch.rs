@@ -146,8 +146,8 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = SessionLiveness>,
 {
-    let _lock = lock_ranch(root, id)?;
-    let mut ranch = ranch::load(root, id)?;
+    let lock = lock_ranch(root, id)?;
+    let mut ranch = lock.load()?;
     let before = ranch.clone();
     let Some(w) = ranch.workstream_mut(workstream) else {
         bail!("no workstream `{workstream}` in ranch `{id}`");
@@ -202,7 +202,7 @@ where
     w.worktree_path = None;
     w.branch = None;
     ranch.recompute_readiness();
-    ranch::save_progress(root, &before, &ranch)?;
+    lock.save_progress(&before, &ranch)?;
     println!(
         "{}",
         crate::style::success(&format!(
@@ -246,34 +246,13 @@ async fn session_liveness(sid: &str) -> SessionLiveness {
     }
 }
 
-/// A held exclusive lock on a ranch's directory. `ranch.yaml` is the committed
-/// source of truth, mutated by several processes (the daemon coordinator's
-/// `advance`, `cowboy ranch start/accept`, the watch TUI). Without a lock, two
-/// concurrent advances each load → mutate → save and the last write wins —
-/// losing updates and even double-spawning a workstream. Holding this around the
-/// whole load→save cycle serializes them. Released on drop (file close).
-struct RanchLock {
-    _file: std::fs::File,
-}
-
-fn lock_ranch(root: &Path, id: &str) -> Result<RanchLock> {
-    use std::os::fd::AsRawFd;
-    let dir = ranch::ranches_dir(root).join(id);
-    std::fs::create_dir_all(&dir).ok();
-    let path = dir.join(".lock");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)
-        .with_context(|| format!("opening ranch lock {}", path.display()))?;
-    // Blocking exclusive lock; advances are short and infrequent, so brief
-    // contention here is fine.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        bail!("acquiring ranch lock {}", path.display());
+fn lock_ranch(root: &Path, id: &str) -> Result<ranch::RanchLock> {
+    // This check must stay before even opening the repository root: command-line
+    // input must never reach a path operation until it is a safe component.
+    if !ranch::is_safe_id(id) {
+        bail!("unsafe ranch id {id:?}: must be a single path component");
     }
-    Ok(RanchLock { _file: file })
+    ranch::RanchLock::acquire(root, id).map_err(Into::into)
 }
 
 /// Tear down a worktree created for a launch that did not happen, adding a line to the
@@ -295,24 +274,30 @@ fn note_failed_cleanup(log: &mut Vec<String>, root: &Path, path: &Path, branch: 
 /// Shared body for `complete`/`accept`: force a workstream to Complete, promote
 /// its outputs, recompute readiness, and report newly-unblocked dependents.
 fn mark_done(root: &std::path::Path, id: &str, workstream: &str, verb: &str) -> Result<()> {
-    let _lock = lock_ranch(root, id)?;
-    let mut ranch = ranch::load(root, id)?;
+    let lock = lock_ranch(root, id)?;
+    let mut ranch = lock.load()?;
     let before = ranch.clone();
-    {
-        let ws = ranch
-            .workstream_mut(workstream)
-            .with_context(|| format!("no workstream `{workstream}` in ranch `{id}`"))?;
-        ws.status = WorkstreamStatus::Complete;
-    }
-    let ws = ranch.workstream(workstream).unwrap().clone();
-    let n = promote_artifacts(root, &ranch, &ws);
+    let ws = ranch
+        .workstream(workstream)
+        .with_context(|| format!("no workstream `{workstream}` in ranch `{id}`"))?
+        .clone();
+    // Publication is the gate: no status/readiness mutation reaches disk unless a
+    // complete durable snapshot was published first.
+    let promotion = promote_artifacts(&lock, &ws)?;
+    ranch.workstream_mut(workstream).unwrap().status = WorkstreamStatus::Complete;
     let newly = ranch.recompute_readiness();
     if !ranch.workstreams.is_empty() && ranch.workstreams.iter().all(|w| w.status.is_done()) {
         ranch.status = RanchStatus::Complete;
     }
     ranch.updated_ms = now_ms();
-    ranch::save_progress(root, &before, &ranch)?;
-    crate::ui::ok(&format!("{workstream} {verb} — promoted {n} artifact(s)"));
+    lock.save_progress(&before, &ranch)?;
+    crate::ui::ok(&format!(
+        "{workstream} {verb} — promoted {}",
+        promotion.summary()
+    ));
+    if let Some(warning) = promotion.cleanup_warning {
+        eprintln!("warning: published snapshot but could not remove the old snapshot: {warning}");
+    }
     if !newly.is_empty() {
         println!("newly ready: {}", newly.join(", "));
         println!("launch them with `cowboy ranch start {id}`.");
@@ -432,7 +417,7 @@ fn approve(root: &std::path::Path, id: &str, pid: &str) -> Result<()> {
     // lock an in-flight `advance` that loaded the pre-approval plan would write its
     // stale scope back over this approval (lost update). Every ranch.yaml writer must
     // hold this lock — retry/mark_done/advance already do.
-    let _lock = lock_ranch(root, id)?;
+    let lock = lock_ranch(root, id)?;
     let mut p = scope::load(root, id, pid)?;
     if p.status != ProposalStatus::Pending {
         bail!(
@@ -440,10 +425,10 @@ fn approve(root: &std::path::Path, id: &str, pid: &str) -> Result<()> {
             proposal_status_str(p.status)
         );
     }
-    let mut ranch = ranch::load(root, id)?;
+    let mut ranch = lock.load()?;
     let msg = apply_change(&mut ranch, &p.change)?;
     ranch.updated_ms = now_ms();
-    ranch::save(root, &ranch)?;
+    lock.save(&ranch)?;
     p.status = ProposalStatus::Approved;
     p.decided_ms = Some(now_ms());
     scope::save(root, &p)?;
@@ -558,16 +543,9 @@ fn create(root: &std::path::Path, title: &str, goal: Option<String>) -> Result<(
          #     expected_artifacts: [api-contract.md]\n"
     );
     let path = ranch::ranch_path(root, &id);
-    std::fs::create_dir_all(path.parent().unwrap())
-        .with_context(|| format!("creating {}", path.display()))?;
-    // Temp + rename, like `ranch::save`. Not *through* `ranch::save`: this skeleton is
-    // hand-written YAML carrying commented examples, and going through serde would strip
-    // them. A bare `fs::write` left a crash mid-write showing up as a truncated plan that
-    // fails to parse — which blocks every later `cowboy ranch` command for that id, since
-    // they all start by loading it.
-    let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, &yaml).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("writing {}", path.display()))?;
+    // Preserve the commented skeleton while using the same descriptor-relative,
+    // durable atomic write as normal Ranch saves.
+    ranch::save_yaml(root, &id, yaml.as_bytes())?;
     // Validate it parses.
     ranch::load(root, &id).context("the new ranch.yaml should parse")?;
     crate::ui::ok(&format!("created ranch `{id}` at {}", path.display()));
@@ -714,8 +692,8 @@ fn add_workstream(
 ) -> Result<()> {
     // Scope-mutating path: hold the ranch lock so a concurrent `advance` can't write
     // a stale plan back over this addition (same rationale as `approve`).
-    let _lock = lock_ranch(root, ranch_id)?;
-    let mut ranch = ranch::load(root, ranch_id)?;
+    let lock = lock_ranch(root, ranch_id)?;
+    let mut ranch = lock.load()?;
     if ranch.workstreams.iter().any(|w| w.id == ws_id) {
         bail!("workstream `{ws_id}` already exists in ranch `{ranch_id}`");
     }
@@ -737,7 +715,7 @@ fn add_workstream(
         .validate()
         .map_err(|e| anyhow::anyhow!("adding `{ws_id}` would break the plan: {e}"))?;
     ranch.updated_ms = now_ms();
-    ranch::save(root, &ranch)?;
+    lock.save(&ranch)?;
 
     let ws = ranch.workstream(ws_id).expect("just added");
     let deps = if ws.depends_on.is_empty() {
@@ -901,9 +879,9 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
     // Serialize the whole load→mutate→save against other advances/accepts so two
     // coordinators can't both launch the same Ready workstream (each would create
     // a distinct worktree, so the per-worktree lease doesn't catch it).
-    let _lock = lock_ranch(root, id)?;
+    let lock = lock_ranch(root, id)?;
     let mut log: Vec<String> = Vec::new();
-    let mut ranch = ranch::load(root, id)?;
+    let mut ranch = lock.load()?;
     // The scope as committed. Everything below is progress bookkeeping — statuses,
     // session ids, branches, worktrees — so the write at the end asserts that rather
     // than trusting it. The coordinator runs unattended inside the daemon; it is the
@@ -933,10 +911,22 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
     // interactive session you attach to, refine, and `/accept` when happy.
     for ws_id in &reconciled.awaiting_acceptance {
         if let Some(ws) = ranch.workstream(ws_id).cloned() {
-            let n = promote_artifacts(root, &ranch, &ws);
-            log.push(format!(
-                "{ws_id} finished a first attempt — promoted {n} artifact(s) for review"
-            ));
+            match promote_artifacts(&lock, &ws) {
+                Ok(outcome) => {
+                    log.push(format!(
+                        "{ws_id} finished a first attempt — promoted {} for review",
+                        outcome.summary()
+                    ));
+                    if let Some(warning) = outcome.cleanup_warning {
+                        log.push(format!(
+                            "  warning: published snapshot but could not remove the old snapshot: {warning}"
+                        ));
+                    }
+                }
+                Err(error) => log.push(format!(
+                    "{ws_id} finished a first attempt, but artifact promotion failed: {error}"
+                )),
+            }
             log.push(format!(
                 "  attach with `cowboy ranch attach {} {ws_id}`, then `/accept` in-session \
                  (or `cowboy ranch accept {} {ws_id}`) to sign off and unblock dependents",
@@ -963,7 +953,7 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
             }
             other => bail!("unexpected daemon response: {other:?}"),
         };
-        let task = compose_task(root, &ranch, &ws);
+        let task = compose_task(&lock, &ranch, &ws);
         match daemon::request(DaemonReq::StartSession {
             root: path.clone(),
             task: Some(task),
@@ -1025,7 +1015,7 @@ async fn advance(root: &std::path::Path, id: &str) -> Result<Vec<String>> {
         ranch.status = RanchStatus::WaitingForUser;
     }
     ranch.updated_ms = now_ms();
-    ranch::save_progress(root, &scope_as_committed, &ranch)?;
+    lock.save_progress(&scope_as_committed, &ranch)?;
 
     if started.is_empty() {
         log.push("nothing ready to start.".into());
@@ -1353,47 +1343,150 @@ fn reconcile_and_pick(
     }
 }
 
-/// Promote a completed workstream's published artifacts (+ handoff) from its
-/// session dir in its worktree into the ranch's committed artifact store, so
-/// downstream workstreams (and reviewers) can consume them. Returns the count.
-fn promote_artifacts(
-    root: &std::path::Path,
-    ranch: &Ranch,
-    ws: &cowboy_core::ranch::Workstream,
-) -> usize {
-    let (Some(wt), Some(sid)) = (&ws.worktree_path, &ws.session_id) else {
-        return 0;
-    };
-    let session_dir = crate::session::session_dir(wt, sid);
-    let dest = ranch::ranch_artifact_dir(root, &ranch.id, &ws.id);
-    // Clean sync: clear the prior promotion first so the store mirrors the current
-    // session (promotion runs again at acceptance; an artifact the user *removed*
-    // between attempts must not survive as a stale copy downstream consumers see).
-    let _ = std::fs::remove_dir_all(&dest);
-    if std::fs::create_dir_all(&dest).is_err() {
-        return 0;
+/// The complete result of publishing one workstream snapshot.
+#[derive(Debug, PartialEq, Eq)]
+struct PromotionOutcome {
+    artifacts: usize,
+    handoff: bool,
+    /// Publication already succeeded if old-snapshot cleanup fails; surface that
+    /// separately rather than misreporting a committed snapshot as a copy failure.
+    cleanup_warning: Option<String>,
+}
+
+impl PromotionOutcome {
+    fn summary(&self) -> String {
+        format!(
+            "{} artifact(s){}",
+            self.artifacts,
+            if self.handoff { " plus handoff" } else { "" }
+        )
     }
-    let mut n = 0;
-    for a in cowboy_core::artifact::list_in(&session_dir) {
-        let src = session_dir.join(&a.path);
-        if let Some(name) = a.path.file_name() {
-            if std::fs::copy(&src, dest.join(name)).is_ok() {
-                n += 1;
+}
+
+/// Promote one session's selected outputs as a durable, atomic directory snapshot.
+fn promote_artifacts(
+    lock: &ranch::RanchLock,
+    ws: &cowboy_core::ranch::Workstream,
+) -> Result<PromotionOutcome> {
+    let wt = ws
+        .worktree_path
+        .as_ref()
+        .with_context(|| format!("workstream `{}` has no worktree to promote", ws.id))?;
+    let sid = ws
+        .session_id
+        .as_deref()
+        .with_context(|| format!("workstream `{}` has no session to promote", ws.id))?;
+    if !ranch::is_safe_id(&ws.id) || !ranch::is_safe_id(sid) {
+        bail!("unsafe workstream/session id while promoting `{}`", ws.id);
+    }
+
+    // Pin every repository-controlled source component and reject symlinks before
+    // opening the index, artifacts, or handoff.
+    let worktree = cowboy_core::fs::Dir::open(wt)
+        .with_context(|| format!("opening worktree for `{}`", ws.id))?;
+    let session = worktree
+        .open_dir(".cowboy")
+        .and_then(|dir| dir.open_dir("sessions"))
+        .and_then(|dir| dir.open_dir(sid))
+        .with_context(|| format!("opening session `{sid}` for `{}`", ws.id))?;
+    let selected = match session.read_to_string_optional("artifacts.jsonl")? {
+        Some(text) => cowboy_core::artifact::parse_index(&text)
+            .with_context(|| format!("parsing artifact index for `{}`", ws.id))?,
+        None => Vec::new(),
+    };
+
+    let artifacts = lock.artifacts_dir()?;
+    let stage_prefix = format!(".{}.stage", ws.id);
+    let (stage_name, stage) = artifacts.create_unique_dir(&stage_prefix)?;
+    let staged = (|| -> Result<PromotionOutcome> {
+        for artifact in &selected {
+            let name = artifact
+                .path
+                .file_name()
+                .with_context(|| format!("artifact {} has no destination filename", artifact.id))?;
+            let mut source = session
+                .open_regular_path(&artifact.path)
+                .with_context(|| format!("opening artifact {} for `{}`", artifact.id, ws.id))?;
+            let mut destination = stage
+                .create_regular(name, 0o644)
+                .with_context(|| format!("staging artifact {} for `{}`", artifact.id, ws.id))?;
+            std::io::copy(&mut source, &mut destination)
+                .with_context(|| format!("copying artifact {} for `{}`", artifact.id, ws.id))?;
+            destination
+                .sync_all()
+                .with_context(|| format!("syncing artifact {} for `{}`", artifact.id, ws.id))?;
+        }
+
+        let handoff = match session.open_regular_optional("handoff.md")? {
+            Some(mut source) => {
+                let mut destination = stage.create_regular("handoff.md", 0o644)?;
+                std::io::copy(&mut source, &mut destination)
+                    .with_context(|| format!("copying handoff for `{}`", ws.id))?;
+                destination
+                    .sync_all()
+                    .with_context(|| format!("syncing handoff for `{}`", ws.id))?;
+                true
+            }
+            None => false,
+        };
+        stage.sync()?;
+        artifacts.sync()?;
+        Ok(PromotionOutcome {
+            artifacts: selected.len(),
+            handoff,
+            cleanup_warning: None,
+        })
+    })();
+
+    let mut outcome = match staged {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            drop(stage);
+            let _ = artifacts.remove_tree(&stage_name);
+            return Err(error);
+        }
+    };
+    drop(stage);
+
+    let destination_kind = match artifacts.entry_kind(&ws.id) {
+        Ok(kind) => kind,
+        Err(error) => {
+            let _ = artifacts.remove_tree(&stage_name);
+            return Err(error.into());
+        }
+    };
+    match destination_kind {
+        None => {
+            if let Err(error) = artifacts.rename_noreplace(&stage_name, &ws.id) {
+                let _ = artifacts.remove_tree(&stage_name);
+                return Err(error.into());
             }
         }
+        Some(cowboy_core::fs::EntryKind::Directory) => {
+            if let Err(error) = artifacts.exchange(&stage_name, &ws.id) {
+                let _ = artifacts.remove_tree(&stage_name);
+                return Err(error.into());
+            }
+            if let Err(error) = artifacts.remove_tree(&stage_name) {
+                outcome.cleanup_warning = Some(error.to_string());
+            }
+        }
+        Some(_) => {
+            let _ = artifacts.remove_tree(&stage_name);
+            bail!(
+                "refusing to publish `{}` over a non-directory artifact destination",
+                ws.id
+            );
+        }
     }
-    // The handoff is the headline output; promote it too if present.
-    let handoff = session_dir.join("handoff.md");
-    if handoff.exists() {
-        let _ = std::fs::copy(&handoff, dest.join("handoff.md"));
-    }
-    n
+    artifacts.sync()?;
+    Ok(outcome)
 }
 
 /// Build the worker task prompt for a workstream, injecting the promoted
 /// artifacts of its completed dependencies so it can consume them directly.
 fn compose_task(
-    root: &std::path::Path,
+    lock: &ranch::RanchLock,
     ranch: &Ranch,
     ws: &cowboy_core::ranch::Workstream,
 ) -> String {
@@ -1439,23 +1532,25 @@ fn compose_task(
     const TOTAL: usize = 48_000;
     let mut deps_block = String::new();
     let mut omitted = 0usize;
+    let artifact_store = lock.artifacts_dir().ok();
     for dep in &ws.depends_on {
-        let dir = ranch::ranch_artifact_dir(root, &ranch.id, dep);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+        let Some(dir) = artifact_store
+            .as_ref()
+            .and_then(|store| store.open_dir(dep).ok())
+        else {
             continue;
         };
-        let mut files: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+        let mut files = dir.list_names().unwrap_or_default();
         files.sort();
-        for f in files {
-            let name = f.file_name().map(|n| n.to_string_lossy().into_owned());
-            let Some(name) = name else { continue };
-            if let Ok(body) = std::fs::read_to_string(&f) {
+        for name in files {
+            let display_name = name.to_string_lossy();
+            if let Ok(body) = dir.read_to_string(&name) {
                 if deps_block.len() >= TOTAL {
                     omitted += 1;
                     continue;
                 }
                 let body = truncate(&body, PER_FILE);
-                deps_block.push_str(&format!("\n### {dep}/{name}\n{body}\n"));
+                deps_block.push_str(&format!("\n### {dep}/{display_name}\n{body}\n"));
             }
         }
     }
@@ -2097,20 +2192,255 @@ mod tests {
         std::fs::write(session_dir.join("handoff.md"), "# Handoff\ndone").unwrap();
 
         let r = ranch(vec![]);
+        ranch::save(root, &r).unwrap();
+        let dest = cowboy_core::ranch::ranch_artifact_dir(root, &r.id, "schema");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("stale.md"), "old snapshot").unwrap();
+        let lock = lock_ranch(root, &r.id).unwrap();
         let mut w = ws("schema", &[], WorkstreamStatus::Complete, Some("sess1"));
         w.worktree_path = Some(wt.clone());
-        let n = promote_artifacts(root, &r, &w);
-        assert_eq!(n, 1, "one artifact promoted");
+        let outcome = promote_artifacts(&lock, &w).unwrap();
+        assert_eq!(
+            outcome,
+            PromotionOutcome {
+                artifacts: 1,
+                handoff: true,
+                cleanup_warning: None,
+            }
+        );
 
-        let dest = cowboy_core::ranch::ranch_artifact_dir(root, &r.id, "schema");
         assert!(dest.join("a0001-schema.md").exists(), "artifact copied");
         assert!(dest.join("handoff.md").exists(), "handoff copied");
+        assert!(!dest.join("stale.md").exists(), "old snapshot removed");
+    }
+
+    #[test]
+    fn failed_source_copy_preserves_snapshot_and_ranch_progress() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let wt = root.join("wt");
+        let session_dir = wt.join(".cowboy/sessions/sess1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let artifact = cowboy_core::artifact::add_in(
+            &session_dir,
+            "sess1",
+            cowboy_core::artifact::ArtifactKind::Contract,
+            "Schema",
+            "new snapshot",
+            None,
+            1,
+        )
+        .unwrap();
+        let victim = root.join("victim");
+        std::fs::write(&victim, "host data").unwrap();
+        std::fs::remove_file(session_dir.join(&artifact.path)).unwrap();
+        symlink(&victim, session_dir.join(&artifact.path)).unwrap();
+
+        let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("sess1"));
+        schema.worktree_path = Some(wt);
+        let r = ranch(vec![
+            schema,
+            ws("api", &["schema"], WorkstreamStatus::Planned, None),
+        ]);
+        ranch::save(root, &r).unwrap();
+        let dest = ranch::ranch_artifact_dir(root, &r.id, "schema");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("old.md"), "old snapshot").unwrap();
+
+        let error = complete(root, &r.id, "schema").unwrap_err();
+        assert!(error.to_string().contains("opening artifact"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("old.md")).unwrap(),
+            "old snapshot"
+        );
+        assert!(!dest.join("a0001-schema.md").exists());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "host data");
+        let after = ranch::load(root, &r.id).unwrap();
+        assert_eq!(
+            after.workstream("schema").unwrap().status,
+            WorkstreamStatus::Running
+        );
+        assert_eq!(
+            after.workstream("api").unwrap().status,
+            WorkstreamStatus::Planned
+        );
+    }
+
+    #[test]
+    fn invalid_artifact_indexes_preserve_snapshot_and_ranch_progress() {
+        let cases = [
+            ("malformed JSON", b"{not json\n".as_slice()),
+            (
+                "unsafe path",
+                b"{\"id\":\"a9999\",\"session_id\":\"sess1\",\"kind\":\"other\",\"title\":\"escape\",\"path\":\"../outside\",\"created_ms\":2}\n"
+                    .as_slice(),
+            ),
+            ("invalid UTF-8", &[0xff, b'\n']),
+        ];
+
+        for (label, suffix) in cases {
+            let tmp = assert_fs::TempDir::new().unwrap();
+            let root = tmp.path();
+            let wt = root.join("wt");
+            let session_dir = wt.join(".cowboy/sessions/sess1");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            cowboy_core::artifact::add_in(
+                &session_dir,
+                "sess1",
+                cowboy_core::artifact::ArtifactKind::Contract,
+                "Schema",
+                "new snapshot",
+                None,
+                1,
+            )
+            .unwrap();
+            let index_path = session_dir.join("artifacts.jsonl");
+            let mut index = std::fs::read(&index_path).unwrap();
+            index.extend_from_slice(suffix);
+            std::fs::write(&index_path, index).unwrap();
+
+            let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("sess1"));
+            schema.worktree_path = Some(wt);
+            let r = ranch(vec![
+                schema,
+                ws("api", &["schema"], WorkstreamStatus::Planned, None),
+            ]);
+            ranch::save(root, &r).unwrap();
+            let plan_path = root.join(".cowboy/ranches/r/ranch.yaml");
+            let plan_before = std::fs::read(&plan_path).unwrap();
+            let dest = ranch::ranch_artifact_dir(root, &r.id, "schema");
+            std::fs::create_dir_all(&dest).unwrap();
+            std::fs::write(dest.join("old.md"), "old snapshot").unwrap();
+
+            complete(root, &r.id, "schema").expect_err(label);
+
+            assert_eq!(
+                std::fs::read_to_string(dest.join("old.md")).unwrap(),
+                "old snapshot",
+                "{label} replaced the prior snapshot"
+            );
+            assert!(
+                !dest.join("a0001-schema.md").exists(),
+                "{label} published a partial snapshot"
+            );
+            assert_eq!(
+                std::fs::read(&plan_path).unwrap(),
+                plan_before,
+                "{label} changed ranch progress"
+            );
+            let mut artifact_entries = std::fs::read_dir(dest.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            artifact_entries.sort();
+            assert_eq!(
+                artifact_entries,
+                vec![std::ffi::OsString::from("schema")],
+                "{label} left a staging directory"
+            );
+        }
+    }
+
+    #[test]
+    fn promotion_index_fifo_is_rejected_without_changing_snapshot_or_progress() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let wt = root.join("wt");
+        let session_dir = wt.join(".cowboy/sessions/sess1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let index = session_dir.join("artifacts.jsonl");
+        let index = CString::new(index.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `index` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(index.as_ptr(), 0o600) }, 0);
+
+        let mut schema = ws("schema", &[], WorkstreamStatus::Running, Some("sess1"));
+        schema.worktree_path = Some(wt);
+        let r = ranch(vec![
+            schema,
+            ws("api", &["schema"], WorkstreamStatus::Planned, None),
+        ]);
+        ranch::save(root, &r).unwrap();
+        let plan_path = root.join(".cowboy/ranches/r/ranch.yaml");
+        let plan_before = std::fs::read(&plan_path).unwrap();
+        let dest = ranch::ranch_artifact_dir(root, &r.id, "schema");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(dest.join("old.md"), "old snapshot").unwrap();
+
+        let complete_root = root.to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(complete(&complete_root, "r", "schema").is_err());
+        });
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("reading a FIFO artifact index must not block"),
+            "FIFO index must be rejected as non-regular"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("old.md")).unwrap(),
+            "old snapshot"
+        );
+        assert_eq!(std::fs::read(&plan_path).unwrap(), plan_before);
+    }
+
+    #[test]
+    fn promotion_refuses_a_symlinked_destination() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path();
+        let wt = root.join("wt");
+        let session_dir = wt.join(".cowboy/sessions/sess1");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        cowboy_core::artifact::add_in(
+            &session_dir,
+            "sess1",
+            cowboy_core::artifact::ArtifactKind::Contract,
+            "Schema",
+            "new snapshot",
+            None,
+            1,
+        )
+        .unwrap();
+        let r = ranch(vec![]);
+        ranch::save(root, &r).unwrap();
+        let artifacts = ranch::ranch_artifact_dir(root, &r.id, "unused")
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let victim = root.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("marker"), "untouched").unwrap();
+        symlink(&victim, artifacts.join("schema")).unwrap();
+
+        let mut w = ws("schema", &[], WorkstreamStatus::Complete, Some("sess1"));
+        w.worktree_path = Some(wt);
+        let lock = lock_ranch(root, &r.id).unwrap();
+        let error = promote_artifacts(&lock, &w).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("non-directory artifact destination"));
+        assert_eq!(
+            std::fs::read_to_string(victim.join("marker")).unwrap(),
+            "untouched"
+        );
+        assert!(!victim.join("a0001-schema.md").exists());
     }
 
     #[test]
     fn compose_task_includes_goal_rules_and_dependency_artifacts() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let r = ranch(vec![]);
+        ranch::save(tmp.path(), &r).unwrap();
+        let lock = lock_ranch(tmp.path(), &r.id).unwrap();
         // A dependency (schema) already promoted a contract into the ranch store.
         let dep_dir = cowboy_core::ranch::ranch_artifact_dir(tmp.path(), &r.id, "schema");
         std::fs::create_dir_all(&dep_dir).unwrap();
@@ -2118,7 +2448,7 @@ mod tests {
 
         let mut w = ws("api", &["schema"], WorkstreamStatus::Ready, None);
         w.acceptance = vec!["tests pass".into()];
-        let task = compose_task(tmp.path(), &r, &w);
+        let task = compose_task(&lock, &r, &w);
 
         assert!(task.contains("Your workstream: API (api)"));
         assert!(task.contains("Depends on (complete): schema"));
@@ -2138,6 +2468,8 @@ mod tests {
     fn compose_task_bounds_the_total_inlined_artifacts() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let r = ranch(vec![]);
+        ranch::save(tmp.path(), &r).unwrap();
+        let lock = lock_ranch(tmp.path(), &r.id).unwrap();
         let dep_dir = cowboy_core::ranch::ranch_artifact_dir(tmp.path(), &r.id, "schema");
         std::fs::create_dir_all(&dep_dir).unwrap();
         // 40 artifacts of 8 KB each: 320 KB if nothing bounds the aggregate.
@@ -2146,7 +2478,7 @@ mod tests {
         }
 
         let w = ws("api", &["schema"], WorkstreamStatus::Ready, None);
-        let task = compose_task(tmp.path(), &r, &w);
+        let task = compose_task(&lock, &r, &w);
 
         assert!(
             task.len() < 120_000,

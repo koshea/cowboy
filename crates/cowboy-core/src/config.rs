@@ -1049,6 +1049,16 @@ impl AgentConfig {
         read_yaml(path)
     }
 
+    /// Load `agent.yaml` if it exists, returning `None` only when the strict
+    /// loader reports that the config file is absent.
+    pub fn load_opt(path: &Path) -> Result<Option<Self>> {
+        match Self::load(path) {
+            Ok(config) => Ok(Some(config)),
+            Err(Error::ConfigNotFound(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// The shell commands [`AgentBehavior::verify`] names, resolved against
     /// [`Self::commands`].
     ///
@@ -1138,8 +1148,15 @@ impl ProvidersConfig {
     /// Load the home providers file, or an empty config if it doesn't exist.
     pub fn load_global() -> Result<Self> {
         match Self::global_path() {
-            Some(p) if p.exists() => read_yaml(&p),
-            _ => Ok(Self::default()),
+            Some(path) => {
+                recover_global_model_pair_if_needed(&path)?;
+                if path.exists() {
+                    read_yaml(&path)
+                } else {
+                    Ok(Self::default())
+                }
+            }
+            None => Ok(Self::default()),
         }
     }
 
@@ -1243,7 +1260,7 @@ fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let tmp = path.with_extension("tmp");
         // Helper so any failure after the temp file exists removes it (no stale
         // 0600 leftover) before propagating the error.
@@ -1258,6 +1275,10 @@ fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
             .mode(0o600)
             .open(&tmp)
             .map_err(|s| err(&tmp, s))?;
+        // `mode` only applies when creating. A stale/pre-created temp file must not
+        // turn the credential staging path into a group-readable secret leak.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|s| cleanup(err(&tmp, s)))?;
         f.write_all(yaml.as_bytes())
             .map_err(|s| cleanup(err(&tmp, s)))?;
         f.sync_all().map_err(|s| cleanup(err(&tmp, s)))?;
@@ -1279,6 +1300,319 @@ fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_owner_only(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Exact file contents observed when model setup began.
+///
+/// Setup holds an advisory lock while capturing these bytes and compares them again
+/// immediately before committing. This prevents a second Cowboy process (or a manual
+/// edit) from being silently overwritten while the user is answering prompts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelConfigGeneration {
+    providers: Option<Vec<u8>>,
+    models: Option<Vec<u8>>,
+}
+
+/// Strictly loaded user-level provider/model state plus its on-disk generation.
+#[derive(Debug, Clone)]
+pub struct ModelSetupState {
+    pub providers: ProvidersConfig,
+    pub models: ModelsConfig,
+    pub generation: ModelConfigGeneration,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum PairCommitPhase {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairCommitMarker {
+    phase: PairCommitPhase,
+    providers_existed: bool,
+    models_existed: bool,
+}
+
+struct ModelConfigLock {
+    _file: std::fs::File,
+}
+
+struct PairPaths {
+    lock: PathBuf,
+    marker: PathBuf,
+    providers_next: PathBuf,
+    models_next: PathBuf,
+    providers_backup: PathBuf,
+    models_backup: PathBuf,
+}
+
+impl PairPaths {
+    fn new(providers: &Path, models: &Path) -> Result<Self> {
+        let provider_parent = providers.parent().ok_or_else(|| {
+            Error::Invalid(format!(
+                "providers path has no parent: {}",
+                providers.display()
+            ))
+        })?;
+        if models.parent() != Some(provider_parent) {
+            return Err(Error::Invalid(
+                "providers.yaml and user models.yaml must share a config directory".into(),
+            ));
+        }
+        Ok(Self {
+            lock: provider_parent.join(".model-setup.lock"),
+            marker: provider_parent.join(".model-setup.transaction"),
+            providers_next: provider_parent.join(".model-setup.providers.next"),
+            models_next: provider_parent.join(".model-setup.models.next"),
+            providers_backup: provider_parent.join(".model-setup.providers.backup"),
+            models_backup: provider_parent.join(".model-setup.models.backup"),
+        })
+    }
+
+    fn cleanup_staging(&self) {
+        for path in [
+            &self.providers_next,
+            &self.models_next,
+            &self.providers_backup,
+            &self.models_backup,
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn config_io(path: &Path, source: std::io::Error) -> Error {
+    Error::ConfigRead {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn acquire_model_config_lock(paths: &PairPaths) -> Result<ModelConfigLock> {
+    if let Some(parent) = paths.lock.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| config_io(parent, e))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&paths.lock)
+        .map_err(|e| config_io(&paths.lock, e))?;
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) } != 0 {
+            return Err(config_io(&paths.lock, std::io::Error::last_os_error()));
+        }
+    }
+    Ok(ModelConfigLock { _file: file })
+}
+
+fn optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(config_io(path, e)),
+    }
+}
+
+fn generation(providers: &Path, models: &Path) -> Result<ModelConfigGeneration> {
+    Ok(ModelConfigGeneration {
+        providers: optional_bytes(providers)?,
+        models: optional_bytes(models)?,
+    })
+}
+
+fn write_bytes(path: &Path, bytes: &[u8], private: bool) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| config_io(path, e))?;
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| config_io(path, e))?;
+    }
+    file.write_all(bytes).map_err(|e| config_io(path, e))?;
+    file.sync_all().map_err(|e| config_io(path, e))
+}
+
+fn restore_file(path: &Path, backup: &Path, existed: bool, private: bool) -> Result<()> {
+    if existed {
+        let bytes = std::fs::read(backup).map_err(|e| config_io(backup, e))?;
+        let restore = path.with_extension("restore");
+        write_bytes(&restore, &bytes, private)?;
+        std::fs::rename(&restore, path).map_err(|e| config_io(path, e))?;
+    } else if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(config_io(path, e));
+        }
+    }
+    Ok(())
+}
+
+fn rollback_pair(
+    providers: &Path,
+    models: &Path,
+    paths: &PairPaths,
+    marker: &PairCommitMarker,
+) -> Result<()> {
+    let provider_result = restore_file(
+        providers,
+        &paths.providers_backup,
+        marker.providers_existed,
+        true,
+    );
+    let model_result = restore_file(models, &paths.models_backup, marker.models_existed, false);
+    provider_result.and(model_result)?;
+    paths.cleanup_staging();
+    std::fs::remove_file(&paths.marker).map_err(|e| config_io(&paths.marker, e))?;
+    Ok(())
+}
+
+fn recover_pair(providers: &Path, models: &Path, paths: &PairPaths) -> Result<()> {
+    let marker = match optional_bytes(&paths.marker)? {
+        Some(bytes) => serde_yaml_ng::from_slice::<PairCommitMarker>(&bytes).map_err(|e| {
+            Error::Invalid(format!(
+                "cannot recover interrupted model setup from {}: {e}",
+                paths.marker.display()
+            ))
+        })?,
+        None => {
+            paths.cleanup_staging();
+            return Ok(());
+        }
+    };
+    match marker.phase {
+        PairCommitPhase::Prepared => rollback_pair(providers, models, paths, &marker),
+        PairCommitPhase::Committed => {
+            paths.cleanup_staging();
+            std::fs::remove_file(&paths.marker).map_err(|e| config_io(&paths.marker, e))
+        }
+    }
+}
+
+fn recover_global_model_pair_if_needed(providers: &Path) -> Result<()> {
+    let Some(parent) = providers.parent() else {
+        return Ok(());
+    };
+    let models = parent.join(MODELS_FILE);
+    let paths = PairPaths::new(providers, &models)?;
+    // Ordinary reads must not create ~/.config/cowboy merely to discover that it is
+    // absent. Only enter recovery when setup left a durable marker behind.
+    if !paths.marker.exists() {
+        return Ok(());
+    }
+    let _lock = acquire_model_config_lock(&paths)?;
+    recover_pair(providers, &models, &paths)
+}
+
+/// Load setup's two home-owned files under one lock, recovering any interrupted
+/// paired commit first. Missing files become empty configs; present malformed files
+/// remain errors and are never replaced by setup.
+pub fn load_model_setup_state(providers: &Path, models: &Path) -> Result<ModelSetupState> {
+    let paths = PairPaths::new(providers, models)?;
+    let _lock = acquire_model_config_lock(&paths)?;
+    recover_pair(providers, models, &paths)?;
+    let observed = generation(providers, models)?;
+    let provider_config = match &observed.providers {
+        Some(_) => ProvidersConfig::load(providers)?,
+        None => ProvidersConfig::default(),
+    };
+    let model_config = match &observed.models {
+        Some(_) => ModelsConfig::load(models)?,
+        None => ModelsConfig::default(),
+    };
+    if generation(providers, models)? != observed {
+        return Err(Error::Invalid(
+            "model configuration changed while it was being loaded; retry setup".into(),
+        ));
+    }
+    Ok(ModelSetupState {
+        providers: provider_config,
+        models: model_config,
+        generation: observed,
+    })
+}
+
+/// Atomically commit setup's provider and model configs as a recoverable pair.
+///
+/// The exact generation captured by [`load_model_setup_state`] must still be current.
+/// Both replacements are staged with backups and a durable phase marker. An ordinary
+/// error rolls both files back; after a process crash, the next setup either restores
+/// the old pair or recognizes the fully committed pair before accepting more input.
+pub fn commit_model_setup_pair(
+    providers_path: &Path,
+    models_path: &Path,
+    expected: &ModelConfigGeneration,
+    providers: &ProvidersConfig,
+    models: &ModelsConfig,
+) -> Result<()> {
+    let paths = PairPaths::new(providers_path, models_path)?;
+    let _lock = acquire_model_config_lock(&paths)?;
+    recover_pair(providers_path, models_path, &paths)?;
+    if &generation(providers_path, models_path)? != expected {
+        return Err(Error::Invalid(
+            "model configuration changed while setup was open; nothing was written; retry setup"
+                .into(),
+        ));
+    }
+
+    let provider_yaml =
+        serde_yaml_ng::to_string(providers).map_err(|e| Error::Invalid(e.to_string()))?;
+    let model_yaml = serde_yaml_ng::to_string(models).map_err(|e| Error::Invalid(e.to_string()))?;
+    paths.cleanup_staging();
+    write_bytes(&paths.providers_next, provider_yaml.as_bytes(), true)?;
+    write_bytes(&paths.models_next, model_yaml.as_bytes(), false)?;
+    if let Some(bytes) = &expected.providers {
+        write_bytes(&paths.providers_backup, bytes, true)?;
+    }
+    if let Some(bytes) = &expected.models {
+        write_bytes(&paths.models_backup, bytes, false)?;
+    }
+    let mut marker = PairCommitMarker {
+        phase: PairCommitPhase::Prepared,
+        providers_existed: expected.providers.is_some(),
+        models_existed: expected.models.is_some(),
+    };
+    write_yaml_private(&marker, &paths.marker)?;
+
+    let install = (|| {
+        std::fs::rename(&paths.providers_next, providers_path)
+            .map_err(|e| config_io(providers_path, e))?;
+        std::fs::rename(&paths.models_next, models_path).map_err(|e| config_io(models_path, e))?;
+        marker.phase = PairCommitPhase::Committed;
+        write_yaml_private(&marker, &paths.marker)
+    })();
+    if let Err(error) = install {
+        return match rollback_pair(providers_path, models_path, &paths, &marker) {
+            Ok(()) => Err(error),
+            Err(rollback) => Err(Error::Invalid(format!(
+                "committing model configuration failed: {error}; rollback also failed: {rollback}"
+            ))),
+        };
+    }
+
+    paths.cleanup_staging();
+    std::fs::remove_file(&paths.marker).map_err(|e| config_io(&paths.marker, e))?;
+    if let Some(parent) = providers_path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 

@@ -2,7 +2,7 @@
 //! mutated by the wire `ServerMsg`/`UiEventMsg` stream. Kept free of Yew/web-sys
 //! so it stays pure and mirrors `apply_wire` 1:1.
 
-use cowboy_proto::daemonproto::{ServerMsg, SessionStatus, UiEventMsg};
+use cowboy_proto::daemonproto::{PendingPrompt, ServerMsg, SessionStatus, UiEventMsg};
 
 /// One rendered transcript entry.
 #[derive(Clone, PartialEq)]
@@ -31,6 +31,9 @@ pub enum ConnState {
     Live,
     /// The socket dropped (network blip); the client is retrying.
     Reconnecting,
+    /// Repeated connection attempts could not reach the session, but no terminal
+    /// `Ended` was observed.
+    Unavailable,
     /// The session itself ended (terminal — no reconnect).
     Ended(String),
 }
@@ -54,6 +57,30 @@ pub struct Approval {
     /// `dest` is all there is to show.
     pub rows: Vec<(String, String)>,
     pub note: Option<String>,
+}
+
+impl Approval {
+    fn new(id: u64, dest: String, detail: Option<cowboy_proto::netproto::ApprovalDetail>) -> Self {
+        use cowboy_proto::netproto::ApprovalKind;
+        let (title, rows, note) = match detail {
+            Some(d) => (
+                match d.kind {
+                    ApprovalKind::Network => "Network request",
+                    ApprovalKind::Credential => "Credential access",
+                },
+                d.rows,
+                d.note,
+            ),
+            None => ("Approval", Vec::new(), None),
+        };
+        Approval {
+            id,
+            dest,
+            title: title.to_string(),
+            rows,
+            note,
+        }
+    }
 }
 
 /// A crew subagent shown in the session view; click it to watch its live output.
@@ -122,12 +149,43 @@ impl Model {
     /// Apply one worker→client message.
     pub fn apply(&mut self, msg: ServerMsg) {
         match msg {
-            ServerMsg::Snapshot { info, .. } => {
+            ServerMsg::Snapshot {
+                info,
+                pending_prompts,
+                ..
+            } => {
                 self.conn = ConnState::Live;
-                self.status = Some(info.status);
-                if self.title.is_empty() {
-                    self.title = info.task.unwrap_or(info.id);
+                // Outstanding prompts reach a (re)connecting client only through
+                // the snapshot, and it is authoritative: anything not listed was
+                // resolved while we were away. The modals hold one of each kind,
+                // so show the oldest, as the worker would answer it first.
+                self.ask = None;
+                self.approval = None;
+                for prompt in pending_prompts {
+                    match prompt {
+                        PendingPrompt::Ask {
+                            id,
+                            question,
+                            options,
+                        } => {
+                            self.ask.get_or_insert(Ask {
+                                id,
+                                question,
+                                options,
+                            });
+                        }
+                        PendingPrompt::Approval { id, dest, detail } => {
+                            self.approval
+                                .get_or_insert_with(|| Approval::new(id, dest, detail));
+                        }
+                    }
                 }
+                self.status = Some(info.status);
+                self.title = info.task.unwrap_or(info.id);
+                self.tokens_in = info.tokens.0;
+                self.tokens_out = info.tokens.1;
+                self.diffstat = info.diffstat;
+                self.blocked = info.blocked_reason;
             }
             ServerMsg::Event { event, .. } => self.apply_event(event),
             ServerMsg::Ask {
@@ -139,28 +197,15 @@ impl Model {
                     id,
                     question,
                     options,
-                });
+                })
             }
             ServerMsg::Approval { id, dest, detail } => {
-                use cowboy_proto::netproto::ApprovalKind;
-                let (title, rows, note) = match detail {
-                    Some(d) => (
-                        match d.kind {
-                            ApprovalKind::Network => "Network request",
-                            ApprovalKind::Credential => "Credential access",
-                        },
-                        d.rows,
-                        d.note,
-                    ),
-                    None => ("Approval", Vec::new(), None),
-                };
-                self.approval = Some(Approval {
-                    id,
-                    dest,
-                    title: title.to_string(),
-                    rows,
-                    note,
-                });
+                self.approval = Some(Approval::new(id, dest, detail));
+            }
+            ServerMsg::AskResolved { id } => {
+                if self.ask.as_ref().is_some_and(|ask| ask.id == id) {
+                    self.ask = None;
+                }
             }
             ServerMsg::ApprovalResolved { id } => {
                 if self.approval.as_ref().is_some_and(|a| a.id == id) {
@@ -196,6 +241,12 @@ impl Model {
     pub fn set_reconnecting(&mut self) {
         if !matches!(self.conn, ConnState::Ended(_)) {
             self.conn = ConnState::Reconnecting;
+        }
+    }
+
+    pub fn set_unavailable(&mut self) {
+        if !matches!(self.conn, ConnState::Ended(_)) {
+            self.conn = ConnState::Unavailable;
         }
     }
 
@@ -486,6 +537,61 @@ mod tests {
             m.subagents.iter().find(|s| s.id == "a").unwrap().done,
             Some(false)
         );
+    }
+
+    #[test]
+    fn ask_resolution_only_clears_the_matching_prompt() {
+        let mut m = Model::default();
+        m.apply(ServerMsg::Ask {
+            id: 7,
+            question: "continue?".into(),
+            options: Vec::new(),
+        });
+        m.apply(ServerMsg::AskResolved { id: 6 });
+        assert_eq!(m.ask.as_ref().map(|ask| ask.id), Some(7));
+        m.apply(ServerMsg::AskResolved { id: 7 });
+        assert!(m.ask.is_none());
+    }
+
+    #[test]
+    fn snapshot_prompts_are_authoritative() {
+        let mut m = Model::default();
+        m.apply(ServerMsg::Ask {
+            id: 1,
+            question: "stale?".into(),
+            options: Vec::new(),
+        });
+        let snapshot = |pending_prompts| ServerMsg::Snapshot {
+            info: serde_json::from_value(serde_json::json!({
+                "id": "s1",
+                "root": "/tmp/p",
+                "status": "running",
+            }))
+            .unwrap(),
+            journal_len: 0,
+            pending_prompts,
+        };
+        m.apply(snapshot(vec![
+            PendingPrompt::Ask {
+                id: 2,
+                question: "continue?".into(),
+                options: vec!["yes".into()],
+            },
+            PendingPrompt::Ask {
+                id: 3,
+                question: "later".into(),
+                options: Vec::new(),
+            },
+            PendingPrompt::Approval {
+                id: 4,
+                dest: "example.com:443".into(),
+                detail: None,
+            },
+        ]));
+        assert_eq!(m.ask.as_ref().map(|a| a.id), Some(2));
+        assert_eq!(m.approval.as_ref().map(|a| a.id), Some(4));
+        m.apply(snapshot(Vec::new()));
+        assert!(m.ask.is_none() && m.approval.is_none());
     }
 
     #[test]

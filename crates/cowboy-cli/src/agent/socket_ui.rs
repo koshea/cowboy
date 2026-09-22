@@ -10,14 +10,17 @@
 //! client is attached (approvals `Deny`/`Once`, `ask_user` returns "").
 
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cowboy_core::daemonproto::{ClientMsg, ServerMsg, SessionInfo, UiEventMsg};
+use cowboy_core::daemonproto::{
+    ClientMsg, PendingPrompt, ServerMsg, SessionInfo, SessionStatus, UiEventMsg,
+};
 use cowboy_core::netproto::{encode_line, ApprovalDetail, ApprovalScope, Verdict};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -31,28 +34,159 @@ use super::ui::AgentUi;
 const APPROVAL_TIMEOUT: Duration =
     Duration::from_secs(cowboy_core::netproto::APPROVAL_TIMEOUT_SECS);
 
+/// How long an already-published prompt survives with no attached client.
+const RECONNECT_GRACE: Duration = Duration::from_secs(30);
+
 /// How long `ask_user` waits for a human answer before giving up (returns "").
 const ASK_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy)]
+struct PromptTimeouts {
+    reconnect_grace: Duration,
+    ask_absolute: Duration,
+    approval_absolute: Duration,
+}
+
+impl Default for PromptTimeouts {
+    fn default() -> Self {
+        Self {
+            reconnect_grace: RECONNECT_GRACE,
+            ask_absolute: ASK_TIMEOUT,
+            approval_absolute: APPROVAL_TIMEOUT,
+        }
+    }
+}
 
 /// Live broadcast item: a server message (journaled `Event`s plus control
 /// messages like `Ask`/`Approval`/`Ended`).
 type Live = ServerMsg;
 
+struct PendingAsk {
+    question: String,
+    options: Vec<String>,
+    reply: std::sync::mpsc::Sender<String>,
+}
+
+impl PendingAsk {
+    fn descriptor(&self, id: u64) -> PendingPrompt {
+        PendingPrompt::Ask {
+            id,
+            question: self.question.clone(),
+            options: self.options.clone(),
+        }
+    }
+}
+
+struct PendingApproval {
+    dest: String,
+    detail: Option<ApprovalDetail>,
+    reply: oneshot::Sender<(Verdict, ApprovalScope)>,
+}
+
+impl PendingApproval {
+    fn descriptor(&self, id: u64) -> PendingPrompt {
+        PendingPrompt::Approval {
+            id,
+            dest: self.dest.clone(),
+            detail: self.detail.clone(),
+        }
+    }
+}
+
+struct DisconnectGrace {
+    attachment_epoch: u64,
+    disconnected_since: Option<std::time::Instant>,
+}
+
+impl DisconnectGrace {
+    fn new(inner: &Inner) -> Self {
+        Self {
+            attachment_epoch: inner.attachment_epoch.load(Ordering::Acquire),
+            disconnected_since: None,
+        }
+    }
+
+    /// True after one continuous zero-client period reaches `grace`.
+    /// Any attachment advances the epoch and resets that period, even if the
+    /// client disconnects again between two waiter polls.
+    fn expired(&mut self, inner: &Inner, grace: Duration) -> bool {
+        let epoch = inner.attachment_epoch.load(Ordering::Acquire);
+        if epoch != self.attachment_epoch {
+            self.attachment_epoch = epoch;
+            self.disconnected_since = None;
+        }
+        if inner.attached.load(Ordering::Relaxed) > 0 {
+            self.disconnected_since = None;
+            return false;
+        }
+        self.disconnected_since
+            .get_or_insert_with(std::time::Instant::now)
+            .elapsed()
+            >= grace
+    }
+}
+
 struct Journal {
     file: std::fs::File,
     path: PathBuf,
     len: u64,
+    /// Snapshot metadata and prompt state share this publication lock. A new
+    /// subscriber therefore sees each prompt either in its snapshot or live.
+    info: SessionInfo,
+    base_status: SessionStatus,
+    blocked: bool,
+    pending_asks: HashMap<u64, PendingAsk>,
+    pending_approvals: HashMap<u64, PendingApproval>,
+    /// First append failure. Once set, no later event may touch the file: a
+    /// rollback can itself fail, leaving bytes after the last committed record.
+    poisoned: Option<String>,
+}
+
+fn effective_status(publication: &Journal) -> SessionStatus {
+    if !publication.pending_approvals.is_empty() {
+        SessionStatus::AwaitingApproval
+    } else if !publication.pending_asks.is_empty() {
+        SessionStatus::AwaitingInput
+    } else if publication.blocked {
+        SessionStatus::Blocked
+    } else {
+        publication.base_status
+    }
+}
+
+fn pending_prompts(publication: &Journal) -> Vec<PendingPrompt> {
+    let mut prompts = publication
+        .pending_asks
+        .iter()
+        .map(|(&id, pending)| pending.descriptor(id))
+        .chain(
+            publication
+                .pending_approvals
+                .iter()
+                .map(|(&id, pending)| pending.descriptor(id)),
+        )
+        .collect::<Vec<_>>();
+    prompts.sort_by_key(|prompt| match prompt {
+        PendingPrompt::Ask { id, .. } | PendingPrompt::Approval { id, .. } => *id,
+    });
+    prompts
 }
 
 struct Inner {
-    /// Guards journal append + length so a new subscriber's replay/live handoff
-    /// is atomic.
+    /// Guards journal append + sequence allocation + publication. Keeping the
+    /// broadcast send inside this short synchronous critical section makes live
+    /// delivery order exactly match committed file order.
     journal: std::sync::Mutex<Journal>,
     live: broadcast::Sender<Live>,
-    /// Latest snapshot metadata, sent to each new client.
-    info: std::sync::Mutex<SessionInfo>,
+    /// Wakes the worker so an unwritable journal terminates the session through
+    /// its normal bounded cancellation path.
+    journal_failed: tokio_util::sync::CancellationToken,
     /// Count of currently attached clients.
     attached: AtomicU32,
+    /// Advanced on every attachment so a prompt waiter observes even a complete
+    /// attach/disconnect cycle between polls and resets continuous grace.
+    attachment_epoch: AtomicU64,
+    prompt_timeouts: PromptTimeouts,
     /// Set when a client's connection dropped **without** a `Detach` first.
     ///
     /// The distinction is the whole point: a client that detaches on purpose is
@@ -61,13 +195,8 @@ struct Inner {
     /// second case used to leave the worker waiting for a client that would never
     /// speak again. Cleared when someone attaches, so a reconnect cancels it.
     abandoned: std::sync::atomic::AtomicBool,
-    /// Monotonic id for outstanding `Ask`/`Approval` prompts (disjoint spaces
-    /// are unnecessary — the maps are keyed separately).
+    /// Monotonic id for outstanding `Ask`/`Approval` prompts.
     next_req_id: AtomicU64,
-    /// Outstanding approvals awaiting a client verdict, keyed by request id.
-    pending_approvals: std::sync::Mutex<HashMap<u64, oneshot::Sender<(Verdict, ApprovalScope)>>>,
-    /// Outstanding `ask_user` questions awaiting a client answer.
-    pending_asks: std::sync::Mutex<HashMap<u64, std::sync::mpsc::Sender<String>>>,
     /// Live progress, mirrored from the event stream so the daemon registry
     /// (`cowboy sessions`) can show real numbers without parsing the journal.
     stats: std::sync::Mutex<SessionStats>,
@@ -78,14 +207,28 @@ struct Inner {
 }
 
 /// Snapshot of a session's live progress for the daemon registry.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SessionStats {
+    pub status: SessionStatus,
     pub turn: u64,
     pub tokens: (u64, u64),
     pub diffstat: String,
     pub running_command: Option<String>,
     /// Set while the session has declared itself blocked.
     pub blocked_reason: Option<String>,
+}
+
+impl Default for SessionStats {
+    fn default() -> Self {
+        Self {
+            status: SessionStatus::Starting,
+            turn: 0,
+            tokens: (0, 0),
+            diffstat: String::new(),
+            running_command: None,
+            blocked_reason: None,
+        }
+    }
 }
 
 /// Handle to the worker's UI: cloneable, shared between the agent loop (which
@@ -103,6 +246,31 @@ impl SocketUi {
         journal_path: &Path,
         info: SessionInfo,
     ) -> Result<(Self, mpsc::UnboundedReceiver<ClientMsg>)> {
+        Self::bind_with_timeouts(socket_path, journal_path, info, PromptTimeouts::default()).await
+    }
+
+    async fn bind_with_timeouts(
+        socket_path: &Path,
+        journal_path: &Path,
+        info: SessionInfo,
+        prompt_timeouts: PromptTimeouts,
+    ) -> Result<(Self, mpsc::UnboundedReceiver<ClientMsg>)> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(journal_path)
+            .with_context(|| format!("opening journal {}", journal_path.display()))?;
+        // Validate through the same descriptor used for every later append and
+        // replay. The worktree path is writable, so reopening it would let a rename
+        // substitute a different history while this worker still writes the old
+        // inode.
+        let byte_len = file
+            .metadata()
+            .with_context(|| format!("reading journal metadata {}", journal_path.display()))?
+            .len();
+        let len = read_journal_records_from(&file, journal_path, 0, None, byte_len)?.len() as u64;
+
         // Owner-only, in an owner-only directory. A peer on this socket can inject
         // messages into the agent's conversation and answer outstanding
         // network-approval prompts — answering those *is* the `ask` policy gate — so
@@ -110,30 +278,36 @@ impl SocketUi {
         let listener = crate::localsock::bind(socket_path)
             .with_context(|| format!("binding session socket {}", socket_path.display()))?;
 
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(journal_path)
-            .with_context(|| format!("opening journal {}", journal_path.display()))?;
-        let len = std::fs::read_to_string(journal_path)
-            .map(|s| s.lines().count() as u64)
-            .unwrap_or(0);
-
+        let initial_status = info.status;
         let (live, _) = broadcast::channel(4096);
         let inner = Arc::new(Inner {
             journal: std::sync::Mutex::new(Journal {
                 file,
                 path: journal_path.to_path_buf(),
                 len,
+                info,
+                base_status: match initial_status {
+                    SessionStatus::AwaitingApproval
+                    | SessionStatus::AwaitingInput
+                    | SessionStatus::Blocked => SessionStatus::Running,
+                    status => status,
+                },
+                blocked: initial_status == SessionStatus::Blocked,
+                pending_asks: HashMap::new(),
+                pending_approvals: HashMap::new(),
+                poisoned: None,
             }),
             live,
-            info: std::sync::Mutex::new(info),
+            journal_failed: tokio_util::sync::CancellationToken::new(),
             attached: AtomicU32::new(0),
+            attachment_epoch: AtomicU64::new(0),
+            prompt_timeouts,
             abandoned: std::sync::atomic::AtomicBool::new(false),
             next_req_id: AtomicU64::new(0),
-            pending_approvals: std::sync::Mutex::new(HashMap::new()),
-            pending_asks: std::sync::Mutex::new(HashMap::new()),
-            stats: std::sync::Mutex::new(SessionStats::default()),
+            stats: std::sync::Mutex::new(SessionStats {
+                status: initial_status,
+                ..SessionStats::default()
+            }),
             socket_path: socket_path.to_path_buf(),
             closed: tokio_util::sync::CancellationToken::new(),
         });
@@ -154,6 +328,11 @@ impl SocketUi {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Generation advanced on every attachment, including short-lived reconnects.
+    pub(crate) fn attachment_epoch(&self) -> u64 {
+        self.inner.attachment_epoch.load(Ordering::Acquire)
+    }
+
     /// Has the session been left with nobody driving it?
     ///
     /// True once a client's connection dropped without detaching and no client has
@@ -170,31 +349,186 @@ impl SocketUi {
                 .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Update the snapshot metadata new clients receive.
-    pub fn set_info(&self, info: SessionInfo) {
-        *self
+    /// Replace snapshot metadata while retaining the authoritative live status.
+    pub fn set_info(&self, mut info: SessionInfo) {
+        let mut publication = self
             .inner
-            .info
+            .journal
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = info;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        info.status = effective_status(&publication);
+        publication.info = info;
+    }
+
+    /// Current effective lifecycle status.
+    pub fn status(&self) -> SessionStatus {
+        let publication = self
+            .inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        effective_status(&publication)
+    }
+
+    /// Set the worker's underlying lifecycle phase. Pending approvals, asks, and
+    /// a declared block take precedence, and the effective status is both
+    /// snapshotted and broadcast as a transient, nonjournaled control.
+    pub fn set_status(&self, status: SessionStatus) {
+        let mut publication = self
+            .inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publication.base_status = status;
+        self.publish_status_locked(&mut publication);
+    }
+
+    fn set_blocked(&self, blocked: bool) {
+        let mut publication = self
+            .inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        publication.blocked = blocked;
+        self.publish_status_locked(&mut publication);
+    }
+
+    /// Lock order is publication (`journal`) then `stats`. No path may acquire
+    /// them in the opposite order, and no async or channel-blocking work belongs
+    /// in this critical section.
+    fn publish_status_locked(&self, publication: &mut Journal) {
+        let status = effective_status(publication);
+        publication.info.status = status;
+        let mut stats = self
+            .inner
+            .stats
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stats.status != status {
+            stats.status = status;
+            let _ = self.inner.live.send(ServerMsg::Status(status));
+        }
+    }
+
+    fn resolve_ask(&self, id: u64, answer: String) -> bool {
+        let pending = {
+            let mut publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(pending) = publication.pending_asks.remove(&id) else {
+                return false;
+            };
+            let _ = self.inner.live.send(ServerMsg::AskResolved { id });
+            self.publish_status_locked(&mut publication);
+            pending
+        };
+        let _ = pending.reply.send(answer);
+        true
+    }
+
+    fn resolve_approval(&self, id: u64, verdict: (Verdict, ApprovalScope)) -> bool {
+        let pending = {
+            let mut publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(pending) = publication.pending_approvals.remove(&id) else {
+                return false;
+            };
+            let _ = self.inner.live.send(ServerMsg::ApprovalResolved { id });
+            self.publish_status_locked(&mut publication);
+            pending
+        };
+        let _ = pending.reply.send(verdict);
+        true
     }
 
     /// Journal + broadcast a display event (worker-originated events like
     /// `DiffStat`/`Title`/`Processes`/`TurnDone` use this directly).
     pub fn emit(&self, event: UiEventMsg) {
-        self.track(&event);
+        let encoded = serde_json::to_vec(&event).map(|mut line| {
+            line.push(b'\n');
+            line
+        });
         let mut j = self
             .inner
             .journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if j.poisoned.is_some() {
+            return;
+        }
+
+        let line = match encoded {
+            Ok(line) => line,
+            Err(error) => {
+                self.poison_journal(&mut j, format!("serializing event: {error}"));
+                return;
+            }
+        };
         let seq = j.len;
-        let line = serde_json::to_string(&event).unwrap_or_default();
-        let _ = writeln!(j.file, "{line}");
-        let _ = j.file.flush();
+        let offset = match j.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                self.poison_journal(&mut j, format!("reading append position: {error}"));
+                return;
+            }
+        };
+        if let Err(error) = j.file.write_all(&line).and_then(|()| j.file.flush()) {
+            let rollback = j.file.set_len(offset).err();
+            let detail = match rollback {
+                Some(rollback) => format!(
+                    "appending event: {error}; rollback to byte {offset} also failed: {rollback}"
+                ),
+                None => format!("appending event: {error}; rolled back to byte {offset}"),
+            };
+            self.poison_journal(&mut j, detail);
+            return;
+        }
+
+        // Sequence allocation and broadcast happen only after the complete record
+        // has been written and flushed. Keep publication under the same lock so two
+        // concurrent emitters cannot broadcast in the opposite order from commit.
         j.len += 1;
-        drop(j);
+        self.track(&event);
         let _ = self.inner.live.send(ServerMsg::Event { seq, event });
+    }
+
+    fn poison_journal(&self, journal: &mut Journal, detail: String) {
+        if journal.poisoned.is_some() {
+            return;
+        }
+        let reason = format!(
+            "session journal failed at {}: {detail}",
+            journal.path.display()
+        );
+        tracing::error!(path = %journal.path.display(), error = %detail, "session journal poisoned");
+        journal.poisoned = Some(reason.clone());
+        // This terminal signal is deliberately out-of-band: trying to journal a
+        // journal failure would append into possible corruption. Like Ask/Approval,
+        // nonjournaled control messages cannot be reconstructed during lag recovery.
+        let _ = self.inner.live.send(ServerMsg::Ended { reason });
+        self.inner.journal_failed.cancel();
+    }
+
+    /// Wait until the first journal failure and return its stable diagnostic.
+    pub async fn wait_for_journal_failure(&self) -> String {
+        self.inner.journal_failed.cancelled().await;
+        self.journal_failure()
+            .unwrap_or_else(|| "session journal failed".into())
+    }
+
+    /// The first journal failure, if appends have been permanently disabled.
+    pub fn journal_failure(&self) -> Option<String> {
+        self.inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .poisoned
+            .clone()
     }
 
     /// Mirror progress-bearing events into `stats` for the daemon registry.
@@ -239,6 +573,27 @@ impl SocketUi {
     /// Removing the socket first means a late attach fails immediately with "no such
     /// file", which is both true and actionable, instead of connecting to nothing.
     pub fn end(&self, reason: &str) {
+        let (asks, approvals) = {
+            let publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                publication.pending_asks.keys().copied().collect::<Vec<_>>(),
+                publication
+                    .pending_approvals
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            )
+        };
+        for id in asks {
+            self.resolve_ask(id, String::new());
+        }
+        for id in approvals {
+            self.resolve_approval(id, (Verdict::Deny, ApprovalScope::Once));
+        }
         let _ = self.inner.live.send(ServerMsg::Ended {
             reason: reason.to_string(),
         });
@@ -262,11 +617,11 @@ impl SocketUi {
         self.attached() > 0
     }
 
-    /// Ask attached clients to approve a network destination. Fails closed: with
-    /// zero attached clients (or on timeout) the verdict is `Deny`/`Once` so a
-    /// parked gateway connection never hangs. With clients, the first
-    /// [`ClientMsg::ApprovalReply`] wins; a follow-up `ApprovalResolved` tells
-    /// the others to dismiss their modal.
+    /// Ask attached clients to approve a network destination. A new request with
+    /// no client fails closed immediately. Once published, it survives a continuous
+    /// zero-client period for the reconnect grace; any attachment resets that grace.
+    /// The first reply wins, and every published outcome emits `ApprovalResolved`.
+    /// Absolute or grace expiry returns `Deny`/`Once`.
     ///
     /// `detail` is display-only structure for the modal (see
     /// [`cowboy_core::netproto::ApprovalDetail`]); it never affects the verdict.
@@ -279,31 +634,47 @@ impl SocketUi {
             return (Verdict::Deny, ApprovalScope::Once);
         }
         let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.inner
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, tx);
-        let _ = self.inner.live.send(ServerMsg::Approval {
-            id,
-            dest: dest.clone(),
-            detail,
-        });
+        let (tx, mut rx) = oneshot::channel();
+        {
+            let mut publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            publication.pending_approvals.insert(
+                id,
+                PendingApproval {
+                    dest: dest.clone(),
+                    detail: detail.clone(),
+                    reply: tx,
+                },
+            );
+            let _ = self
+                .inner
+                .live
+                .send(ServerMsg::Approval { id, dest, detail });
+            self.publish_status_locked(&mut publication);
+        }
 
-        let verdict = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
-            Ok(Ok(v)) => v,
-            // Sender dropped (no reply) or timed out -> fail closed.
-            _ => (Verdict::Deny, ApprovalScope::Once),
-        };
-        self.inner
-            .pending_approvals
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-        // Tell any other clients still showing this approval to dismiss it.
-        let _ = self.inner.live.send(ServerMsg::ApprovalResolved { id });
-        verdict
+        let timeouts = self.inner.prompt_timeouts;
+        let absolute = tokio::time::Instant::now() + timeouts.approval_absolute;
+        let mut disconnect = DisconnectGrace::new(&self.inner);
+        loop {
+            tokio::select! {
+                result = &mut rx => {
+                    return result.unwrap_or((Verdict::Deny, ApprovalScope::Once));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                    let fallback = (Verdict::Deny, ApprovalScope::Once);
+                    if (disconnect.expired(&self.inner, timeouts.reconnect_grace)
+                        || tokio::time::Instant::now() >= absolute)
+                        && self.resolve_approval(id, fallback)
+                    {
+                        return fallback;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -354,6 +725,7 @@ impl AgentUi for SocketUi {
         self.emit(UiEventMsg::Cost(usd));
     }
     fn blocked(&mut self, reason: Option<&str>) {
+        self.set_blocked(reason.is_some());
         self.emit(UiEventMsg::Blocked(reason.map(str::to_string)));
     }
     fn plan(&mut self, steps: &[(String, String)]) {
@@ -398,23 +770,34 @@ impl AgentUi for SocketUi {
         self.emit(UiEventMsg::Notice(msg.to_string()));
     }
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
-        // No attached client can answer -> empty (matches the non-interactive
-        // / subagent contract).
+        // A new prompt with nobody attached has never been published, so it fails
+        // immediately according to the non-interactive/subagent contract.
         if self.attached() == 0 {
             return String::new();
         }
         let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = std::sync::mpsc::channel();
-        self.inner
-            .pending_asks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(id, tx);
-        let _ = self.inner.live.send(ServerMsg::Ask {
-            id,
-            question: question.to_string(),
-            options: options.to_vec(),
-        });
+        {
+            let mut publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            publication.pending_asks.insert(
+                id,
+                PendingAsk {
+                    question: question.to_string(),
+                    options: options.to_vec(),
+                    reply: tx,
+                },
+            );
+            let _ = self.inner.live.send(ServerMsg::Ask {
+                id,
+                question: question.to_string(),
+                options: options.to_vec(),
+            });
+            self.publish_status_locked(&mut publication);
+        }
         // The agent loop blocks here for the answer. That is safe, and deliberately so
         // rather than by luck: `AgentUi` is a sync trait called from the middle of the
         // loop, and the loop is driven by the worker's top-level `block_on` future —
@@ -429,27 +812,25 @@ impl AgentUi for SocketUi {
         // when the ask resolves rather than during it. Acceptable: a session should not
         // be torn down halfway through asking the user a question.
         //
-        // First reply wins. Bail to "" early if every client detaches mid-ask (no one
-        // left to answer — e.g. a detached ranch workstream), and cap the total wait at
-        // ASK_TIMEOUT.
-        let deadline = std::time::Instant::now() + ASK_TIMEOUT;
-        let answer = loop {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(a) => break a,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break String::new(),
+        // First reply wins. Once published, a prompt survives a continuous
+        // zero-client period for reconnect; any attachment resets that period.
+        let timeouts = self.inner.prompt_timeouts;
+        let deadline = std::time::Instant::now() + timeouts.ask_absolute;
+        let mut disconnect = DisconnectGrace::new(&self.inner);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(answer) => return answer,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return String::new(),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if self.attached() == 0 || std::time::Instant::now() >= deadline {
-                        break String::new();
+                    if (disconnect.expired(&self.inner, timeouts.reconnect_grace)
+                        || std::time::Instant::now() >= deadline)
+                        && self.resolve_ask(id, String::new())
+                    {
+                        return String::new();
                     }
                 }
             }
-        };
-        self.inner
-            .pending_asks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&id);
-        answer
+        }
     }
 }
 
@@ -484,20 +865,29 @@ async fn accept_loop(
             inner
                 .attached
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inner
+                .attachment_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
             // A fresh client cancels any earlier abandonment: someone is driving again.
             inner
                 .abandoned
                 .store(false, std::sync::atomic::Ordering::Relaxed);
-            let graceful = serve_client(stream, &inner, cmd_tx).await.unwrap_or(false);
-            if !graceful {
+            let graceful = serve_client(stream, inner.clone(), cmd_tx)
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(%error, "client connection failed");
+                    false
+                });
+            let remaining = inner
+                .attached
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(1);
+            if !graceful && remaining == 0 {
                 inner
                     .abandoned
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
-            inner
-                .attached
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(graceful, "client connection closed");
+            tracing::debug!(graceful, remaining, "client connection closed");
         });
     }
 }
@@ -506,7 +896,7 @@ async fn accept_loop(
 /// that is, said `Detach` rather than simply vanishing.
 async fn serve_client(
     stream: UnixStream,
-    inner: &Inner,
+    inner: Arc<Inner>,
     cmd_tx: mpsc::UnboundedSender<ClientMsg>,
 ) -> Result<bool> {
     let (r, w) = stream.into_split();
@@ -540,123 +930,332 @@ async fn serve_client(
         }
     };
 
-    // Atomically: subscribe to live, snapshot length, read the journal slice.
-    let (mut rx, journal_len, replay) = {
-        let j = inner
+    // Atomically subscribe to live and snapshot the committed journal boundary.
+    // Parsing uses `read_at` on a duplicate of the pinned descriptor after the
+    // synchronous lock is released, so a large replay cannot block emitters and
+    // no pathname replacement can substitute another history.
+    let (rx, journal_len, replay_file, replay_path, replay_bytes, info, prompts) = {
+        let mut j = inner
             .journal
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let rx = inner.live.subscribe();
-        let len = j.len;
-        let replay = read_journal_slice(&j.path, since, len);
-        (rx, len, replay)
+        let file = j.file.try_clone().context("duplicating live journal")?;
+        let byte_len = j
+            .file
+            .metadata()
+            .context("reading live journal metadata")?
+            .len();
+        j.info.status = effective_status(&j);
+        let prompts = pending_prompts(&j);
+        (
+            inner.live.subscribe(),
+            j.len,
+            file,
+            j.path.clone(),
+            byte_len,
+            j.info.clone(),
+            prompts,
+        )
     };
+    let replay = read_journal_slice(&replay_file, &replay_path, since, journal_len, replay_bytes)?;
 
-    let info = inner
-        .info
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    send(&writer, &ServerMsg::Snapshot { info, journal_len }).await?;
+    send(
+        &writer,
+        &ServerMsg::Snapshot {
+            info,
+            journal_len,
+            pending_prompts: prompts,
+        },
+    )
+    .await?;
     for (seq, event) in replay {
         send(&writer, &ServerMsg::Event { seq, event }).await?;
     }
 
-    // Pump live events to this client.
+    // Pump live events and client input concurrently. If the publication pump
+    // requests a resync (for example after broadcast lag), dropping the reader
+    // closes this connection so the client must reconnect through an authoritative
+    // Snapshot instead of continuing after possibly skipped controls.
     let live_writer = writer.clone();
-    let live = tokio::spawn(async move {
+    let live_inner = inner.clone();
+    let mut live =
+        tokio::spawn(async move { pump_live(rx, live_writer, live_inner, journal_len).await });
+    let read_inner = inner.clone();
+    let mut input = tokio::spawn(async move {
+        let mut graceful = false;
+        let mut line = String::new();
         loop {
-            match rx.recv().await {
-                Ok(msg) => {
-                    let ended = matches!(msg, ServerMsg::Ended { .. });
-                    if send(&live_writer, &msg).await.is_err() || ended {
-                        break;
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) {
+                        match msg {
+                            ClientMsg::Detach => {
+                                graceful = true;
+                                break;
+                            }
+                            ClientMsg::ApprovalReply { .. } | ClientMsg::AskReply { .. }
+                                if read_only =>
+                            {
+                                tracing::debug!("dropping a prompt reply from a read-only client");
+                            }
+                            ClientMsg::ApprovalReply { id, verdict, scope } => {
+                                SocketUi {
+                                    inner: read_inner.clone(),
+                                }
+                                .resolve_approval(id, (verdict, scope));
+                            }
+                            ClientMsg::AskReply { id, answer } => {
+                                SocketUi {
+                                    inner: read_inner.clone(),
+                                }
+                                .resolve_ask(id, answer);
+                            }
+                            other if read_only => {
+                                tracing::debug!(
+                                    msg = ?std::mem::discriminant(&other),
+                                    "dropping a mutating message from a read-only client"
+                                );
+                            }
+                            other => {
+                                let _ = cmd_tx.send(other);
+                            }
+                        }
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => break,
             }
         }
+        graceful
     });
 
-    // Read client input until disconnect. `graceful` distinguishes "the client said
-    // goodbye" from "the socket closed", which is what decides whether the session
-    // should keep waiting for it to come back.
-    let mut graceful = false;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                if let Ok(msg) = serde_json::from_str::<ClientMsg>(line.trim()) {
-                    match msg {
-                        ClientMsg::Detach => {
-                            graceful = true;
-                            break;
-                        }
-                        // Approval/ask replies resolve a pending prompt here
-                        // (first reply wins); they never reach the agent loop.
-                        ClientMsg::ApprovalReply { id, verdict, scope } => {
-                            if let Some(tx) = inner
-                                .pending_approvals
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .remove(&id)
-                            {
-                                let _ = tx.send((verdict, scope));
-                            }
-                        }
-                        ClientMsg::AskReply { id, answer } => {
-                            if let Some(tx) = inner
-                                .pending_asks
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .remove(&id)
-                            {
-                                let _ = tx.send(answer);
-                            }
-                        }
-                        // A read-only client may watch and detach, and may answer a
-                        // prompt it was asked (handled above) — but it must not
-                        // drive the session: no messages, interrupts, model
-                        // switches, sign-offs, or ends.
-                        other if read_only => {
-                            tracing::debug!(
-                                msg = ?std::mem::discriminant(&other),
-                                "dropping a mutating message from a read-only client"
-                            );
-                        }
-                        other => {
-                            let _ = cmd_tx.send(other);
-                        }
-                    }
-                }
+    let graceful = tokio::select! {
+        result = &mut input => result.unwrap_or(false),
+        result = &mut live => {
+            if let Ok(Err(error)) = result {
+                tracing::warn!(%error, "client event stream requires reconnect");
             }
+            false
         }
-    }
+    };
+    input.abort();
     live.abort();
     Ok(graceful)
 }
 
-/// Read journaled events `[since..len)` (0-based seq = line number).
-fn read_journal_slice(path: &Path, since: u64, len: u64) -> Vec<(u64, UiEventMsg)> {
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
-    std::io::BufReader::new(file)
-        .lines()
-        .enumerate()
-        .filter_map(|(i, l)| {
-            let seq = i as u64;
-            if seq < since || seq >= len {
-                return None;
+/// Pump committed events contiguously to one client.
+///
+/// A lag notification or forward sequence jump is repaired from the journal. Any
+/// queued Event that overlaps the repaired range is then discarded, so the client
+/// sees each sequence exactly once. Nonjournaled control messages have no sequence
+/// and cannot be reconstructed if the broadcast receiver lagged past them.
+async fn pump_live(
+    mut rx: broadcast::Receiver<Live>,
+    writer: Arc<AsyncMutex<tokio::net::unix::OwnedWriteHalf>>,
+    inner: Arc<Inner>,
+    mut next_seq: u64,
+) -> Result<()> {
+    loop {
+        match rx.recv().await {
+            Ok(ServerMsg::Event { seq, event }) => {
+                if seq > next_seq {
+                    recover_committed(&writer, &inner, &mut next_seq).await?;
+                    anyhow::bail!(
+                        "live sequence jumped; reconnect required to resnapshot transient controls"
+                    );
+                }
+                if seq < next_seq {
+                    continue;
+                }
+                if seq != next_seq {
+                    anyhow::bail!(
+                        "event sequence jumped from {next_seq} to {seq} beyond committed journal"
+                    );
+                }
+                send(&writer, &ServerMsg::Event { seq, event }).await?;
+                next_seq += 1;
             }
-            let line = l.ok()?;
-            let event: UiEventMsg = serde_json::from_str(&line).ok()?;
-            Some((seq, event))
-        })
-        .collect()
+            Ok(msg) => {
+                let ended = matches!(msg, ServerMsg::Ended { .. });
+                send(&writer, &msg).await?;
+                if ended {
+                    return Ok(());
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                tracing::debug!(
+                    skipped,
+                    next_seq,
+                    "client lagged; recovering journal before reconnect"
+                );
+                recover_committed(&writer, &inner, &mut next_seq).await?;
+                anyhow::bail!("client lagged; reconnect required to resnapshot transient controls");
+            }
+            Err(broadcast::error::RecvError::Closed) => return Ok(()),
+        }
+    }
+}
+
+async fn recover_committed(
+    writer: &AsyncMutex<tokio::net::unix::OwnedWriteHalf>,
+    inner: &Inner,
+    next_seq: &mut u64,
+) -> Result<()> {
+    let (file, path, committed_len, committed_bytes) = {
+        let journal = inner
+            .journal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            journal
+                .file
+                .try_clone()
+                .context("duplicating live journal")?,
+            journal.path.clone(),
+            journal.len,
+            journal
+                .file
+                .metadata()
+                .context("reading live journal metadata")?
+                .len(),
+        )
+    };
+    let missing = read_journal_slice(&file, &path, *next_seq, committed_len, committed_bytes)?;
+    for (seq, event) in missing {
+        if seq != *next_seq {
+            anyhow::bail!(
+                "journal recovery expected sequence {}, found {seq}",
+                *next_seq
+            );
+        }
+        send(writer, &ServerMsg::Event { seq, event }).await?;
+        *next_seq += 1;
+    }
+    if *next_seq != committed_len {
+        anyhow::bail!(
+            "journal recovery ended at sequence {}, expected {committed_len}",
+            *next_seq
+        );
+    }
+    Ok(())
+}
+
+/// Read and validate journaled events `[since..len)` (0-based seq = line number).
+fn read_journal_slice(
+    file: &std::fs::File,
+    path: &Path,
+    since: u64,
+    len: u64,
+    byte_len: u64,
+) -> Result<Vec<(u64, UiEventMsg)>> {
+    read_journal_records_from(file, path, since.min(len), Some(len), byte_len)
+}
+
+/// Read a complete journal, rejecting malformed JSON and unterminated records.
+pub(crate) fn read_journal(path: &Path) -> Result<Vec<UiEventMsg>> {
+    Ok(read_journal_records(path, 0, None)?
+        .into_iter()
+        .map(|(_, event)| event)
+        .collect())
+}
+
+fn read_journal_records(
+    path: &Path,
+    since: u64,
+    end: Option<u64>,
+) -> Result<Vec<(u64, UiEventMsg)>> {
+    let file =
+        std::fs::File::open(path).with_context(|| format!("opening journal {}", path.display()))?;
+    let byte_len = file
+        .metadata()
+        .with_context(|| format!("reading journal metadata {}", path.display()))?
+        .len();
+    read_journal_records_from(&file, path, since, end, byte_len)
+}
+
+/// A bounded, offset-independent view of an open file.
+///
+/// Using `read_at` avoids changing the append descriptor's shared offset and lets
+/// multiple clients scan one pinned inode concurrently without allocating the
+/// complete journal.
+struct FileSlice<'a> {
+    file: &'a std::fs::File,
+    offset: u64,
+    end: u64,
+}
+
+impl Read for FileSlice<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.offset >= self.end || buf.is_empty() {
+            return Ok(0);
+        }
+        let remaining = self.end - self.offset;
+        let limit = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buf.len());
+        let read = self.file.read_at(&mut buf[..limit], self.offset)?;
+        self.offset += read as u64;
+        Ok(read)
+    }
+}
+
+/// Parse a stable byte snapshot through an already-open journal descriptor.
+///
+/// `byte_len` is captured under the append lock, so later complete appends or a
+/// failed append rollback cannot change this reader's committed boundary.
+fn read_journal_records_from(
+    file: &std::fs::File,
+    path: &Path,
+    since: u64,
+    end: Option<u64>,
+    byte_len: u64,
+) -> Result<Vec<(u64, UiEventMsg)>> {
+    let source = FileSlice {
+        file,
+        offset: 0,
+        end: byte_len,
+    };
+    let mut reader = std::io::BufReader::new(source);
+    let mut records = Vec::new();
+    let mut seq = 0u64;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = std::io::BufRead::read_until(&mut reader, b'\n', &mut line)
+            .with_context(|| format!("reading journal {} at sequence {seq}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            anyhow::bail!(
+                "journal {} has an incomplete record at sequence {seq}",
+                path.display()
+            );
+        }
+        line.pop();
+        let event = serde_json::from_slice::<UiEventMsg>(&line).with_context(|| {
+            format!(
+                "parsing journal {} record at sequence {seq}",
+                path.display()
+            )
+        })?;
+        if seq >= since && end.is_none_or(|limit| seq < limit) {
+            records.push((seq, event));
+        }
+        seq += 1;
+        if end.is_some_and(|limit| seq >= limit) {
+            break;
+        }
+    }
+    if let Some(end) = end {
+        if seq < end {
+            anyhow::bail!(
+                "journal {} ended at sequence {seq}, expected {end}",
+                path.display()
+            );
+        }
+    }
+    Ok(records)
 }
 
 async fn send(
@@ -961,6 +1560,28 @@ mod tests {
         w.flush().await.unwrap();
     }
 
+    async fn wait_for_attached(ui: &SocketUi, expected: u32) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ui.attached() != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn test_timeouts(
+        reconnect_grace: Duration,
+        ask_absolute: Duration,
+        approval_absolute: Duration,
+    ) -> PromptTimeouts {
+        PromptTimeouts {
+            reconnect_grace,
+            ask_absolute,
+            approval_absolute,
+        }
+    }
+
     #[tokio::test]
     async fn approval_denies_with_zero_clients() {
         let tmp = assert_fs::TempDir::new().unwrap();
@@ -1014,10 +1635,17 @@ mod tests {
             verdict.await.unwrap(),
             (Verdict::Allow, ApprovalScope::Session)
         );
-        // Other clients are told to dismiss the now-decided modal.
-        match read_msg(&mut reader).await {
-            ServerMsg::ApprovalResolved { id: rid } => assert_eq!(rid, id),
-            other => panic!("expected ApprovalResolved, got {other:?}"),
+        // Other clients are told to dismiss the now-decided modal. A lifecycle
+        // update may have been queued immediately after publication.
+        loop {
+            match read_msg(&mut reader).await {
+                ServerMsg::ApprovalResolved { id: rid } => {
+                    assert_eq!(rid, id);
+                    break;
+                }
+                ServerMsg::Status(_) => {}
+                other => panic!("expected ApprovalResolved, got {other:?}"),
+            }
         }
     }
 
@@ -1064,6 +1692,16 @@ mod tests {
         )
         .await;
         assert_eq!(answer.await.unwrap(), "yes");
+        loop {
+            match read_msg(&mut reader).await {
+                ServerMsg::AskResolved { id: resolved } => {
+                    assert_eq!(resolved, id);
+                    break;
+                }
+                ServerMsg::Status(_) => {}
+                other => panic!("expected AskResolved, got {other:?}"),
+            }
+        }
     }
 
     /// The same property on a runtime with a **single** worker thread, with `ask_user`
@@ -1124,31 +1762,609 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ask_user_returns_empty_when_client_detaches_midask() {
+    async fn snapshot_contains_sorted_full_pending_descriptors() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let sock = tmp.path().join("s.sock");
         let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
             .await
             .unwrap();
+        let (mut first_reader, _first_writer) = attach_client(&sock).await;
 
-        let (mut reader, w) = attach_client(&sock).await;
         let mut ask_ui = ui.clone();
-        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("continue?", &[]));
+        let answer = tokio::task::spawn_blocking(move || {
+            ask_ui.ask_user("continue?", &["yes".into(), "no".into()])
+        });
+        let ask_id = loop {
+            if let ServerMsg::Ask { id, .. } = read_msg(&mut first_reader).await {
+                break id;
+            }
+        };
 
-        // Confirm the ask was routed (so the client is attached and waiting)…
+        let detail = ApprovalDetail {
+            kind: cowboy_core::netproto::ApprovalKind::Credential,
+            rows: vec![("mount".into(), "/secret".into())],
+            note: Some("display only".into()),
+        };
+        let approval_ui = ui.clone();
+        let expected_detail = detail.clone();
+        let verdict = tokio::spawn(async move {
+            approval_ui
+                .request_approval("credential mount".into(), Some(detail))
+                .await
+        });
+        let approval_id = loop {
+            if let ServerMsg::Approval { id, .. } = read_msg(&mut first_reader).await {
+                break id;
+            }
+        };
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        send_client(
+            &mut w,
+            &ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            },
+        )
+        .await;
         match read_msg(&mut reader).await {
-            ServerMsg::Ask { .. } => {}
-            other => panic!("expected Ask, got {other:?}"),
+            ServerMsg::Snapshot {
+                info,
+                pending_prompts,
+                ..
+            } => {
+                assert_eq!(info.status, SessionStatus::AwaitingApproval);
+                assert_eq!(
+                    pending_prompts,
+                    vec![
+                        PendingPrompt::Ask {
+                            id: ask_id,
+                            question: "continue?".into(),
+                            options: vec!["yes".into(), "no".into()],
+                        },
+                        PendingPrompt::Approval {
+                            id: approval_id,
+                            dest: "credential mount".into(),
+                            detail: Some(expected_detail),
+                        },
+                    ]
+                );
+            }
+            other => panic!("expected authoritative Snapshot, got {other:?}"),
         }
-        // …then detach. With no one left to answer, ask_user must give up promptly
-        // (poll interval), not block for ASK_TIMEOUT.
+
+        send_client(
+            &mut w,
+            &ClientMsg::AskReply {
+                id: ask_id,
+                answer: "yes".into(),
+            },
+        )
+        .await;
+        send_client(
+            &mut w,
+            &ClientMsg::ApprovalReply {
+                id: approval_id,
+                verdict: Verdict::Allow,
+                scope: ApprovalScope::Session,
+            },
+        )
+        .await;
+        assert_eq!(answer.await.unwrap(), "yes");
+        assert_eq!(
+            verdict.await.unwrap(),
+            (Verdict::Allow, ApprovalScope::Session)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn published_ask_survives_reconnects_and_each_attachment_resets_grace() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let timeouts = test_timeouts(
+            Duration::from_millis(600),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        let (ui, _cmd_rx) =
+            SocketUi::bind_with_timeouts(&sock, &tmp.path().join("events.jsonl"), info(), timeouts)
+                .await
+                .unwrap();
+        let (mut reader, writer) = attach_client(&sock).await;
+        let mut ask_ui = ui.clone();
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("still there?", &[]));
+        let id = loop {
+            if let ServerMsg::Ask { id, .. } = read_msg(&mut reader).await {
+                break id;
+            }
+        };
         drop(reader);
-        drop(w);
-        let got = tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+        drop(writer);
+        wait_for_attached(&ui, 0).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // This brief attachment resets grace even though it disconnects again.
+        let (reader, writer) = attach_client(&sock).await;
+        drop(reader);
+        drop(writer);
+        wait_for_attached(&ui, 0).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // Total disconnected time exceeds grace, but neither continuous period does.
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        send_client(
+            &mut w,
+            &ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            },
+        )
+        .await;
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot {
+                pending_prompts, ..
+            } => assert_eq!(
+                pending_prompts,
+                vec![PendingPrompt::Ask {
+                    id,
+                    question: "still there?".into(),
+                    options: Vec::new(),
+                }]
+            ),
+            other => panic!("expected reconnect Snapshot, got {other:?}"),
+        }
+        send_client(
+            &mut w,
+            &ClientMsg::AskReply {
+                id,
+                answer: "yes".into(),
+            },
+        )
+        .await;
+        assert_eq!(answer.await.unwrap(), "yes");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_grace_expiry_resolves_with_safe_fallbacks() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let timeouts = test_timeouts(
+            Duration::from_millis(250),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        let (ui, _cmd_rx) =
+            SocketUi::bind_with_timeouts(&sock, &tmp.path().join("events.jsonl"), info(), timeouts)
+                .await
+                .unwrap();
+        let (reader, writer) = attach_client(&sock).await;
+        let mut live = ui.inner.live.subscribe();
+
+        let mut ask_ui = ui.clone();
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("answer?", &[]));
+        let ask_id = loop {
+            if let ServerMsg::Ask { id, .. } = live.recv().await.unwrap() {
+                break id;
+            }
+        };
+        drop(reader);
+        drop(writer);
+        wait_for_attached(&ui, 0).await;
+        assert_eq!(answer.await.unwrap(), "");
+        loop {
+            if matches!(live.recv().await.unwrap(), ServerMsg::AskResolved { id } if id == ask_id) {
+                break;
+            }
+        }
+
+        let (reader, writer) = attach_client(&sock).await;
+        let verdict_ui = ui.clone();
+        let verdict = tokio::spawn(async move {
+            verdict_ui
+                .request_approval("example.com:443".into(), None)
+                .await
+        });
+        let approval_id = loop {
+            if let ServerMsg::Approval { id, .. } = live.recv().await.unwrap() {
+                break id;
+            }
+        };
+        drop(reader);
+        drop(writer);
+        wait_for_attached(&ui, 0).await;
+        assert_eq!(verdict.await.unwrap(), (Verdict::Deny, ApprovalScope::Once));
+        loop {
+            if matches!(live.recv().await.unwrap(), ServerMsg::ApprovalResolved { id } if id == approval_id)
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn absolute_timeouts_resolve_published_prompts_with_safe_fallbacks() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let timeouts = test_timeouts(
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            Duration::from_millis(250),
+        );
+        let (ui, _cmd_rx) =
+            SocketUi::bind_with_timeouts(&sock, &tmp.path().join("events.jsonl"), info(), timeouts)
+                .await
+                .unwrap();
+        let (_reader, _writer) = attach_client(&sock).await;
+        let mut live = ui.inner.live.subscribe();
+
+        let mut ask_ui = ui.clone();
+        let answer = tokio::task::spawn_blocking(move || ask_ui.ask_user("answer?", &[]));
+        let ask_id = loop {
+            if let ServerMsg::Ask { id, .. } = live.recv().await.unwrap() {
+                break id;
+            }
+        };
+        assert_eq!(answer.await.unwrap(), "");
+        loop {
+            if matches!(live.recv().await.unwrap(), ServerMsg::AskResolved { id } if id == ask_id) {
+                break;
+            }
+        }
+
+        let verdict_ui = ui.clone();
+        let verdict = tokio::spawn(async move {
+            verdict_ui
+                .request_approval("example.com:443".into(), None)
+                .await
+        });
+        let approval_id = loop {
+            if let ServerMsg::Approval { id, .. } = live.recv().await.unwrap() {
+                break id;
+            }
+        };
+        assert_eq!(verdict.await.unwrap(), (Verdict::Deny, ApprovalScope::Once));
+        loop {
+            if matches!(live.recv().await.unwrap(), ServerMsg::ApprovalResolved { id } if id == approval_id)
+            {
+                break;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_status_preserves_base_and_only_broadcasts_changes() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
             .await
-            .expect("ask_user must return promptly after the last client detaches")
             .unwrap();
-        assert_eq!(got, "");
+        let mut live = ui.inner.live.subscribe();
+
+        assert_eq!(ui.status(), SessionStatus::Running);
+        ui.set_status(SessionStatus::Running);
+        assert!(matches!(
+            live.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        ui.set_status(SessionStatus::Idle);
+        assert_eq!(
+            live.try_recv().unwrap(),
+            ServerMsg::Status(SessionStatus::Idle)
+        );
+
+        ui.set_blocked(true);
+        assert_eq!(ui.status(), SessionStatus::Blocked);
+        assert_eq!(
+            live.try_recv().unwrap(),
+            ServerMsg::Status(SessionStatus::Blocked)
+        );
+        ui.set_status(SessionStatus::Running);
+        assert!(matches!(
+            live.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let (ask_tx, _ask_rx) = std::sync::mpsc::channel();
+        let (approval_tx, _approval_rx) = oneshot::channel();
+        {
+            let mut publication = ui.inner.journal.lock().unwrap();
+            publication.pending_asks.insert(
+                1,
+                PendingAsk {
+                    question: "question".into(),
+                    options: Vec::new(),
+                    reply: ask_tx,
+                },
+            );
+            ui.publish_status_locked(&mut publication);
+            publication.pending_approvals.insert(
+                2,
+                PendingApproval {
+                    dest: "destination".into(),
+                    detail: None,
+                    reply: approval_tx,
+                },
+            );
+            ui.publish_status_locked(&mut publication);
+            publication.pending_approvals.remove(&2);
+            ui.publish_status_locked(&mut publication);
+            publication.pending_asks.remove(&1);
+            ui.publish_status_locked(&mut publication);
+        }
+        for expected in [
+            SessionStatus::AwaitingInput,
+            SessionStatus::AwaitingApproval,
+            SessionStatus::AwaitingInput,
+            SessionStatus::Blocked,
+        ] {
+            assert_eq!(live.try_recv().unwrap(), ServerMsg::Status(expected));
+        }
+
+        ui.set_blocked(false);
+        assert_eq!(ui.status(), SessionStatus::Running);
+        assert_eq!(
+            live.try_recv().unwrap(),
+            ServerMsg::Status(SessionStatus::Running)
+        );
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        send_client(
+            &mut writer,
+            &ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            },
+        )
+        .await;
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot { info, .. } => {
+                assert_eq!(info.status, SessionStatus::Running)
+            }
+            other => panic!("expected current status in Snapshot, got {other:?}"),
+        }
+        assert!(matches!(
+            live.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_emitters_broadcast_in_journal_commit_order() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+        let mut rx = ui.inner.live.subscribe();
+        let ui = Arc::new(ui);
+
+        std::thread::scope(|scope| {
+            for emitter in 0..32 {
+                let ui = ui.clone();
+                scope.spawn(move || ui.emit(UiEventMsg::ToolUse(emitter.to_string())));
+            }
+        });
+
+        let committed = read_journal(&journal).unwrap();
+        assert_eq!(committed.len(), 32);
+        for (seq, expected) in committed.into_iter().enumerate() {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                ServerMsg::Event {
+                    seq: seq as u64,
+                    event: expected,
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lag_replays_missing_range_and_discards_queued_overlap() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+        let rx = ui.inner.live.subscribe();
+
+        // The receiver is deliberately not polled until the fixed 4096-slot
+        // broadcast ring has overflowed.
+        const EVENTS: u64 = 4_100;
+        for seq in 0..EVENTS {
+            ui.emit(UiEventMsg::ToolUse(seq.to_string()));
+        }
+
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_server_r, server_w) = server.into_split();
+        let (client_r, _client_w) = client.into_split();
+        let writer = Arc::new(AsyncMutex::new(server_w));
+        let inner = ui.inner.clone();
+        let pump = tokio::spawn(pump_live(rx, writer, inner, 0));
+        let mut reader = BufReader::new(client_r);
+
+        for expected in 0..EVENTS {
+            match read_msg(&mut reader).await {
+                ServerMsg::Event {
+                    seq,
+                    event: UiEventMsg::ToolUse(value),
+                } => {
+                    assert_eq!(seq, expected);
+                    assert_eq!(value, expected.to_string());
+                }
+                other => panic!("expected contiguous event {expected}, got {other:?}"),
+            }
+        }
+        let error = pump.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("reconnect required"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_jump_recovers_then_discards_the_overlapping_event() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+        for seq in 0..3 {
+            ui.emit(UiEventMsg::ToolUse(seq.to_string()));
+        }
+
+        // Feed the pump only seq 2, simulating a receiver that observes a forward
+        // jump without Tokio first reporting Lagged.
+        let (tx, rx) = broadcast::channel(8);
+        tx.send(ServerMsg::Event {
+            seq: 2,
+            event: UiEventMsg::ToolUse("2".into()),
+        })
+        .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_server_r, server_w) = server.into_split();
+        let (client_r, _client_w) = client.into_split();
+        let writer = Arc::new(AsyncMutex::new(server_w));
+        let inner = ui.inner.clone();
+        let pump = tokio::spawn(pump_live(rx, writer, inner, 0));
+        let mut reader = BufReader::new(client_r);
+
+        for expected in 0..3 {
+            match read_msg(&mut reader).await {
+                ServerMsg::Event { seq, .. } => assert_eq!(seq, expected),
+                other => panic!("expected recovered event {expected}, got {other:?}"),
+            }
+        }
+        let error = pump.await.unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("reconnect required"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_failure_poisoning_is_permanent_and_out_of_band() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+        let mut rx = ui.inner.live.subscribe();
+        {
+            let mut state = ui.inner.journal.lock().unwrap();
+            state.file = std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap();
+        }
+
+        ui.emit(UiEventMsg::ToolUse("fails".into()));
+        let reason = ui.wait_for_journal_failure().await;
+        assert!(reason.contains("session journal failed"), "{reason}");
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            ServerMsg::Ended { reason: sent } if sent == reason
+        ));
+
+        ui.emit(UiEventMsg::ToolUse("must not append".into()));
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn live_replay_stays_on_the_bound_inode_after_path_replacement() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let moved = tmp.path().join("original-events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+        for value in ["original-zero", "original-one", "original-two"] {
+            ui.emit(UiEventMsg::ToolUse(value.into()));
+        }
+
+        std::fs::rename(&journal, &moved).unwrap();
+        let mut replacement =
+            serde_json::to_vec(&UiEventMsg::ToolUse("replacement".into())).unwrap();
+        replacement.push(b'\n');
+        std::fs::write(&journal, replacement).unwrap();
+
+        // Initial attach replays the inode opened by bind, not the new pathname.
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        w.write_all(
+            encode_line(&ClientMsg::Hello {
+                since_seq: None,
+                read_only: false,
+            })
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        w.flush().await.unwrap();
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot { journal_len, .. } => assert_eq!(journal_len, 3),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+        for (seq, expected) in ["original-zero", "original-one", "original-two"]
+            .into_iter()
+            .enumerate()
+        {
+            match read_msg(&mut reader).await {
+                ServerMsg::Event {
+                    seq: got,
+                    event: UiEventMsg::ToolUse(value),
+                } => {
+                    assert_eq!(got, seq as u64);
+                    assert_eq!(value, expected);
+                }
+                other => panic!("expected pinned replay event {seq}, got {other:?}"),
+            }
+        }
+
+        // Lag/jump recovery uses the same pinned descriptor.
+        let (server, client) = UnixStream::pair().unwrap();
+        let (_server_r, server_w) = server.into_split();
+        let (client_r, _client_w) = client.into_split();
+        let writer = AsyncMutex::new(server_w);
+        let mut next_seq = 0;
+        recover_committed(&writer, &ui.inner, &mut next_seq)
+            .await
+            .unwrap();
+        assert_eq!(next_seq, 3);
+        let mut recovery_reader = BufReader::new(client_r);
+        for (seq, expected) in ["original-zero", "original-one", "original-two"]
+            .into_iter()
+            .enumerate()
+        {
+            match read_msg(&mut recovery_reader).await {
+                ServerMsg::Event {
+                    seq: got,
+                    event: UiEventMsg::ToolUse(value),
+                } => {
+                    assert_eq!(got, seq as u64);
+                    assert_eq!(value, expected);
+                }
+                other => panic!("expected pinned recovery event {seq}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_an_incomplete_existing_record() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        std::fs::write(&journal, serde_json::to_vec(&UiEventMsg::TurnDone).unwrap()).unwrap();
+
+        let error = match SocketUi::bind(&sock, &journal, info()).await {
+            Ok(_) => panic!("incomplete journal unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("incomplete record"), "{error:#}");
     }
 
     /// `Hello{since_seq: Some(n)}` resumes: the snapshot reports the true

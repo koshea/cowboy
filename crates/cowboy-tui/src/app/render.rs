@@ -153,7 +153,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     draw_status(f, app, rows[1]);
     draw_input(f, app, rows[2]);
     // Slash-command autocomplete floats just above the input.
-    if matches!(app.mode, Mode::Idle | Mode::Running) {
+    if app.access == Access::Interactive && matches!(app.mode, Mode::Idle | Mode::Running) {
         draw_completions(f, app, rows[2]);
     }
 
@@ -1128,19 +1128,23 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
-    let mode = match &app.mode {
-        Mode::Running => "running",
-        Mode::Idle => "ready",
-        // These three are deliberate "over to you" pauses, not stalls — the agent
-        // is parked waiting on your answer and will pick up the moment you reply.
-        Mode::AwaitingInput(_) => "your turn — answer above",
-        Mode::AwaitingChoice => "your turn — pick above",
-        Mode::Approval(_) => "paused for you — your call",
-        Mode::Help => "help",
-        Mode::ModelPicker => "models",
-        Mode::ModelForm => "models",
-        Mode::WatchingSubagent => "watching",
-        Mode::Done => "done",
+    let mode = match app.access {
+        Access::ReadOnlyLive => "read-only live",
+        Access::Replay => "replay",
+        Access::Interactive => match &app.mode {
+            Mode::Running => "running",
+            Mode::Idle => "ready",
+            // These three are deliberate "over to you" pauses, not stalls — the agent
+            // is parked waiting on your answer and will pick up the moment you reply.
+            Mode::AwaitingInput(_) => "your turn — answer above",
+            Mode::AwaitingChoice => "your turn — pick above",
+            Mode::Approval(_) => "paused for you — your call",
+            Mode::Help => "help",
+            Mode::ModelPicker => "models",
+            Mode::ModelForm => "models",
+            Mode::WatchingSubagent => "watching",
+            Mode::Done => "done",
+        },
     };
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1152,12 +1156,28 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         f.render_stateful_widget(Throbber::default(), cols[0], &mut ts);
     }
     let bar = Style::default().bg(Color::Blue).fg(Color::White);
-    // Right side: a blocked flag, the running token estimate, then the diff.
+    // Right side: transport and worker lifecycle are separate facts. A broken
+    // connection must never make a running session look ended (or vice versa).
+    let mut segs: Vec<(String, Option<Color>)> = Vec::new();
+    if app.connection != ConnectionState::Local {
+        let accent = match &app.connection {
+            ConnectionState::Live => Some(Color::Green),
+            ConnectionState::Connecting | ConnectionState::Reconnecting { .. } => {
+                Some(Color::Yellow)
+            }
+            ConnectionState::Unavailable | ConnectionState::Ended { .. } => Some(Color::LightRed),
+            ConnectionState::Local => None,
+        };
+        segs.push((app.connection.label(), accent));
+    }
+    if let Some(lifecycle) = &app.lifecycle {
+        segs.push((format!("session {lifecycle}"), None));
+    }
+    // Then the boundary, blocked state, token estimate, and diff.
     // Each segment carries an optional accent colour so the context meter can
     // warn (amber/red) without recolouring the whole bar.
-    let mut segs: Vec<(String, Option<Color>)> = Vec::new();
-    // The boundary first: it is the one fact here that does not change all session,
-    // and the one the whole design rests on.
+    // The boundary first among the session details: it is the one fact here that
+    // does not change all session, and the one the whole design rests on.
     if !app.boundary.is_empty() {
         segs.push((app.boundary.clone(), None));
     }
@@ -1404,16 +1424,20 @@ pub(super) fn draw_completions(f: &mut Frame, app: &App, input_area: Rect) {
 }
 
 pub(super) fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let hint = match &app.mode {
-        Mode::Done => "session finished — press q to quit",
-        Mode::AwaitingInput(_) => "type your answer · Enter submits",
-        Mode::Idle => "Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end",
-        // While the agent works, typing steers the turn in flight rather than waiting
-        // for it — worth saying, because the old behaviour was the opposite.
-        Mode::Running => "type to steer · /after <msg> to queue · Ctrl-C interrupts · F1 help",
-        _ => "Enter send · Shift+Enter newline · F1 help",
+    let hint = match app.access {
+        Access::ReadOnlyLive => "READ-ONLY LIVE · navigate/help/copy · q/Esc exits",
+        Access::Replay => "REPLAY · read-only · navigate/help/copy · q/Esc exits",
+        Access::Interactive => match &app.mode {
+            Mode::Done => "session finished — press q to quit",
+            Mode::AwaitingInput(_) => "type your answer · Enter submits",
+            Mode::Idle => "Enter send · ↑↓ history · drag+y copy · F1 help · Ctrl-C twice to end",
+            // While the agent works, typing steers the turn in flight rather than waiting
+            // for it — worth saying, because the old behaviour was the opposite.
+            Mode::Running => "type to steer · /after <msg> to queue · Ctrl-C interrupts · F1 help",
+            _ => "Enter send · Shift+Enter newline · F1 help",
+        },
     };
-    let accent = if app.mode == Mode::Idle {
+    let accent = if app.access == Access::Interactive && app.mode == Mode::Idle {
         Color::Cyan
     } else {
         Color::DarkGray

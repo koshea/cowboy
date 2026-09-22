@@ -345,13 +345,28 @@ fn end_terminates_the_worker() {
         other => panic!("expected a session record, got {other:?}"),
     };
 
+    // The worker's base phase becomes Idle after setup, and UpdateSession must
+    // preserve that status rather than flattening it back to Running.
+    let started = Instant::now();
+    let mut idle = false;
+    while started.elapsed() < Duration::from_secs(12) {
+        match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
+            Some(DaemonResp::Session { info }) if info.status == SessionStatus::Idle => {
+                idle = true;
+                break;
+            }
+            _ => std::thread::sleep(Duration::from_millis(150)),
+        }
+    }
+    assert!(idle, "an inactive worker must heartbeat as Idle");
+
     c.send(&ClientMsg::End);
 
     let started = Instant::now();
     let mut ended = false;
     while started.elapsed() < Duration::from_secs(8) {
         match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
-            Some(DaemonResp::Session { info }) if info.status != SessionStatus::Running => {
+            Some(DaemonResp::Session { info }) if info.status.is_terminal() => {
                 ended = true;
                 break;
             }
@@ -442,7 +457,7 @@ async fn end_via_bridge_terminates_the_worker() {
     let mut ended = false;
     while started.elapsed() < Duration::from_secs(8) {
         match dreq(&fx.sock, DaemonReq::GetSession { id: id.clone() }) {
-            Some(DaemonResp::Session { info }) if info.status != SessionStatus::Running => {
+            Some(DaemonResp::Session { info }) if info.status.is_terminal() => {
                 ended = true;
                 break;
             }
@@ -571,7 +586,7 @@ fn a_client_that_vanishes_without_detaching_ends_the_session() {
     drop(c);
 
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(40) {
+    while started.elapsed() < Duration::from_secs(50) {
         if !pid_alive(worker_pid) {
             return;
         }
@@ -604,7 +619,8 @@ fn a_client_that_detaches_leaves_the_session_running() {
     c.send(&ClientMsg::Detach);
     drop(c);
 
-    // Well past the abandonment grace period.
+    // Long enough to catch an accidental immediate abandonment, while the focused
+    // abrupt-disconnect test covers the full reconnect grace.
     std::thread::sleep(Duration::from_secs(12));
     assert!(
         pid_alive(worker_pid),

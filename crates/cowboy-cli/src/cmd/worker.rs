@@ -74,7 +74,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     security
         .validate()
         .context("validating merged credential grants")?;
-    let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
+    let agent_cfg = AgentConfig::load_opt(&paths.agent)
+        .with_context(|| format!("loading {}", paths.agent.display()))?
+        .unwrap_or_default();
 
     let providers = ProvidersConfig::load_global().context("loading providers.yaml")?;
     if providers.providers.is_empty() {
@@ -132,7 +134,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         id: id.clone(),
         root: root.clone(),
         task: args.task.clone(),
-        status: SessionStatus::Running,
+        status: SessionStatus::Starting,
         pid: Some(std::process::id()),
         branch: git_branch(&root),
         session_name: Some(session_name_for(&root)),
@@ -160,6 +162,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // client is attached — so an orphaned worker shuts itself down (container +
     // finalize) instead of lingering forever.
     let orphan = CancellationToken::new();
+    let heartbeat_stop = CancellationToken::new();
 
     // Register with the daemon + heartbeat (daemon-managed sessions only).
     if args.register {
@@ -171,17 +174,17 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let hb_ui = emitter.clone();
         let hb_info = reg_info;
         let hb_orphan = orphan.clone();
+        let hb_stop = heartbeat_stop.clone();
         tokio::spawn(async move {
             // Consecutive heartbeats the daemon has been unreachable.
             let mut unreachable = 0u32;
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = hb_stop.cancelled() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                }
                 let st = hb_ui.stats();
-                let status = if st.blocked_reason.is_some() {
-                    SessionStatus::Blocked
-                } else {
-                    SessionStatus::Running
-                };
+                let status = hb_ui.status();
                 let attached = hb_ui.attached();
                 let resp = daemon::request(DaemonReq::UpdateSession {
                     id: hb_id.clone(),
@@ -457,10 +460,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // token + a bounded wait) so a slow/hung setup never makes the session
     // unendable: End/Detach/orphan abort it and end/detach cleanly; an Interrupt
     // abandons it and returns to idle; a Message typed during setup is queued.
+    // Setup is active work after the socket has become attachable. From here on,
+    // every phase transition updates the same status snapshots and heartbeats use.
+    emitter.set_status(SessionStatus::Running);
     let mut setup_pending = true;
     // Control messages that arrived while setup held `&mut agent`, applied as soon as
     // it lets go.
     let mut deferred: Vec<ClientMsg> = Vec::new();
+    let mut journal_failure: Option<String> = None;
     'serve: loop {
         if std::mem::take(&mut setup_pending) {
             // Scoped so the setup future — and with it its `&mut agent` borrow — is
@@ -474,6 +481,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     tokio::select! {
                         _ = &mut setup => break,
                         _ = orphan.cancelled() => {
+                            tc.cancel();
+                            let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
+                            break 'serve;
+                        }
+                        failure = emitter.wait_for_journal_failure() => {
+                            journal_failure = Some(failure);
                             tc.cancel();
                             let _ = tokio::time::timeout(TURN_UNWIND_BOUND, &mut setup).await;
                             break 'serve;
@@ -549,6 +562,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 m
             }
             None => {
+                emitter.set_status(SessionStatus::Idle);
                 // Idle: wait for the next client message, or shut down if orphaned.
                 // If we sit idle with no client attached past the configured
                 // timeout, stop the container to free its RAM (the next command
@@ -564,6 +578,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     };
                     tokio::select! {
                         _ = orphan.cancelled() => break 'serve,
+                        failure = emitter.wait_for_journal_failure() => {
+                            journal_failure = Some(failure);
+                            break 'serve;
+                        }
                         m = cmd_rx.recv() => break m,
                         // Nobody is driving and nobody said they'd be back: end,
                         // rather than waiting for an `End` that is not coming.
@@ -644,6 +662,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             }
         };
 
+        emitter.set_status(SessionStatus::Running);
         let mut end = false;
         let mut switch_to: Option<String> = None;
         {
@@ -665,6 +684,21 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                                  abandoning it"
                             );
                             emitter.emit(UiEventMsg::TurnDone);
+                        }
+                        end = true;
+                        break;
+                    }
+                    failure = emitter.wait_for_journal_failure() => {
+                        journal_failure = Some(failure);
+                        tc.cancel();
+                        if tokio::time::timeout(TURN_UNWIND_BOUND, &mut turn)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!(
+                                "turn did not unwind within {TURN_UNWIND_BOUND:?} after journal \
+                                 failure; abandoning it"
+                            );
                         }
                         end = true;
                         break;
@@ -835,18 +869,38 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             "stopped {reaped} background subagent(s) on session end"
         );
     }
-    // Tell the world the session has ended BEFORE any container cleanup. The    // cleanup below touches Docker (a `container_state` probe, exec, container +
+    // Tell the world the session has ended BEFORE any container cleanup. The
+    // cleanup below touches Docker (a `container_state` probe, exec, container +
     // network removal) and a wedged/unreachable Docker can make those calls hang
     // for their full timeout — that must not delay the daemon learning the session
     // is over, or it keeps reporting it `Running` (and a client keeps waiting) long
     // after `End`. Finalizing the journal and notifying clients/daemon are
     // disk/socket-only and complete promptly.
     agent.finalize_session();
+    // Finalization emits too, so inspect the latch again before choosing the daemon
+    // terminal state. The first failure was already sent to live clients via the
+    // nonjournaled Ended control message; sending it again here also covers a client
+    // that attached while the bounded turn unwind was in progress.
+    journal_failure = journal_failure.or_else(|| emitter.journal_failure());
+    let end_reason = journal_failure
+        .as_deref()
+        .map(|failure| format!("session failed: {failure}"))
+        .unwrap_or_else(|| "session ended".into());
     // Stops serving and unlinks the socket, so the session is un-attachable from this
     // moment — before the teardown below, which is bounded but not instant.
-    emitter.end("session ended");
+    // Stop registry updates before the terminal transition so a late heartbeat
+    // cannot resurrect Completed/Failed as a live status during teardown.
+    heartbeat_stop.cancel();
+    emitter.end(&end_reason);
     if args.register {
-        let _ = daemon::request(DaemonReq::CompleteSession { id: id.clone() }).await;
+        let req = match journal_failure {
+            Some(error) => DaemonReq::FailSession {
+                id: id.clone(),
+                error,
+            },
+            None => DaemonReq::CompleteSession { id: id.clone() },
+        };
+        let _ = daemon::request(req).await;
     }
     // Guarantee the process exits. Every step below is individually bounded, but
     // "bounded" is not the same as "guaranteed": a wedged step, a blocking task the
@@ -875,14 +929,25 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
 /// startup, where there is briefly no client because the first one is still
 /// connecting.
 async fn abandoned(emitter: &crate::agent::socket_ui::SocketUi) {
-    const GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+    // Covers the terminal supervisor's full reconnect budget while still bounding a
+    // genuinely vanished terminal. Pending prompts have their own absolute caps.
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(35);
     const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+    let mut attachment_epoch = emitter.attachment_epoch();
+    let mut abandoned_since = None;
     loop {
+        let current_epoch = emitter.attachment_epoch();
+        if current_epoch != attachment_epoch {
+            attachment_epoch = current_epoch;
+            abandoned_since = None;
+        }
         if emitter.abandoned() {
-            tokio::time::sleep(GRACE).await;
-            if emitter.abandoned() {
+            let since = abandoned_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= GRACE {
                 return;
             }
+        } else {
+            abandoned_since = None;
         }
         tokio::time::sleep(POLL).await;
     }

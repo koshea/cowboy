@@ -43,7 +43,9 @@ pub async fn run(args: ProcArgs) -> Result<()> {
     let paths = ConfigPaths::for_root(&root);
     let security = SecurityConfig::load(&paths.security)
         .context("loading .cowboy/security.yaml (run `cowboy init` first)")?;
-    let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
+    let agent_cfg = AgentConfig::load_opt(&paths.agent)
+        .with_context(|| format!("loading {}", paths.agent.display()))?
+        .unwrap_or_default();
     let workdir = security.sandbox.workdir.clone();
     let proc_dir = format!("{workdir}/.cowboy/proc");
     // No UI here, so an `ask` has nobody to answer it: fail closed explicitly.

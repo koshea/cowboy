@@ -630,3 +630,113 @@ fn an_explicit_cached_price_is_never_overridden() {
     let r = resolve_model(&providers, Some(&user), None, None).unwrap();
     assert_eq!(r.cached_input_cost_per_mtok, Some(0.123));
 }
+
+#[test]
+fn model_setup_pair_preserves_both_files_and_provider_permissions() {
+    let tmp = tempdir();
+    let providers_path = tmp.path().join(PROVIDERS_FILE);
+    let models_path = tmp.path().join(MODELS_FILE);
+
+    let state = load_model_setup_state(&providers_path, &models_path).unwrap();
+    let mut providers = state.providers.clone();
+    providers
+        .providers
+        .insert("p".into(), provider("https://api.example/v1"));
+    let mut models = state.models.clone();
+    models.default = Some("m".into());
+    models.models.insert("m".into(), model_def("p", "model/id"));
+    commit_model_setup_pair(
+        &providers_path,
+        &models_path,
+        &state.generation,
+        &providers,
+        &models,
+    )
+    .unwrap();
+
+    assert_eq!(ProvidersConfig::load(&providers_path).unwrap(), providers);
+    assert_eq!(ModelsConfig::load(&models_path).unwrap(), models);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&providers_path)
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn model_setup_generation_refuses_a_concurrent_edit() {
+    let tmp = tempdir();
+    let providers_path = tmp.path().join(PROVIDERS_FILE);
+    let models_path = tmp.path().join(MODELS_FILE);
+    let state = load_model_setup_state(&providers_path, &models_path).unwrap();
+
+    std::fs::write(&models_path, "version: 1\nmodels: {}\n# hand edit\n").unwrap();
+    let error = commit_model_setup_pair(
+        &providers_path,
+        &models_path,
+        &state.generation,
+        &state.providers,
+        &state.models,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("changed while setup was open"));
+    assert!(std::fs::read_to_string(&models_path)
+        .unwrap()
+        .contains("# hand edit"));
+}
+
+#[test]
+fn model_setup_strictly_rejects_a_malformed_existing_file() {
+    let tmp = tempdir();
+    let providers_path = write(tmp.path(), PROVIDERS_FILE, "providers: [not-a-map]\n");
+    let models_path = tmp.path().join(MODELS_FILE);
+    assert!(matches!(
+        load_model_setup_state(&providers_path, &models_path),
+        Err(Error::ConfigParse { .. })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(providers_path).unwrap(),
+        "providers: [not-a-map]\n"
+    );
+}
+
+#[test]
+fn model_setup_recovers_an_interrupted_prepared_pair() {
+    let tmp = tempdir();
+    let providers_path = tmp.path().join(PROVIDERS_FILE);
+    let models_path = tmp.path().join(MODELS_FILE);
+    let mut old_providers = ProvidersConfig::default();
+    old_providers
+        .providers
+        .insert("old".into(), provider("https://old.example/v1"));
+    old_providers.save(&providers_path).unwrap();
+    let mut old_models = ModelsConfig::default();
+    old_models.default = Some("old".into());
+    old_models
+        .models
+        .insert("old".into(), model_def("old", "old/model"));
+    old_models.save(&models_path).unwrap();
+
+    std::fs::copy(
+        &providers_path,
+        tmp.path().join(".model-setup.providers.backup"),
+    )
+    .unwrap();
+    std::fs::copy(&models_path, tmp.path().join(".model-setup.models.backup")).unwrap();
+    std::fs::write(&providers_path, "version: 1\nproviders: {}\n").unwrap();
+    std::fs::write(&models_path, "version: 1\nmodels: {}\n").unwrap();
+    std::fs::write(
+        tmp.path().join(".model-setup.transaction"),
+        "phase: prepared\nproviders_existed: true\nmodels_existed: true\n",
+    )
+    .unwrap();
+
+    let recovered = load_model_setup_state(&providers_path, &models_path).unwrap();
+    assert_eq!(recovered.providers, old_providers);
+    assert_eq!(recovered.models, old_models);
+    assert!(!tmp.path().join(".model-setup.transaction").exists());
+}

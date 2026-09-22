@@ -13,8 +13,10 @@ a crashed/stale exit), the daemon's coordinator:
 3. spawns `cowboy ranch start <id>` against the main repo.
 
 That reuses the exact, tested advance path out-of-band, so it never blocks the
-daemon. The result: a workstream completes → its outputs are promoted → its
-dependents unblock → they launch — automatically.
+daemon. The advance reconciles a finished or stale workstream to `WaitingForUser`
+and attempts to promote a snapshot for review; its dependents remain blocked. After
+you successfully sign off, the same coordinator can launch the newly-ready
+workstreams automatically.
 
 ## Bursts and races
 
@@ -29,6 +31,6 @@ Set `auto_advance: false` in `ranch.yaml` to drive the plan manually with `cowbo
 ranch start` (or the [dashboard](dashboard.md)'s `s` key). This is useful when you
 want to inspect each step before the next workstream launches.
 
-Note that **acceptance gates still pause** regardless of `auto_advance`: the
-coordinator advances through the safe parts and stops for your
-[sign-off](acceptance-gates.md) where a workstream declares acceptance criteria.
+Note that **acceptance gates still pause** regardless of `auto_advance`: every
+finished workstream stops for your [sign-off](acceptance-gates.md), even when it
+declares no acceptance criteria.

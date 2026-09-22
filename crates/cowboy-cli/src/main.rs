@@ -52,9 +52,9 @@ async fn run() -> Result<()> {
             cowboy_cli::cli::WebCommand::Status => cmd::web::status().await,
         },
         Some(Command::Attach { target }) => cmd::attach::run(target).await,
-        Some(Command::Sessions) => cmd::sessions::run().await,
+        Some(Command::Sessions { all }) => cmd::sessions::run(all).await,
         Some(Command::Session(args)) => match args.command {
-            cowboy_cli::cli::SessionCommand::List => cmd::sessions::run().await,
+            cowboy_cli::cli::SessionCommand::List { all } => cmd::sessions::run(all).await,
             cowboy_cli::cli::SessionCommand::Cleanup { dry_run } => {
                 cmd::sessions::cleanup(dry_run).await
             }
@@ -81,7 +81,7 @@ async fn run() -> Result<()> {
         Some(Command::Ranch(args)) => cmd::ranch::run(args.command).await,
         Some(Command::Crew(args)) => cmd::crew::run(args.command).await,
         Some(Command::Logs) => cmd::logs::run().await,
-        Some(Command::Replay { session_id }) => cmd::logs::replay(session_id).await,
+        Some(Command::Replay { session_id, tui }) => cmd::logs::replay(session_id, tui).await,
         Some(Command::Completions { shell }) => {
             clap_complete::generate(
                 shell,

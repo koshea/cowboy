@@ -36,7 +36,9 @@ pub async fn run(
     // Resolve a `--continue`/`--resume` request to a concrete session id, up
     // front against the starting worktree.
     let resume_id = match &resume {
-        Some(crate::cli::ResumeSpec::Id(id)) => Some(id.clone()),
+        Some(crate::cli::ResumeSpec::Id(id)) => {
+            Some(crate::session::replay::resolve_id(&root, id)?)
+        }
         Some(crate::cli::ResumeSpec::Latest) => match crate::session::latest_session_id(&root) {
             Some(id) => Some(id),
             None => anyhow::bail!("no prior session to continue in this worktree"),
@@ -185,7 +187,9 @@ pub async fn run(
         // Headless (piped) runs can't prompt — credential grants flagged
         // `approval: required` fail closed and are dropped before any mount.
         drop_approval_required_grants(&mut security);
-        let agent_cfg = AgentConfig::load(&paths.agent).unwrap_or_default();
+        let agent_cfg = AgentConfig::load_opt(&paths.agent)
+            .with_context(|| format!("loading {}", paths.agent.display()))?
+            .unwrap_or_default();
         let context_window = resolved.context_window as usize;
         let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
         let logger = crate::session::SessionLogger::create(&root).ok();

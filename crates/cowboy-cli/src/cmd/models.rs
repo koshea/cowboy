@@ -8,11 +8,12 @@
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{
-    expand_env, resolve_model, ConfigPaths, ModelDef, ModelsConfig, Provider, ProvidersConfig,
-    ReasoningEffort,
+    commit_model_setup_pair, expand_env, load_model_setup_state, resolve_model, ConfigPaths,
+    ModelDef, ModelsConfig, Provider, ProvidersConfig, ReasoningEffort,
 };
 use cowboy_core::model::list_models;
 use cowboy_core::model_defaults;
@@ -22,11 +23,11 @@ use crate::style;
 
 pub async fn run(args: ModelsArgs) -> Result<()> {
     match args.command {
-        ModelsCommand::Setup => setup(),
-        ModelsCommand::List => list(),
-        ModelsCommand::Use { name, global } => use_default(&name, global),
-        ModelsCommand::Available { all } => available(all).await,
-        ModelsCommand::Add {
+        None | Some(ModelsCommand::List) => list(),
+        Some(ModelsCommand::Setup) => setup().await,
+        Some(ModelsCommand::Use { name, global }) => use_default(&name, global),
+        Some(ModelsCommand::Available { all }) => available(all).await,
+        Some(ModelsCommand::Add {
             id,
             name,
             provider,
@@ -35,7 +36,7 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
             max_output,
             reasoning,
             default,
-        } => add(AddArgs {
+        }) => add(AddArgs {
             id,
             name,
             provider,
@@ -50,104 +51,276 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
 
 // --- interactive setup ---
 
-fn setup() -> Result<()> {
+const CATALOGUE_TIMEOUT: Duration = Duration::from_secs(8);
+const CATALOGUE_LIMIT: usize = 50;
+
+struct SetupPlan {
+    provider_name: String,
+    provider: Provider,
+    model_name: String,
+    model: ModelDef,
+}
+
+async fn setup() -> Result<()> {
     let providers_path =
         ProvidersConfig::global_path().context("cannot resolve home config directory")?;
-    let user_models_path =
-        ModelsConfig::user_path().context("cannot resolve home config directory")?;
-
-    let mut providers = ProvidersConfig::load_global().unwrap_or_default();
-    let mut user_models = ModelsConfig::load_opt(&user_models_path)?.unwrap_or_default();
+    let models_path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
+    let state = load_model_setup_state(&providers_path, &models_path)?;
 
     println!("Configure a model provider (saved to your home dir, never a project).\n");
+    let provider_name = prompt_required("Provider name", Some("default"), valid_name)?;
+    let base_url = prompt_required(
+        "Endpoint base URL (e.g. https://host/v1)",
+        None,
+        validate_base_url,
+    )?;
+    let api_key = loop {
+        let value = read_secret(&format!("API key for {provider_name}"))?;
+        if !value.trim().is_empty() {
+            break value.trim().to_string();
+        }
+        crate::ui::warn("an API key is required; try again");
+    };
+    let provider = Provider {
+        base_url,
+        api_key,
+        headers: BTreeMap::new(),
+    };
 
-    // --- provider ---
-    let pname = prompt("Provider name", Some("default"))?;
-    let base_url = prompt("Endpoint base URL (e.g. https://host/v1)", None)?;
-    if base_url.is_empty() {
-        bail!("a base URL is required");
+    println!("\nChecking the endpoint model catalogue (up to 8 seconds)…");
+    let model_id = choose_model_id(&provider).await?;
+    let defaults = model_defaults::lookup(&model_id);
+    let model_name = prompt_required("Model name", Some(&defaults.name), valid_name)?;
+
+    let mut temperature = defaults.temperature;
+    let mut max_tokens = defaults.max_tokens;
+    let mut context_window = defaults.context_window;
+    let mut reasoning_effort = defaults.reasoning_effort;
+    if crate::prompt::confirm("Configure advanced model tuning?", false)? {
+        temperature = prompt_value("Temperature", temperature, parse_temperature)?;
+        max_tokens = prompt_value("Max output tokens", max_tokens, parse_positive_u32)?;
+        context_window = prompt_value("Context window", context_window, parse_positive_u32)?;
+        let reasoning_default = reasoning_effort
+            .map(ReasoningEffort::as_str)
+            .unwrap_or("none");
+        reasoning_effort = loop {
+            let raw = prompt("Reasoning effort", Some(reasoning_default))?;
+            match parse_reasoning(&raw) {
+                Ok(value) => break value,
+                Err(error) => crate::ui::warn(&format!("{error}; try again")),
+            }
+        };
     }
-    let api_key = read_secret(&format!("API key for {pname}"))?;
-    if api_key.trim().is_empty() {
-        bail!("an API key is required");
-    }
-    providers.providers.insert(
-        pname.clone(),
-        Provider {
-            base_url,
-            api_key: api_key.trim().to_string(),
+
+    let plan = SetupPlan {
+        provider_name: provider_name.clone(),
+        provider,
+        model_name: model_name.clone(),
+        model: ModelDef {
+            provider: provider_name.clone(),
+            model: model_id,
+            temperature,
+            max_tokens,
+            context_window,
+            reasoning_effort,
+            top_p: None,
+            stop: Vec::new(),
+            extra: BTreeMap::new(),
+            input_cost_per_mtok: defaults.input_cost_per_mtok,
+            output_cost_per_mtok: defaults.output_cost_per_mtok,
+            cached_input_cost_per_mtok: defaults.cached_input_cost_per_mtok,
             headers: BTreeMap::new(),
+            anthropic_cache: false,
+            stream_idle_timeout_seconds: None,
         },
-    );
-    providers.save(&providers_path)?;
-    crate::ui::ok(&format!(
-        "saved provider `{pname}` to {}",
-        providers_path.display()
-    ));
+    };
 
-    // --- model ---
-    //
-    // Not optional. Declining used to leave a provider saved and no model, and the next
-    // `cowboy` failed inside `resolve_model` with a message about configuration shape —
-    // the one gap in this flow with no remedy attached. A provider on its own cannot run
-    // anything, so setup is not done until there is a model.
-    println!(
-        "\nNow a model that uses it. `cowboy models available` lists what the endpoint offers."
-    );
+    let replacements = replacements(&state.providers, &state.models, &plan);
+    if !replacements.is_empty()
+        && !crate::prompt::confirm_destructive(&format!(
+            "Replace existing {}?",
+            replacements.join(" and ")
+        ))?
     {
-        let mname = prompt("Model name", Some(&pname))?;
-        let model_id = prompt("Model id (e.g. anthropic/claude-sonnet-4-6)", None)?;
-        if model_id.is_empty() {
-            bail!("a model id is required");
-        }
-        let temperature = prompt_parsed("Temperature", 0.2_f32)?;
-        let max_tokens = prompt_parsed("Max tokens", 8192_u32)?;
-        let context_window = prompt_parsed("Context window", 200_000_u32)?;
-
-        let first = user_models.models.is_empty();
-        user_models.models.insert(
-            mname.clone(),
-            ModelDef {
-                provider: pname.clone(),
-                model: model_id,
-                temperature,
-                max_tokens,
-                context_window,
-                reasoning_effort: None,
-                top_p: None,
-                stop: Vec::new(),
-                extra: BTreeMap::new(),
-                input_cost_per_mtok: None,
-                output_cost_per_mtok: None,
-                cached_input_cost_per_mtok: None,
-                headers: BTreeMap::new(),
-                anthropic_cache: false,
-                stream_idle_timeout_seconds: None,
-            },
-        );
-        // Make the first-ever model the default.
-        if first || user_models.default.is_none() {
-            user_models.default = Some(mname.clone());
-        }
-        user_models.save(&user_models_path)?;
-        crate::ui::ok(&format!(
-            "saved model `{mname}` to {}",
-            user_models_path.display()
-        ));
-        if user_models.default.as_deref() == Some(mname.as_str()) {
-            println!("  (set as the default model)");
-        }
+        return Ok(());
     }
 
+    let (providers, models) = apply_setup(&state.providers, &state.models, plan);
+    commit_model_setup_pair(
+        &providers_path,
+        &models_path,
+        &state.generation,
+        &providers,
+        &models,
+    )?;
+
+    crate::ui::ok(&format!(
+        "saved provider `{provider_name}` and model `{model_name}`"
+    ));
+    println!("  credentials: {} (mode 0600)", providers_path.display());
+    println!("  models: {}", models_path.display());
     println!("\n{}", style::success("Done — you can run `cowboy` now."));
-    println!("  review it with `cowboy models list`, or verify the host with `cowboy doctor`");
+    println!("  review it with `cowboy models`, or verify the host with `cowboy doctor`");
     Ok(())
+}
+
+fn replacements(
+    providers: &ProvidersConfig,
+    models: &ModelsConfig,
+    plan: &SetupPlan,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    if providers.providers.contains_key(&plan.provider_name) {
+        found.push(format!("provider `{}`", plan.provider_name));
+    }
+    if models.models.contains_key(&plan.model_name) {
+        found.push(format!("model `{}`", plan.model_name));
+    }
+    found
+}
+
+fn apply_setup(
+    existing_providers: &ProvidersConfig,
+    existing_models: &ModelsConfig,
+    plan: SetupPlan,
+) -> (ProvidersConfig, ModelsConfig) {
+    let mut providers = existing_providers.clone();
+    let mut models = existing_models.clone();
+    let first = models.models.is_empty();
+    providers
+        .providers
+        .insert(plan.provider_name, plan.provider);
+    models.models.insert(plan.model_name.clone(), plan.model);
+    if first || models.default.is_none() {
+        models.default = Some(plan.model_name);
+    }
+    (providers, models)
+}
+
+async fn choose_model_id(provider: &Provider) -> Result<String> {
+    let base_url = expand_env(&provider.base_url)?;
+    let entries = tokio::time::timeout(
+        CATALOGUE_TIMEOUT,
+        list_models(&base_url, &provider.api_key, &provider.headers),
+    )
+    .await;
+    let mut entries = match entries {
+        Ok(Ok(entries)) => entries
+            .into_iter()
+            .filter(|entry| model_defaults::is_chat(&entry.id))
+            .collect::<Vec<_>>(),
+        Ok(Err(_)) => {
+            crate::ui::warn(
+                "the endpoint did not provide a usable catalogue; enter a model id manually",
+            );
+            return prompt_required("Model id", None, valid_name);
+        }
+        Err(_) => {
+            crate::ui::warn("catalogue lookup timed out; enter a model id manually");
+            return prompt_required("Model id", None, valid_name);
+        }
+    };
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+    entries.dedup_by(|left, right| left.id == right.id);
+    entries.truncate(CATALOGUE_LIMIT);
+    if entries.is_empty() {
+        crate::ui::warn("the endpoint returned no chat models; enter a model id manually");
+        return prompt_required("Model id", None, valid_name);
+    }
+
+    println!("Choose a model, or enter its provider id manually:");
+    for (index, entry) in entries.iter().enumerate() {
+        println!("  {:>2}. {}", index + 1, entry.id);
+    }
+    loop {
+        let raw = prompt("Model number or id", None)?;
+        if let Ok(index) = raw.parse::<usize>() {
+            if let Some(entry) = index.checked_sub(1).and_then(|i| entries.get(i)) {
+                return Ok(entry.id.clone());
+            }
+            crate::ui::warn("that catalogue number is not available; try again");
+        } else if valid_name(&raw).is_ok() {
+            return Ok(raw);
+        } else {
+            crate::ui::warn("a model id is required; try again");
+        }
+    }
+}
+
+fn valid_name(value: &str) -> std::result::Result<(), String> {
+    if value.trim().is_empty() {
+        Err("a value is required".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_base_url(value: &str) -> std::result::Result<(), String> {
+    let expanded = expand_env(value).map_err(|error| error.to_string())?;
+    let url =
+        reqwest::Url::parse(&expanded).map_err(|_| "enter a valid absolute URL".to_string())?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("the endpoint URL must use http or https".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("do not put credentials in the endpoint URL".into());
+    }
+    if url.host_str().is_none() {
+        return Err("the endpoint URL must include a host".into());
+    }
+    Ok(())
+}
+
+fn parse_temperature(value: &str) -> std::result::Result<f32, String> {
+    let parsed = value
+        .parse::<f32>()
+        .map_err(|_| "temperature must be a number".to_string())?;
+    if parsed.is_finite() && (0.0..=2.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err("temperature must be between 0 and 2".into())
+    }
+}
+
+fn parse_positive_u32(value: &str) -> std::result::Result<u32, String> {
+    match value.parse::<u32>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err("enter a positive whole number".into()),
+    }
+}
+
+fn prompt_required(
+    label: &str,
+    default: Option<&str>,
+    validate: impl Fn(&str) -> std::result::Result<(), String>,
+) -> Result<String> {
+    loop {
+        let value = prompt(label, default)?;
+        match validate(&value) {
+            Ok(()) => return Ok(value),
+            Err(error) => crate::ui::warn(&format!("{error}; try again")),
+        }
+    }
+}
+
+fn prompt_value<T: std::fmt::Display>(
+    label: &str,
+    default: T,
+    parse: impl Fn(&str) -> std::result::Result<T, String>,
+) -> Result<T> {
+    loop {
+        let raw = prompt(label, Some(&default.to_string()))?;
+        match parse(&raw) {
+            Ok(value) => return Ok(value),
+            Err(error) => crate::ui::warn(&format!("{error}; try again")),
+        }
+    }
 }
 
 // --- list ---
 
 fn list() -> Result<()> {
-    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    let providers = ProvidersConfig::load_global()?;
     let user = ModelsConfig::user_path()
         .map(|p| ModelsConfig::load_opt(&p))
         .transpose()?
@@ -273,7 +446,7 @@ fn use_default(name: &str, global: bool) -> Result<()> {
 // --- available (list the provider catalogue) ---
 
 async fn available(all: bool) -> Result<()> {
-    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    let providers = ProvidersConfig::load_global()?;
     if providers.providers.is_empty() {
         bail!("no providers configured; run `cowboy models setup`");
     }
@@ -334,7 +507,7 @@ struct AddArgs {
 }
 
 fn add(a: AddArgs) -> Result<()> {
-    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    let providers = ProvidersConfig::load_global()?;
     if providers.providers.is_empty() {
         bail!("no providers configured; run `cowboy models setup`");
     }
@@ -442,7 +615,7 @@ pub fn save_user_model(
     max_output: u32,
     reasoning: &str,
 ) -> Result<()> {
-    let providers = ProvidersConfig::load_global().unwrap_or_default();
+    let providers = ProvidersConfig::load_global()?;
     if providers.providers.is_empty() {
         bail!("no providers configured; run `cowboy models setup`");
     }
@@ -500,9 +673,100 @@ fn prompt(label: &str, default: Option<&str>) -> Result<String> {
     crate::prompt::line(label, default)
 }
 
-/// Prompt for a value parseable to `T`, falling back to `default` on empty;
-/// re-uses the default on a parse error after warning.
-fn prompt_parsed<T: std::str::FromStr + std::fmt::Display>(label: &str, default: T) -> Result<T> {
-    let raw = prompt(label, Some(&default.to_string()))?;
-    Ok(raw.parse().unwrap_or(default))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(url: &str) -> Provider {
+        Provider {
+            base_url: url.into(),
+            api_key: "secret".into(),
+            headers: BTreeMap::new(),
+        }
+    }
+
+    fn model(provider_name: &str, id: &str) -> ModelDef {
+        ModelDef {
+            provider: provider_name.into(),
+            model: id.into(),
+            temperature: 0.2,
+            max_tokens: 8_192,
+            context_window: 200_000,
+            reasoning_effort: None,
+            top_p: None,
+            stop: Vec::new(),
+            extra: BTreeMap::new(),
+            input_cost_per_mtok: None,
+            output_cost_per_mtok: None,
+            cached_input_cost_per_mtok: None,
+            headers: BTreeMap::new(),
+            anthropic_cache: false,
+            stream_idle_timeout_seconds: None,
+        }
+    }
+
+    fn plan(provider_name: &str, model_name: &str) -> SetupPlan {
+        SetupPlan {
+            provider_name: provider_name.into(),
+            provider: provider("https://new.example/v1"),
+            model_name: model_name.into(),
+            model: model(provider_name, "new/model"),
+        }
+    }
+
+    #[test]
+    fn setup_merge_preserves_unrelated_entries_and_default() {
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert("old".into(), provider("https://old.example/v1"));
+        let mut models = ModelsConfig {
+            default: Some("old".into()),
+            ..ModelsConfig::default()
+        };
+        models
+            .models
+            .insert("old".into(), model("old", "old/model"));
+
+        let (updated_providers, updated_models) =
+            apply_setup(&providers, &models, plan("new", "new"));
+        assert!(updated_providers.providers.contains_key("old"));
+        assert!(updated_providers.providers.contains_key("new"));
+        assert!(updated_models.models.contains_key("old"));
+        assert!(updated_models.models.contains_key("new"));
+        assert_eq!(updated_models.default.as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn replacement_detection_names_each_collision() {
+        let mut providers = ProvidersConfig::default();
+        providers
+            .providers
+            .insert("same".into(), provider("https://old.example/v1"));
+        let mut models = ModelsConfig::default();
+        models
+            .models
+            .insert("same".into(), model("same", "old/model"));
+        let found = replacements(&providers, &models, &plan("same", "same"));
+        assert_eq!(found, ["provider `same`", "model `same`"]);
+    }
+
+    #[test]
+    fn invalid_tuning_is_rejected_instead_of_defaulted() {
+        assert!(parse_temperature("warm").is_err());
+        assert!(parse_temperature("NaN").is_err());
+        assert!(parse_temperature("2.1").is_err());
+        assert_eq!(parse_temperature("0.7").unwrap(), 0.7);
+        assert!(parse_positive_u32("0").is_err());
+        assert!(parse_positive_u32("many").is_err());
+        assert_eq!(parse_positive_u32("4096").unwrap(), 4096);
+    }
+
+    #[test]
+    fn endpoint_validation_refuses_embedded_credentials() {
+        assert!(validate_base_url("not a url").is_err());
+        assert!(validate_base_url("file:///tmp/api").is_err());
+        assert!(validate_base_url("https://key@example.test/v1").is_err());
+        assert!(validate_base_url("https://example.test/v1").is_ok());
+    }
 }

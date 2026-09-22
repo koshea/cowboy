@@ -390,12 +390,12 @@ Examples:
 
 ## `cowboy models`
 
-Configure model providers (home-owned) and models
+Configure model providers (home-owned) and models. With no subcommand, show the current configuration and effective default
 
 ```text
 Examples:
-  cowboy models setup                  # the guided path: provider, key, then a model
-  cowboy models list                   # what is configured, and the effective default
+  cowboy models                        # what is configured, and the effective default
+  cowboy models setup                  # guided provider + model setup
   cowboy models available              # what your endpoint actually offers
   cowboy models use claude-sonnet-4-6  # set the project default
 
@@ -446,7 +446,13 @@ List configured providers and models, and the effective default
 
 ### `cowboy models setup`
 
-Interactively add a provider (endpoint + key, saved to your home dir) and a model that uses it
+Guided provider and model setup. Validates everything before replacing the two home-owned files, and asks before replacing an existing entry
+
+```text
+Setup first tries the endpoint catalogue for 8 seconds, then falls back to a manual
+model id without exposing credentials or raw server responses. Existing malformed files
+are never overwritten; repair them first. Advanced tuning is optional.
+```
 
 
 ### `cowboy models use`
@@ -729,6 +735,7 @@ Replay or inspect a previous session
 | Arg | Description |
 |-----|-------------|
 | `<SESSION_ID>` |  |
+| `--tui` | Browse the terminal event journal in a read-only TUI |
 
 
 ## `cowboy review`
@@ -840,10 +847,18 @@ Reap stale (crashed/abandoned) session records and release their leases. Worktre
 
 List sessions tracked by the daemon (same as `cowboy sessions`)
 
+| Arg | Description |
+|-----|-------------|
+| `--all` | Merge daemon-known sessions from every project with on-disk history from the current project. Still works when the daemon is unavailable |
+
 
 ## `cowboy sessions`
 
 List sessions tracked by the daemon
+
+| Arg | Description |
+|-----|-------------|
+| `--all` | Merge daemon-known sessions from every project with on-disk history from the current project. Still works when the daemon is unavailable |
 
 
 ## `cowboy shell`

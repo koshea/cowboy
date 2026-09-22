@@ -117,7 +117,13 @@ processes cannot see it, so restart those with `cowboy proc restart`.
 
 ## `agent.yaml` (mounted, agent-editable)
 
-Non-security behavior only.
+Non-security behavior only. This file is authoritative for execution when present:
+Cowboy uses built-in defaults only when `agent.yaml` is absent. If the file exists
+but is unreadable or malformed, session launch fails with the configuration error
+rather than silently running with defaults. The taskless TUI launchpad is different:
+its suggested prompts are best-effort UI hints, so it falls back to generic
+suggestions when it cannot read this file; the worker still performs the strict load
+before executing anything.
 
 ```yaml
 version: 1

@@ -8,21 +8,23 @@
 //! their answers sent back as `ClientMsg`), and an `AgentCmd` from the UI
 //! becomes a `ClientMsg` on the socket.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
 use cowboy_core::daemonproto::{
-    AttachTarget, ClientMsg, DaemonReq, DaemonResp, InterruptKind, ServerMsg, SessionInfo,
-    UiEventMsg,
+    AttachTarget, ClientMsg, DaemonReq, DaemonResp, InterruptKind, PendingPrompt, ServerMsg,
+    SessionInfo, UiEventMsg,
 };
 use cowboy_core::netproto::encode_line;
+use cowboy_tui::{Access, ConnectionState};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio_util::sync::CancellationToken;
 
-use crate::agent::tui::{run_event_loop, AgentCmd, SessionCtx, TurnCancel, UiEvent};
+use crate::agent::tui::{run_event_loop, AgentCmd, SessionCtx, TurnCancel, UiEvent, UiPrompt};
 
 /// Attach to a session: by id (via the daemon) or, for testing, a worker socket
 /// path directly.
@@ -42,15 +44,24 @@ pub async fn run(target: String) -> Result<()> {
         return attach_socket(&p, "cowboy", Vec::new(), ctx);
     }
 
-    // Otherwise treat it as a session id and ask the daemon where to attach.
-    let info = match crate::cmd::daemon::request(DaemonReq::GetSession { id: target.clone() }).await
-    {
+    // Otherwise resolve an exact or unambiguous session-id prefix against the
+    // daemon's registry, then use the full id for both requests.
+    let sessions = match crate::cmd::daemon::request(DaemonReq::ListSessions { root: None }).await {
+        Ok(DaemonResp::Sessions { sessions }) => sessions,
+        Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
+        Err(e) => anyhow::bail!("cowboyd not reachable: {e}"),
+    };
+    let id = crate::session::replay::resolve_from(
+        &target,
+        sessions.iter().map(|session| session.id.as_str()),
+    )?;
+    let info = match crate::cmd::daemon::request(DaemonReq::GetSession { id: id.clone() }).await {
         Ok(DaemonResp::Session { info }) => info,
         Ok(DaemonResp::Err { message }) => anyhow::bail!(message),
         Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
         Err(e) => anyhow::bail!("cowboyd not reachable: {e}"),
     };
-    let resp = crate::cmd::daemon::request(DaemonReq::AttachSession { id: target }).await?;
+    let resp = crate::cmd::daemon::request(DaemonReq::AttachSession { id }).await?;
     let target = match resp {
         DaemonResp::Attach { target } => target,
         DaemonResp::Err { message } => anyhow::bail!(message),
@@ -93,8 +104,8 @@ pub async fn run(target: String) -> Result<()> {
 }
 
 /// Render a terminal session read-only by replaying its `events.jsonl` from
-/// disk. There is no worker socket: we feed every journaled event into the UI,
-/// then `Done` so the loop drops into review-only mode.
+/// disk. Loading the last event is not session completion: the viewer remains
+/// navigable until the user exits with q/Esc.
 pub fn replay_journal(
     journal_path: &std::path::Path,
     title: &str,
@@ -107,7 +118,7 @@ pub fn replay_journal(
     let (task_tx, _task_rx) = std::sync::mpsc::channel::<AgentCmd>();
     let turn_cancel: TurnCancel = std::sync::Arc::new(std::sync::Mutex::new(None));
 
-    let events = read_journal(journal_path);
+    let events = crate::agent::socket_ui::read_journal(journal_path)?;
     let loop_tx = ui_tx.clone();
     let feeder = std::thread::spawn(move || {
         for event in events {
@@ -115,7 +126,6 @@ pub fn replay_journal(
                 return;
             }
         }
-        let _ = ui_tx.send(UiEvent::Done);
     });
 
     let intro = vec![format!("replay of {status} session (read-only)")];
@@ -127,21 +137,11 @@ pub fn replay_journal(
         loop_tx,
         task_tx,
         turn_cancel,
+        Access::Replay,
         ctx,
     )?;
     let _ = feeder.join();
     Ok(())
-}
-
-/// Read every journaled [`UiEventMsg`] from an `events.jsonl` (one per line),
-/// skipping any unparseable lines.
-fn read_journal(path: &std::path::Path) -> Vec<UiEventMsg> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<UiEventMsg>(l.trim()).ok())
-        .collect()
 }
 
 /// Run the TUI attached to `sock`. The terminal event loop runs on this thread;
@@ -179,21 +179,11 @@ pub fn attach_socket_ro(
             .enable_all()
             .build()
         else {
-            let _ = ui_tx.send(UiEvent::Done);
+            let _ = ui_tx.send(UiEvent::Connection(ConnectionState::Unavailable));
             return;
         };
         rt.block_on(async move {
-            match crate::localsock::connect(&sock).await {
-                Ok(stream) => {
-                    let _ = bridge(stream, ui_tx.clone(), task_rx, bridge_cancel, read_only).await;
-                }
-                Err(e) => {
-                    let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(format!(
-                        "attach failed: {e}"
-                    ))));
-                }
-            }
-            let _ = ui_tx.send(UiEvent::Done);
+            supervise_socket(&sock, ui_tx, task_rx, bridge_cancel, read_only).await;
         });
     });
 
@@ -205,10 +195,516 @@ pub fn attach_socket_ro(
         loop_tx,
         task_tx,
         turn_cancel,
+        if read_only {
+            Access::ReadOnlyLive
+        } else {
+            Access::Interactive
+        },
         ctx,
     )?;
     let _ = handle.join();
     Ok(())
+}
+
+/// Keep one TUI/App attached across transport failures. Journal input resumes at
+/// the first event the UI has actually accepted. Ordinary commands are attempted
+/// once; ID-tagged prompt replies are retained only while snapshots say the prompt
+/// is still pending.
+async fn supervise_socket(
+    sock: &std::path::Path,
+    ui_tx: Sender<UiEvent>,
+    task_rx: Receiver<AgentCmd>,
+    turn_cancel: TurnCancel,
+    read_only: bool,
+) {
+    supervise_socket_with_window(
+        sock,
+        ui_tx,
+        task_rx,
+        turn_cancel,
+        read_only,
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+async fn supervise_socket_with_window(
+    sock: &std::path::Path,
+    ui_tx: Sender<UiEvent>,
+    mut task_rx: Receiver<AgentCmd>,
+    turn_cancel: TurnCancel,
+    read_only: bool,
+    reconnect_window: Duration,
+) {
+    let (reply_tx, mut reply_rx) = unbounded_channel::<ClientMsg>();
+    let mut next_seq: Option<u64> = None;
+    let mut authoritative_prompts = HashSet::new();
+    let mut pending_replies = HashMap::<u64, ClientMsg>::new();
+    let mut reconnect_started = None;
+    let mut attempt = 0u32;
+
+    if ui_tx
+        .send(UiEvent::Connection(ConnectionState::Connecting))
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        let stream = match crate::localsock::connect(sock).await {
+            Ok(stream) => stream,
+            Err(_) => {
+                if reconnect_or_stop(
+                    &ui_tx,
+                    &mut task_rx,
+                    &mut reply_rx,
+                    &authoritative_prompts,
+                    &mut pending_replies,
+                    &mut reconnect_started,
+                    &mut attempt,
+                    reconnect_window,
+                )
+                .await
+                {
+                    return;
+                }
+                continue;
+            }
+        };
+        let (r, mut w) = stream.into_split();
+        if !write_client(
+            &mut w,
+            &ClientMsg::Hello {
+                since_seq: next_seq,
+                read_only,
+            },
+        )
+        .await
+        {
+            if reconnect_or_stop(
+                &ui_tx,
+                &mut task_rx,
+                &mut reply_rx,
+                &authoritative_prompts,
+                &mut pending_replies,
+                &mut reconnect_started,
+                &mut attempt,
+                reconnect_window,
+            )
+            .await
+            {
+                return;
+            }
+            continue;
+        }
+
+        let mut reader = BufReader::new(r);
+        let mut line = String::new();
+        let mut expected = next_seq.unwrap_or(0);
+        let mut replay_boundary = None;
+        let mut synced = false;
+        let mut reconnect = false;
+
+        while !reconnect {
+            tokio::select! {
+                read = reader.read_line(&mut line) => {
+                    match read {
+                        Ok(0) | Err(_) => {
+                            reconnect = true;
+                            continue;
+                        }
+                        Ok(_) => {}
+                    }
+                    let parsed = serde_json::from_str::<ServerMsg>(line.trim());
+                    line.clear();
+                    let Ok(msg) = parsed else {
+                        reconnect = true;
+                        continue;
+                    };
+                    if replay_boundary.is_none()
+                        && !matches!(&msg, ServerMsg::Snapshot { .. } | ServerMsg::Ended { .. })
+                    {
+                        reconnect = true;
+                        continue;
+                    }
+                    match msg {
+                        ServerMsg::Snapshot {
+                            info,
+                            journal_len,
+                            pending_prompts,
+                        } => {
+                            if replay_boundary.is_some() || journal_len < expected {
+                                let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(
+                                    "invalid session replay boundary; reconnecting".into(),
+                                )));
+                                reconnect = true;
+                                continue;
+                            }
+                            replay_boundary = Some(journal_len);
+                            next_seq.get_or_insert(expected);
+                            authoritative_prompts = pending_prompts
+                                .iter()
+                                .map(pending_prompt_id)
+                                .collect();
+                            pending_replies.retain(|id, _| authoritative_prompts.contains(id));
+                            let replacement = if read_only {
+                                Vec::new()
+                            } else {
+                                pending_prompts
+                                    .into_iter()
+                                    .map(|prompt| make_ui_prompt(prompt, &reply_tx))
+                                    .collect()
+                            };
+                            if ui_tx
+                                .send(UiEvent::Wire(UiEventMsg::Title(title_for(&info))))
+                                .is_err()
+                                || ui_tx.send(UiEvent::Lifecycle(info.status)).is_err()
+                                || ui_tx.send(UiEvent::ReplacePrompts(replacement)).is_err()
+                            {
+                                return;
+                            }
+                            for reply in pending_replies.values() {
+                                if !write_client(&mut w, reply).await {
+                                    reconnect = true;
+                                    break;
+                                }
+                            }
+                            if !reconnect && expected == journal_len {
+                                if ui_tx.send(UiEvent::Connection(ConnectionState::Live)).is_err() {
+                                    return;
+                                }
+                                synced = true;
+                                reconnect_started = None;
+                                attempt = 0;
+                            }
+                        }
+                        ServerMsg::Event { seq, event } => {
+                            let Some(boundary) = replay_boundary else {
+                                reconnect = true;
+                                continue;
+                            };
+                            if seq != expected {
+                                let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(format!(
+                                    "session event gap at {expected}; reconnecting"
+                                ))));
+                                reconnect = true;
+                                continue;
+                            }
+                            // Commit the sequence only after the single long-lived UI
+                            // accepted the event. A closed receiver means there is no
+                            // consumer to reconnect on behalf of.
+                            if ui_tx.send(UiEvent::Wire(event)).is_err() {
+                                return;
+                            }
+                            expected += 1;
+                            next_seq = Some(expected);
+                            if !synced && expected == boundary {
+                                if ui_tx.send(UiEvent::Connection(ConnectionState::Live)).is_err() {
+                                    return;
+                                }
+                                synced = true;
+                                reconnect_started = None;
+                                attempt = 0;
+                            }
+                        }
+                        ServerMsg::Ask { id, question, options } => {
+                            if replay_boundary.is_none() {
+                                reconnect = true;
+                                continue;
+                            }
+                            authoritative_prompts.insert(id);
+                            if !read_only {
+                                let prompt = make_ui_prompt(
+                                    PendingPrompt::Ask { id, question, options },
+                                    &reply_tx,
+                                );
+                                if let UiPrompt::Ask { id, question, options, reply } = prompt {
+                                    if ui_tx.send(UiEvent::Ask(id, question, options, reply)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        ServerMsg::Approval { id, dest, detail } => {
+                            if replay_boundary.is_none() {
+                                reconnect = true;
+                                continue;
+                            }
+                            authoritative_prompts.insert(id);
+                            if !read_only {
+                                let prompt = make_ui_prompt(
+                                    PendingPrompt::Approval { id, dest, detail },
+                                    &reply_tx,
+                                );
+                                if let UiPrompt::Approval { id, dest, detail, reply } = prompt {
+                                    if ui_tx.send(UiEvent::Approval(id, dest, detail, reply)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        ServerMsg::AskResolved { id } => {
+                            authoritative_prompts.remove(&id);
+                            pending_replies.remove(&id);
+                            if ui_tx.send(UiEvent::AskResolved(id)).is_err() {
+                                return;
+                            }
+                        }
+                        ServerMsg::ApprovalResolved { id } => {
+                            authoritative_prompts.remove(&id);
+                            pending_replies.remove(&id);
+                            if ui_tx.send(UiEvent::ApprovalResolved(id)).is_err() {
+                                return;
+                            }
+                        }
+                        ServerMsg::Status(status) => {
+                            if ui_tx.send(UiEvent::Lifecycle(status)).is_err() {
+                                return;
+                            }
+                        }
+                        ServerMsg::Ended { reason } => {
+                            let _ = ui_tx.send(UiEvent::Connection(ConnectionState::Ended {
+                                reason: reason.clone(),
+                            }));
+                            if !reason.is_empty() {
+                                let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(reason)));
+                            }
+                            let _ = ui_tx.send(UiEvent::Done);
+                            return;
+                        }
+                    }
+                }
+                reply = reply_rx.recv() => {
+                    let Some(reply) = reply else { return };
+                    let Some(id) = prompt_reply_id(&reply) else { continue };
+                    if !authoritative_prompts.contains(&id) {
+                        continue;
+                    }
+                    pending_replies.insert(id, reply.clone());
+                    if !synced || !write_client(&mut w, &reply).await {
+                        reconnect = true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    match task_rx.try_recv() {
+                        Ok(cmd) => {
+                            let (msg, leave) = agent_command(cmd);
+                            if read_only {
+                                if leave {
+                                    let _ = write_client(&mut w, &ClientMsg::Detach).await;
+                                    return;
+                                }
+                                continue;
+                            }
+                            let wrote = write_client(&mut w, &msg).await;
+                            if !wrote && !leave {
+                                let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(
+                                    "connection dropped while sending a command; it was not replayed"
+                                        .into(),
+                                )));
+                            }
+                            if leave {
+                                return;
+                            }
+                            if !wrote {
+                                reconnect = true;
+                            }
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                            let msg = if read_only { ClientMsg::Detach } else { ClientMsg::End };
+                            let _ = write_client(&mut w, &msg).await;
+                            return;
+                        }
+                        Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    }
+                    if !read_only {
+                        let token = turn_cancel.lock().unwrap().clone();
+                        if token.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                            let msg = ClientMsg::Interrupt { kind: InterruptKind::Turn };
+                            let wrote = write_client(&mut w, &msg).await;
+                            *turn_cancel.lock().unwrap() = Some(CancellationToken::new());
+                            if !wrote {
+                                reconnect = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if reconnect_or_stop(
+            &ui_tx,
+            &mut task_rx,
+            &mut reply_rx,
+            &authoritative_prompts,
+            &mut pending_replies,
+            &mut reconnect_started,
+            &mut attempt,
+            reconnect_window,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn reconnect_or_stop(
+    ui_tx: &Sender<UiEvent>,
+    task_rx: &mut Receiver<AgentCmd>,
+    reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>,
+    authoritative_prompts: &HashSet<u64>,
+    pending_replies: &mut HashMap<u64, ClientMsg>,
+    reconnect_started: &mut Option<tokio::time::Instant>,
+    attempt: &mut u32,
+    reconnect_window: Duration,
+) -> bool {
+    let started = reconnect_started.get_or_insert_with(tokio::time::Instant::now);
+    if started.elapsed() >= reconnect_window {
+        let _ = ui_tx.send(UiEvent::Connection(ConnectionState::Unavailable));
+        return wait_unavailable(task_rx, reply_rx, authoritative_prompts, pending_replies).await;
+    }
+    *attempt = attempt.saturating_add(1);
+    if ui_tx
+        .send(UiEvent::Connection(ConnectionState::Reconnecting {
+            attempt: *attempt,
+        }))
+        .is_err()
+    {
+        return true;
+    }
+    let delay = reconnect_backoff(*attempt);
+    let until = tokio::time::Instant::now() + delay;
+    loop {
+        if tokio::time::Instant::now() >= until {
+            return false;
+        }
+        tokio::select! {
+            reply = reply_rx.recv() => {
+                let Some(reply) = reply else { return true };
+                if let Some(id) = prompt_reply_id(&reply) {
+                    if authoritative_prompts.contains(&id) {
+                        pending_replies.insert(id, reply);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                match task_rx.try_recv() {
+                    Ok(AgentCmd::Detach | AgentCmd::End) => return true,
+                    Ok(_) => {
+                        let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(
+                            "command was not sent while the session was reconnecting".into(),
+                        )));
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn wait_unavailable(
+    task_rx: &mut Receiver<AgentCmd>,
+    reply_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ClientMsg>,
+    authoritative_prompts: &HashSet<u64>,
+    pending_replies: &mut HashMap<u64, ClientMsg>,
+) -> bool {
+    loop {
+        tokio::select! {
+            reply = reply_rx.recv() => {
+                let Some(reply) = reply else { return true };
+                if let Some(id) = prompt_reply_id(&reply) {
+                    if authoritative_prompts.contains(&id) {
+                        pending_replies.insert(id, reply);
+                    }
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                match task_rx.try_recv() {
+                    Ok(AgentCmd::Detach | AgentCmd::End) => return true,
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+        }
+    }
+}
+
+async fn write_client(writer: &mut tokio::net::unix::OwnedWriteHalf, msg: &ClientMsg) -> bool {
+    writer.write_all(encode_line(msg).as_bytes()).await.is_ok() && writer.flush().await.is_ok()
+}
+
+fn pending_prompt_id(prompt: &PendingPrompt) -> u64 {
+    match prompt {
+        PendingPrompt::Ask { id, .. } | PendingPrompt::Approval { id, .. } => *id,
+    }
+}
+
+fn prompt_reply_id(msg: &ClientMsg) -> Option<u64> {
+    match msg {
+        ClientMsg::AskReply { id, .. } | ClientMsg::ApprovalReply { id, .. } => Some(*id),
+        _ => None,
+    }
+}
+
+fn make_ui_prompt(prompt: PendingPrompt, out_tx: &UnboundedSender<ClientMsg>) -> UiPrompt {
+    match prompt {
+        PendingPrompt::Ask {
+            id,
+            question,
+            options,
+        } => {
+            let (reply, answers) = std::sync::mpsc::channel();
+            let out = out_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(answer) = answers.recv() {
+                    let _ = out.send(ClientMsg::AskReply { id, answer });
+                }
+            });
+            UiPrompt::Ask {
+                id,
+                question,
+                options,
+                reply,
+            }
+        }
+        PendingPrompt::Approval { id, dest, detail } => {
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let out = out_tx.clone();
+            tokio::spawn(async move {
+                if let Ok((verdict, scope)) = answer.await {
+                    let _ = out.send(ClientMsg::ApprovalReply { id, verdict, scope });
+                }
+            });
+            UiPrompt::Approval {
+                id,
+                dest,
+                detail,
+                reply,
+            }
+        }
+    }
+}
+
+fn reconnect_backoff(attempt: u32) -> Duration {
+    Duration::from_millis((250u64 << attempt.saturating_sub(1).min(3)).min(2_000))
+}
+
+fn agent_command(cmd: AgentCmd) -> (ClientMsg, bool) {
+    match cmd {
+        AgentCmd::Message(m) => (ClientMsg::Message(m), false),
+        AgentCmd::Enqueue(m) => (ClientMsg::Enqueue(m), false),
+        AgentCmd::QueueClear => (ClientMsg::QueueClear, false),
+        AgentCmd::SwitchModel(n) => (ClientMsg::SwitchModel(n), false),
+        AgentCmd::PlanMode(b) => (ClientMsg::PlanMode(b), false),
+        AgentCmd::Accept { note } => (ClientMsg::Accept { note }, false),
+        AgentCmd::StopSubagents => (ClientMsg::StopSubagents, false),
+        AgentCmd::Detach => (ClientMsg::Detach, true),
+        AgentCmd::End => (ClientMsg::End, true),
+    }
 }
 
 /// Bridge a connected worker `stream` to the UI channels. Returns when the
@@ -335,6 +831,7 @@ pub async fn bridge(
                 continue;
             };
             if !handle_server_msg(msg, &ui_tx, &read_out) {
+                let _ = ui_tx.send(UiEvent::Done);
                 break; // Ended
             }
         }
@@ -379,8 +876,18 @@ fn handle_server_msg(
     out_tx: &UnboundedSender<ClientMsg>,
 ) -> bool {
     match msg {
-        ServerMsg::Snapshot { info, .. } => {
+        ServerMsg::Snapshot {
+            info,
+            pending_prompts,
+            ..
+        } => {
             let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Title(title_for(&info))));
+            let _ = ui_tx.send(UiEvent::Lifecycle(info.status));
+            let prompts = pending_prompts
+                .into_iter()
+                .map(|prompt| make_ui_prompt(prompt, out_tx))
+                .collect();
+            let _ = ui_tx.send(UiEvent::ReplacePrompts(prompts));
         }
         ServerMsg::Event { event, .. } => {
             let _ = ui_tx.send(UiEvent::Wire(event));
@@ -391,16 +898,17 @@ fn handle_server_msg(
             options,
         } => {
             let (reply_tx, reply_rx) = std::sync::mpsc::channel::<String>();
-            let _ = ui_tx.send(UiEvent::Ask(question, options, reply_tx));
+            let _ = ui_tx.send(UiEvent::Ask(id, question, options, reply_tx));
             let out = out_tx.clone();
             tokio::task::spawn_blocking(move || {
-                let answer = reply_rx.recv().unwrap_or_default();
-                let _ = out.send(ClientMsg::AskReply { id, answer });
+                if let Ok(answer) = reply_rx.recv() {
+                    let _ = out.send(ClientMsg::AskReply { id, answer });
+                }
             });
         }
         ServerMsg::Approval { id, dest, detail } => {
             let (vtx, vrx) = tokio::sync::oneshot::channel();
-            let _ = ui_tx.send(UiEvent::Approval(dest, detail, vtx));
+            let _ = ui_tx.send(UiEvent::Approval(id, dest, detail, vtx));
             let out = out_tx.clone();
             tokio::spawn(async move {
                 if let Ok((verdict, scope)) = vrx.await {
@@ -408,11 +916,19 @@ fn handle_server_msg(
                 }
             });
         }
-        ServerMsg::ApprovalResolved { .. } => {
-            let _ = ui_tx.send(UiEvent::ApprovalResolved);
+        ServerMsg::AskResolved { id } => {
+            let _ = ui_tx.send(UiEvent::AskResolved(id));
         }
-        ServerMsg::Status(_) => {}
+        ServerMsg::ApprovalResolved { id } => {
+            let _ = ui_tx.send(UiEvent::ApprovalResolved(id));
+        }
+        ServerMsg::Status(status) => {
+            let _ = ui_tx.send(UiEvent::Lifecycle(status));
+        }
         ServerMsg::Ended { reason } => {
+            let _ = ui_tx.send(UiEvent::Connection(ConnectionState::Ended {
+                reason: reason.clone(),
+            }));
             if !reason.is_empty() {
                 let _ = ui_tx.send(UiEvent::Wire(UiEventMsg::Notice(reason)));
             }
@@ -700,6 +1216,7 @@ mod tests {
                 ServerMsg::Snapshot {
                     info: info(),
                     journal_len: 0,
+                    pending_prompts: Vec::new(),
                 },
                 ServerMsg::Event {
                     seq: 0,
@@ -753,14 +1270,19 @@ mod tests {
 
         let title = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(matches!(title, UiEvent::Wire(UiEventMsg::Title(t)) if t.contains("main")));
-        let delta = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let delta = loop {
+            let event = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            if matches!(event, UiEvent::Wire(UiEventMsg::Delta(ref t)) if t == "hi") {
+                break event;
+            }
+        };
         assert!(matches!(delta, UiEvent::Wire(UiEventMsg::Delta(t)) if t == "hi"));
 
         task_tx.send(AgentCmd::Message("go".into())).unwrap();
 
         let ask = ui_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         match ask {
-            UiEvent::Ask(q, _options, reply) => {
+            UiEvent::Ask(_id, q, _options, reply) => {
                 assert_eq!(q, "ok?");
                 reply.send("yes".into()).unwrap();
             }
@@ -772,7 +1294,322 @@ mod tests {
     }
 
     #[test]
-    fn read_journal_parses_events_and_skips_garbage() {
+    fn reconnect_backoff_starts_at_250ms_and_caps_at_2s() {
+        assert_eq!(reconnect_backoff(1), Duration::from_millis(250));
+        assert_eq!(reconnect_backoff(2), Duration::from_millis(500));
+        assert_eq!(reconnect_backoff(3), Duration::from_secs(1));
+        assert_eq!(reconnect_backoff(4), Duration::from_secs(2));
+        assert_eq!(reconnect_backoff(20), Duration::from_secs(2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_is_nonterminal_after_the_reconnect_window() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("missing.sock");
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let client_sock = sock.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise_socket_with_window(
+                &client_sock,
+                ui_tx,
+                task_rx,
+                cancel,
+                false,
+                Duration::from_millis(10),
+            )
+            .await;
+        });
+
+        let states = tokio::task::spawn_blocking(move || {
+            let mut states = Vec::new();
+            while !states
+                .iter()
+                .any(|event| matches!(event, UiEvent::Connection(ConnectionState::Unavailable)))
+            {
+                states.push(ui_rx.recv_timeout(Duration::from_secs(3)).unwrap());
+            }
+            states
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            states.first(),
+            Some(UiEvent::Connection(ConnectionState::Connecting))
+        ));
+        assert!(states.iter().any(|event| matches!(
+            event,
+            UiEvent::Connection(ConnectionState::Reconnecting { attempt: 1 })
+        )));
+        assert!(!states.iter().any(|event| matches!(event, UiEvent::Done)));
+        task_tx.send(AgentCmd::Detach).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_reply_is_resent_only_while_snapshots_list_its_id() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("prompt-reconnect.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move {
+            let prompt = PendingPrompt::Ask {
+                id: 7,
+                question: "continue?".into(),
+                options: Vec::new(),
+            };
+
+            let (first, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let (r, mut w) = first.into_split();
+            let mut lines = BufReader::new(r).lines();
+            assert!(matches!(
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()),
+                Ok(ClientMsg::Hello { .. })
+            ));
+            w.write_all(
+                encode_line(&ServerMsg::Snapshot {
+                    info: info(),
+                    journal_len: 0,
+                    pending_prompts: vec![prompt.clone()],
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            let first_reply: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                first_reply,
+                ClientMsg::AskReply { id: 7, ref answer } if answer == "yes"
+            ));
+            drop(w);
+            let _ = std::fs::remove_file(&server_sock);
+
+            let listener = UnixListener::bind(&server_sock).unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let (r, mut w) = second.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let hello: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMsg::Hello {
+                    since_seq: Some(0),
+                    ..
+                }
+            ));
+            w.write_all(
+                encode_line(&ServerMsg::Snapshot {
+                    info: info(),
+                    journal_len: 0,
+                    pending_prompts: vec![prompt],
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            let resent: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                resent,
+                ClientMsg::AskReply { id: 7, ref answer } if answer == "yes"
+            ));
+            drop(w);
+            let _ = std::fs::remove_file(&server_sock);
+
+            let listener = UnixListener::bind(&server_sock).unwrap();
+            let (third, _) = listener.accept().await.unwrap();
+            let (r, mut w) = third.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let hello: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMsg::Hello {
+                    since_seq: Some(0),
+                    ..
+                }
+            ));
+            w.write_all(
+                encode_line(&ServerMsg::Snapshot {
+                    info: info(),
+                    journal_len: 0,
+                    pending_prompts: Vec::new(),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), lines.next_line())
+                    .await
+                    .is_err(),
+                "a reply whose ID disappeared from Snapshot must not be resent"
+            );
+            w.write_all(
+                encode_line(&ServerMsg::Ended {
+                    reason: "complete".into(),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+        });
+
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (_task_tx, task_rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let client_sock = sock.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise_socket(&client_sock, ui_tx, task_rx, cancel, false).await;
+        });
+        let _ui_rx = tokio::task::spawn_blocking(move || loop {
+            if let UiEvent::ReplacePrompts(prompts) =
+                ui_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            {
+                if let Some(UiPrompt::Ask { reply, .. }) = prompts.into_iter().next() {
+                    reply.send("yes".into()).unwrap();
+                    break ui_rx;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_reconnects_with_the_next_contiguous_sequence() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("reconnect.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server_sock = sock.clone();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(listener);
+            let (r, mut w) = first.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let hello: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMsg::Hello {
+                    since_seq: None,
+                    ..
+                }
+            ));
+            w.write_all(
+                encode_line(&ServerMsg::Snapshot {
+                    info: info(),
+                    journal_len: 1,
+                    pending_prompts: Vec::new(),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.write_all(
+                encode_line(&ServerMsg::Event {
+                    seq: 0,
+                    event: UiEventMsg::Notice("first".into()),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            drop(w);
+            let _ = std::fs::remove_file(&server_sock);
+
+            let listener = UnixListener::bind(&server_sock).unwrap();
+            let (second, _) = listener.accept().await.unwrap();
+            let (r, mut w) = second.into_split();
+            let mut lines = BufReader::new(r).lines();
+            let hello: ClientMsg =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            assert!(matches!(
+                hello,
+                ClientMsg::Hello {
+                    since_seq: Some(1),
+                    ..
+                }
+            ));
+            w.write_all(
+                encode_line(&ServerMsg::Snapshot {
+                    info: info(),
+                    journal_len: 2,
+                    pending_prompts: Vec::new(),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.write_all(
+                encode_line(&ServerMsg::Event {
+                    seq: 1,
+                    event: UiEventMsg::Notice("second".into()),
+                })
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            w.flush().await.unwrap();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if matches!(serde_json::from_str(&line), Ok(ClientMsg::End)) {
+                    break;
+                }
+            }
+        });
+
+        let (ui_tx, ui_rx) = std::sync::mpsc::channel();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let cancel = std::sync::Arc::new(std::sync::Mutex::new(Some(CancellationToken::new())));
+        let client_sock = sock.clone();
+        let supervisor = tokio::spawn(async move {
+            supervise_socket(&client_sock, ui_tx, task_rx, cancel, false).await;
+        });
+        let seen = tokio::task::spawn_blocking(move || {
+            let mut notices = Vec::new();
+            while notices.len() < 2 {
+                if let UiEvent::Wire(UiEventMsg::Notice(text)) =
+                    ui_rx.recv_timeout(Duration::from_secs(10)).unwrap()
+                {
+                    notices.push(text);
+                }
+            }
+            notices
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen, vec!["first", "second"]);
+        task_tx.send(AgentCmd::End).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn malformed_terminal_journal_is_an_error() {
         let tmp = assert_fs::TempDir::new().unwrap();
         let journal = tmp.path().join("events.jsonl");
         let lines = [
@@ -780,16 +1617,17 @@ mod tests {
             "{ not json".to_string(),
             serde_json::to_string(&UiEventMsg::Final("done".into())).unwrap(),
         ];
-        std::fs::write(&journal, lines.join("\n")).unwrap();
+        std::fs::write(&journal, format!("{}\n", lines.join("\n"))).unwrap();
 
-        let events = read_journal(&journal);
-        assert_eq!(events.len(), 2, "garbage line must be skipped");
-        assert!(matches!(&events[0], UiEventMsg::ToolUse(s) if s == "read foo"));
-        assert!(matches!(&events[1], UiEventMsg::Final(s) if s == "done"));
+        let error = crate::agent::socket_ui::read_journal(&journal).unwrap_err();
+        assert!(error.to_string().contains("sequence 1"), "{error:#}");
     }
 
     #[test]
-    fn read_journal_missing_file_is_empty() {
-        assert!(read_journal(std::path::Path::new("/nope/missing.jsonl")).is_empty());
+    fn missing_terminal_journal_is_an_error() {
+        let error =
+            crate::agent::socket_ui::read_journal(std::path::Path::new("/nope/missing.jsonl"))
+                .unwrap_err();
+        assert!(error.to_string().contains("opening journal"), "{error:#}");
     }
 }

@@ -168,9 +168,7 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
     let resolve_root: RootResolver = Arc::new(|id: String| {
         Box::pin(async move {
             match crate::cmd::daemon::request(DaemonReq::GetSession { id }).await {
-                Ok(DaemonResp::Session { info }) => {
-                    Some((info.root, info.status == SessionStatus::Running))
-                }
+                Ok(DaemonResp::Session { info }) => Some((info.root, !info.status.is_terminal())),
                 _ => None,
             }
         })

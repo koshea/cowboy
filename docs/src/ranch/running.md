@@ -47,12 +47,14 @@ cowboy ranch start billing
 `start` is **idempotent and re-entrant**. Each run:
 
 1. reconciles already-started workstreams from their live session status;
-2. promotes the outputs of any that just finished;
-3. launches every newly-**ready** workstream in its own `cowboy/<ranch>-<ws>`
-   worktree/branch, tagging the session with the ranch + workstream;
+2. moves newly finished workstreams to `WaitingForUser` and attempts to promote
+   their outputs for review, without unblocking dependents;
+3. launches every already-**ready** workstream in its own
+   `cowboy/<ranch>-<ws>` worktree/branch, tagging the session with the ranch +
+   workstream;
 4. saves the updated plan.
 
-Run it again as workstreams complete to advance the graph — or let the
+Run it again after signing off on workstreams to advance the graph — or let the
 [coordinator](coordination.md) do it for you (the default).
 
 ## Attach & finish
@@ -63,6 +65,8 @@ cowboy ranch complete billing schema   # manually mark a workstream done + promo
 ```
 
 Each workstream worker is **one-shot**: it runs its seeded task and then ends, so
-its session goes `Completed` and the plan can advance. The worker's task prompt
-includes the workstream goal, its dependencies' promoted artifacts (inline),
-expected artifacts, acceptance criteria, and the coordination rules.
+its session goes `Completed`; reconciliation then parks the workstream for explicit
+sign-off. Its dependents become ready only after `accept` or `complete` successfully
+publishes the output snapshot and records the workstream as complete. The worker's
+task prompt includes the workstream goal, its dependencies' promoted artifacts
+(inline), expected artifacts, acceptance criteria, and the coordination rules.

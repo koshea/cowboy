@@ -13,11 +13,11 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
-use cowboy_core::daemonproto::UiEventMsg;
+use cowboy_core::daemonproto::{SessionStatus, UiEventMsg};
 use cowboy_core::netproto::{ApprovalDetail, ApprovalKind, ApprovalScope, Verdict};
 use cowboy_tui::{
-    draw, App, CrewMember, CrewStatus, LineKind, Mode, ModelChoice, ModelForm, ModelPicker,
-    REASONING_OPTS,
+    draw, Access, App, ConnectionState, CrewMember, CrewStatus, LineKind, Mode, ModelChoice,
+    ModelForm, ModelPicker, REASONING_OPTS,
 };
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
@@ -63,27 +63,192 @@ pub enum AgentCmd {
 /// protocol — they ride inside [`UiEvent::Wire`] rather than being restated
 /// here, so the two enums can't drift. The remaining variants are client-only:
 /// they carry non-serializable reply channels or are synthesized by the client.
+/// One reply-capable prompt delivered to the terminal. The descriptor and reply
+/// channel stay together so authoritative snapshots can reconcile by ID without
+/// ever manufacturing an empty answer when an obsolete channel is dropped.
+#[derive(Debug)]
+pub enum UiPrompt {
+    Ask {
+        id: u64,
+        question: String,
+        options: Vec<String>,
+        reply: Sender<String>,
+    },
+    Approval {
+        id: u64,
+        dest: String,
+        detail: Option<ApprovalDetail>,
+        reply: tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>,
+    },
+}
+
+impl UiPrompt {
+    fn id(&self) -> u64 {
+        match self {
+            Self::Ask { id, .. } | Self::Approval { id, .. } => *id,
+        }
+    }
+
+    fn same_kind(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Ask { .. }, Self::Ask { .. }) | (Self::Approval { .. }, Self::Approval { .. })
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum UiEvent {
     /// A journaled display event (the shared [`UiEventMsg`] payload).
     Wire(UiEventMsg),
-    /// A question for the user: prompt, suggested options (possibly empty), and
-    /// the reply channel.
-    Ask(String, Vec<String>, Sender<String>),
-    /// An approval request: the flat destination label, the structured detail for the
-    /// modal (absent when there is none), and a reply channel.
+    /// A question for the user: id, prompt, suggested options, and reply channel.
+    Ask(u64, String, Vec<String>, Sender<String>),
+    /// An approval request: id, display state, and reply channel.
     Approval(
+        u64,
         String,
         Option<ApprovalDetail>,
         tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>,
     ),
-    /// A pending approval was decided elsewhere (another client / timeout);
-    /// dismiss the modal if one is showing.
-    ApprovalResolved,
+    /// Replace all reply-capable prompts from an authoritative worker snapshot.
+    ReplacePrompts(Vec<UiPrompt>),
+    AskResolved(u64),
+    ApprovalResolved(u64),
+    Connection(ConnectionState),
+    Lifecycle(SessionStatus),
     /// The `/models` catalogue finished loading; open the picker.
     ModelsFetched(Vec<ModelChoice>),
     /// The session ended.
     Done,
+}
+
+#[derive(Default)]
+struct PendingPrompts {
+    items: Vec<UiPrompt>,
+    active: Option<u64>,
+    return_mode: Option<Mode>,
+}
+
+impl PendingPrompts {
+    fn add(&mut self, app: &mut App, prompt: UiPrompt) {
+        if app.access.is_read_only() {
+            return;
+        }
+        let id = prompt.id();
+        if let Some(existing) = self.items.iter().position(|old| old.id() == id) {
+            if self.items[existing].same_kind(&prompt) {
+                // A snapshot/live overlap may describe the same prompt twice. Keep
+                // the channel already displayed by the TUI; dropping the newcomer
+                // only closes a forwarder that sends nothing on cancellation.
+                return;
+            }
+            self.items.remove(existing);
+            if self.active == Some(id) {
+                self.active = None;
+            }
+        }
+        self.items.push(prompt);
+        self.items.sort_by_key(UiPrompt::id);
+        self.reconcile(app);
+    }
+
+    fn replace(&mut self, app: &mut App, incoming: Vec<UiPrompt>) {
+        if app.access.is_read_only() {
+            self.items.clear();
+            self.active = None;
+            return;
+        }
+        let mut old = std::mem::take(&mut self.items);
+        self.items = incoming
+            .into_iter()
+            .map(|prompt| {
+                let same = old.iter().position(|candidate| {
+                    candidate.id() == prompt.id() && candidate.same_kind(&prompt)
+                });
+                same.map(|index| old.remove(index)).unwrap_or(prompt)
+            })
+            .collect();
+        self.items.sort_by_key(UiPrompt::id);
+        if self
+            .active
+            .is_some_and(|id| !self.items.iter().any(|prompt| prompt.id() == id))
+        {
+            self.active = None;
+            Self::clear_modal(app);
+        }
+        self.reconcile(app);
+    }
+
+    fn resolve(&mut self, app: &mut App, id: u64) {
+        let was_active = self.active == Some(id);
+        self.items.retain(|prompt| prompt.id() != id);
+        if was_active {
+            self.active = None;
+            Self::clear_modal(app);
+        }
+        self.reconcile(app);
+    }
+
+    fn answer_ask(&mut self, app: &mut App, answer: String) {
+        let Some(id) = self.active else { return };
+        let Some(index) = self.items.iter().position(|prompt| prompt.id() == id) else {
+            return;
+        };
+        let prompt = self.items.remove(index);
+        self.active = None;
+        Self::clear_modal(app);
+        if let UiPrompt::Ask { reply, .. } = prompt {
+            let _ = reply.send(answer);
+        }
+        self.reconcile(app);
+    }
+
+    fn answer_approval(&mut self, app: &mut App, answer: (Verdict, ApprovalScope)) {
+        let Some(id) = self.active else { return };
+        let Some(index) = self.items.iter().position(|prompt| prompt.id() == id) else {
+            return;
+        };
+        let prompt = self.items.remove(index);
+        self.active = None;
+        Self::clear_modal(app);
+        if let UiPrompt::Approval { reply, .. } = prompt {
+            let _ = reply.send(answer);
+        }
+        self.reconcile(app);
+    }
+
+    fn reconcile(&mut self, app: &mut App) {
+        if app.access.is_read_only() || self.active.is_some() {
+            return;
+        }
+        let Some(prompt) = self.items.first() else {
+            if let Some(mode) = self.return_mode.take() {
+                app.mode = mode;
+            }
+            return;
+        };
+        self.return_mode.get_or_insert_with(|| app.mode.clone());
+        self.active = Some(prompt.id());
+        app.commit_stream();
+        match prompt {
+            UiPrompt::Ask {
+                question, options, ..
+            } if options.is_empty() => {
+                app.mode = Mode::AwaitingInput(question.clone());
+            }
+            UiPrompt::Ask {
+                question, options, ..
+            } => app.begin_choice(question.clone(), options.clone()),
+            UiPrompt::Approval { dest, detail, .. } => {
+                app.begin_approval(dest.clone(), detail.clone().map(approval_view));
+            }
+        }
+    }
+
+    fn clear_modal(app: &mut App) {
+        app.choice = None;
+        app.end_approval();
+    }
 }
 
 /// `AgentUi` implementation that forwards to the TUI thread.
@@ -156,7 +321,7 @@ impl AgentUi for TuiUi {
         let (rtx, rrx) = std::sync::mpsc::channel();
         if self
             .tx
-            .send(UiEvent::Ask(question.to_string(), options.to_vec(), rtx))
+            .send(UiEvent::Ask(0, question.to_string(), options.to_vec(), rtx))
             .is_err()
         {
             return String::new();
@@ -172,10 +337,14 @@ impl AgentUi for TuiUi {
 /// mutation; control-flow events (Ask/Approval/TurnDone/Done) stay in the loop.
 fn apply_wire(app: &mut App, msg: UiEventMsg) {
     match msg {
-        // The TUI echoes user input locally on submit, so ignore the journaled
-        // copy to avoid a double line. (The web client, which can refresh, renders
-        // from this instead.)
-        UiEventMsg::UserMessage(_) => {}
+        // Interactive submission is echoed locally before it reaches the worker.
+        // Observers and replay have no local echo, so the journal is their only
+        // source for the user's side of the conversation.
+        UiEventMsg::UserMessage(message) => {
+            if app.access.is_read_only() {
+                app.push(LineKind::User, message);
+            }
+        }
         UiEventMsg::Delta(t) => app.stream(&t),
         UiEventMsg::Reasoning(t) => app.stream_reasoning(&t),
         UiEventMsg::ModelDone => app.commit_stream(),
@@ -301,6 +470,7 @@ pub fn run_event_loop(
     ui_tx: Sender<UiEvent>,
     task_tx: Sender<AgentCmd>,
     turn_cancel: TurnCancel,
+    access: Access,
     ctx: SessionCtx,
 ) -> Result<()> {
     // Keep stray host logs (tracing on stderr) off the alternate screen.
@@ -315,6 +485,7 @@ pub fn run_event_loop(
         ui_tx,
         task_tx,
         turn_cancel,
+        access,
         ctx,
     );
     restore_terminal(&mut terminal)?;
@@ -663,11 +834,11 @@ fn event_loop(
     ui_tx: Sender<UiEvent>,
     task_tx: Sender<AgentCmd>,
     turn_cancel: TurnCancel,
+    access: Access,
     mut session: SessionCtx,
 ) -> Result<()> {
-    let mut app = App::new(title.to_string());
-    let mut pending_reply: Option<Sender<String>> = None;
-    let mut pending_approval: Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>> = None;
+    let mut app = App::new_with_access(title.to_string(), access);
+    let mut prompts = PendingPrompts::default();
     let mut mode_before_overlay = Mode::Idle;
     // Whether a second Ctrl-C would end the session (see `handle_interrupt`).
     let mut quit_armed = false;
@@ -750,31 +921,36 @@ fn event_loop(
                     }
                 }
                 UiEvent::Wire(msg) => apply_wire(&mut app, msg),
-                UiEvent::Ask(q, options, reply) => {
-                    app.commit_stream();
-                    if options.is_empty() {
-                        app.mode = Mode::AwaitingInput(q);
-                    } else {
-                        app.begin_choice(q, options);
-                    }
-                    pending_reply = Some(reply);
+                UiEvent::Ask(id, question, options, reply) => {
+                    prompts.add(
+                        &mut app,
+                        UiPrompt::Ask {
+                            id,
+                            question,
+                            options,
+                            reply,
+                        },
+                    );
                 }
-                UiEvent::Approval(dest, detail, reply) => {
-                    if !matches!(app.mode, Mode::Approval(_) | Mode::Help) {
-                        mode_before_overlay = app.mode.clone();
-                    }
-                    app.begin_approval(dest, detail.map(approval_view));
-                    pending_approval = Some(reply);
+                UiEvent::Approval(id, dest, detail, reply) => {
+                    prompts.add(
+                        &mut app,
+                        UiPrompt::Approval {
+                            id,
+                            dest,
+                            detail,
+                            reply,
+                        },
+                    );
                 }
-                UiEvent::ApprovalResolved => {
-                    // Decided elsewhere: drop our prompt and restore the prior
-                    // mode. (If we were the decider we've already moved on.)
-                    if matches!(app.mode, Mode::Approval(_)) {
-                        pending_approval = None;
-                        app.end_approval();
-                        app.mode = mode_before_overlay.clone();
-                    }
+                UiEvent::ReplacePrompts(replacement) => {
+                    prompts.replace(&mut app, replacement);
                 }
+                UiEvent::AskResolved(id) | UiEvent::ApprovalResolved(id) => {
+                    prompts.resolve(&mut app, id);
+                }
+                UiEvent::Connection(state) => app.connection = state,
+                UiEvent::Lifecycle(status) => app.lifecycle = Some(status.to_string()),
                 UiEvent::ModelsFetched(entries) => {
                     if entries.is_empty() {
                         app.push(LineKind::Notice, "no chat models offered by the provider");
@@ -917,8 +1093,7 @@ fn event_loop(
                 // Ignore key *release* events (kitty protocol reports them).
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     let ctx = KeyCtx {
-                        pending_reply: &mut pending_reply,
-                        pending_approval: &mut pending_approval,
+                        prompts: &mut prompts,
                         mode_before_overlay: &mut mode_before_overlay,
                         turn_cancel: &turn_cancel,
                         task_tx: &mut task_tx,
@@ -934,20 +1109,16 @@ fn event_loop(
                     }
                 }
                 Event::Mouse(me) => handle_mouse(me, &mut app),
-                // Bracketed paste — insert as one chunk (when editing input).
-                Event::Paste(text) => {
-                    if matches!(
-                        app.mode,
-                        Mode::Idle | Mode::Running | Mode::AwaitingInput(_)
-                    ) {
-                        app.input_paste(&text);
-                    }
+                // Bracketed paste — insert as one chunk only with interactive
+                // access and an editable transient mode.
+                Event::Paste(text) if accepts_paste(app.access, &app.mode) => {
+                    app.input_paste(&text);
                 }
                 _ => {}
             }
             // Refresh the slash-command autocomplete when the input changed (so
             // navigation keys, which don't touch the text, keep the selection).
-            if matches!(app.mode, Mode::Idle | Mode::Running) {
+            if app.access == Access::Interactive && matches!(app.mode, Mode::Idle | Mode::Running) {
                 if app.input_text() != input_before {
                     refresh_completions(&mut app, &completion_catalog);
                 }
@@ -1079,8 +1250,7 @@ use cowboy_core::time::now_ms;
 
 /// Mutable context handed to the key handler.
 struct KeyCtx<'a> {
-    pending_reply: &'a mut Option<Sender<String>>,
-    pending_approval: &'a mut Option<tokio::sync::oneshot::Sender<(Verdict, ApprovalScope)>>,
+    prompts: &'a mut PendingPrompts,
     mode_before_overlay: &'a mut Mode,
     turn_cancel: &'a TurnCancel,
     /// `None` once the session has been ended (sender dropped).
@@ -1199,6 +1369,17 @@ fn help_skills(session: &SessionCtx) -> Vec<(String, String)> {
         .collect()
 }
 
+fn read_only_exit_key(access: Access, key: KeyCode) -> Option<bool> {
+    access
+        .is_read_only()
+        .then_some(matches!(key, KeyCode::Char('q') | KeyCode::Esc))
+}
+
+fn accepts_paste(access: Access, mode: &Mode) -> bool {
+    access == Access::Interactive
+        && matches!(mode, Mode::Idle | Mode::Running | Mode::AwaitingInput(_))
+}
+
 /// Returns true if the loop should exit.
 fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bool {
     // Slash-command autocomplete popup: Up/Down navigate, Tab accepts, Esc
@@ -1308,6 +1489,34 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         _ => {}
     }
 
+    // Persistent read-only access is orthogonal to the transient mode. After
+    // navigation/copy, the only local actions are help and exit; nothing below
+    // this gate may edit input, answer prompts, interrupt, detach through the
+    // command channel, or otherwise mutate the session.
+    if app.access.is_read_only() {
+        if key.code == KeyCode::F(1) && app.mode != Mode::Help {
+            *ctx.mode_before_overlay = app.mode.clone();
+            open_help(app, &mut ctx, None);
+            return false;
+        }
+        if app.mode == Mode::Help {
+            match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Enter | KeyCode::Char('q') => {
+                    app.close_help(ctx.mode_before_overlay.clone());
+                }
+                KeyCode::Up => scroll_help(app, -1),
+                KeyCode::Down => scroll_help(app, 1),
+                KeyCode::PageUp => scroll_help(app, -10),
+                KeyCode::PageDown => scroll_help(app, 10),
+                KeyCode::Home => scroll_help(app, isize::MIN / 2),
+                KeyCode::End => scroll_help(app, isize::MAX / 2),
+                _ => {}
+            }
+            return false;
+        }
+        return read_only_exit_key(app.access, key.code).unwrap_or(false);
+    }
+
     // Ctrl-C acts, rather than opening a menu to act from.
     //
     // Three meanings, picked from what is on screen rather than from a submenu — this is
@@ -1409,12 +1618,8 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             KeyCode::Char('d') | KeyCode::Esc => Some((Verdict::Deny, ApprovalScope::Once)),
             _ => None,
         };
-        if let Some(d) = decision {
-            if let Some(reply) = ctx.pending_approval.take() {
-                let _ = reply.send(d);
-            }
-            app.end_approval();
-            app.mode = ctx.mode_before_overlay.clone();
+        if let Some(decision) = decision {
+            ctx.prompts.answer_approval(app, decision);
         }
         return false;
     }
@@ -1458,10 +1663,7 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         (Mode::AwaitingInput(_), KeyCode::Enter) => {
             let answer = app.take_input();
             app.push(LineKind::User, answer.clone());
-            if let Some(reply) = ctx.pending_reply.take() {
-                let _ = reply.send(answer);
-            }
-            app.mode = Mode::Running;
+            ctx.prompts.answer_ask(app, answer);
             app.status = "running".into();
         }
         // Multiple-choice question: arrows move, digits pick, Enter chooses, and
@@ -1472,22 +1674,15 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             if d.is_ascii_digit() && d != '0' && app.input_is_empty() =>
         {
             if let Some(answer) = app.choice_option(d as usize - '1' as usize) {
-                app.choice = None;
                 app.push(LineKind::User, answer.clone());
-                if let Some(reply) = ctx.pending_reply.take() {
-                    let _ = reply.send(answer);
-                }
-                app.mode = Mode::Running;
+                ctx.prompts.answer_ask(app, answer);
                 app.status = "running".into();
             }
         }
         (Mode::AwaitingChoice, KeyCode::Enter) => {
             let answer = app.choice_answer();
             app.push(LineKind::User, answer.clone());
-            if let Some(reply) = ctx.pending_reply.take() {
-                let _ = reply.send(answer);
-            }
-            app.mode = Mode::Running;
+            ctx.prompts.answer_ask(app, answer);
             app.status = "running".into();
         }
         (Mode::AwaitingChoice, _) => app.input_event(event),
@@ -2347,6 +2542,135 @@ fn history_recall_next(app: &mut App, history: &[String], hist_pos: &mut Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn journaled_user_messages_render_only_without_an_interactive_local_echo() {
+        let mut interactive = App::new_with_access("t", Access::Interactive);
+        apply_wire(&mut interactive, UiEventMsg::UserMessage("hello".into()));
+        assert!(interactive.transcript.is_empty());
+
+        for access in [Access::ReadOnlyLive, Access::Replay] {
+            let mut app = App::new_with_access("t", access);
+            apply_wire(&mut app, UiEventMsg::UserMessage("hello".into()));
+            assert_eq!(app.transcript.len(), 1);
+            assert_eq!(app.transcript[0].kind, LineKind::User);
+            assert_eq!(app.transcript[0].text, "hello");
+        }
+    }
+
+    #[test]
+    fn read_only_capabilities_accept_no_mutating_input_and_exit_only_on_q_or_escape() {
+        for access in [Access::ReadOnlyLive, Access::Replay] {
+            for mode in [
+                Mode::Idle,
+                Mode::Running,
+                Mode::AwaitingInput("question".into()),
+                Mode::Done,
+            ] {
+                assert!(!accepts_paste(access, &mode));
+            }
+            assert_eq!(read_only_exit_key(access, KeyCode::Char('x')), Some(false));
+            assert_eq!(read_only_exit_key(access, KeyCode::Enter), Some(false));
+            assert_eq!(read_only_exit_key(access, KeyCode::Char('q')), Some(true));
+            assert_eq!(read_only_exit_key(access, KeyCode::Esc), Some(true));
+        }
+        assert_eq!(
+            read_only_exit_key(Access::Interactive, KeyCode::Char('q')),
+            None
+        );
+        assert!(accepts_paste(Access::Interactive, &Mode::Idle));
+    }
+
+    #[test]
+    fn authoritative_prompts_preserve_matching_channel_and_modal_draft() {
+        let mut app = App::new("t");
+        app.mode = Mode::Running;
+        let mut prompts = PendingPrompts::default();
+        let (old_tx, old_rx) = std::sync::mpsc::channel();
+        prompts.add(
+            &mut app,
+            UiPrompt::Ask {
+                id: 7,
+                question: "continue?".into(),
+                options: Vec::new(),
+                reply: old_tx,
+            },
+        );
+        app.textarea.insert_str("draft answer");
+
+        let (new_tx, new_rx) = std::sync::mpsc::channel();
+        prompts.replace(
+            &mut app,
+            vec![UiPrompt::Ask {
+                id: 7,
+                question: "continue?".into(),
+                options: Vec::new(),
+                reply: new_tx,
+            }],
+        );
+
+        assert_eq!(app.input_text(), "draft answer");
+        assert!(matches!(app.mode, Mode::AwaitingInput(ref q) if q == "continue?"));
+        prompts.answer_ask(&mut app, "yes".into());
+        assert_eq!(old_rx.recv().unwrap(), "yes");
+        assert!(
+            new_rx.recv().is_err(),
+            "replacement channel must be dropped silently"
+        );
+        assert_eq!(app.mode, Mode::Running);
+    }
+
+    #[test]
+    fn resolving_an_exact_prompt_restores_the_next_modal() {
+        let mut app = App::new("t");
+        app.mode = Mode::Idle;
+        let mut prompts = PendingPrompts::default();
+        let (ask_tx, _ask_rx) = std::sync::mpsc::channel();
+        let (approval_tx, _approval_rx) = tokio::sync::oneshot::channel();
+        prompts.replace(
+            &mut app,
+            vec![
+                UiPrompt::Ask {
+                    id: 1,
+                    question: "first?".into(),
+                    options: Vec::new(),
+                    reply: ask_tx,
+                },
+                UiPrompt::Approval {
+                    id: 2,
+                    dest: "example.com:443".into(),
+                    detail: None,
+                    reply: approval_tx,
+                },
+            ],
+        );
+        assert!(matches!(app.mode, Mode::AwaitingInput(ref q) if q == "first?"));
+
+        prompts.resolve(&mut app, 99);
+        assert!(matches!(app.mode, Mode::AwaitingInput(_)));
+        prompts.resolve(&mut app, 1);
+        assert!(matches!(app.mode, Mode::Approval(ref dest) if dest == "example.com:443"));
+        prompts.resolve(&mut app, 2);
+        assert_eq!(app.mode, Mode::Idle);
+    }
+
+    #[test]
+    fn read_only_access_drops_prompts_without_answering() {
+        let mut app = App::new_with_access("t", Access::ReadOnlyLive);
+        let mut prompts = PendingPrompts::default();
+        let (reply, answers) = std::sync::mpsc::channel();
+        prompts.add(
+            &mut app,
+            UiPrompt::Ask {
+                id: 1,
+                question: "answer?".into(),
+                options: Vec::new(),
+                reply,
+            },
+        );
+        assert!(answers.recv().is_err());
+        assert_eq!(app.mode, Mode::Running);
+    }
 
     #[test]
     fn base64_matches_known_vectors() {

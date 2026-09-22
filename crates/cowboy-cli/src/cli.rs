@@ -273,11 +273,12 @@ tree — commit them with plain git.")]
     /// Inspect the session's long-running processes (the agent starts them).
     Proc(ProcArgs),
 
-    /// Configure model providers (home-owned) and models.
+    /// Configure model providers (home-owned) and models. With no subcommand,
+    /// show the current configuration and effective default.
     #[command(after_help = "\
 Examples:
-  cowboy models setup                  # the guided path: provider, key, then a model
-  cowboy models list                   # what is configured, and the effective default
+  cowboy models                        # what is configured, and the effective default
+  cowboy models setup                  # guided provider + model setup
   cowboy models available              # what your endpoint actually offers
   cowboy models use claude-sonnet-4-6  # set the project default
 
@@ -315,7 +316,12 @@ Examples:
     /// List sessions tracked by the daemon.
     ///
     /// A shortcut for `cowboy session list`.
-    Sessions,
+    Sessions {
+        /// Merge daemon-known sessions from every project with on-disk history
+        /// from the current project. Still works when the daemon is unavailable.
+        #[arg(long)]
+        all: bool,
+    },
 
     /// Inspect and maintain sessions (list, reap stale records and their leases).
     Session(SessionCmdArgs),
@@ -422,6 +428,9 @@ its own worktree and branch. The usual arc:
     Replay {
         #[arg(value_name = "SESSION_ID")]
         session_id: String,
+        /// Browse the terminal event journal in a read-only TUI.
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Print a shell completion script.
@@ -603,15 +612,23 @@ pub enum WebCommand {
 }
 
 #[derive(Debug, Args)]
+#[command(
+    after_help = "Run `cowboy models` with no subcommand to show the current configuration.\n\
+Use `cowboy models setup` for guided provider and model setup."
+)]
 pub struct ModelsArgs {
     #[command(subcommand)]
-    pub command: ModelsCommand,
+    pub command: Option<ModelsCommand>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ModelsCommand {
-    /// Interactively add a provider (endpoint + key, saved to your home dir)
-    /// and a model that uses it.
+    /// Guided provider and model setup. Validates everything before replacing
+    /// the two home-owned files, and asks before replacing an existing entry.
+    #[command(after_help = "\
+Setup first tries the endpoint catalogue for 8 seconds, then falls back to a manual\n\
+model id without exposing credentials or raw server responses. Existing malformed files\n\
+are never overwritten; repair them first. Advanced tuning is optional.")]
     Setup,
     /// List configured providers and models, and the effective default.
     List,
@@ -676,7 +693,12 @@ pub struct SessionCmdArgs {
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     /// List sessions tracked by the daemon (same as `cowboy sessions`).
-    List,
+    List {
+        /// Merge daemon-known sessions from every project with on-disk history
+        /// from the current project. Still works when the daemon is unavailable.
+        #[arg(long)]
+        all: bool,
+    },
     /// Reap stale (crashed/abandoned) session records and release their leases.
     /// Worktrees and branches are never touched.
     Cleanup {
@@ -1162,5 +1184,38 @@ mod tests {
         // An ordinary task still parses with or without the separator.
         let cli = Cli::try_parse_from(["cowboy", "fix the tests"]).unwrap();
         assert_eq!(cli.task.as_deref(), Some("fix the tests"));
+    }
+
+    #[test]
+    fn session_browser_and_tui_replay_flags_parse_additively() {
+        let bare = Cli::try_parse_from(["cowboy", "sessions"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Some(Command::Sessions { all: false })
+        ));
+        let all = Cli::try_parse_from(["cowboy", "session", "list", "--all"]).unwrap();
+        assert!(matches!(
+            all.command,
+            Some(Command::Session(SessionCmdArgs {
+                command: SessionCommand::List { all: true }
+            }))
+        ));
+        let replay = Cli::try_parse_from(["cowboy", "replay", "1789651", "--tui"]).unwrap();
+        assert!(matches!(
+            replay.command,
+            Some(Command::Replay {
+                session_id,
+                tui: true
+            }) if session_id == "1789651"
+        ));
+    }
+
+    #[test]
+    fn bare_models_is_a_valid_discovery_command() {
+        let cli = Cli::try_parse_from(["cowboy", "models"]).expect("bare models parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Models(ModelsArgs { command: None }))
+        ));
     }
 }

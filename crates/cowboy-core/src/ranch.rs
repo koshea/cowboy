@@ -334,116 +334,192 @@ pub fn ranch_artifact_dir(root: &Path, ranch_id: &str, workstream_id: &str) -> P
         .join(workstream_id)
 }
 
-/// Load a ranch plan by id.
-pub fn load(root: &Path, id: &str) -> Result<Ranch> {
-    // Reject a traversing ranch id before it is `join`ed into a host path (the id
-    // may come from a directory listing of the agent-writable store).
-    if !is_safe_id(id) {
-        return Err(Error::Invalid(format!(
-            "unsafe ranch id {id:?}: must be a single path component"
-        )));
-    }
-    let path = ranch_path(root, id);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|_| Error::Invalid(format!("no ranch `{id}` ({})", path.display())))?;
-    let ranch: Ranch =
-        serde_yaml_ng::from_str(&text).map_err(|e| Error::Invalid(format!("parsing {id}: {e}")))?;
-    // The committed file is agent-writable, so its ids are untrusted. Reject any
-    // that would traverse when `join`ed into an artifact/store path host-side
-    // (`promote_artifacts` reaches `remove_dir_all`), and reject an id/file mismatch
-    // that would make the loaded ranch write back to a different directory.
-    if ranch.id != id {
-        return Err(Error::Invalid(format!(
-            "ranch id mismatch: directory `{id}` holds a plan with id {:?}",
-            ranch.id
-        )));
-    }
-    for w in &ranch.workstreams {
-        if !is_safe_id(&w.id) {
+/// A ranch directory pinned beneath the repository root.
+///
+/// The repository controls `.cowboy` and everything below it. Each component is
+/// therefore opened relative to the previous descriptor with `O_NOFOLLOW`; plan
+/// reads and atomic renames stay relative to the pinned ranch directory.
+struct RanchDir {
+    id: String,
+    dir: crate::fs::Dir,
+}
+
+impl RanchDir {
+    fn open(root: &Path, id: &str, create: bool) -> Result<Self> {
+        if !is_safe_id(id) {
             return Err(Error::Invalid(format!(
-                "unsafe workstream id {:?} in ranch `{id}`: must be a single path component",
-                w.id
+                "unsafe ranch id {id:?}: must be a single path component"
             )));
         }
+        let root = crate::fs::Dir::open(root)?;
+        let cowboy = if create {
+            root.ensure_dir(".cowboy")?
+        } else {
+            root.open_dir(".cowboy")?
+        };
+        let ranches = if create {
+            cowboy.ensure_dir("ranches")?
+        } else {
+            cowboy.open_dir("ranches")?
+        };
+        let dir = if create {
+            ranches.ensure_dir(id)?
+        } else {
+            ranches.open_dir(id)?
+        };
+        Ok(Self {
+            id: id.to_string(),
+            dir,
+        })
     }
-    Ok(ranch)
-}
 
-/// Write a ranch plan (creates its dir; atomic temp+rename).
-///
-/// Use [`save_progress`] for any write that is *not* meant to change the plan's scope.
-pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
-    // Never let a traversing id reach the filesystem, even on a write path that
-    // didn't go through `load`/`validate` (e.g. a freshly constructed ranch).
-    if !is_safe_id(&ranch.id) {
-        return Err(Error::Invalid(format!(
-            "unsafe ranch id {:?}: must be a single path component",
-            ranch.id
-        )));
-    }
-    let path = ranch_path(root, &ranch.id);
-    let yaml = serde_yaml_ng::to_string(ranch).map_err(|e| Error::Invalid(e.to_string()))?;
-    // Symlink-safe atomic write: the tmp path lives in the agent-writable workspace,
-    // so a plain `fs::write` there would follow a planted symlink (host-side TOCTOU).
-    crate::fs::write_atomic(&path, yaml.as_bytes())
-}
-
-/// Write a plan whose **scope has not changed**, refusing the write if it has.
-///
-/// `ranch.yaml` is the committed source of truth, and the rule is that its *scope* —
-/// which workstreams exist, what they depend on, what they are for, what they must
-/// deliver — changes only when the user says so, via a scope proposal and
-/// `cowboy ranch approve`. Progress is different: which workstream is running, its
-/// session id, branch and worktree, and the derived overall status. The daemon
-/// coordinator writes those on its own, all day.
-///
-/// That distinction was documented and then enforced by nothing, which is the kind of
-/// invariant that quietly stops being true. `before` is the plan as loaded; passing it
-/// here makes the write assert what it claims. The check is on the scope fields only,
-/// so ordinary bookkeeping passes and an accidental (or agent-driven) scope edit on a
-/// progress path fails loudly instead of landing in a committed file.
-pub fn save_progress(root: &Path, before: &Ranch, after: &Ranch) -> Result<()> {
-    // 1. The caller did not itself change scope between its own load and this save.
-    if before.scope_fingerprint() != after.scope_fingerprint() {
-        return Err(Error::Invalid(format!(
-            "refusing to write ranch `{}`: this is a progress update, but the plan's scope \
-             changed. Scope changes go through a proposal and `cowboy ranch approve`",
-            after.id
-        )));
-    }
-    // 2. And the on-disk scope has not changed since the caller loaded it. `before`
-    //    is a stale in-memory snapshot; a user-gated `cowboy ranch approve` may have
-    //    landed a new scope on disk while this progress write was in flight. Writing
-    //    `after` (built on the stale scope) would silently clobber that approval — a
-    //    lost update. Re-read and compare against the committed file; refuse on drift.
-    //    Callers should hold the ranch lock around load→…→save so this window is
-    //    closed entirely (see `lock_ranch`); the re-read is the backstop that makes
-    //    the invariant hold even for a caller that does not.
-    if let Ok(on_disk) = load(root, &after.id) {
-        if on_disk.scope_fingerprint() != after.scope_fingerprint() {
+    fn load(&self) -> Result<Ranch> {
+        let text = self
+            .dir
+            .read_to_string("ranch.yaml")
+            .map_err(|error| Error::Invalid(format!("loading ranch `{}`: {error}", self.id)))?;
+        let ranch: Ranch = serde_yaml_ng::from_str(&text)
+            .map_err(|e| Error::Invalid(format!("parsing {}: {e}", self.id)))?;
+        if ranch.id != self.id {
             return Err(Error::Invalid(format!(
-                "refusing to write ranch `{}`: its scope changed on disk since it was loaded \
-                 (a proposal was approved concurrently). Re-run so the update applies to the \
-                 current plan.",
+                "ranch id mismatch: directory `{}` holds a plan with id {:?}",
+                self.id, ranch.id
+            )));
+        }
+        for w in &ranch.workstreams {
+            if !is_safe_id(&w.id) {
+                return Err(Error::Invalid(format!(
+                    "unsafe workstream id {:?} in ranch `{}`: must be a single path component",
+                    w.id, self.id
+                )));
+            }
+        }
+        Ok(ranch)
+    }
+
+    fn write_yaml(&self, yaml: &[u8]) -> Result<()> {
+        self.dir.write_atomic("ranch.yaml", yaml)
+    }
+
+    fn save(&self, ranch: &Ranch) -> Result<()> {
+        if ranch.id != self.id {
+            return Err(Error::Invalid(format!(
+                "refusing to save ranch {:?} through directory `{}`",
+                ranch.id, self.id
+            )));
+        }
+        let yaml = serde_yaml_ng::to_string(ranch).map_err(|e| Error::Invalid(e.to_string()))?;
+        self.write_yaml(yaml.as_bytes())
+    }
+
+    fn save_progress(&self, before: &Ranch, after: &Ranch) -> Result<()> {
+        if before.scope_fingerprint() != after.scope_fingerprint() {
+            return Err(Error::Invalid(format!(
+                "refusing to write ranch `{}`: this is a progress update, but the plan's scope \
+                 changed. Scope changes go through a proposal and `cowboy ranch approve`",
                 after.id
             )));
         }
-    }
-    save(root, after)
-}
-
-/// List all ranch plans for a project (newest activity is not implied; sorted by id).
-pub fn list(root: &Path) -> Vec<Ranch> {
-    let mut ranches = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(ranches_dir(root)) {
-        for e in entries.flatten() {
-            if let Some(id) = e.file_name().to_str() {
-                if let Ok(r) = load(root, id) {
-                    ranches.push(r);
-                }
+        if let Ok(on_disk) = self.load() {
+            if on_disk.scope_fingerprint() != after.scope_fingerprint() {
+                return Err(Error::Invalid(format!(
+                    "refusing to write ranch `{}`: its scope changed on disk since it was loaded \
+                     (a proposal was approved concurrently). Re-run so the update applies to the \
+                     current plan.",
+                    after.id
+                )));
             }
         }
+        self.save(after)
     }
+}
+
+/// A held exclusive lock plus the pinned ranch directory it protects.
+pub struct RanchLock {
+    store: RanchDir,
+    _lock: std::fs::File,
+}
+
+impl RanchLock {
+    /// Validate `id` before touching the filesystem, then acquire the ranch lock.
+    pub fn acquire(root: &Path, id: &str) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        if !is_safe_id(id) {
+            return Err(Error::Invalid(format!(
+                "unsafe ranch id {id:?}: must be a single path component"
+            )));
+        }
+        let store = RanchDir::open(root, id, true)?;
+        let lock = store.dir.open_regular_create(".lock", 0o644)?;
+        // SAFETY: `lock` owns a valid descriptor. The lock is released on close.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(Error::Invalid(format!(
+                "acquiring ranch lock: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self { store, _lock: lock })
+    }
+
+    pub fn load(&self) -> Result<Ranch> {
+        self.store.load()
+    }
+
+    pub fn save(&self, ranch: &Ranch) -> Result<()> {
+        self.store.save(ranch)
+    }
+
+    pub fn save_progress(&self, before: &Ranch, after: &Ranch) -> Result<()> {
+        self.store.save_progress(before, after)
+    }
+
+    /// Open/create the artifact parent beneath this pinned ranch directory.
+    pub fn artifacts_dir(&self) -> Result<crate::fs::Dir> {
+        self.store.dir.ensure_dir("artifacts")
+    }
+}
+
+/// Load a ranch plan by id without following Ranch-store symlinks.
+pub fn load(root: &Path, id: &str) -> Result<Ranch> {
+    RanchDir::open(root, id, false)?.load()
+}
+
+/// Write a ranch plan (creates its directory and atomically renames the file).
+///
+/// Use [`save_progress`] for any write that is *not* meant to change the plan's scope.
+pub fn save(root: &Path, ranch: &Ranch) -> Result<()> {
+    RanchDir::open(root, &ranch.id, true)?.save(ranch)
+}
+
+/// Descriptor-relative raw YAML write used by the commented `ranch create` skeleton.
+pub fn save_yaml(root: &Path, id: &str, yaml: &[u8]) -> Result<()> {
+    RanchDir::open(root, id, true)?.write_yaml(yaml)
+}
+
+/// Write a plan whose **scope has not changed**, refusing the write if it has.
+pub fn save_progress(root: &Path, before: &Ranch, after: &Ranch) -> Result<()> {
+    RanchDir::open(root, &after.id, true)?.save_progress(before, after)
+}
+
+/// List all ranch plans for a project (sorted by id).
+pub fn list(root: &Path) -> Vec<Ranch> {
+    let Ok(root_dir) = crate::fs::Dir::open(root) else {
+        return Vec::new();
+    };
+    let Ok(ranches_dir) = root_dir
+        .open_dir(".cowboy")
+        .and_then(|dir| dir.open_dir("ranches"))
+    else {
+        return Vec::new();
+    };
+    let mut ranches = ranches_dir
+        .list_names()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|name| name.into_string().ok())
+        .filter_map(|id| load(root, &id).ok())
+        .collect::<Vec<_>>();
     ranches.sort_by(|a, b| a.id.cmp(&b.id));
     ranches
 }
@@ -451,9 +527,18 @@ pub fn list(root: &Path) -> Vec<Ranch> {
 /// A free id from a title (slug), suffixed until unused under `root`.
 pub fn fresh_id(root: &Path, title: &str) -> String {
     let base = crate::memory::slugify(title);
+    let existing = crate::fs::Dir::open(root)
+        .and_then(|dir| dir.open_dir(".cowboy"))
+        .and_then(|dir| dir.open_dir("ranches"));
     let mut id = base.clone();
     let mut n = 2;
-    while ranches_dir(root).join(&id).exists() {
+    while existing
+        .as_ref()
+        .ok()
+        .and_then(|dir| dir.entry_kind(&id).ok())
+        .flatten()
+        .is_some()
+    {
         id = format!("{base}-{n}");
         n += 1;
     }
@@ -592,6 +677,89 @@ mod tests {
             save(&tmp, &r).is_err(),
             "save must refuse a traversing ranch id"
         );
+    }
+
+    #[test]
+    fn lock_rejects_an_unsafe_id_before_opening_the_root() {
+        let root = std::env::temp_dir().join(format!(
+            "cowboy-ranch-invalid-lock-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        assert!(RanchLock::acquire(&root, "../escape").is_err());
+        assert!(
+            !root.exists(),
+            "validation must precede every path operation"
+        );
+    }
+
+    #[test]
+    fn ranch_store_refuses_symlinked_ancestors_lock_and_plan() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "cowboy-ranch-links-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let victim = root.with_extension("victim");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&victim).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&victim).unwrap();
+        symlink(&victim, root.join(".cowboy")).unwrap();
+        assert!(save(&root, &ranch(vec![])).is_err());
+        assert!(!victim.join("ranches").exists());
+
+        std::fs::remove_file(root.join(".cowboy")).unwrap();
+        let ranch_dir = root.join(".cowboy/ranches/r");
+        std::fs::create_dir_all(&ranch_dir).unwrap();
+        let victim_file = victim.join("file");
+        std::fs::write(&victim_file, "untouched").unwrap();
+        symlink(&victim_file, ranch_dir.join(".lock")).unwrap();
+        assert!(RanchLock::acquire(&root, "r").is_err());
+        assert_eq!(std::fs::read_to_string(&victim_file).unwrap(), "untouched");
+
+        std::fs::remove_file(ranch_dir.join(".lock")).unwrap();
+        symlink(&victim_file, ranch_dir.join("ranch.yaml")).unwrap();
+        assert!(load(&root, "r").is_err());
+        assert_eq!(std::fs::read_to_string(&victim_file).unwrap(), "untouched");
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&victim).ok();
+    }
+
+    #[test]
+    fn ranch_plan_fifo_is_rejected_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let root = std::env::temp_dir().join(format!(
+            "cowboy-ranch-fifo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&root).ok();
+        let ranch_dir = root.join(".cowboy/ranches/r");
+        std::fs::create_dir_all(&ranch_dir).unwrap();
+        let plan = ranch_dir.join("ranch.yaml");
+        let plan = CString::new(plan.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `plan` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(plan.as_ptr(), 0o600) }, 0);
+
+        let load_root = root.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(load(&load_root, "r").is_err());
+        });
+        assert!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("loading a FIFO plan must not block"),
+            "FIFO plan must be rejected as non-regular"
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The artifact dir for any *validated* ranch stays inside the store — a

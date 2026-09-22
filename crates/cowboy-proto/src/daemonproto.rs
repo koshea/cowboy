@@ -537,14 +537,38 @@ pub struct JobInfo {
     pub requested: u32,
 }
 
+/// A serializable description of a reply-capable prompt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingPrompt {
+    Ask {
+        id: u64,
+        question: String,
+        #[serde(default)]
+        options: Vec<String>,
+    },
+    Approval {
+        id: u64,
+        dest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<crate::netproto::ApprovalDetail>,
+    },
+}
+
 /// Worker → client messages over the per-session socket.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)] // `Snapshot` is sent once per attach; a wire enum, size is moot
 pub enum ServerMsg {
-    /// Sent once per attach (not journaled): session metadata + journal length
-    /// at the moment of subscription.
-    Snapshot { info: SessionInfo, journal_len: u64 },
+    /// Sent once per attach (not journaled): session metadata, pending prompts,
+    /// and journal length at the moment of subscription.
+    Snapshot {
+        info: SessionInfo,
+        journal_len: u64,
+        /// Defaulted so new clients still accept snapshots from older workers.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_prompts: Vec<PendingPrompt>,
+    },
     /// A journaled display event with its sequence number (= journal line).
     Event { seq: u64, event: UiEventMsg },
     /// A pending question for the user; reply with [`ClientMsg::AskReply`].
@@ -567,6 +591,9 @@ pub enum ServerMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<crate::netproto::ApprovalDetail>,
     },
+    /// A previously broadcast `Ask` has been answered or expired; clients should
+    /// dismiss only the matching prompt.
+    AskResolved { id: u64 },
     /// A previously broadcast `Approval` has been decided (by another client or
     /// on timeout); clients should dismiss its modal.
     ApprovalResolved { id: u64 },
@@ -743,6 +770,18 @@ mod tests {
         roundtrip(&ServerMsg::Snapshot {
             info: sample_info(),
             journal_len: 12,
+            pending_prompts: vec![
+                PendingPrompt::Ask {
+                    id: 7,
+                    question: "continue?".into(),
+                    options: vec!["yes".into()],
+                },
+                PendingPrompt::Approval {
+                    id: 8,
+                    dest: "example.com:443".into(),
+                    detail: None,
+                },
+            ],
         });
         roundtrip(&ClientMsg::Hello {
             since_seq: Some(3),
@@ -769,7 +808,13 @@ mod tests {
                 note: Some("nothing saved yet".into()),
             }),
         });
+        roundtrip(&ServerMsg::AskResolved { id: 1 });
         roundtrip(&ServerMsg::ApprovalResolved { id: 2 });
+        roundtrip(&ServerMsg::Status(SessionStatus::AwaitingInput));
+        roundtrip(&ClientMsg::AskReply {
+            id: 1,
+            answer: "yes".into(),
+        });
         roundtrip(&ClientMsg::Accept {
             note: Some("ship it".into()),
         });
@@ -784,6 +829,24 @@ mod tests {
         roundtrip(&ClientMsg::Interrupt {
             kind: InterruptKind::Instruct,
         });
+    }
+
+    #[test]
+    fn old_snapshot_defaults_pending_prompts() {
+        let value = serde_json::json!({
+            "snapshot": {
+                "info": sample_info(),
+                "journal_len": 12
+            }
+        });
+        let parsed: ServerMsg = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            parsed,
+            ServerMsg::Snapshot {
+                pending_prompts,
+                ..
+            } if pending_prompts.is_empty()
+        ));
     }
 
     #[test]

@@ -16,30 +16,41 @@ use std::path::{Path, PathBuf};
 use std::io::IsTerminal;
 
 use anyhow::Result;
-use cowboy_core::config::{resolve_model, ConfigPaths, ModelsConfig, ProvidersConfig};
+use cowboy_core::config::{
+    resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
+};
+use cowboy_core::Error;
 
 use crate::style;
 
-/// Something missing that a session cannot start without.
+/// Something that prevents a session from starting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Gap {
-    /// No `.cowboy/` config for this project.
+    /// No required `security.yaml` for this project.
     Project { root: PathBuf },
+    /// A present config file could not be read, parsed, or validated.
+    InvalidConfig {
+        name: String,
+        path: PathBuf,
+        detail: String,
+    },
     /// No provider in the home config (endpoint + key).
     Provider,
-    /// A provider exists, but no usable model — including the "said no to the model
-    /// step of `models setup`" case, which used to fail with an unactionable
-    /// resolve error.
+    /// A provider exists, but no usable model.
     Model { detail: String },
 }
 
 impl Gap {
-    /// What is wrong, and the command that fixes it.
+    /// What is wrong, and the action that fixes it.
     fn line(&self) -> (String, String) {
         match self {
             Gap::Project { root } => (
                 format!("no .cowboy/ config in {}", root.display()),
                 "cowboy init".into(),
+            ),
+            Gap::InvalidConfig { name, path, detail } => (
+                format!("invalid {name}: {detail}"),
+                format!("fix {}", path.display()),
             ),
             Gap::Provider => (
                 "no model provider configured".into(),
@@ -50,31 +61,111 @@ impl Gap {
     }
 }
 
+#[derive(Debug)]
+enum Loaded<T> {
+    Absent,
+    Value(T),
+    Invalid(String),
+}
+
+fn loaded<T>(result: cowboy_core::Result<T>) -> Loaded<T> {
+    match result {
+        Ok(value) => Loaded::Value(value),
+        Err(Error::ConfigNotFound(_)) => Loaded::Absent,
+        Err(error) => Loaded::Invalid(error.to_string()),
+    }
+}
+
+fn loaded_opt<T>(result: cowboy_core::Result<Option<T>>) -> Loaded<T> {
+    match result {
+        Ok(Some(value)) => Loaded::Value(value),
+        Ok(None) | Err(Error::ConfigNotFound(_)) => Loaded::Absent,
+        Err(error) => Loaded::Invalid(error.to_string()),
+    }
+}
+
+fn record_config<T>(gaps: &mut Vec<Gap>, name: &str, path: &Path, state: Loaded<T>) -> Option<T> {
+    match state {
+        Loaded::Value(value) => Some(value),
+        Loaded::Absent => None,
+        Loaded::Invalid(detail) => {
+            gaps.push(Gap::InvalidConfig {
+                name: name.into(),
+                path: path.to_path_buf(),
+                detail,
+            });
+            None
+        }
+    }
+}
+
 /// Everything a session start needs, in the order a user would fix it.
 ///
-/// Deliberately does not touch the daemon, the sandbox, or the network: this runs before
-/// any of that exists, and its only job is to answer "can this possibly work?".
+/// Every existing file is loaded strictly and independently. A malformed file is never
+/// collapsed into "missing": doing so can recommend `init` or `models setup`, both of
+/// which are the wrong operation when the user's file needs repair.
 pub fn check(root: &Path) -> Vec<Gap> {
     let paths = ConfigPaths::for_root(root);
+    let providers_path = ProvidersConfig::global_path();
+    let user_models_path = ModelsConfig::user_path();
     let mut gaps = Vec::new();
-    if !paths.security.is_file() {
-        gaps.push(Gap::Project {
+
+    match loaded(SecurityConfig::load(&paths.security)) {
+        Loaded::Absent => gaps.push(Gap::Project {
             root: root.to_path_buf(),
-        });
+        }),
+        state => {
+            record_config(&mut gaps, "security.yaml", &paths.security, state);
+        }
     }
-    let providers = ProvidersConfig::load_global().unwrap_or_default();
-    if providers.providers.is_empty() {
-        gaps.push(Gap::Provider);
-        // Without a provider there is nothing to resolve a model against, so a second
-        // complaint about models would just be noise.
-        return gaps;
-    }
-    let user = ModelsConfig::user_path().and_then(|p| ModelsConfig::load_opt(&p).ok().flatten());
-    let project = ModelsConfig::load_opt(&paths.models).ok().flatten();
-    if let Err(e) = resolve_model(&providers, user.as_ref(), project.as_ref(), None) {
-        gaps.push(Gap::Model {
-            detail: format!("a provider is configured, but no usable model ({e})"),
-        });
+    record_config(
+        &mut gaps,
+        "agent.yaml",
+        &paths.agent,
+        loaded_opt(AgentConfig::load_opt(&paths.agent)),
+    );
+
+    let providers = match &providers_path {
+        Some(path) => record_config(
+            &mut gaps,
+            "providers.yaml",
+            path,
+            loaded(ProvidersConfig::load_global()),
+        ),
+        None => {
+            gaps.push(Gap::InvalidConfig {
+                name: "providers.yaml".into(),
+                path: PathBuf::from("~/.config/cowboy/providers.yaml"),
+                detail: "cannot resolve the home config directory".into(),
+            });
+            None
+        }
+    };
+    let user = match &user_models_path {
+        Some(path) => record_config(
+            &mut gaps,
+            "user models.yaml",
+            path,
+            loaded_opt(ModelsConfig::load_opt(path)),
+        ),
+        None => None,
+    };
+    let project = record_config(
+        &mut gaps,
+        "project models.yaml",
+        &paths.models,
+        loaded_opt(ModelsConfig::load_opt(&paths.models)),
+    );
+
+    if let Some(providers) = providers {
+        if providers.providers.is_empty() {
+            gaps.push(Gap::Provider);
+        } else if let Err(error) = resolve_model(&providers, user.as_ref(), project.as_ref(), None)
+        {
+            gaps.push(Gap::Model {
+                detail: format!("a provider is configured, but no usable model ({error})"),
+            });
+        }
     }
     gaps
 }
@@ -178,20 +269,42 @@ mod tests {
     }
 
     #[test]
-    fn the_provider_gap_suppresses_a_redundant_model_gap() {
-        // With no endpoint there is nothing to resolve against; two complaints for one
-        // cause is how the old flow read.
-        let tmp = assert_fs::TempDir::new().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".cowboy")).unwrap();
-        std::fs::write(tmp.path().join(".cowboy/security.yaml"), "version: 1\n").unwrap();
-        // Only meaningful when the host really has no provider; otherwise the check
-        // legitimately passes and there is nothing to assert.
-        if ProvidersConfig::load_global()
-            .map(|p| p.providers.is_empty())
-            .unwrap_or(true)
-        {
-            let gaps = check(tmp.path());
-            assert_eq!(gaps, vec![Gap::Provider]);
-        }
+    fn invalid_config_is_never_reported_as_absent_or_sent_to_setup() {
+        let root = PathBuf::from("/p");
+        let path = root.join(".cowboy/models.yaml");
+        let gaps = [Gap::InvalidConfig {
+            name: "project models.yaml".into(),
+            path: path.clone(),
+            detail: "failed to parse".into(),
+        }];
+        let out = report(&root, &gaps);
+        assert!(out.contains("invalid project models.yaml"), "{out}");
+        assert!(out.contains(&format!("fix {}", path.display())), "{out}");
+        assert!(!out.contains("cowboy init"), "{out}");
+        assert!(!out.contains("cowboy models setup"), "{out}");
+    }
+
+    #[test]
+    fn independent_invalid_configs_are_all_recorded() {
+        let root = PathBuf::from("/p");
+        let mut gaps = Vec::new();
+        let first: Loaded<()> = Loaded::Invalid("bad yaml".into());
+        let second: Loaded<()> = Loaded::Invalid("unknown field".into());
+        record_config(
+            &mut gaps,
+            "providers.yaml",
+            Path::new("/home/providers.yaml"),
+            first,
+        );
+        record_config(
+            &mut gaps,
+            "project models.yaml",
+            &root.join("models.yaml"),
+            second,
+        );
+        assert_eq!(gaps.len(), 2);
+        assert!(gaps
+            .iter()
+            .all(|gap| matches!(gap, Gap::InvalidConfig { .. })));
     }
 }
