@@ -290,6 +290,9 @@ pub struct AgentLoop<'a> {
     /// truncation, reset to 0 whenever a turn produces content or a tool call.
     /// Bounds recovery so a model that always truncates can't spin.
     reprime_attempts: u32,
+    /// Consecutive empty replies nudged past; see [`MAX_EMPTY_RETRIES`]. Reset by
+    /// any reply that makes progress.
+    empty_retries: u32,
     /// Set after a truncation recovery: the next model call asks the provider for
     /// minimal reasoning effort. One turn only — a model that answered is not the
     /// problem, and permanently dulling its thinking would be a poor trade.
@@ -899,6 +902,20 @@ never resolved. Terse bullet points. Output only the distilled conclusions.";
 /// giving up and reporting `[incomplete]`.
 const MAX_REPRIME_ATTEMPTS: u32 = 2;
 
+/// Consecutive empty replies (no text, no tool call, not truncated) the loop nudges
+/// past before handing the turn back to the user.
+///
+/// An empty reply is usually a model stumbling, not a model that is done: observed
+/// on GLM at ~320k context straight after a `grep` that matched nothing — one output
+/// token, end of turn — and the user's "try again" was all it took to carry on.
+/// Asking the user to rephrase for that is making them do the retry by hand.
+const MAX_EMPTY_RETRIES: u32 = 2;
+
+/// What the loop tells a model whose reply was empty.
+const EMPTY_REPLY_NUDGE: &str = "[cowboy] Your last reply was empty — no text and no \
+tool call. Continue the task: make your next tool call, or call `final` if you are \
+done. (A command that printed nothing found nothing; that is a result, not an error.)";
+
 /// Tokens reserved for the model's response + tool schemas when budgeting.
 const RESPONSE_HEADROOM: usize = 4096;
 
@@ -1066,6 +1083,7 @@ impl<'a> AgentLoop<'a> {
             cancel,
             context_window,
             reprime_attempts: 0,
+            empty_retries: 0,
             minimize_reasoning_next_turn: false,
             reasoning_shed_notified: false,
             budget,
@@ -2716,6 +2734,23 @@ impl<'a> AgentLoop<'a> {
                         self.ui.notice(&note);
                         return Ok(Some(format!("[incomplete] {note}")));
                     }
+                    // Empty and not truncated: nudge and retry before involving the
+                    // user. The empty assistant turn is dropped rather than kept —
+                    // some providers reject an assistant message with neither
+                    // content nor tool calls, and it carries nothing anyway.
+                    if self.empty_retries < MAX_EMPTY_RETRIES {
+                        self.empty_retries += 1;
+                        self.messages.pop();
+                        self.ui
+                            .notice("the model returned nothing — nudging it to continue");
+                        let msg = Message::user(EMPTY_REPLY_NUDGE.to_string());
+                        if let Some(l) = &mut self.logger {
+                            l.log_message(&msg);
+                        }
+                        self.messages.push(msg);
+                        continue;
+                    }
+                    self.empty_retries = 0;
                     self.ui.notice(
                         "the model didn't return anything to do — rephrase your request, \
                      or try a different model with /model",
@@ -2727,6 +2762,7 @@ impl<'a> AgentLoop<'a> {
                 // truncation gets a fresh reprime budget rather than the tail of an
                 // earlier recovery.
                 self.reprime_attempts = 0;
+                self.empty_retries = 0;
 
                 // Coordination-only batches skip both progress guards. A foreman with four
                 // workers in flight legitimately calls `jobs` — or `wait` — several times
@@ -3940,6 +3976,15 @@ impl<'a> AgentLoop<'a> {
                     // `push_tool_result` truncates again — head-only — and cuts off
                     // the tail `truncate_middle` just preserved. The prefix is at the
                     // head, which middle truncation always keeps.
+                    // Say so when there was no output. A bare exit-code line reads as
+                    // a blank to a model, and a blank observation is what preceded an
+                    // empty reply in practice; "(no output)" is a result it can act on
+                    // — the grep matched nothing, the build printed nothing.
+                    let output = if output.trim().is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        output
+                    };
                     let observation = format!(
                         "[exit code: {} · {}]\n{}",
                         result.exit_code,
@@ -5616,6 +5661,110 @@ mod tests {
             name: name.into(),
             arguments: args.into(),
         }
+    }
+
+    fn empty_reply() -> ChatResponse {
+        ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![],
+        }
+    }
+
+    /// An empty reply is nudged past rather than handed to the user; only a model
+    /// that stays empty past the retries ends the turn with the "rephrase" notice.
+    #[tokio::test]
+    async fn an_empty_reply_is_retried_before_giving_up() {
+        let finish = ChatResponse {
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("f", "final", r#"{"message":"carried on"}"#)],
+        };
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![empty_reply(), empty_reply(), finish]);
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let out = agent.run("do the thing").await.unwrap();
+        assert!(
+            !agent.messages.iter().any(|m| m.role == Role::Assistant
+                && m.content.is_empty()
+                && m.tool_calls.is_empty()),
+            "empty assistant turns must not stay in the conversation"
+        );
+        drop(agent);
+        assert_eq!(out.as_deref(), Some("carried on"));
+        assert_eq!(
+            ui.notices
+                .iter()
+                .filter(|n| n.contains("nudging it"))
+                .count(),
+            2
+        );
+        assert!(!ui.notices.iter().any(|n| n.contains("rephrase")));
+
+        let mut ui = RecordingUi::default();
+        let model = ScriptedModel::new(vec![empty_reply(), empty_reply(), empty_reply()]);
+        let out = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .run("do the thing")
+        .await
+        .unwrap();
+        assert_eq!(out, None);
+        assert!(ui.notices.iter().any(|n| n.contains("rephrase")));
+    }
+
+    /// A command that prints nothing says so, instead of a bare exit-code line.
+    #[tokio::test]
+    async fn a_silent_command_reports_no_output() {
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"grep nope x"}"#)],
+            },
+            ChatResponse {
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"none"}"#)],
+            },
+        ]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::printing(""),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        agent.run("search").await.unwrap();
+        let obs = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .map(|m| m.content.clone())
+            .unwrap();
+        assert!(obs.contains("(no output)"), "{obs}");
     }
 
     #[tokio::test]
