@@ -107,6 +107,7 @@ fn build_command(
         command: shell_command.to_string(),
         read_only: to_strings(&plan.landlock.read_only),
         read_write: to_strings(&plan.landlock.read_write),
+        list_dirs: to_strings(&plan.landlock.list_dirs),
         scope_ipc: plan.landlock.scope_ipc,
         deny_syscalls: plan.seccomp.denied.iter().map(|s| s.to_string()).collect(),
         deny_raw_sockets: plan.seccomp.deny_raw_sockets,
@@ -513,6 +514,7 @@ mod tests {
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/cache/cowboy/home/proj"),
+                git_identity: None,
             },
             &probe,
         )
@@ -549,6 +551,7 @@ mod tests {
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/cache/cowboy/home/proj"),
+                git_identity: None,
             },
             &probe,
         )
@@ -583,6 +586,7 @@ mod tests {
                 relay_port: 8443,
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/cache/cowboy/home/proj"),
+                git_identity: None,
             },
             &live,
         )

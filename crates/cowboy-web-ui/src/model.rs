@@ -11,7 +11,11 @@ pub enum Block {
     Agent(String),
     Command {
         cmd: String,
+        /// Committed (newline-terminated) output.
         output: String,
+        /// The current transient line — a `\r` progress update the producer sends
+        /// without a newline. Each one replaces the last, as in a terminal.
+        live: String,
         exit: Option<i32>,
     },
     Tool(String),
@@ -57,12 +61,14 @@ pub struct Approval {
     /// `dest` is all there is to show.
     pub rows: Vec<(String, String)>,
     pub note: Option<String>,
+    /// A credential grant: per request, never remembered, so no scope is offered.
+    pub once_only: bool,
 }
 
 impl Approval {
     fn new(id: u64, dest: String, detail: Option<cowboy_proto::netproto::ApprovalDetail>) -> Self {
         use cowboy_proto::netproto::ApprovalKind;
-        let (title, rows, note) = match detail {
+        let (title, rows, note, once_only) = match detail {
             Some(d) => (
                 match d.kind {
                     ApprovalKind::Network => "Network request",
@@ -70,8 +76,9 @@ impl Approval {
                 },
                 d.rows,
                 d.note,
+                d.kind == ApprovalKind::Credential,
             ),
-            None => ("Approval", Vec::new(), None),
+            None => ("Approval", Vec::new(), None, false),
         };
         Approval {
             id,
@@ -79,6 +86,7 @@ impl Approval {
             title: title.to_string(),
             rows,
             note,
+            once_only,
         }
     }
 }
@@ -100,10 +108,42 @@ pub struct SubagentStatus {
     /// Turns spent / granted, when the roster supervises turn budgets.
     pub used: u32,
     pub granted: u32,
+    /// Waiting on an answer from the foreman (`asking a question`).
+    pub asking: bool,
+    /// Wall time so far, as of the last job snapshot.
+    pub elapsed_ms: u64,
+    /// What it was asked to do.
+    pub task: String,
 }
+
+/// The latest context-window snapshot (the TUI's `/context`).
+#[derive(Clone, PartialEq, Default)]
+pub struct Context {
+    pub used: u64,
+    pub budget: u64,
+    pub window: u64,
+    pub reserve: u64,
+    pub top: Vec<(String, u64)>,
+}
+
+impl Context {
+    /// Percent of the conversation budget in use (saturating, like the TUI's).
+    pub fn percent(&self) -> u64 {
+        if self.budget == 0 {
+            return if self.used == 0 { 0 } else { 100 };
+        }
+        (self.used.saturating_mul(100) / self.budget).min(999)
+    }
+}
+
+/// How many network events the activity panel keeps.
+const NET_EVENTS_KEPT: usize = 200;
 
 #[derive(Clone, PartialEq, Default)]
 pub struct Model {
+    /// What the session is about (its task, or first message) — the header title.
+    pub task: Option<String>,
+    /// The worker's context title (`~/proj ⎇ branch`), shown under the task.
     pub title: String,
     pub blocks: Vec<Block>,
     /// In-progress (un-committed) model output.
@@ -113,26 +153,31 @@ pub struct Model {
     pub tokens_in: u64,
     pub tokens_out: u64,
     pub cost_usd: f64,
-    /// Conversation tokens against the conversation budget, from the loop's own
-    /// accounting — the same numbers `/context` shows in the TUI. `None` until the
-    /// first turn reports them.
-    ///
-    /// Only the two figures the header needs: the window/reserve split and the list of
-    /// top consumers are a diagnostic view the phone-sized header has no room for.
-    pub context: Option<(u64, u64)>,
+    /// `None` until the first turn reports it.
+    pub context: Option<Context>,
     pub diffstat: String,
     pub plan: Vec<(String, String)>,
     pub blocked: Option<String>,
-    pub ask: Option<Ask>,
-    pub approval: Option<Approval>,
+    /// Outstanding questions, oldest first — the worker answers them in id order,
+    /// so the oldest is the one shown.
+    pub asks: Vec<Ask>,
+    /// Outstanding approvals, oldest first.
+    pub approvals: Vec<Approval>,
     pub status: Option<SessionStatus>,
     pub conn: ConnState,
-    /// A turn is in flight (drives the spinner / disables nothing).
+    /// Derived from events when the worker hasn't reported a status (an old
+    /// worker, a replay); otherwise the status is authoritative — see [`Self::busy`].
     pub running: bool,
     /// Crew subagents dispatched this session, for the watch list.
     pub subagents: Vec<SubagentStatus>,
     /// Input the user queued to run after the current turn.
     pub queued: Vec<String>,
+    /// Recent network activity, newest last.
+    pub net: Vec<String>,
+    /// Background processes as `(name, state)`.
+    pub processes: Vec<(String, String)>,
+    /// Journal events this client could not parse (a newer worker), skipped.
+    pub skipped: u64,
 }
 
 impl Model {
@@ -159,29 +204,31 @@ impl Model {
                 // the snapshot, and it is authoritative: anything not listed was
                 // resolved while we were away. The modals hold one of each kind,
                 // so show the oldest, as the worker would answer it first.
-                self.ask = None;
-                self.approval = None;
+                self.asks.clear();
+                self.approvals.clear();
                 for prompt in pending_prompts {
                     match prompt {
                         PendingPrompt::Ask {
                             id,
                             question,
                             options,
-                        } => {
-                            self.ask.get_or_insert(Ask {
-                                id,
-                                question,
-                                options,
-                            });
-                        }
+                        } => self.push_ask(Ask {
+                            id,
+                            question,
+                            options,
+                        }),
                         PendingPrompt::Approval { id, dest, detail } => {
-                            self.approval
-                                .get_or_insert_with(|| Approval::new(id, dest, detail));
+                            self.push_approval(Approval::new(id, dest, detail))
                         }
                     }
                 }
                 self.status = Some(info.status);
-                self.title = info.task.unwrap_or(info.id);
+                if info.task.is_some() {
+                    self.task = info.task;
+                }
+                if self.title.is_empty() {
+                    self.title = info.id;
+                }
                 self.tokens_in = info.tokens.0;
                 self.tokens_out = info.tokens.1;
                 self.diffstat = info.diffstat;
@@ -192,48 +239,88 @@ impl Model {
                 id,
                 question,
                 options,
-            } => {
-                self.ask = Some(Ask {
-                    id,
-                    question,
-                    options,
-                })
-            }
+            } => self.push_ask(Ask {
+                id,
+                question,
+                options,
+            }),
             ServerMsg::Approval { id, dest, detail } => {
-                self.approval = Some(Approval::new(id, dest, detail));
+                self.push_approval(Approval::new(id, dest, detail))
             }
-            ServerMsg::AskResolved { id } => {
-                if self.ask.as_ref().is_some_and(|ask| ask.id == id) {
-                    self.ask = None;
-                }
-            }
-            ServerMsg::ApprovalResolved { id } => {
-                if self.approval.as_ref().is_some_and(|a| a.id == id) {
-                    self.approval = None;
-                }
-            }
+            ServerMsg::AskResolved { id } => self.asks.retain(|a| a.id != id),
+            ServerMsg::ApprovalResolved { id } => self.approvals.retain(|a| a.id != id),
+            ServerMsg::CommandReply { text } => self.push_notice(text),
             ServerMsg::Status(s) => self.status = Some(s),
             ServerMsg::Ended { reason } => {
                 self.commit();
+                self.reasoning.clear();
                 self.running = false;
                 self.conn = ConnState::Ended(reason);
+                // Nothing can answer a prompt once the worker is gone.
+                self.asks.clear();
+                self.approvals.clear();
                 // The worker may die before reporting in-flight subagents done;
-                // freeze them so the list doesn't show them forever "running".
+                // freeze them (pending ones included) so none shows forever live.
                 for s in &mut self.subagents {
                     if s.done.is_none() {
                         s.done = Some(false);
+                        s.pending = false;
+                        s.requested = 0;
+                        s.asking = false;
                     }
                 }
             }
         }
     }
 
-    /// Optimistically echo a message the user just sent, so it appears instantly
-    /// (the worker's journaled `UserMessage` echo is then deduped in `apply`).
-    pub fn push_user(&mut self, text: String) {
+    /// Show something to this user only (a local command's output, a refusal).
+    pub fn push_notice(&mut self, text: String) {
         self.commit();
-        self.blocks.push(Block::User(text));
-        self.running = true;
+        self.blocks.push(Block::Notice(text));
+    }
+
+    fn push_ask(&mut self, ask: Ask) {
+        if !self.asks.iter().any(|a| a.id == ask.id) {
+            self.asks.push(ask);
+            self.asks.sort_by_key(|a| a.id);
+        }
+    }
+
+    fn push_approval(&mut self, ap: Approval) {
+        if !self.approvals.iter().any(|a| a.id == ap.id) {
+            self.approvals.push(ap);
+            self.approvals.sort_by_key(|a| a.id);
+        }
+    }
+
+    /// The session is over: nothing more can be sent.
+    pub fn ended(&self) -> bool {
+        matches!(self.conn, ConnState::Ended(_)) || self.status.is_some_and(|s| s.is_terminal())
+    }
+
+    /// A turn is in progress. The worker's status when it has reported one — so a
+    /// reconnect in a quiet stretch of a turn still shows it, and a steer or the gap
+    /// between queued turns doesn't flicker it off — else the event-derived guess.
+    pub fn busy(&self) -> bool {
+        if self.ended() {
+            return false;
+        }
+        match self.status {
+            Some(s) => !matches!(s, SessionStatus::Idle | SessionStatus::Starting),
+            None => self.running,
+        }
+    }
+
+    /// The open command a chunk of output belongs to: the newest one without an
+    /// exit code. Not simply the last block — a notice (a blocked egress, sandbox
+    /// bring-up) can land mid-command, and the output after it must not be lost.
+    fn open_command(&mut self) -> Option<(&mut String, &mut String, &mut Option<i32>)> {
+        self.blocks.iter_mut().rev().find_map(|b| match b {
+            Block::Command {
+                output, live, exit, ..
+            } if exit.is_none() => Some((output, live, exit)),
+            _ => None,
+        })
     }
 
     /// The socket dropped (not a session end) — show "reconnecting" unless the
@@ -259,15 +346,12 @@ impl Model {
 
     fn apply_event(&mut self, ev: UiEventMsg) {
         match ev {
+            // No optimistic echo: the journaled message *is* the echo, so live, replay
+            // and other clients' messages all render identically, once each.
             UiEventMsg::UserMessage(m) => {
                 self.running = true;
-                // Skip the journaled echo of our own optimistic local push (live
-                // send); render genuinely-new ones — a journal replay on refresh,
-                // or a message another client sent.
-                if !matches!(self.blocks.last(), Some(Block::User(prev)) if *prev == m) {
-                    self.commit();
-                    self.blocks.push(Block::User(m));
-                }
+                self.commit();
+                self.blocks.push(Block::User(m));
             }
             UiEventMsg::Delta(t) => {
                 self.running = true;
@@ -284,16 +368,27 @@ impl Model {
                 self.blocks.push(Block::Command {
                     cmd,
                     output: String::new(),
+                    live: String::new(),
                     exit: None,
                 });
             }
             UiEventMsg::CommandOutput(chunk) => {
-                if let Some(Block::Command { output, .. }) = self.blocks.last_mut() {
-                    output.push_str(&chunk);
+                if let Some((output, live, _)) = self.open_command() {
+                    // A chunk without a newline is the current line's latest state
+                    // (a `\r` progress update); it replaces the previous one.
+                    if chunk.ends_with('\n') {
+                        live.clear();
+                        output.push_str(&chunk);
+                    } else {
+                        *live = chunk;
+                    }
                 }
             }
+            // `output` is ignored, as the TUI ignores it: the text already streamed
+            // as `CommandOutput`, and appending it again would duplicate it.
             UiEventMsg::CommandEnd { code, .. } => {
-                if let Some(Block::Command { exit, .. }) = self.blocks.last_mut() {
+                if let Some((output, live, exit)) = self.open_command() {
+                    output.push_str(&std::mem::take(live));
                     *exit = Some(code);
                 }
             }
@@ -324,13 +419,40 @@ impl Model {
                 self.tokens_out = output;
             }
             UiEventMsg::Cost(c) => self.cost_usd = c,
-            UiEventMsg::ContextUsage { used, budget, .. } => {
-                self.context = Some((used, budget));
+            UiEventMsg::ContextUsage {
+                used,
+                budget,
+                window,
+                reserve,
+                top,
+            } => {
+                self.context = Some(Context {
+                    used,
+                    budget,
+                    window,
+                    reserve,
+                    top,
+                });
             }
-            UiEventMsg::Blocked(r) => self.blocked = r,
+            // Banner for the current state, plus a transcript line for each change
+            // (as the TUI does), so a past block and its reason aren't lost.
+            UiEventMsg::Blocked(r) => {
+                if r != self.blocked {
+                    self.push_notice(match &r {
+                        Some(reason) => format!("⏸ blocked: {reason}"),
+                        None => "▶ unblocked".into(),
+                    });
+                }
+                self.blocked = r;
+            }
             UiEventMsg::Plan(p) => self.plan = p,
             UiEventMsg::Title(t) => self.title = t,
-            UiEventMsg::TurnDone => self.running = false,
+            // Flush what the turn streamed: an interrupted model call ends without
+            // `ModelDone`, and its partial answer must not stay looking live.
+            UiEventMsg::TurnDone => {
+                self.commit();
+                self.running = false;
+            }
             UiEventMsg::SubagentPending { label, model, id } => {
                 // A fresh fan-out (none still pending or running) replaces the batch.
                 if !self.subagents.iter().any(|s| s.done.is_none()) {
@@ -345,6 +467,9 @@ impl Model {
                     requested: 0,
                     used: 0,
                     granted: 0,
+                    asking: false,
+                    elapsed_ms: 0,
+                    task: String::new(),
                 });
             }
             UiEventMsg::SubagentStarted { label, model, id } => {
@@ -369,6 +494,9 @@ impl Model {
                         requested: 0,
                         used: 0,
                         granted: 0,
+                        asking: false,
+                        elapsed_ms: 0,
+                        task: String::new(),
                     });
                 }
             }
@@ -401,6 +529,9 @@ impl Model {
                         },
                         used: j.used,
                         granted: j.granted,
+                        asking: j.state == "asking a question",
+                        elapsed_ms: j.elapsed_ms,
+                        task: j.task,
                         id: j.id,
                         label: j.label,
                         model: j.model,
@@ -413,8 +544,14 @@ impl Model {
             UiEventMsg::SteerDelivered(text) => self
                 .blocks
                 .push(Block::Notice(format!("↳ steering: {text}"))),
-            // Process / net-activity panes are not rendered in v1.
-            UiEventMsg::NetEvent(_) | UiEventMsg::Processes(_) => {}
+            UiEventMsg::NetEvent(e) => {
+                self.net.push(e);
+                if self.net.len() > NET_EVENTS_KEPT {
+                    let drop = self.net.len() - NET_EVENTS_KEPT;
+                    self.net.drain(..drop);
+                }
+            }
+            UiEventMsg::Processes(p) => self.processes = p,
         }
     }
 }
@@ -502,7 +639,7 @@ mod tests {
     #[test]
     fn context_usage_lands_in_the_header_stats() {
         let mut m = Model::default();
-        assert_eq!(m.context, None, "nothing to show before the first turn");
+        assert!(m.context.is_none(), "nothing to show before the first turn");
         m.apply_event(UiEventMsg::ContextUsage {
             used: 84_500,
             budget: 160_000,
@@ -510,7 +647,13 @@ mod tests {
             reserve: 40_000,
             top: vec![("shell".into(), 30_000)],
         });
-        assert_eq!(m.context, Some((84_500, 160_000)));
+        let c = m.context.as_ref().unwrap();
+        assert_eq!(
+            (c.used, c.budget, c.window, c.reserve),
+            (84_500, 160_000, 200_000, 40_000)
+        );
+        assert_eq!(c.top[0].0, "shell");
+        assert_eq!(c.percent(), 52);
     }
 
     #[test]
@@ -548,9 +691,9 @@ mod tests {
             options: Vec::new(),
         });
         m.apply(ServerMsg::AskResolved { id: 6 });
-        assert_eq!(m.ask.as_ref().map(|ask| ask.id), Some(7));
+        assert_eq!(m.asks.first().map(|ask| ask.id), Some(7));
         m.apply(ServerMsg::AskResolved { id: 7 });
-        assert!(m.ask.is_none());
+        assert!(m.asks.is_empty());
     }
 
     #[test]
@@ -588,10 +731,123 @@ mod tests {
                 detail: None,
             },
         ]));
-        assert_eq!(m.ask.as_ref().map(|a| a.id), Some(2));
-        assert_eq!(m.approval.as_ref().map(|a| a.id), Some(4));
+        assert_eq!(m.asks.first().map(|a| a.id), Some(2));
+        assert_eq!(m.approvals.first().map(|a| a.id), Some(4));
         m.apply(snapshot(Vec::new()));
-        assert!(m.ask.is_none() && m.approval.is_none());
+        assert!(m.asks.is_empty() && m.approvals.is_empty());
+    }
+
+    /// Two approvals outstanding: the older is shown first, and answering the newer
+    /// must not lose it (it used to overwrite a single slot, then clear it).
+    #[test]
+    fn concurrent_approvals_queue_oldest_first() {
+        let mut m = Model::default();
+        let ap = |id| ServerMsg::Approval {
+            id,
+            dest: format!("h{id}:443"),
+            detail: None,
+        };
+        m.apply(ap(5));
+        m.apply(ap(4));
+        assert_eq!(m.approvals.first().map(|a| a.id), Some(4));
+        m.apply(ServerMsg::ApprovalResolved { id: 5 });
+        assert_eq!(
+            m.approvals.iter().map(|a| a.id).collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
+    /// Output after a mid-command notice still reaches the command, and so does its
+    /// exit code — a failed `curl` whose egress was blocked must not look clean.
+    #[test]
+    fn command_output_survives_a_notice_and_progress_lines_overwrite() {
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::CommandStart("curl x".into()));
+        m.apply_event(UiEventMsg::CommandOutput("start\n".into()));
+        m.apply_event(UiEventMsg::Notice("🛡 blocked x:443".into()));
+        m.apply_event(UiEventMsg::CommandOutput("10%".into()));
+        m.apply_event(UiEventMsg::CommandOutput("50%".into()));
+        m.apply_event(UiEventMsg::CommandOutput("100%\n".into()));
+        m.apply_event(UiEventMsg::CommandEnd {
+            code: 7,
+            output: String::new(),
+        });
+        let Some(Block::Command {
+            output, live, exit, ..
+        }) = m.blocks.first()
+        else {
+            panic!("command block first");
+        };
+        assert_eq!(output, "start\n100%\n");
+        assert!(live.is_empty());
+        assert_eq!(*exit, Some(7));
+    }
+
+    /// An interrupted turn ends without `ModelDone`; its partial text is committed.
+    #[test]
+    fn turn_done_commits_a_partial_answer() {
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::Reasoning("hmm".into()));
+        m.apply_event(UiEventMsg::Delta("half an ans".into()));
+        m.apply_event(UiEventMsg::TurnDone);
+        assert!(m.streaming.is_empty() && m.reasoning.is_empty());
+        assert!(matches!(m.blocks.last(), Some(Block::Agent(t)) if t == "half an ans"));
+    }
+
+    /// The journal is the only source of user messages, so a replay renders two
+    /// identical consecutive messages twice, as they were sent.
+    #[test]
+    fn repeated_user_messages_are_not_collapsed() {
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::UserMessage("again".into()));
+        m.apply_event(UiEventMsg::UserMessage("again".into()));
+        assert_eq!(
+            m.blocks
+                .iter()
+                .filter(|b| matches!(b, Block::User(_)))
+                .count(),
+            2
+        );
+    }
+
+    /// Busy comes from the worker's status when it has one, so it survives the
+    /// gap between queued turns and a reconnect mid-turn.
+    #[test]
+    fn busy_follows_the_worker_status_and_stops_at_end() {
+        let mut m = Model::default();
+        m.apply(ServerMsg::Status(SessionStatus::Running));
+        m.apply_event(UiEventMsg::TurnDone);
+        assert!(
+            m.busy(),
+            "a queued turn follows; the worker still says running"
+        );
+        m.apply(ServerMsg::Status(SessionStatus::Idle));
+        assert!(!m.busy());
+        m.apply(ServerMsg::Ask {
+            id: 1,
+            question: "q".into(),
+            options: vec![],
+        });
+        m.apply(ServerMsg::Ended {
+            reason: "done".into(),
+        });
+        assert!(!m.busy() && m.ended() && m.asks.is_empty());
+    }
+
+    #[test]
+    fn blocked_changes_leave_a_transcript_line() {
+        let mut m = Model::default();
+        m.apply_event(UiEventMsg::Blocked(Some("need creds".into())));
+        m.apply_event(UiEventMsg::Blocked(None));
+        let notices: Vec<_> = m
+            .blocks
+            .iter()
+            .filter_map(|b| match b {
+                Block::Notice(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices, ["⏸ blocked: need creds", "▶ unblocked"]);
     }
 
     #[test]

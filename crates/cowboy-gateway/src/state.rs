@@ -183,15 +183,17 @@ impl GatewayState {
                 {
                     return cached;
                 }
-                let decided = self.approver.ask(attempt, Some(&reason)).await;
-                // Cache concrete decisions (not a re-ask).
-                if decided != Verdict::Ask {
+                let answer = self.approver.answer(attempt, Some(&reason)).await;
+                // Cache concrete decisions (not a re-ask) that are meant to stand. An
+                // "allow once" is for this connection only: caching it is exactly how
+                // "just this request" used to last the whole session.
+                if answer.verdict != Verdict::Ask && answer.remember {
                     self.cache
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(key, decided);
+                        .insert(key, answer.verdict);
                 }
-                decided
+                answer.verdict
             }
         }
     }
@@ -329,6 +331,8 @@ mod tests {
     /// assert on *what the user would have been shown* — not just the outcome.
     struct FakeApprover {
         answer: Verdict,
+        /// What `Approver::answer` reports for `remember`.
+        remember: bool,
         asked: Mutex<Vec<(NetworkAttempt, Option<String>)>>,
         events: Mutex<Vec<(NetworkAttempt, Verdict, String)>>,
     }
@@ -337,6 +341,7 @@ mod tests {
         fn answering(answer: Verdict) -> Self {
             Self {
                 answer,
+                remember: true,
                 asked: Mutex::new(Vec::new()),
                 events: Mutex::new(Vec::new()),
             }
@@ -351,6 +356,12 @@ mod tests {
                 .unwrap()
                 .push((attempt.clone(), reason.map(String::from)));
             self.answer
+        }
+        async fn answer(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> crate::Answer {
+            crate::Answer {
+                verdict: self.ask(attempt, reason).await,
+                remember: self.remember,
+            }
         }
         async fn event(&self, attempt: &NetworkAttempt, verdict: Verdict, reason: String) {
             self.events
@@ -500,6 +511,38 @@ mod tests {
         assert_eq!(
             asked[1].0.ip.map(|ip| ip.to_string()).as_deref(),
             Some("10.1.2.3")
+        );
+    }
+
+    /// An answer the approver says not to remember ("allow once") covers the one
+    /// connection that asked; the next connection to the same place asks again. A
+    /// remembered one is reused.
+    #[tokio::test]
+    async fn only_a_remembered_answer_is_reused() {
+        let mut once = FakeApprover::answering(Verdict::Allow);
+        once.remember = false;
+        let once = std::sync::Arc::new(once);
+        let s = GatewayState::new(NetworkPolicy::default(), DnsMap::new(), once.clone());
+        for _ in 0..2 {
+            assert_eq!(
+                s.decide(&attempt(Some("once.test"), None, 443)).await,
+                Verdict::Allow
+            );
+        }
+        assert_eq!(
+            once.asked.lock().unwrap().len(),
+            2,
+            "once must not be cached"
+        );
+
+        let (s, session) = state_with(NetworkPolicy::default(), Verdict::Allow);
+        for _ in 0..2 {
+            s.decide(&attempt(Some("session.test"), None, 443)).await;
+        }
+        assert_eq!(
+            session.asked.lock().unwrap().len(),
+            1,
+            "a remembered answer is reused"
         );
     }
 

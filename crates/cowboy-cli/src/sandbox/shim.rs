@@ -29,6 +29,9 @@ pub struct ShimRequest {
     /// Paths the Landlock domain may read and write.
     #[serde(default)]
     pub read_write: Vec<String>,
+    /// Directories the Landlock domain may open and list, but not read files in.
+    #[serde(default)]
+    pub list_dirs: Vec<String>,
     /// Scope the domain against signalling and abstract sockets outside it.
     #[serde(default)]
     pub scope_ipc: bool,
@@ -119,6 +122,7 @@ mod tests {
             command: "echo hi".into(),
             read_only: vec!["/usr".into()],
             read_write: vec!["/workspace".into()],
+            list_dirs: vec!["/".into()],
             scope_ipc: true,
             deny_syscalls: vec!["io_uring_setup".into()],
             deny_raw_sockets: true,

@@ -1,6 +1,5 @@
 ---
 source: crates/cowboy-tui/src/app/mod.rs
-assertion_line: 1777
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
@@ -13,11 +12,11 @@ expression: render(&app)
 │  │                                                                │──╯
 │  │ 3 endpoints are already saved for this project                 │──╮
 │  │                                                                │it│
-│  │ o  once — just this request                                    │  │
+│  │ o  once — this connection only; the next one asks again        │  │
 │  │ s  session — every request here until this session ends        │  │
 │  │ p  project — always allow here (saved for this repo)           │  │
-╰──│ g  global — always allow everywhere                            │──╯
-   │ d  deny                                                        │
+╰──│ g  global — always allow, in every project (saved)             │──╯
+   │ d  deny — for the rest of this session                         │
 ╭ E╰ press a key · Esc = deny ──────────────────────────────────────╯──╮
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯

@@ -271,6 +271,10 @@ pub enum DaemonReq {
         branch: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         blocked_reason: Option<String>,
+        /// The session's topic (its first user message), for a session that was
+        /// started without a task. The daemon adopts it only while `task` is unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic: Option<String>,
     },
     Heartbeat {
         id: SessionId,
@@ -525,7 +529,8 @@ pub struct JobInfo {
     pub model: String,
     /// The one-line task, for display.
     pub task: String,
-    /// `pending` | `running` | `awaiting verdict` | `done` | `failed`.
+    /// `pending` | `running` | `awaiting verdict` | `asking a question` | `done` |
+    /// `failed`.
     pub state: String,
     /// Milliseconds since dispatch, frozen when the job finishes.
     pub elapsed_ms: u64,
@@ -597,6 +602,10 @@ pub enum ServerMsg {
     /// A previously broadcast `Approval` has been decided (by another client or
     /// on timeout); clients should dismiss its modal.
     ApprovalResolved { id: u64 },
+    /// The answer to this client's own [`ClientMsg::Command`] — a usage hint, a
+    /// listing, a report such as `/diff`. Sent only to the client that asked and
+    /// never journaled, so one client's lookups don't land in everyone's history.
+    CommandReply { text: String },
     /// The session changed lifecycle state.
     Status(SessionStatus),
     /// Terminal: the worker is shutting down; the connection will close.
@@ -645,6 +654,10 @@ pub enum ClientMsg {
         scope: ApprovalScope,
     },
     SwitchModel(String),
+    /// Turn the per-message iteration budget on/off for this session (`/budget`).
+    /// Off means a long task runs without stopping to ask "keep going?" — the user
+    /// accepting the risk of a long-running turn. Takes effect mid-turn.
+    IterationBudget(bool),
     /// Turn plan mode on/off: while on, the agent proposes a plan and the loop
     /// blocks file edits until it's turned off (the user approves with `/go`).
     PlanMode(bool),
@@ -666,6 +679,12 @@ pub enum ClientMsg {
     /// Drop everything the user has queued for after the current turn, without
     /// touching the turn or the running subagents.
     QueueClear,
+    /// A session slash command as typed, without the leading `/` (`"go ship it"`,
+    /// `"plan add a cache"`, `"review-pr 12"`). The worker expands it into the
+    /// ordinary control messages (`cowboy_cli::agent::commands`), so every client
+    /// gets identical `/go`, `/plan`, `/accept`, skills, … without reimplementing
+    /// them. View-only commands (`/clear`, `/help`) stay client-side.
+    Command(String),
     /// Disconnect but leave the session running.
     Detach,
     /// End the session.

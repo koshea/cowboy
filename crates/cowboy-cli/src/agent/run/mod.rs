@@ -329,6 +329,9 @@ pub struct AgentLoop<'a> {
     /// Fired to stop every running job. Cloneable and independent of `&mut self`, so
     /// the worker can honour "stop the subagents" while a turn is in flight.
     job_stopper: crate::agent::jobs::JobStopper,
+    /// Whether the per-message iteration budget is enforced (`/budget on|off`).
+    /// Shared, like `job_stopper`, so the worker can flip it mid-turn.
+    budget_enforced: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// This worker's own channel for asking its foreman for more turns. `None` for a
     /// foreman, and for any worker whose roster disabled supervision.
     control: Option<crate::agent::jobctl::ControlDir>,
@@ -1073,6 +1076,7 @@ impl<'a> AgentLoop<'a> {
                 delegation.max_parallel.max(1) as usize,
             )),
             job_stopper: crate::agent::jobs::JobStopper::default(),
+            budget_enforced: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             control: can_request_turns.then_some(control).flatten(),
             turn_requests: 0,
             user_extensions: 0,
@@ -2567,10 +2571,17 @@ impl<'a> AgentLoop<'a> {
                 // Tell the model where it stands *before* it plans the next step, so it
                 // can choose to converge (or ask for more turns) while it still has the
                 // turns to do either. Injected as a user message, once per stage.
+                //
+                // Not for an unsupervised session someone is watching (or one whose
+                // budget is off): it will ask to continue rather than stop, so telling
+                // the model to hurry would only cut legitimate long work short. The
+                // nudges exist for runs nobody sees — subagents, unattended sessions.
                 let stage = grant_stage(self.budget.used, self.budget.granted);
+                let quiet =
+                    !self.budget.supervised && (!self.budget_enforced() || self.ui.can_ask_user());
                 if stage > self.grant_stage_seen {
                     self.grant_stage_seen = stage;
-                    if let Some(note) = grant_notice(stage, &self.budget) {
+                    if let Some(note) = grant_notice(stage, &self.budget).filter(|_| !quiet) {
                         self.ui.notice(&note);
                         let msg = Message::user(note);
                         if let Some(l) = &mut self.logger {
@@ -3499,6 +3510,16 @@ impl<'a> AgentLoop<'a> {
             return false;
         }
         let used = self.budget.used;
+        // `/budget off`: the user accepted a long-running turn, so keep going without
+        // asking. Still bounded by the loop/churn guards, which are independent of this.
+        if !self.budget_enforced() {
+            let added = self.budget.extend_with_consent(self.extension_step());
+            self.grant_stage_seen = GrantStage::Fine;
+            self.ui.notice(&format!(
+                "▶ {used} turns — iteration budget is off, continuing (/budget on to restore)"
+            ));
+            return added > 0;
+        }
         let question = format!(
             "The agent has used its {used}-turn budget for this message and is not done. \
              Keep going?"
@@ -3518,12 +3539,7 @@ impl<'a> AgentLoop<'a> {
         // double each time (100 → 200 → 400 …), so "yes" would quietly escalate and the
         // extension cap would bound something enormous. A constant step matches what the
         // answer means: keep going for another budget's worth.
-        let step = if self.behavior.max_iterations > 0 {
-            self.behavior.max_iterations
-        } else {
-            self.budget.granted.max(1)
-        };
-        let added = self.budget.extend_with_consent(step);
+        let added = self.budget.extend_with_consent(self.extension_step());
         self.ui
             .notice(&format!("▶ continuing with {added} more turns"));
         self.progress.clear_streak();
@@ -3536,6 +3552,16 @@ impl<'a> AgentLoop<'a> {
         ));
         true
     }
+    /// One more *round* for a consented extension: the configured budget, not the
+    /// current grant (which would double every time).
+    fn extension_step(&self) -> u32 {
+        if self.behavior.max_iterations > 0 {
+            self.behavior.max_iterations
+        } else {
+            self.budget.granted.max(1)
+        }
+    }
+
     /// A one-line description of what is still running, for the `final` refusal.
     fn outstanding_jobs_summary(&self) -> String {
         let jobs = self.jobs.outstanding();
@@ -4601,6 +4627,16 @@ impl<'a> AgentLoop<'a> {
     /// The worker holds a clone so "stop the subagents" (and session teardown) does not
     /// have to wait for `&mut` on the loop. Session-scoped jobs make this necessary:
     /// nothing else guarantees a child dies.
+    /// The `/budget` switch: `true` = enforced. Flip it from anywhere.
+    pub fn budget_switch(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.budget_enforced.clone()
+    }
+
+    fn budget_enforced(&self) -> bool {
+        self.budget_enforced
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn job_stopper(&self) -> crate::agent::jobs::JobStopper {
         self.job_stopper.clone()
     }
@@ -5313,6 +5349,8 @@ mod tests {
         asks: Vec<String>,
         /// The answer to give. `None` keeps the historical "yes".
         ask_answer: Option<String>,
+        /// Whether a person is "attached" to answer asks.
+        attended: bool,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
@@ -5334,6 +5372,9 @@ mod tests {
         }
         fn final_message(&mut self, message: &str) {
             self.finals.push(message.to_string());
+        }
+        fn can_ask_user(&self) -> bool {
+            self.attended
         }
         fn ask_user(&mut self, question: &str, _options: &[String]) -> String {
             self.asks.push(question.to_string());
@@ -7724,6 +7765,61 @@ mod tests {
             CancellationToken::new(),
             ui,
         )
+    }
+
+    /// `/budget off`: a long task runs past its budget without stopping to ask.
+    #[tokio::test]
+    async fn with_the_budget_off_the_turn_runs_on_without_asking() {
+        let mut ui = RecordingUi::default();
+        let mut agent = budget_agent(never_finishes(12), &mut ui, 3);
+        agent
+            .budget_switch()
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = agent.run("keep working").await.unwrap();
+        assert!(ui.asks.is_empty(), "no one should be asked: {:?}", ui.asks);
+        assert!(
+            ui.commands.len() > 3,
+            "it should run past the 3-turn budget, got {}",
+            ui.commands.len()
+        );
+        assert!(ui.notices.iter().any(|n| n.contains("budget is off")));
+    }
+
+    /// With someone watching, the budget is a question at the end, not pressure along
+    /// the way: the "start converging" nudges only go to runs nobody sees.
+    #[tokio::test]
+    async fn an_attended_session_gets_no_converge_nudges() {
+        let nudges = |ui: &RecordingUi| {
+            ui.notices
+                .iter()
+                .filter(|n| n.contains("iteration budget") && n.contains("used"))
+                .count()
+                + ui.notices
+                    .iter()
+                    .filter(|n| n.contains("nearly spent"))
+                    .count()
+        };
+        let mut attended = RecordingUi {
+            attended: true,
+            ask_answer: Some("no".into()),
+            ..Default::default()
+        };
+        let _ = budget_agent(never_finishes(20), &mut attended, 10)
+            .run("keep working")
+            .await
+            .unwrap();
+        assert_eq!(nudges(&attended), 0, "{:?}", attended.notices);
+        assert!(attended.asks.iter().any(|q| q.contains("Keep going?")));
+
+        let mut unattended = RecordingUi {
+            ask_answer: Some("no".into()),
+            ..Default::default()
+        };
+        let _ = budget_agent(never_finishes(20), &mut unattended, 10)
+            .run("keep working")
+            .await
+            .unwrap();
+        assert!(nudges(&unattended) > 0, "{:?}", unattended.notices);
     }
 
     /// The foreman asks rather than silently stopping.

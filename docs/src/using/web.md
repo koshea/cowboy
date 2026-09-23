@@ -35,24 +35,43 @@ came up. Fix the bind and run `cowboy web on` again.
 
 ## What you can do
 
-Open the URL and you get a list of your sessions; tap one to:
+Open the URL and you get a list of your sessions — newest first, with the project
+and start time, refreshed every few seconds. Tap one to:
 
 - watch the transcript stream live — model output renders as **markdown as it
-  arrives**, alongside command output, diffs, plan steps, and a token/cost header;
-- **send messages** and answer the agent's questions;
-- **approve or deny** the agent's network-access prompts;
-- **interrupt** the current turn;
+  arrives**, alongside command output (progress lines update in place), diffs, plan
+  steps, and a header with status, tokens, a context meter (amber from 70%, red from
+  90%, naming the biggest consumer), cost and the diffstat;
+- **send messages**. While the agent is working a message *steers* the current turn;
+  **Later** queues it to run afterwards instead, and the `⏭ N queued` bar lists and
+  clears the queue. On a phone, Enter is a newline and the Send button sends;
+- use the same **slash commands as the TUI** — `/plan`, `/go`, `/after`,
+  `/queue clear`, `/model`, `/stop`, `/accept`, `/ranch`, skills (`/<name> args`),
+  `/diff`, `/mcp`, `/boundary`, `/crew`, `/context`, `/jobs`, `/copy`, `/fold`,
+  `/clear`; `/help` lists them. They're expanded by the session's worker, so they
+  behave identically from either client;
+- **answer questions** and **approve or deny** access prompts with the TUI's choices
+  — once, session, project or global for a network request; allow or deny for a
+  credential, which is never remembered. Several outstanding prompts are shown one
+  at a time, oldest first;
+- **interrupt** the current turn (■), **stop the subagents** it dispatched, or
+  **end** the session;
+- start a fresh session from the same **openers** the TUI offers;
 - **watch a subagent** — when the agent fans work out to a [crew](crew.md), the
   subagents appear as chips above the transcript; tap one to open its live output
-  read-only (and tap back to return). A chip marked `⏸ +N?` is a worker waiting for
-  the foreman to grant it more turns; a `⏭ N queued` marker shows input deferred to
-  after the current turn.
+  read-only (and tap back to return). A chip marked `?` is a worker waiting on the
+  foreman (a turn grant or a question); a pending one isn't tappable until it starts.
+
+Network activity and the session's background processes are under collapsible
+panels below the header.
 
 The view **sticks to the bottom** as new content streams in (scroll up to read
 back; it re-follows when you return to the bottom). If the connection drops — a
 phone sleeping, a network switch — it **reconnects automatically** and resumes the
-journal where it left off. A finished session opens **read-only**, replaying its
-recorded transcript.
+journal where it left off; while it's down, anything you send is refused with a
+notice rather than held and delivered later out of context. A finished session opens
+**read-only**, replaying its recorded transcript. A page older than the session's
+worker skips events it doesn't understand (and says so) instead of stalling.
 
 ## Access & exposure
 

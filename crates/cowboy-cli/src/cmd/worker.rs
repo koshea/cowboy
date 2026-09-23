@@ -196,6 +196,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     running_command: st.running_command.clone(),
                     branch: None,
                     blocked_reason: st.blocked_reason.clone(),
+                    topic: st.topic.clone(),
                 })
                 .await;
                 match resp {
@@ -214,6 +215,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         info.attached_clients = attached;
                         info.running_command = st.running_command.clone();
                         info.blocked_reason = st.blocked_reason.clone();
+                        info.task = info.task.or_else(|| st.topic.clone());
                         let _ = daemon::request(DaemonReq::RegisterWorker { info }).await;
                     }
                     Ok(_) => unreachable = 0,
@@ -318,15 +320,31 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         .and_then(|m| m.default.clone())
         .or_else(|| user_models.as_ref().and_then(|m| m.default.clone()));
     let fallback_name = default_model_name.filter(|d| Some(d) != model_override.as_ref());
+    // For `/model` from any client (see `agent::commands`).
+    let (model_names, default_name) =
+        crate::cmd::session::models_and_default(&user_models, &project_models);
+    emitter.set_models(
+        model_names,
+        model_override
+            .clone()
+            .or_else(|| (!default_name.is_empty()).then_some(default_name)),
+    );
 
     // Extracted before `agent_cfg.agent` is moved into the loop.
     let project_commands = agent_cfg.commands.clone();
     let project_processes = agent_cfg.processes.clone();
     let verify = agent_cfg.verify_commands();
+    // The interactive session gets its own, larger budget: someone is there to say
+    // "keep going", so the check is a periodic question, not the runaway guard that
+    // `max_iterations` is for the subagents and unattended runs nobody watches.
+    let mut behavior = agent_cfg.agent;
+    behavior.max_iterations = behavior.session_max_iterations.max(1);
+    let session_budget = behavior.max_iterations;
+    emitter.set_budget(true, session_budget);
     let mut agent = AgentLoop::new(
         Box::new(model),
         runtime,
-        agent_cfg.agent,
+        behavior,
         context_window,
         CancellationToken::new(),
         &mut ui,
@@ -438,6 +456,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // "stop the subagents" arriving mid-turn is honoured immediately rather than when
     // the turn happens to end. Jobs outlive turns by design; this is what bounds them.
     let job_stopper = agent.job_stopper();
+    let budget_switch = agent.budget_switch();
+    let set_budget = |on: bool| set_iteration_budget(&budget_switch, &emitter, on, session_budget);
     // Delivers user input into a *running* turn (the agent picks it up at its next
     // iteration boundary). Only `Message` steers; `Enqueue` still defers to the queue.
     let steer_tx = agent.steer_sender();
@@ -538,6 +558,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             Some(m @ (ClientMsg::SwitchModel(_) | ClientMsg::PlanMode(_))) => {
                                 deferred.push(m);
                             }
+                            // A shared switch, so unlike the settings above it needs no
+                            // `&mut agent` and applies immediately.
+                            Some(ClientMsg::IterationBudget(on)) => set_budget(on),
                             // Detach leaves the session running; setup keeps going.
                             _ => {}
                         }
@@ -653,6 +676,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     Some(ClientMsg::QueueClear) => {
                         queue.clear();
                         publish_queue(&queue);
+                        continue;
+                    }
+                    Some(ClientMsg::IterationBudget(on)) => {
+                        set_budget(on);
                         continue;
                     }
                     // No turn is running; interrupts and other control messages are
@@ -798,6 +825,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             publish_queue(&queue);
                             emitter.emit(UiEventMsg::Notice("queued messages dropped".into()));
                         }
+                        // Mid-turn, through the shared switch: turning it off here is
+                        // the point — the turn in flight then runs past its budget
+                        // without stopping to ask.
+                        Some(ClientMsg::IterationBudget(on)) => set_budget(on),
                         // Mid-turn: stop what was delegated, not what the foreman is
                         // doing. Honoured through the shared switch, since the turn
                         // holds `&mut agent`; each stopped job reports itself as
@@ -1097,6 +1128,29 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
     security.secrets.files = kept_files;
 }
 
+/// Save an allow that should outlive this session: `Project` to this project's
+/// approvals, `Global` to the host-wide file every project reads. `Once`/`Session`
+/// live only in the gateway (and `Once` not even there). A save that fails is said
+/// out loud — the user chose "always" and will otherwise be asked again, puzzled.
+fn persist_approval(
+    ui: &SocketUi,
+    root: &std::path::Path,
+    attempt: &cowboy_core::netproto::NetworkAttempt,
+    scope: ApprovalScope,
+) {
+    let saved = match scope {
+        ApprovalScope::Project => approvals::append(root, attempt),
+        ApprovalScope::Global => approvals::append_global(attempt),
+        ApprovalScope::Once | ApprovalScope::Session => return,
+    };
+    if let Err(e) = saved {
+        ui.emit(UiEventMsg::Notice(format!(
+            "could not save the approval for {}: {e} (it still applies to this session)",
+            attempt.label()
+        )));
+    }
+}
+
 /// Build this session's policy approver: `event`s are logged and surfaced in the
 /// activity pane; `ask`s are routed to attached clients via
 /// [`SocketUi::request_approval`] (failing closed when none are), approved
@@ -1189,10 +1243,8 @@ fn control_approver(
             }
             let detail = network_detail(&root, &req.attempt, req.reason.as_deref(), command);
             let (verdict, scope) = ui.request_approval(prompt, Some(detail)).await;
-            if verdict == Verdict::Allow
-                && matches!(scope, ApprovalScope::Project | ApprovalScope::Global)
-            {
-                let _ = approvals::append(&root, &req.attempt);
+            if verdict == Verdict::Allow {
+                persist_approval(&ui, &root, &req.attempt, scope);
             }
             log_approval(&session_dir, &req.attempt, verdict, scope);
             log_network(&session_dir, &req.attempt, verdict, "user decision");
@@ -1256,10 +1308,17 @@ fn network_detail(
     // recommendation — "you approved 12 things" is a reason to look closer, not a
     // reason to approve a thirteenth.
     let saved = crate::net::approvals::load(root).len();
+    // `load` merges this project's saved approvals with the global ones. There is no
+    // listing command, so point at where they live.
     let note = Some(match saved {
         0 => "nothing is saved for this project yet — `p` would be the first".to_string(),
-        1 => "1 endpoint is already saved for this project (`cowboy net list`)".to_string(),
-        n => format!("{n} endpoints are already saved for this project (`cowboy net list`)"),
+        1 => "1 endpoint is already allowed here (project + global, under \
+              ~/.config/cowboy/approvals/)"
+            .to_string(),
+        n => format!(
+            "{n} endpoints are already allowed here (project + global, under \
+             ~/.config/cowboy/approvals/)"
+        ),
     });
     ApprovalDetail {
         kind: ApprovalKind::Network,
@@ -1283,10 +1342,29 @@ fn pricing_of(r: &cowboy_core::config::ResolvedModel) -> ModelPricing {
 type Resolver = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, ModelPricing)>>;
 
 /// Apply a `/model` switch: re-resolve and swap the client, or report why not.
+/// `/budget on|off`: flip the loop's shared switch and say what it now means.
+fn set_iteration_budget(
+    switch: &std::sync::atomic::AtomicBool,
+    ui: &SocketUi,
+    on: bool,
+    limit: u32,
+) {
+    switch.store(on, std::sync::atomic::Ordering::Relaxed);
+    ui.set_budget(on, limit);
+    ui.emit(UiEventMsg::Notice(if on {
+        format!("iteration budget on — the agent asks before going past {limit} turns a message")
+    } else {
+        "iteration budget off — long tasks run without stopping to ask (loop guards still \
+         apply; /budget on to restore)"
+            .to_string()
+    }));
+}
+
 fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
     match resolve(name) {
         Ok((client, cw, pricing)) => {
             agent.set_model(client, cw, pricing);
+            ui.set_current_model(name);
             ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
         }
         Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),

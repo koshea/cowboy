@@ -195,6 +195,7 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
         relay_port: crate::sandbox::RELAY_PORT,
         scratch: &scratch,
         agent_home: &agent_home,
+        git_identity: None,
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
     let mut out = plan.render(&denylist);

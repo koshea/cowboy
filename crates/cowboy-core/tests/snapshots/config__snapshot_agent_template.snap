@@ -14,7 +14,11 @@ agent:
   # turn, no attached client) to free its RAM; the next command restarts it.
   # 0 disables. The container is *removed* outright when the session ends.
   idle_sandbox_timeout_seconds: 1800
+  # Turns per message: subagents and unattended runs stop at max_iterations; the
+  # interactive session asks you to continue every session_max_iterations turns
+  # (`/budget off` turns that check off for the session).
   max_iterations: 100
+  session_max_iterations: 500
   max_command_output_bytes: 60000
   # Bytes of this repo's AGENTS.md (or CLAUDE.md) pinned into the agent's system
   # message, so it starts every session knowing your conventions instead of

@@ -200,6 +200,11 @@ struct Inner {
     /// Live progress, mirrored from the event stream so the daemon registry
     /// (`cowboy sessions`) can show real numbers without parsing the journal.
     stats: std::sync::Mutex<SessionStats>,
+    /// Configured model names and the current one, for `/model` (see
+    /// [`crate::agent::commands`]). Set by the worker; empty until it does.
+    models: std::sync::Mutex<(Vec<String>, Option<String>)>,
+    /// The iteration budget as `(enforced, turns per message)`, for `/budget`.
+    budget: std::sync::Mutex<Option<(bool, u32)>>,
     /// Where this session's socket lives, so ending can remove it.
     socket_path: std::path::PathBuf,
     /// Fired by [`SocketUi::end`] to stop the accept loop.
@@ -216,6 +221,10 @@ pub struct SessionStats {
     pub running_command: Option<String>,
     /// Set while the session has declared itself blocked.
     pub blocked_reason: Option<String>,
+    /// What the session is about: its first real user message (see
+    /// [`session_topic`]). Reported so a session started without a task still
+    /// gets a title in `cowboy sessions` and the web UI.
+    pub topic: Option<String>,
 }
 
 impl Default for SessionStats {
@@ -227,8 +236,47 @@ impl Default for SessionStats {
             diffstat: String::new(),
             running_command: None,
             blocked_reason: None,
+            topic: None,
         }
     }
+}
+
+/// Longest topic kept, in chars. The registry holds one per session, and a list
+/// row only shows a line or two anyway.
+const TOPIC_MAX_CHARS: usize = 200;
+
+/// A session title from a user message: whitespace collapsed and capped at
+/// [`TOPIC_MAX_CHARS`]. `None` for an empty message or a slash command (`/go`,
+/// `/accept`), which says nothing about what the session is for.
+pub fn session_topic(message: &str) -> Option<String> {
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() || collapsed.starts_with('/') {
+        return None;
+    }
+    let mut topic: String = collapsed.chars().take(TOPIC_MAX_CHARS).collect();
+    if topic.len() < collapsed.len() {
+        topic.push('…');
+    }
+    Some(topic)
+}
+
+/// The `SessionInfo` a `Snapshot` carries: the bind-time registration with the
+/// live progress from `stats` laid over it. The registration alone still says
+/// `tokens: (0,0)`, `turn: 0`, no diffstat — so a client attaching mid-session
+/// would show startup numbers until the next event happened to correct them.
+/// `status` is left alone: the caller has just set it from the publication
+/// state, which is authoritative (it includes pending prompts).
+fn snapshot_info(registered: &SessionInfo, stats: &SessionStats) -> SessionInfo {
+    let mut info = registered.clone();
+    info.turn = stats.turn;
+    info.tokens = stats.tokens;
+    info.diffstat = stats.diffstat.clone();
+    info.running_command = stats.running_command.clone();
+    info.blocked_reason = stats.blocked_reason.clone();
+    if info.task.is_none() {
+        info.task = stats.topic.clone();
+    }
+    info
 }
 
 /// Handle to the worker's UI: cloneable, shared between the agent loop (which
@@ -308,6 +356,8 @@ impl SocketUi {
                 status: initial_status,
                 ..SessionStats::default()
             }),
+            models: std::sync::Mutex::new((Vec::new(), None)),
+            budget: std::sync::Mutex::new(None),
             socket_path: socket_path.to_path_buf(),
             closed: tokio_util::sync::CancellationToken::new(),
         });
@@ -319,6 +369,83 @@ impl SocketUi {
         });
 
         Ok((Self { inner }, cmd_rx))
+    }
+
+    /// Record the configured models for `/model`.
+    pub fn set_models(&self, names: Vec<String>, current: Option<String>) {
+        *self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = (names, current);
+    }
+
+    /// Record the iteration budget's state, for `/budget`.
+    pub fn set_budget(&self, enforced: bool, limit: u32) {
+        *self
+            .inner
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((enforced, limit));
+    }
+
+    /// Record a successful model switch, so `/model` reports the live one.
+    pub fn set_current_model(&self, name: &str) {
+        self.inner
+            .models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = Some(name.to_string());
+    }
+
+    /// Expand a session slash command from any client into control messages, and
+    /// forward them as if the client had sent them. Returns the reply for the asking
+    /// client alone — usage, a listing, a report, or "unknown command" — so a
+    /// mistyped command is answered rather than sent to the model.
+    fn run_command(&self, text: &str, cmd_tx: &mpsc::UnboundedSender<ClientMsg>) -> Option<String> {
+        use crate::agent::commands::{expand, CommandCtx, Expansion};
+        let (root, workstream) = {
+            let j = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (j.info.root.clone(), j.info.workstream_id.is_some())
+        };
+        let (models, current) = self
+            .inner
+            .models
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let budget = *self
+            .inner
+            .budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ctx = CommandCtx {
+            root: &root,
+            workstream,
+            models: &models,
+            current_model: current.as_deref(),
+            budget,
+        };
+        match expand(text, &ctx) {
+            Some(Expansion::Send(msgs)) => {
+                for m in msgs {
+                    let _ = cmd_tx.send(m);
+                }
+                None
+            }
+            Some(Expansion::Notice(n)) => Some(n),
+            None => {
+                let name = text.split_whitespace().next().unwrap_or("");
+                Some(match crate::agent::help::nearest(name) {
+                    Some(c) => format!("unknown command /{name} — did you mean /{c}?"),
+                    None => format!("unknown command /{name}"),
+                })
+            }
+        }
     }
 
     /// Number of currently attached clients.
@@ -539,6 +666,7 @@ impl SocketUi {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match event {
+            UiEventMsg::UserMessage(m) if s.topic.is_none() => s.topic = session_topic(m),
             UiEventMsg::Tokens { input, output } => s.tokens = (*input, *output),
             UiEventMsg::Blocked(reason) => s.blocked_reason = reason.clone(),
             UiEventMsg::DiffStat(d) => s.diffstat = d.clone(),
@@ -769,6 +897,9 @@ impl AgentUi for SocketUi {
     fn notice(&mut self, msg: &str) {
         self.emit(UiEventMsg::Notice(msg.to_string()));
     }
+    fn can_ask_user(&self) -> bool {
+        self.attached() > 0
+    }
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
         // A new prompt with nobody attached has never been published, so it fails
         // immediately according to the non-interactive/subagent contract.
@@ -947,13 +1078,22 @@ async fn serve_client(
             .len();
         j.info.status = effective_status(&j);
         let prompts = pending_prompts(&j);
+        // `j.info` is the bind-time registration; the live numbers are in
+        // `stats`. Lock order: publication (held) then stats.
+        let info = {
+            let stats = inner
+                .stats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            snapshot_info(&j.info, &stats)
+        };
         (
             inner.live.subscribe(),
             j.len,
             file,
             j.path.clone(),
             byte_len,
-            j.info.clone(),
+            info,
             prompts,
         )
     };
@@ -981,6 +1121,7 @@ async fn serve_client(
     let mut live =
         tokio::spawn(async move { pump_live(rx, live_writer, live_inner, journal_len).await });
     let read_inner = inner.clone();
+    let reply_writer = writer.clone();
     let mut input = tokio::spawn(async move {
         let mut graceful = false;
         let mut line = String::new();
@@ -1011,6 +1152,18 @@ async fn serve_client(
                                     inner: read_inner.clone(),
                                 }
                                 .resolve_ask(id, answer);
+                            }
+                            ClientMsg::Command(text) if !read_only => {
+                                let reply = SocketUi {
+                                    inner: read_inner.clone(),
+                                }
+                                .run_command(&text, &cmd_tx);
+                                if let Some(text) = reply {
+                                    let msg = ServerMsg::CommandReply { text };
+                                    if send(&reply_writer, &msg).await.is_err() {
+                                        break;
+                                    }
+                                }
                             }
                             other if read_only => {
                                 tracing::debug!(
@@ -1273,6 +1426,19 @@ mod tests {
     use super::*;
     use cowboy_core::daemonproto::SessionStatus;
 
+    #[test]
+    fn session_topic_collapses_caps_and_skips_commands() {
+        assert_eq!(
+            session_topic("  fix\n\tthe  bug "),
+            Some("fix the bug".into())
+        );
+        assert_eq!(session_topic("/go"), None);
+        assert_eq!(session_topic("   "), None);
+        let long = session_topic(&"é".repeat(TOPIC_MAX_CHARS + 5)).unwrap();
+        assert_eq!(long.chars().count(), TOPIC_MAX_CHARS + 1);
+        assert!(long.ends_with('…'));
+    }
+
     fn info() -> SessionInfo {
         SessionInfo {
             id: "t".into(),
@@ -1302,6 +1468,68 @@ mod tests {
         let mut line = String::new();
         reader.read_line(&mut line).await.unwrap();
         serde_json::from_str(line.trim()).unwrap()
+    }
+
+    /// A client attaching mid-session gets the live numbers in its Snapshot, not
+    /// the bind-time registration (`tokens: (0,0)`, `turn: 0`, no task).
+    #[tokio::test]
+    async fn snapshot_carries_live_stats_and_topic() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+
+        ui.emit(UiEventMsg::UserMessage("  fix the\nbug ".into()));
+        ui.emit(UiEventMsg::Tokens {
+            input: 120,
+            output: 34,
+        });
+        ui.emit(UiEventMsg::DiffStat("+3 -1".into()));
+        ui.emit(UiEventMsg::TurnDone);
+        ui.emit(UiEventMsg::CommandStart("cargo test".into()));
+        ui.emit(UiEventMsg::Blocked(Some("needs a key".into())));
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        send_client(
+            &mut w,
+            &ClientMsg::Hello {
+                since_seq: Some(6),
+                read_only: true,
+            },
+        )
+        .await;
+        match read_msg(&mut reader).await {
+            ServerMsg::Snapshot { info, .. } => {
+                assert_eq!(info.tokens, (120, 34));
+                assert_eq!(info.turn, 1);
+                assert_eq!(info.diffstat, "+3 -1");
+                assert_eq!(info.running_command.as_deref(), Some("cargo test"));
+                assert_eq!(info.blocked_reason.as_deref(), Some("needs a key"));
+                assert_eq!(
+                    info.task.as_deref(),
+                    Some("fix the bug"),
+                    "topic fills task"
+                );
+            }
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    /// An explicit task is never replaced by the topic.
+    #[test]
+    fn snapshot_info_keeps_an_explicit_task() {
+        let mut registered = info();
+        registered.task = Some("the task".into());
+        let stats = SessionStats {
+            topic: Some("first message".into()),
+            ..SessionStats::default()
+        };
+        assert_eq!(
+            snapshot_info(&registered, &stats).task.as_deref(),
+            Some("the task")
+        );
     }
 
     #[tokio::test]
@@ -1439,6 +1667,62 @@ mod tests {
         assert!(
             cmd_rx.try_recv().is_err(),
             "no message from a read-only client may reach the agent loop"
+        );
+    }
+
+    /// A slash command from any client is expanded by the worker: `/go` becomes the
+    /// same `PlanMode(false)` + approval turn the TUI sends, and a typo is answered to
+    /// that client alone rather than sent to the model. A read-only client's command
+    /// is dropped like any other mutation.
+    #[tokio::test]
+    async fn slash_commands_are_expanded_by_the_worker_for_every_client() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let journal = tmp.path().join("events.jsonl");
+        let (_ui, mut cmd_rx) = SocketUi::bind(&sock, &journal, info()).await.unwrap();
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let (r, mut w) = stream.into_split();
+        let mut reader = BufReader::new(r);
+        let hello = ClientMsg::Hello {
+            since_seq: None,
+            read_only: false,
+        };
+        w.write_all(encode_line(&hello).as_bytes()).await.unwrap();
+        assert!(matches!(
+            read_msg(&mut reader).await,
+            ServerMsg::Snapshot { .. }
+        ));
+
+        w.write_all(encode_line(&ClientMsg::Command("go ship it".into())).as_bytes())
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        for _ in 0..2 {
+            let m = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            got.push(m);
+        }
+        assert_eq!(
+            got,
+            [
+                ClientMsg::PlanMode(false),
+                ClientMsg::Message(crate::agent::commands::go_prompt("ship it")),
+            ]
+        );
+
+        w.write_all(encode_line(&ClientMsg::Command("gp".into())).as_bytes())
+            .await
+            .unwrap();
+        match read_msg(&mut reader).await {
+            ServerMsg::CommandReply { text } => assert!(text.contains("/go"), "{text}"),
+            other => panic!("expected a reply to the asking client, got {other:?}"),
+        }
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "a typo must not reach the agent loop"
         );
     }
 

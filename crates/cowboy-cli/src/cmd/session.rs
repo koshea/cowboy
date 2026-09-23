@@ -543,7 +543,7 @@ async fn create_worktree_for(root: &std::path::Path, task: Option<&str>) -> Resu
 }
 
 /// Merged model names (user + project) and the effective default, for `/model`.
-fn models_and_default(
+pub(crate) fn models_and_default(
     user: &Option<ModelsConfig>,
     project: &Option<ModelsConfig>,
 ) -> (Vec<String>, String) {
@@ -620,7 +620,7 @@ fn welcome_lines(
 /// nothing gets a short generic list rather than a wrong specific one. Capped at
 /// [`MAX_SUGGESTIONS`] because these are a launchpad, not a menu, and every line
 /// here is banner the user has to read past.
-fn launchpad(root: &std::path::Path, agent: &AgentConfig) -> Vec<String> {
+pub(crate) fn launchpad(root: &std::path::Path, agent: &AgentConfig) -> Vec<String> {
     /// Alt-1…Alt-9 is the key space, but three is what fits the banner without
     /// pushing the prompt hint off a short terminal.
     const MAX_SUGGESTIONS: usize = 3;

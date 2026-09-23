@@ -429,8 +429,16 @@ pub struct AgentBehavior {
         alias = "idle_container_timeout_seconds"
     )]
     pub idle_sandbox_timeout_seconds: u64,
+    /// Turns per message for work nobody is watching — crew subagents and
+    /// non-interactive runs — before it stops. The guard against a runaway loop you
+    /// wouldn't otherwise see.
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+    /// Turns per message for the main interactive session before it asks you
+    /// whether to keep going. Higher than `max_iterations` because you are there to
+    /// answer; `/budget off` removes the check for the rest of the session.
+    #[serde(default = "default_session_max_iterations")]
+    pub session_max_iterations: u32,
     #[serde(default = "default_max_output")]
     pub max_command_output_bytes: usize,
     /// How many bytes of the repo's own `AGENTS.md`/`CLAUDE.md` to pin into the
@@ -709,6 +717,9 @@ fn default_idle_sandbox_timeout() -> u64 {
 fn default_max_iterations() -> u32 {
     100
 }
+fn default_session_max_iterations() -> u32 {
+    500
+}
 fn default_max_output() -> usize {
     60_000
 }
@@ -813,6 +824,7 @@ impl Default for AgentBehavior {
             model_timeout_seconds: default_model_timeout(),
             idle_sandbox_timeout_seconds: default_idle_sandbox_timeout(),
             max_iterations: default_max_iterations(),
+            session_max_iterations: default_session_max_iterations(),
             max_command_output_bytes: default_max_output(),
             project_instruction_bytes: default_project_instruction_bytes(),
             token_budget: 0,
@@ -1889,7 +1901,11 @@ agent:
   # turn, no attached client) to free its RAM; the next command restarts it.
   # 0 disables. The container is *removed* outright when the session ends.
   idle_sandbox_timeout_seconds: 1800
+  # Turns per message: subagents and unattended runs stop at max_iterations; the
+  # interactive session asks you to continue every session_max_iterations turns
+  # (`/budget off` turns that check off for the session).
   max_iterations: 100
+  session_max_iterations: 500
   max_command_output_bytes: 60000
   # Bytes of this repo's AGENTS.md (or CLAUDE.md) pinned into the agent's system
   # message, so it starts every session knowing your conventions instead of

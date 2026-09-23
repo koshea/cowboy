@@ -12,6 +12,7 @@
 //! the policy JSON file written to disk for the container to read.
 
 use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
+use cowboy_gateway::Answer;
 use tokio::sync::{mpsc, oneshot};
 
 /// A pending question for the user.
@@ -54,23 +55,45 @@ impl ChannelApprover {
     }
 }
 
+/// Whether the gateway may reuse a user's decision for later connections this
+/// session (see [`ChannelApprover`]'s `answer`).
+fn remembered(verdict: Verdict, scope: ApprovalScope) -> bool {
+    !(verdict == Verdict::Allow && scope == ApprovalScope::Once)
+}
+
 #[async_trait::async_trait]
 impl cowboy_gateway::Approver for ChannelApprover {
     async fn ask(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> Verdict {
+        self.answer(attempt, reason).await.verdict
+    }
+
+    /// The scope decides whether the gateway may reuse the verdict. Only an allow
+    /// scoped `Once` is single-use; every deny stands for the session (a refusal that
+    /// had to be repeated per connection would be a prompt storm, and re-asking is
+    /// never the safer direction). Project/global allows are also persisted by the
+    /// worker, which is what carries them past this session.
+    async fn answer(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> Answer {
         let (tx, rx) = oneshot::channel();
         let req = ApprovalRequest {
             attempt: attempt.clone(),
             reason: reason.map(String::from),
             reply: tx,
         };
+        let deny = Answer {
+            verdict: Verdict::Deny,
+            remember: true,
+        };
         if self.approvals.send(req).is_err() {
             tracing::debug!(dest = %attempt.label(), "no approver attached; denying");
-            return Verdict::Deny;
+            return deny;
         }
         match rx.await {
-            Ok((verdict, _scope)) => verdict,
+            Ok((verdict, scope)) => Answer {
+                verdict,
+                remember: remembered(verdict, scope),
+            },
             // The UI dropped the reply channel: treat as a refusal.
-            Err(_) => Verdict::Deny,
+            Err(_) => deny,
         }
     }
 
@@ -155,6 +178,34 @@ mod tests {
         });
 
         approver.ask(&attempt(), Some("dns tunnel suspected")).await;
+    }
+
+    /// The scope the user picked reaches the gateway: "allow once" is the only answer
+    /// it must not reuse. It used to be discarded here, so "once — just this request"
+    /// quietly lasted the whole session.
+    #[tokio::test]
+    async fn only_an_allow_once_is_single_use() {
+        for (verdict, scope, remember) in [
+            (Verdict::Allow, ApprovalScope::Once, false),
+            (Verdict::Allow, ApprovalScope::Session, true),
+            (Verdict::Allow, ApprovalScope::Project, true),
+            (Verdict::Allow, ApprovalScope::Global, true),
+            (Verdict::Deny, ApprovalScope::Once, true),
+        ] {
+            let (atx, mut arx) = mpsc::unbounded_channel();
+            let (etx, _erx) = mpsc::unbounded_channel();
+            let approver = ChannelApprover::new(atx, etx);
+            tokio::spawn(async move {
+                let req: ApprovalRequest = arx.recv().await.unwrap();
+                let _ = req.reply.send((verdict, scope));
+            });
+            let answer = approver.answer(&attempt(), None).await;
+            assert_eq!(
+                answer,
+                Answer { verdict, remember },
+                "{verdict:?} {scope:?}"
+            );
+        }
     }
 
     #[tokio::test]

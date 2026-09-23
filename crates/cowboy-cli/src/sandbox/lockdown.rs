@@ -23,7 +23,7 @@
 
 use anyhow::{bail, Context, Result};
 use landlock::{
-    Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    Access, AccessFs, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
 
@@ -153,7 +153,12 @@ fn apply_landlock(req: &ShimRequest) -> Result<()> {
     // regular *file* (like the `/.cowboy-shim` bind). For a non-directory, mask the
     // requested access down to the file-applicable subset.
     let file_access = AccessFs::from_file(REQUIRED_ABI);
-    for (paths, access) in [(&req.read_only, ro), (&req.read_write, rw)] {
+    let list = BitFlags::from(AccessFs::ReadDir);
+    for (paths, access) in [
+        (&req.read_only, ro),
+        (&req.read_write, rw),
+        (&req.list_dirs, list),
+    ] {
         for p in paths {
             let fd = PathFd::new(p).with_context(|| {
                 format!("opening Landlock rule path {p:?} (sandbox-internal target)")
@@ -334,6 +339,7 @@ mod tests {
             command: "true".into(),
             read_only: Vec::new(),
             read_write: Vec::new(),
+            list_dirs: Vec::new(),
             scope_ipc: false,
             deny_syscalls: Vec::new(),
             deny_raw_sockets: false,

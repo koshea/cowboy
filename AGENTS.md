@@ -187,6 +187,33 @@ commands*, not the loop.
   `println!` from the loop.
 - **Match the surrounding code** (terse doc comments explaining *why*, not what).
 
+## Client parity — the TUI and the web UI are one product
+
+There are two clients for a live session: the TUI (`agent/tui.rs` + `cmd/attach.rs`)
+and the web UI (`crates/cowboy-web-ui`, bridged by `cmd/web.rs`). Someone driving a
+session from a phone must be able to do — and see — what they can at the terminal.
+**A UI feature isn't done until both clients have it** (or the PR says why one
+can't). Concretely:
+
+- **New slash command or session action:** put the behaviour in the worker, not in a
+  client. Session commands are expanded in one place, `agent/commands.rs`, reached
+  via `ClientMsg::Command`; add the name to `agent/help.rs` `SLASH` **and** to the web's
+  `HELP` table (`cowboy-web-ui/src/commands.rs`) —
+  `every_slash_command_is_offered_by_the_web_client` fails otherwise. Output that is
+  only for the asker goes back as `ServerMsg::CommandReply`, not a journaled notice.
+- **New `UiEventMsg` / `ServerMsg` variant or field:** render it in *both* clients
+  (the web `model.rs` matches every variant with no `_ =>` arm on purpose). State a
+  client derives must rebuild identically from a journal replay and from a reconnect
+  snapshot — test the replay, not just the live path.
+- **New prompt/modal:** clients may have several outstanding at once (they are keyed
+  by id); offer the same choices in both (e.g. every `ApprovalScope`).
+- **Forward compatibility:** a client must *skip* an event it can't parse, in
+  sequence, never reconnect on it — reconnecting replays the same frame forever.
+- **Build the web UI** whenever you touch `cowboy-proto` or the web crate
+  (`cd crates/cowboy-web-ui && cargo test && trunk build --release`); `build.rs`
+  also rebuilds a stale `dist/` when `trunk` is installed, so a protocol change that
+  breaks the web UI fails the `cowboy-cli` build instead of shipping a stale bundle.
+
 ## Security invariants — do not break
 
 - Provider credentials live only in `~/.config/cowboy/providers.yaml` (`0600`),

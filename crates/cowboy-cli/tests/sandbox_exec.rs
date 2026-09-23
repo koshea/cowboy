@@ -142,6 +142,7 @@ fn plan_for(root: &Path) -> SandboxPlan {
         relay_port: 8443,
         scratch: &scratch,
         agent_home: &agent_home,
+        git_identity: None,
     };
     SandboxPlan::build(&inputs, &Host).unwrap()
 }
@@ -313,49 +314,92 @@ async fn the_host_toolchain_is_usable() {
 }
 
 /// The host home is exposed only where the plan says so — the user's tool directories,
-/// read-only — and is otherwise not reachable.
+/// read-only — and nothing else under it can be discovered or read.
 ///
-/// Asserted as a property rather than as one error message. It used to check for "No
-/// such file", which stopped being the truth once tool directories were bound: bwrap
-/// creates `~` as a mount point for them, so the refusal now comes from Landlock
-/// instead. Enumeration being refused is the stronger claim anyway, since it means an
-/// unexposed path cannot even be discovered.
+/// `~` itself is listable: the sandbox root carries a list-only Landlock rule so code
+/// that resolves paths from a `/` dirfd works (see `LandlockRules::list_dirs`). That
+/// is safe because `~` inside the sandbox is a skeleton bwrap creates to hold the
+/// tool-directory binds, so a listing can only name what the plan exposed. This test
+/// pins exactly that: every name visible under `~` (and under the parents of a bound
+/// directory, like `~/.local/share` — where the login keyring lives) must be a bind
+/// target or lead to one, and a file that was not exposed stays unreadable.
 #[tokio::test]
 async fn the_host_home_directory_is_not_browsable() {
     skip_if_unsupported!();
     let p = Project::new();
     let home = cowboy_core::config::expand_path("~").unwrap();
+    let plan = plan_for(&p.path());
+    let exposed: Vec<std::path::PathBuf> = plan
+        .binds
+        .iter()
+        .map(|b| std::path::PathBuf::from(&b.target))
+        .chain(
+            plan.overlays
+                .iter()
+                .map(|o| std::path::PathBuf::from(&o.target)),
+        )
+        .collect();
+    let leads_to_a_bind = |p: &Path| exposed.iter().any(|t| t.starts_with(p));
 
-    let (_code, out) = run(
-        &p.path(),
-        &format!("ls {}/ 2>&1 || true", home.display()),
-        60,
-    )
-    .await;
-    assert!(
-        out.contains("Permission denied") || out.contains("No such file"),
-        "the host home directory must not be enumerable: {out}"
-    );
-
-    // Directories that exist on the host and were not exposed stay unreachable, and
-    // `~/.local/share` in particular must not be listable — that is where the login
-    // keyring lives, and binding `~/.local/share/uv` must not open its parent.
-    for sub in [".cache", ".local/share", ".config"] {
-        let path = home.join(sub);
-        if !path.exists() {
+    for dir in [
+        home.clone(),
+        home.join(".local/share"),
+        home.join(".cache"),
+        home.join(".config"),
+    ] {
+        if !dir.exists() {
             continue;
         }
         let (_code, out) = run(
             &p.path(),
-            &format!("ls {}/ 2>&1 || true", path.display()),
+            &format!("ls -A1 {}/ 2>/dev/null || true", dir.display()),
+            60,
+        )
+        .await;
+        for name in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            let path = dir.join(name);
+            assert!(
+                leads_to_a_bind(&path),
+                "{} is visible in the sandbox but the plan never exposed it",
+                path.display()
+            );
+        }
+    }
+
+    // An unexposed file directly under `~` exists on the host but not in here.
+    for file in [".bashrc", ".profile", ".gitconfig", ".bash_history"] {
+        let path = home.join(file);
+        if !path.is_file() || leads_to_a_bind(&path) {
+            continue;
+        }
+        let (_code, out) = run(
+            &p.path(),
+            &format!("cat {} 2>&1 || true", path.display()),
             60,
         )
         .await;
         assert!(
-            out.contains("Permission denied") || out.contains("No such file"),
-            "~/{sub} was not exposed and must not be reachable: {out}"
+            out.contains("No such file") || out.contains("Permission denied"),
+            "~/{file} was not exposed and must not be readable: {out}"
         );
     }
+}
+
+/// The sandbox root and the skeleton directories bwrap creates for bind targets can
+/// be opened, so code that anchors path resolution at `/` works. Opening `/` used to
+/// fail with EACCES, which broke `openat`-style resolvers in projects under test.
+#[tokio::test]
+async fn the_sandbox_root_can_be_opened_and_listed() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let (code, out) = run(
+        &p.path(),
+        "python3 -c 'import os; [os.close(os.open(d, os.O_RDONLY | os.O_DIRECTORY)) for d in (\"/\", \"/etc\")]; print(\"ok\")' 2>&1 || ls / /etc",
+        60,
+    )
+    .await;
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("ok") || out.contains("usr"), "{out}");
 }
 
 /// The other half: the tool directories that *are* exposed work, and are read-only.
@@ -839,6 +883,7 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
                 relay_port: 8443,
                 scratch: &scratch,
                 agent_home: &scratch,
+                git_identity: None,
             },
             probe,
         )

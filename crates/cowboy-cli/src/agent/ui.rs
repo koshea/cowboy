@@ -78,6 +78,12 @@ pub trait AgentUi {
     /// Ask the user a question and return their answer. `options` (possibly
     /// empty) are suggested choices; the user may still answer freely.
     fn ask_user(&mut self, question: &str, options: &[String]) -> String;
+    /// Whether someone is there to answer [`Self::ask_user`] right now. The loop
+    /// skips its "start converging" budget nudges when so — it will ask instead of
+    /// stopping, so hurrying the model would only cut real work short.
+    fn can_ask_user(&self) -> bool {
+        false
+    }
     /// A general notice (errors, status).
     fn notice(&mut self, msg: &str);
 }

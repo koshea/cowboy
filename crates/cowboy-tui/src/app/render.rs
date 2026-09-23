@@ -172,6 +172,7 @@ pub fn draw(f: &mut Frame, app: &App) {
                 rows: Vec::new(),
                 note: None,
                 summary: p.clone(),
+                once_only: false,
             });
             draw_approval(f, area, &view);
         }
@@ -1088,6 +1089,7 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
             CrewStatus::Pending => ("⋯", Color::DarkGray),
             CrewStatus::Running => ("⟳", Color::Yellow),
             CrewStatus::Asking => ("⏸", Color::Magenta),
+            CrewStatus::Waiting => ("?", Color::Blue),
             CrewStatus::Done => ("✓", Color::Green),
             CrewStatus::Failed => ("✗", Color::Red),
         };
@@ -1098,6 +1100,7 @@ pub(super) fn draw_background(f: &mut Frame, app: &App, area: Rect) {
         let trailing = match m.status {
             CrewStatus::Pending => " queued".to_string(),
             CrewStatus::Asking => format!(" wants +{} turns", m.requested),
+            CrewStatus::Waiting => " asking".to_string(),
             _ => format!(" {}s", m.elapsed_secs),
         };
         lines.push(Line::from(vec![
@@ -1465,12 +1468,17 @@ pub(super) fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 /// agreeing to *and* what the keys do.
 pub(super) fn draw_approval(f: &mut Frame, area: Rect, view: &ApprovalView) {
     /// The scope legend. Kept here beside the layout that has to fit it.
+    ///
+    /// "Once" is one connection: the gateway does not remember it, so a tool that opens
+    /// several connections (a package manager, a retry) asks again for each — `s` is
+    /// the answer for those. A deny stands for the session, so a refused retry does
+    /// not re-prompt.
     const LEGEND: [(&str, &str); 5] = [
-        ("o", "once — just this request"),
+        ("o", "once — this connection only; the next one asks again"),
         ("s", "session — every request here until this session ends"),
         ("p", "project — always allow here (saved for this repo)"),
-        ("g", "global — always allow everywhere"),
-        ("d", "deny"),
+        ("g", "global — always allow, in every project (saved)"),
+        ("d", "deny — for the rest of this session"),
     ];
 
     let w = area.width.saturating_sub(6).min(78);
@@ -1508,20 +1516,29 @@ pub(super) fn draw_approval(f: &mut Frame, area: Rect, view: &ApprovalView) {
         }
     }
 
-    let legend: Vec<Line> = LEGEND
-        .iter()
-        .map(|(key, what)| {
-            Line::from(vec![
-                Span::styled(
-                    format!(" {key}  "),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(trunc(what, inner_w.saturating_sub(4)), dim),
-            ])
-        })
-        .collect();
+    /// A credential grant is per request: no scope to choose, so none is offered.
+    const LEGEND_ONCE: [(&str, &str); 2] = [
+        ("o", "allow — this request only (never remembered)"),
+        ("d", "deny"),
+    ];
+    let legend: Vec<Line> = if view.once_only {
+        &LEGEND_ONCE[..]
+    } else {
+        &LEGEND[..]
+    }
+    .iter()
+    .map(|(key, what)| {
+        Line::from(vec![
+            Span::styled(
+                format!(" {key}  "),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(trunc(what, inner_w.saturating_sub(4)), dim),
+        ])
+    })
+    .collect();
 
     // The legend's rows are *reserved* before the body is allowed any: with a short
     // terminal and a long note, sizing the modal to the body and clamping to the

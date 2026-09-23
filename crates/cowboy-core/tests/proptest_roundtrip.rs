@@ -44,6 +44,7 @@ fn arb_agent_config() -> impl Strategy<Value = AgentConfig> {
                     model_timeout_seconds,
                     idle_sandbox_timeout_seconds: 1800,
                     max_iterations,
+                    session_max_iterations: max_iterations.saturating_mul(5),
                     max_command_output_bytes,
                     project_instruction_bytes: 12_000,
                     token_budget: 0,

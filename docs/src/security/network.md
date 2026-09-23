@@ -146,8 +146,11 @@ straight past every gate above.
 ## Live approvals
 
 An `ask` opens an approval modal in the TUI — allow once / session / project /
-global, or deny. Project and global approvals persist host-side (never in the
-workspace) and merge into the policy on the next run. Non-interactive runs fail
+global, or deny. *Once* covers only the connection that asked (the gateway does not
+cache it); *session* and any deny are cached for the rest of the session. Project
+approvals persist host-side per project, global ones in one host-wide file that
+every project reads (both under `~/.config/cowboy/approvals/`, never in the
+workspace), and merge into the policy on the next run. Non-interactive runs fail
 closed and log the decision.
 
 The prompt also names **the command that wants the destination**, because the

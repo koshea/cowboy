@@ -131,7 +131,8 @@ agent:
   command_timeout_seconds: 600
   model_timeout_seconds: 120
   idle_sandbox_timeout_seconds: 1800   # tear down an idle detached session's sandbox (0 = off)
-  max_iterations: 100                    # turns per turn for THIS session (see note)
+  max_iterations: 100                    # turns per message when nobody is watching (see note)
+  session_max_iterations: 500            # turns per message before your session asks to continue
   max_command_output_bytes: 60000
   project_instruction_bytes: 12000       # bytes of AGENTS.md pinned into the prompt (0 = off)
   setup:                                 # repo setup, run once per worktree (after mise install)
@@ -171,12 +172,23 @@ turn, and output goes to `.cowboy/proc/<name>.log`. A process belongs to the ses
 and is reaped with it. See
 [Background processes](../using/agent-and-tools.md#background-processes).
 
-**Iteration budgets.** `agent.max_iterations` bounds a turn of the session you are
-talking to. When it runs out, cowboy **asks whether to keep going** rather than
-stopping silently — answer yes and it gets another `max_iterations` turns and
-carries on in the same turn, up to ten extensions. A run with nobody to ask (piped,
-or no attached client) is never extended: silence is not consent, so it ends the
-turn, and sending a message resumes with the conversation intact either way.
+**Iteration budgets.** They exist to stop a runaway loop you can't see, so they
+are tight where nobody is watching and loose where you are.
+
+- **Your interactive session** gets `agent.session_max_iterations` (500) turns per
+  message. When they run out, cowboy **asks whether to keep going** rather than
+  stopping silently — answer yes and it gets another round and carries on in the
+  same turn, up to ten extensions. While you're attached it doesn't nag the model to
+  "start converging" on the way there; it just asks at the end.
+- **`/budget off`** (TUI or web) turns the check off for the rest of the session, for
+  a long task you're willing to let run; `/budget on` restores it, and `/budget`
+  shows which is in force. It applies mid-turn. The loop's repeated-command and churn
+  guards still apply either way.
+- **Anything unattended** gets the converge nudges at 70% and 90% and is never
+  extended: silence is not consent, so it ends the turn, and sending a message
+  resumes with the conversation intact either way. A piped `cowboy "…"` run is held
+  to `agent.max_iterations` (100); a session you've detached from keeps its session
+  budget but stops at the end of it rather than extending.
 
 A **delegated** worker does not use it: it gets a small grant sized by
 `effort` and must report progress to earn more, bounded by a host-enforced ceiling.

@@ -20,6 +20,7 @@ filesystem
 
 landlock
   7 read-only, 8 read-write paths
+  list-only: /
   network: not gated here (port-only rules cannot express it)
   ipc scoping: true
 

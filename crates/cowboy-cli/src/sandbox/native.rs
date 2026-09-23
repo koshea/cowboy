@@ -67,6 +67,8 @@ pub struct NativeSandbox {
     /// in one project get independent limits and independent teardown. See
     /// [`crate::project::cgroup_key`].
     cgroup_key: String,
+    /// The user's git identity, read from their global git config once per session.
+    git_identity: crate::project::GitIdentity,
     /// The policy engine that answers the relay.
     ///
     /// Constructed up front rather than attached later: a sandbox with no engine
@@ -115,6 +117,7 @@ impl NativeSandbox {
             session_name,
             scratch_key,
             cgroup_key,
+            git_identity: crate::project::GitIdentity::from_host(),
         })
     }
 
@@ -171,6 +174,9 @@ impl NativeSandbox {
         // through. Fatal, unlike the old in-workspace directory — there is no HOME to
         // fall back to, and a silently missing one would fail the bind instead.
         let agent_home = crate::project::ensure_agent_home(&self.root)?;
+        // Beside the mask: the scratch root is host-only (the agent sees only its
+        // subdirectories), so nothing inside can swap this file for a symlink.
+        let git_identity = crate::project::write_git_identity(&scratch, &self.git_identity);
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -179,6 +185,7 @@ impl NativeSandbox {
             relay_port: super::RELAY_PORT,
             scratch: &scratch,
             agent_home: &agent_home,
+            git_identity: git_identity.as_deref(),
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }

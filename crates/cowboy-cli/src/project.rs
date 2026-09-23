@@ -202,6 +202,77 @@ fn ensure_mask_file(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// The user's git identity from their global config, lent to the sandbox as git's
+/// system config (see [`cowboy_sandbox::plan::GIT_IDENTITY_AT`]).
+///
+/// Only `user.name` and `user.email` — never the whole `~/.gitconfig`, which can
+/// carry credential helpers, tokens in URL rewrites, and aliases that run commands.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitIdentity {
+    pub name: Option<String>,
+    pub email: Option<String>,
+}
+
+impl GitIdentity {
+    /// Read from the host's global git config (`git config --global`).
+    pub fn from_host() -> Self {
+        let get = |key: &str| {
+            std::process::Command::new("git")
+                .args(["config", "--global", "--get", key])
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            name: get("user.name"),
+            email: get("user.email"),
+        }
+    }
+
+    /// The config file's contents, or `None` if there is nothing to lend.
+    pub fn render(&self) -> Option<String> {
+        // A value with a newline would let one setting smuggle in another section.
+        let clean = |v: &Option<String>| {
+            v.as_ref()
+                .filter(|s| !s.chars().any(char::is_control))
+                .map(|s| s.replace('\\', "\\\\").replace('"', "\\\""))
+        };
+        let (name, email) = (clean(&self.name), clean(&self.email));
+        if name.is_none() && email.is_none() {
+            return None;
+        }
+        // Replacing the system config must not drop the host's own: include it.
+        let mut s = String::from("[include]\n\tpath = /etc/gitconfig\n[user]\n");
+        if let Some(n) = name {
+            s.push_str(&format!("\tname = \"{n}\"\n"));
+        }
+        if let Some(e) = email {
+            s.push_str(&format!("\temail = \"{e}\"\n"));
+        }
+        Some(s)
+    }
+}
+
+/// Write `identity` into the (host-only) scratch root for the plan to bind, or
+/// return `None` if there is nothing to write or it can't be written — a missing
+/// identity costs a commit author, not the command, so this never fails the plan.
+pub fn write_git_identity(scratch: &Path, identity: &GitIdentity) -> Option<PathBuf> {
+    let contents = identity.render()?;
+    let path = scratch.join("gitconfig");
+    if std::fs::read_to_string(&path).is_ok_and(|c| c == contents) {
+        return Some(path);
+    }
+    // Temp + rename, so a command reading it never sees half a file.
+    let tmp = scratch.join(format!("gitconfig.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, &contents).ok()?;
+    std::fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
 /// Where the mask file lives inside a scratch directory. One definition, so the
 /// plan and the thing that creates it cannot disagree.
 pub fn mask_file_in(scratch: &Path) -> PathBuf {
@@ -480,6 +551,53 @@ pub(crate) fn private_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identity git reads is exactly the user's name and email, quoted so an
+    /// apostrophe or quote survives, and a value with a control character (which
+    /// could open a new section) is dropped rather than written.
+    #[test]
+    fn git_identity_renders_only_name_and_email_safely() {
+        let id = GitIdentity {
+            name: Some("Kevin O'Shea \"K\"".into()),
+            email: Some("k@example.com".into()),
+        };
+        let text = id.render().unwrap();
+        assert!(text.contains("path = /etc/gitconfig"), "{text}");
+        assert!(text.contains("name = \"Kevin O'Shea \\\"K\\\"\""), "{text}");
+        assert!(text.contains("email = \"k@example.com\""), "{text}");
+
+        let smuggle = GitIdentity {
+            name: Some("x\n[credential]\n\thelper = evil".into()),
+            email: None,
+        };
+        assert_eq!(smuggle.render(), None);
+        assert_eq!(GitIdentity::default().render(), None);
+    }
+
+    /// Git itself reads the file as intended: `git config --file` sees the name.
+    #[test]
+    fn git_reads_the_written_identity() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let id = GitIdentity {
+            name: Some("Kevin O'Shea".into()),
+            email: Some("k@example.com".into()),
+        };
+        let path = write_git_identity(tmp.path(), &id).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["config", "--file"])
+            .arg(&path)
+            .args(["--get", "user.name"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Kevin O'Shea");
+        // Unchanged contents are not rewritten.
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_git_identity(tmp.path(), &id).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    }
 
     /// A directory tree builder: `tree(&["a/.cowboy", "a/b/c"])` creates those dirs.
     fn tree(dirs: &[&str]) -> assert_fs::TempDir {

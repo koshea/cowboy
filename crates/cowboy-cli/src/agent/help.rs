@@ -235,11 +235,28 @@ pub const SLASH: &[Slash] = &[
         workstream_only: false,
     },
     Slash {
+        name: "budget",
+        args: "[on|off]",
+        help:
+            "show, or turn off/on, the per-message turn limit (off: long tasks don't stop to ask)",
+        group: Group::Session,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
+        name: "stop",
+        args: "",
+        help: "stop the background subagents, leaving the session running",
+        group: Group::Session,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
         name: "quit",
         args: "",
         help: "end the session",
         group: Group::Session,
-        aliases: &["exit", "q"],
+        aliases: &["exit", "q", "end"],
         workstream_only: false,
     },
 ];
@@ -462,6 +479,27 @@ pub fn completions(ctx: &Ctx) -> Vec<Completion> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parity: every TUI slash command must exist in the web client too. The web's
+    /// `/help` table is its list of what it supports (view commands locally, the rest
+    /// through `ClientMsg::Command`), so a command added here and not there fails
+    /// this test instead of silently being TUI-only. See AGENTS.md, "Client parity".
+    #[test]
+    fn every_slash_command_is_offered_by_the_web_client() {
+        let web = include_str!("../../../cowboy-web-ui/src/commands.rs");
+        let start = web.find("pub const HELP").expect("the web HELP table");
+        let table = &web[start..start + web[start..].find("];").expect("end of HELP")];
+        let missing: Vec<&str> = SLASH
+            .iter()
+            .map(|s| s.name)
+            .filter(|name| !table.contains(&format!("\"{name}\",")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "slash commands missing from the web client's HELP table \
+             (crates/cowboy-web-ui/src/commands.rs): {missing:?}"
+        );
+    }
 
     fn ctx() -> Ctx<'static> {
         Ctx {

@@ -45,6 +45,9 @@ pub enum AgentCmd {
     Accept { note: Option<String> },
     /// Stop the background subagents, leaving the session and the current turn alone.
     StopSubagents,
+    /// A session slash command for the worker to expand (`agent::commands`), so
+    /// the TUI and the web run it identically. Without the leading `/`.
+    Command(String),
     /// Detach this client, leaving the session running for later re-attach.
     Detach,
     /// End the session.
@@ -428,13 +431,7 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
                 .map(|j| CrewMember {
                     started_ms: now.saturating_sub(j.elapsed_ms),
                     elapsed_secs: j.elapsed_ms / 1000,
-                    status: match j.state.as_str() {
-                        "pending" => CrewStatus::Pending,
-                        "running" => CrewStatus::Running,
-                        "awaiting verdict" => CrewStatus::Asking,
-                        "failed" => CrewStatus::Failed,
-                        _ => CrewStatus::Done,
-                    },
+                    status: crew_status(&j.state),
                     id: j.id,
                     label: j.label,
                     model: j.model,
@@ -450,6 +447,145 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
         UiEventMsg::SteerDelivered(text) => app.push(LineKind::Notice, format!("↳ {text}")),
         // Handled in the event loop (needs loop-local turn bookkeeping).
         UiEventMsg::TurnDone => {}
+    }
+}
+
+/// Messages this client sent (and echoed locally) whose journaled copy has not come
+/// back yet. The worker journals every `Message`/`Enqueue` it receives as a
+/// `UserMessage`, and so does every other client's input; this is what lets the TUI
+/// render the second without doubling the first.
+///
+/// Recorded at the send (see [`TaskTx`]), so it holds the text actually sent — a slash
+/// command echoes `/plan …` but sends a canned prompt, and it is the prompt that comes
+/// back.
+#[derive(Clone, Default)]
+pub(crate) struct LocalEcho(std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<String>>>);
+
+impl LocalEcho {
+    /// Bound on outstanding echoes: a send the worker never journals (the connection
+    /// dropped under it) must not grow this without limit.
+    const CAP: usize = 64;
+
+    fn record(&self, text: String) {
+        let mut q = self.0.borrow_mut();
+        if q.len() >= Self::CAP {
+            q.pop_front();
+        }
+        q.push_back(text);
+    }
+
+    /// True (and consumed) when `text` is one of ours. The worker journals our sends in
+    /// order, so anything queued *ahead* of the match was lost in transit and is dropped
+    /// with it — otherwise one lost send would wedge the front forever and every later
+    /// echo would render twice.
+    fn take(&self, text: &str) -> bool {
+        let mut q = self.0.borrow_mut();
+        match q.iter().position(|sent| sent == text) {
+            Some(i) => {
+                q.drain(..=i);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// The TUI's handle on the agent: a `Sender<AgentCmd>` that records every message it
+/// sends in the [`LocalEcho`], so no send site can forget to.
+pub(crate) struct TaskTx {
+    tx: Sender<AgentCmd>,
+    echo: LocalEcho,
+}
+
+impl TaskTx {
+    fn send(&self, cmd: AgentCmd) -> Result<(), std::sync::mpsc::SendError<AgentCmd>> {
+        if let AgentCmd::Message(m) | AgentCmd::Enqueue(m) = &cmd {
+            self.echo.record(m.clone());
+        }
+        self.tx.send(cmd)
+    }
+}
+
+/// Apply a journaled event on the event loop, where the turn state lives.
+///
+/// Running/idle follows the worker rather than a local count of messages sent: a
+/// message sent mid-turn *steers* that turn (one `TurnDone`, not two), and a turn can
+/// be started by another client entirely. So a journaled `UserMessage` means a turn is
+/// (or is about to be) running, and `TurnDone` with nothing queued means it is not.
+fn apply_live_wire(app: &mut App, prompts: &mut PendingPrompts, echo: &LocalEcho, msg: UiEventMsg) {
+    match msg {
+        UiEventMsg::UserMessage(message) => {
+            if app.access.is_read_only() {
+                apply_wire(app, UiEventMsg::UserMessage(message));
+                return;
+            }
+            if !echo.take(&message) {
+                app.push(LineKind::User, message);
+            }
+            set_running(app, prompts, true);
+        }
+        UiEventMsg::TurnDone => {
+            app.commit_stream();
+            // A queued message runs as the next turn without a fresh `UserMessage` (it
+            // was journaled when it was queued), so stay running until the queue drains.
+            if app.queued.is_empty() {
+                set_running(app, prompts, false);
+            }
+        }
+        other => apply_wire(app, other),
+    }
+}
+
+/// Reconcile running/idle with the worker's published session status. Only the two
+/// "is a turn going" states move the view; the awaiting states are driven by prompts.
+fn apply_status(app: &mut App, prompts: &mut PendingPrompts, status: SessionStatus) {
+    if app.access.is_read_only() {
+        return;
+    }
+    match status {
+        SessionStatus::Running => set_running(app, prompts, true),
+        SessionStatus::Idle => set_running(app, prompts, false),
+        _ => {}
+    }
+}
+
+/// Move between `Running` and `Idle` without disturbing any other mode. Under an open
+/// prompt the change lands in the mode the prompt returns to, so answering an approval
+/// after the turn ended doesn't resurrect a spinner.
+fn set_running(app: &mut App, prompts: &mut PendingPrompts, running: bool) {
+    let (from, to, status) = if running {
+        (Mode::Idle, Mode::Running, "running")
+    } else {
+        (Mode::Running, Mode::Idle, "ready")
+    };
+    if prompts.active.is_some() {
+        if let Some(mode) = prompts.return_mode.as_mut() {
+            if *mode == from {
+                *mode = to;
+            }
+        }
+        return;
+    }
+    if app.mode == from {
+        app.mode = to;
+        app.status = status.into();
+    }
+}
+
+/// Map a job's wire state (`JobState::as_str`) to the pane's status.
+///
+/// An unrecognised state — a newer worker's — is shown as running rather than done:
+/// "done" stops the timer and drops it from the live count, which would misreport a
+/// job that is very much still there.
+fn crew_status(state: &str) -> CrewStatus {
+    match state {
+        "pending" => CrewStatus::Pending,
+        "running" => CrewStatus::Running,
+        "awaiting verdict" => CrewStatus::Asking,
+        "asking a question" => CrewStatus::Waiting,
+        "done" => CrewStatus::Done,
+        "failed" => CrewStatus::Failed,
+        _ => CrewStatus::Running,
     }
 }
 
@@ -499,6 +635,7 @@ pub fn run_event_loop(
 /// it was titled while the modal had only a destination label to work from.
 fn approval_view(d: ApprovalDetail) -> cowboy_tui::ApprovalView {
     cowboy_tui::ApprovalView {
+        once_only: d.kind == ApprovalKind::Credential,
         title: match d.kind {
             ApprovalKind::Network => "Network request".to_string(),
             ApprovalKind::Credential => "Credential access".to_string(),
@@ -847,9 +984,12 @@ fn event_loop(
     // Whether the window title currently carries the "needs you" marker, so it is
     // written only on a change rather than every frame.
     let mut title_marked_waiting = false;
-    // Outstanding messages sent to the agent but not yet acknowledged (TurnDone).
-    let mut pending_turns: usize = 0;
-    let mut task_tx = Some(task_tx);
+    // What this client echoed locally, so the journaled copy isn't rendered twice.
+    let echo = LocalEcho::default();
+    let mut task_tx = Some(TaskTx {
+        tx: task_tx,
+        echo: echo.clone(),
+    });
     // Submitted-message history for Up/Down recall.
     let mut history: Vec<String> = Vec::new();
     let mut hist_pos: Option<usize> = None;
@@ -888,7 +1028,6 @@ fn event_loop(
                 history.push(t.clone());
                 let _ = tx.send(AgentCmd::Message(t));
             }
-            pending_turns = 1;
             app.mode = Mode::Running;
         }
         _ => app.mode = Mode::Idle,
@@ -909,18 +1048,7 @@ fn event_loop(
     'main: loop {
         while let Ok(ev) = events.try_recv() {
             match ev {
-                // TurnDone needs loop-local turn bookkeeping, so it's handled
-                // here; every other journaled (wire) event is pure view-state.
-                UiEvent::Wire(UiEventMsg::TurnDone) => {
-                    pending_turns = pending_turns.saturating_sub(1);
-                    app.commit_stream();
-                    // Back to idle once all queued turns are processed.
-                    if pending_turns == 0 && matches!(app.mode, Mode::Running) {
-                        app.mode = Mode::Idle;
-                        app.status = "ready".into();
-                    }
-                }
-                UiEvent::Wire(msg) => apply_wire(&mut app, msg),
+                UiEvent::Wire(msg) => apply_live_wire(&mut app, &mut prompts, &echo, msg),
                 UiEvent::Ask(id, question, options, reply) => {
                     prompts.add(
                         &mut app,
@@ -950,7 +1078,10 @@ fn event_loop(
                     prompts.resolve(&mut app, id);
                 }
                 UiEvent::Connection(state) => app.connection = state,
-                UiEvent::Lifecycle(status) => app.lifecycle = Some(status.to_string()),
+                UiEvent::Lifecycle(status) => {
+                    app.lifecycle = Some(status.to_string());
+                    apply_status(&mut app, &mut prompts, status);
+                }
                 UiEvent::ModelsFetched(entries) => {
                     if entries.is_empty() {
                         app.push(LineKind::Notice, "no chat models offered by the provider");
@@ -1098,7 +1229,6 @@ fn event_loop(
                         turn_cancel: &turn_cancel,
                         task_tx: &mut task_tx,
                         ui_tx: &ui_tx,
-                        pending_turns: &mut pending_turns,
                         history: &mut history,
                         hist_pos: &mut hist_pos,
                         session: &mut session,
@@ -1254,10 +1384,9 @@ struct KeyCtx<'a> {
     mode_before_overlay: &'a mut Mode,
     turn_cancel: &'a TurnCancel,
     /// `None` once the session has been ended (sender dropped).
-    task_tx: &'a mut Option<Sender<AgentCmd>>,
+    task_tx: &'a mut Option<TaskTx>,
     /// For posting client-side async results (e.g. the fetched model list).
     ui_tx: &'a Sender<UiEvent>,
-    pending_turns: &'a mut usize,
     history: &'a mut Vec<String>,
     hist_pos: &'a mut Option<usize>,
     session: &'a mut SessionCtx,
@@ -1720,33 +1849,12 @@ fn send_message(app: &mut App, ctx: &mut KeyCtx, msg: String) {
     ctx.history.push(msg.clone());
     *ctx.hist_pos = None;
     let _ = tx.send(AgentCmd::Message(msg));
-    *ctx.pending_turns += 1;
     app.mode = Mode::Running;
     app.status = "running".into();
 }
 
-/// `/mcp`: list the configured MCP servers (host + this repo's trust-gated
-/// `.mcp.json`) as notices. Read-only — manage servers with the `cowboy mcp` CLI.
-/// `/boundary`: what the sandbox actually allows — mounts, Landlock, seccomp, the
-/// never-grantable paths, and the egress policy in force.
-///
-/// Read-only, and built from the same code path as `cowboy sandbox plan` so the two
-/// cannot disagree. This is the one thing the UI was not showing about the product's
-/// central claim: the status bar carried tokens, cost and diff, but nothing about
-/// confinement.
 fn boundary_command(app: &mut App, root: &std::path::Path) {
-    match crate::cmd::sandbox::describe(root) {
-        Ok(report) => {
-            app.push(LineKind::Notice, format!("boundary for {}", root.display()));
-            for line in report.lines() {
-                app.push(LineKind::Notice, line.to_string());
-            }
-        }
-        Err(e) => app.push(
-            LineKind::Error,
-            format!("cannot describe the boundary: {e}"),
-        ),
-    }
+    push_report(app, super::commands::boundary_report(root));
 }
 
 /// Render the latest context-window snapshot.
@@ -1820,131 +1928,11 @@ fn fmt_thousands(n: u64) -> String {
 }
 
 fn mcp_command(app: &mut App, root: &std::path::Path) {
-    let cfg = match cowboy_core::mcp::load_or_default() {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            app.push(LineKind::Error, format!("MCP config error: {e}"));
-            return;
-        }
-    };
-    if cfg.servers.is_empty() {
-        app.push(LineKind::Notice, "no host MCP servers configured");
-    } else {
-        app.push(LineKind::Notice, "MCP servers (host):");
-        for (name, s) in &cfg.servers {
-            let state = if s.enabled { "enabled" } else { "disabled" };
-            let desc = if s.description.is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", s.description)
-            };
-            app.push(
-                LineKind::Notice,
-                format!("  {name} [{state}] {}{desc}", s.transport_label()),
-            );
-        }
-    }
-    // This repo's `.mcp.json`, if any (trust-gated).
-    let state = crate::mcp::trust::project_trust(root);
-    if state != crate::mcp::trust::TrustState::NoFile {
-        if let Ok(Some(servers)) = cowboy_core::mcp::load_project_mcp(root) {
-            app.push(
-                LineKind::Notice,
-                format!("MCP servers (.mcp.json) — {}:", state.label()),
-            );
-            for (name, s) in &servers {
-                app.push(
-                    LineKind::Notice,
-                    format!("  {name} {}", s.transport_label()),
-                );
-            }
-            if matches!(
-                state,
-                crate::mcp::trust::TrustState::Untrusted | crate::mcp::trust::TrustState::Stale
-            ) {
-                app.push(LineKind::Notice, "  → enable with `cowboy mcp trust`");
-            }
-        }
-    }
-    app.push(
-        LineKind::Notice,
-        "manage with `cowboy mcp add/trust/remove/test`",
-    );
+    push_report(app, super::commands::mcp_report(root));
 }
 
-/// `/crew` (and `/crew usage`): show the crew roster matrix or usage summary as
-/// notices. Read-only — manage the roster with the `cowboy crew` CLI.
 fn crew_command(arg: Option<&str>, app: &mut App) {
-    use cowboy_core::crew;
-    if arg == Some("usage") {
-        let rows = crew::usage_by_model(&crew::load_history());
-        if rows.is_empty() {
-            app.push(LineKind::Notice, "no recorded crew activity yet");
-            return;
-        }
-        app.push(LineKind::Notice, "crew usage (per model):");
-        for r in rows {
-            app.push(
-                LineKind::Notice,
-                format!(
-                    "  {:<14} {} tasks · {}% ok · {}ms avg",
-                    r.model,
-                    r.tasks,
-                    r.success_pct(),
-                    r.avg_duration_ms()
-                ),
-            );
-        }
-        return;
-    }
-    match crew::load() {
-        Ok(Some(cfg)) => {
-            // Shorten ids to their last path segment so the grid stays readable.
-            let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
-            let foreman =
-                crate::cmd::crew::foreman_model().unwrap_or_else(|| "<default>".to_string());
-            let mut col_w = crew::Effort::all()
-                .iter()
-                .map(|e| e.as_str().len())
-                .max()
-                .unwrap_or(6);
-            for cat in cfg.crew.keys() {
-                for (_, model) in cfg.expanded(cat, &foreman) {
-                    col_w = col_w.max(short(&model).len());
-                }
-            }
-            col_w += 2;
-            app.push(
-                LineKind::Notice,
-                format!(
-                    "crew foreman: {}   delegation: {}",
-                    foreman,
-                    if cfg.enabled() { "on" } else { "off (solo)" }
-                ),
-            );
-            let mut header = format!("{:<14}", "CATEGORY");
-            for e in crew::Effort::all() {
-                header.push_str(&format!("{:<col_w$}", e.as_str()));
-            }
-            app.push(LineKind::Notice, header);
-            for cat in cfg.crew.keys() {
-                let mut row = format!("{cat:<14}");
-                for (_, model) in cfg.expanded(cat, &foreman) {
-                    row.push_str(&format!("{:<col_w$}", short(&model)));
-                }
-                app.push(LineKind::Notice, row);
-            }
-            app.push(
-                LineKind::Notice,
-                "(edit with the `cowboy crew` CLI; `/crew usage` for activity)",
-            );
-        }
-        Ok(None) => app.push(
-            LineKind::Notice,
-            "no crew roster — create one with `cowboy crew init`",
-        ),
-        Err(e) => app.push(LineKind::Error, format!("crew: {e}")),
-    }
+    push_report(app, super::commands::crew_report(arg));
 }
 
 /// Handle a `/command`. Returns `true` if the client should exit the event loop
@@ -1993,7 +1981,12 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                     ),
                 );
             }
-            Some(name) if !ctx.session.models.iter().any(|m| m == name) => {
+            // An attached TUI isn't told the model list (the worker validates the
+            // switch itself), so only refuse a name when there is a list to check.
+            Some(name)
+                if !ctx.session.models.is_empty()
+                    && !ctx.session.models.iter().any(|m| m == name) =>
+            {
                 app.push(
                     LineKind::Error,
                     format!(
@@ -2030,15 +2023,9 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             } else if let Some(tx) = ctx.task_tx.as_ref() {
                 let _ = tx.send(AgentCmd::PlanMode(true));
                 app.plan_mode = true;
-                let prompt = format!(
-                    "Plan mode is ON. Research the codebase READ-ONLY (read/grep/ls — do not \
-                     modify files or run state-changing commands), then present a concise, \
-                     numbered plan of the steps you'll take. Use the `plan` tool to list the \
-                     steps. Then stop and wait — I'll review and run /go to approve.\n\nTask: {task}"
-                );
+                let prompt = super::commands::plan_prompt(task);
                 app.push(LineKind::User, format!("/{input}"));
                 let _ = tx.send(AgentCmd::Message(prompt));
-                *ctx.pending_turns += 1;
                 app.mode = Mode::Running;
                 app.status = "planning…".into();
             }
@@ -2048,16 +2035,8 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             if let Some(tx) = ctx.task_tx.as_ref() {
                 let _ = tx.send(AgentCmd::PlanMode(false));
                 app.plan_mode = false;
-                let extra = if note.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Also: {note}")
-                };
                 app.push(LineKind::User, format!("/{input}"));
-                let _ = tx.send(AgentCmd::Message(format!(
-                    "Approved — implement the plan now.{extra}"
-                )));
-                *ctx.pending_turns += 1;
+                let _ = tx.send(AgentCmd::Message(super::commands::go_prompt(note)));
                 app.mode = Mode::Running;
                 app.status = "executing…".into();
             }
@@ -2084,23 +2063,8 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             // to re-run `cowboy ranch plan`.
             if let Some(tx) = ctx.task_tx.as_ref() {
                 let note = input.strip_prefix("ranch").unwrap_or("").trim();
-                let extra = if note.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Emphasis: {note}.")
-                };
                 app.push(LineKind::User, format!("/{input}"));
-                let _ = tx.send(AgentCmd::Message(format!(
-                    "This is bigger than one session — promote it into a multi-workstream Ranch \
-                     Plan. Using what we've already discussed (don't re-research from scratch), \
-                     decompose the work into independent, parallelizable workstreams wired by \
-                     dependencies. Write the decomposition to `.cowboy/ranch-plan.yaml` with the \
-                     `write` tool (a YAML doc with `title`, `goal`, and a `workstreams` list — each \
-                     with `id`, `goal`, optional `title`, `depends_on`, `expected_artifacts`, \
-                     `acceptance`), then run `cowboy ranch draft .cowboy/ranch-plan.yaml` to \
-                     validate and draft it. Do not implement anything.{extra}"
-                )));
-                *ctx.pending_turns += 1;
+                let _ = tx.send(AgentCmd::Message(super::commands::ranch_prompt(note)));
                 app.mode = Mode::Running;
                 app.status = "drafting a ranch…".into();
             }
@@ -2166,7 +2130,20 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             app.status = format!("expanded {n} turn{}", if n == 1 { "" } else { "s" });
         }
         "boundary" => boundary_command(app, &ctx.session.root),
-        "quit" | "exit" | "q" => {
+        // Expanded by the worker (shared with the web client); its reply comes back
+        // as a notice.
+        "budget" => {
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::Command(input.to_string()));
+            }
+        }
+        "stop" => {
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::StopSubagents);
+            }
+            app.push(LineKind::Notice, "stopping the background subagents…");
+        }
+        "quit" | "exit" | "q" | "end" => {
             ctx.task_tx.take();
             if let Some(tok) = ctx.turn_cancel.lock().unwrap().as_ref() {
                 tok.cancel();
@@ -2204,17 +2181,10 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
             // `$ARGUMENTS` filled in) as the turn so the agent follows them.
             if let Some(skill) = cowboy_core::skills::load(&ctx.session.root, other) {
                 let args = input.get(other.len()..).unwrap_or("").trim();
-                let mut body = skill.instructions.clone();
-                if body.contains("$ARGUMENTS") {
-                    body = body.replace("$ARGUMENTS", args);
-                } else if !args.is_empty() {
-                    body.push_str(&format!("\n\nArguments: {args}"));
-                }
-                let prompt = format!("Run the `{}` skill.\n\n{body}", skill.name);
+                let prompt = super::commands::skill_prompt(&skill, args);
                 if let Some(tx) = ctx.task_tx.as_ref() {
                     app.push(LineKind::User, format!("/{input}"));
                     let _ = tx.send(AgentCmd::Message(prompt));
-                    *ctx.pending_turns += 1;
                     app.mode = Mode::Running;
                     app.status = format!("running skill {}", skill.name);
                 }
@@ -2502,14 +2472,21 @@ fn last_answer(app: &App) -> Option<String> {
 }
 
 fn git_diff(root: &Path) -> String {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .arg("diff")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+    super::commands::git_diff(root)
+}
+
+/// Append a host report's lines to the transcript.
+fn push_report(app: &mut App, report: super::commands::Report) {
+    for (error, line) in report.lines {
+        app.push(
+            if error {
+                LineKind::Error
+            } else {
+                LineKind::Notice
+            },
+            line,
+        );
+    }
 }
 
 /// Recall the previous message into the input editor.
@@ -2543,19 +2520,246 @@ fn history_recall_next(app: &mut App, history: &[String], hist_pos: &mut Option<
 mod tests {
     use super::*;
 
-    #[test]
-    fn journaled_user_messages_render_only_without_an_interactive_local_echo() {
-        let mut interactive = App::new_with_access("t", Access::Interactive);
-        apply_wire(&mut interactive, UiEventMsg::UserMessage("hello".into()));
-        assert!(interactive.transcript.is_empty());
+    /// Everything `KeyCtx` borrows, owned, so tests can drive the real key/command
+    /// handlers and then feed the journal back through the event loop's own path.
+    struct Harness {
+        prompts: PendingPrompts,
+        mode_before_overlay: Mode,
+        turn_cancel: TurnCancel,
+        task_tx: Option<TaskTx>,
+        ui_tx: Sender<UiEvent>,
+        history: Vec<String>,
+        hist_pos: Option<usize>,
+        session: SessionCtx,
+        quit_armed: bool,
+        echo: LocalEcho,
+        sent: Receiver<AgentCmd>,
+        _ui_rx: Receiver<UiEvent>,
+    }
 
+    impl Harness {
+        fn new() -> Self {
+            let (tx, sent) = std::sync::mpsc::channel();
+            let (ui_tx, _ui_rx) = std::sync::mpsc::channel();
+            let echo = LocalEcho::default();
+            Self {
+                prompts: PendingPrompts::default(),
+                mode_before_overlay: Mode::Idle,
+                turn_cancel: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                task_tx: Some(TaskTx {
+                    tx,
+                    echo: echo.clone(),
+                }),
+                ui_tx,
+                history: Vec::new(),
+                hist_pos: None,
+                session: SessionCtx {
+                    root: PathBuf::from("/nonexistent"),
+                    models: Vec::new(),
+                    current_model: String::new(),
+                    ranch_id: None,
+                    workstream_id: None,
+                    suggestions: Vec::new(),
+                },
+                quit_armed: false,
+                echo,
+                sent,
+                _ui_rx,
+            }
+        }
+
+        fn ctx(&mut self) -> KeyCtx<'_> {
+            KeyCtx {
+                prompts: &mut self.prompts,
+                mode_before_overlay: &mut self.mode_before_overlay,
+                turn_cancel: &self.turn_cancel,
+                task_tx: &mut self.task_tx,
+                ui_tx: &self.ui_tx,
+                history: &mut self.history,
+                hist_pos: &mut self.hist_pos,
+                session: &mut self.session,
+                quit_armed: &mut self.quit_armed,
+            }
+        }
+
+        fn journal(&mut self, app: &mut App, msg: UiEventMsg) {
+            apply_live_wire(app, &mut self.prompts, &self.echo, msg);
+        }
+
+        /// The text of the last `Message` sent to the agent.
+        fn last_sent_message(&self) -> String {
+            let mut last = None;
+            while let Ok(cmd) = self.sent.try_recv() {
+                if let AgentCmd::Message(m) = cmd {
+                    last = Some(m);
+                }
+            }
+            last.expect("no message was sent")
+        }
+    }
+
+    fn user_lines(app: &App) -> Vec<&str> {
+        app.transcript
+            .iter()
+            .filter(|l| l.kind == LineKind::User)
+            .map(|l| l.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn journaled_user_messages_render_once_whoever_sent_them() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        send_message(&mut app, &mut h.ctx(), "hello".into());
+        h.journal(&mut app, UiEventMsg::UserMessage("hello".into()));
+        // Another client's message (the web) has no local echo: the journal is the
+        // only place it can come from.
+        h.journal(&mut app, UiEventMsg::UserMessage("from the web".into()));
+        assert_eq!(user_lines(&app), ["hello", "from the web"]);
+
+        // Replay and observers have no local echo at all.
         for access in [Access::ReadOnlyLive, Access::Replay] {
             let mut app = App::new_with_access("t", access);
-            apply_wire(&mut app, UiEventMsg::UserMessage("hello".into()));
-            assert_eq!(app.transcript.len(), 1);
-            assert_eq!(app.transcript[0].kind, LineKind::User);
-            assert_eq!(app.transcript[0].text, "hello");
+            h.journal(&mut app, UiEventMsg::UserMessage("hello".into()));
+            assert_eq!(user_lines(&app), ["hello"]);
         }
+    }
+
+    /// A slash command echoes what was typed but sends a canned prompt, and it is the
+    /// prompt the worker journals. That must neither render a second time nor leave
+    /// the echo queue stuck on it.
+    #[test]
+    fn a_slash_command_renders_its_echo_not_its_canned_prompt() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        assert!(!handle_command("go ship it", &mut app, &mut h.ctx()));
+        let prompt = h.last_sent_message();
+        assert_ne!(prompt, "/go ship it");
+        h.journal(&mut app, UiEventMsg::UserMessage(prompt));
+        h.journal(
+            &mut app,
+            UiEventMsg::UserMessage("later, from the web".into()),
+        );
+        assert_eq!(user_lines(&app), ["/go ship it", "later, from the web"]);
+    }
+
+    #[test]
+    fn a_send_that_never_comes_back_does_not_wedge_the_echo() {
+        let echo = LocalEcho::default();
+        echo.record("lost in transit".into());
+        echo.record("delivered".into());
+        assert!(echo.take("delivered"));
+        // The lost one went with it: a later identical message from elsewhere renders.
+        assert!(!echo.take("lost in transit"));
+    }
+
+    /// Enter mid-turn steers that turn — one `TurnDone`, not two — so the TUI must go
+    /// idle on it rather than waiting for a second that never comes.
+    #[test]
+    fn steering_mid_turn_goes_idle_on_the_one_turn_done() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        send_message(&mut app, &mut h.ctx(), "start".into());
+        assert_eq!(app.mode, Mode::Running);
+        h.journal(&mut app, UiEventMsg::UserMessage("start".into()));
+        send_message(&mut app, &mut h.ctx(), "also check the error path".into());
+        h.journal(
+            &mut app,
+            UiEventMsg::UserMessage("also check the error path".into()),
+        );
+        h.journal(&mut app, UiEventMsg::TurnDone);
+        assert_eq!(app.mode, Mode::Idle);
+        assert_eq!(user_lines(&app).len(), 2);
+    }
+
+    #[test]
+    fn a_turn_started_by_another_client_runs_the_tui() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        app.mode = Mode::Idle;
+        h.journal(
+            &mut app,
+            UiEventMsg::UserMessage("sent from the web".into()),
+        );
+        assert_eq!(app.mode, Mode::Running);
+        h.journal(&mut app, UiEventMsg::TurnDone);
+        assert_eq!(app.mode, Mode::Idle);
+
+        // The published status moves it too (e.g. a Snapshot on attach mid-turn).
+        apply_status(&mut app, &mut h.prompts, SessionStatus::Running);
+        assert_eq!(app.mode, Mode::Running);
+        apply_status(&mut app, &mut h.prompts, SessionStatus::Idle);
+        assert_eq!(app.mode, Mode::Idle);
+        // ...but never a read-only view.
+        let mut ro = App::new_with_access("t", Access::ReadOnlyLive);
+        ro.mode = Mode::Idle;
+        apply_status(&mut ro, &mut h.prompts, SessionStatus::Running);
+        assert_eq!(ro.mode, Mode::Idle);
+    }
+
+    /// A queued message runs as its own turn without a fresh `UserMessage` (it was
+    /// journaled when queued), so the first `TurnDone` must not idle the view.
+    #[test]
+    fn a_queued_turn_keeps_the_tui_running_across_turn_done() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        app.mode = Mode::Running;
+        h.journal(
+            &mut app,
+            UiEventMsg::QueueChanged {
+                pending: vec!["next".into()],
+            },
+        );
+        h.journal(&mut app, UiEventMsg::TurnDone);
+        assert_eq!(app.mode, Mode::Running);
+        h.journal(
+            &mut app,
+            UiEventMsg::QueueChanged {
+                pending: Vec::new(),
+            },
+        );
+        h.journal(&mut app, UiEventMsg::TurnDone);
+        assert_eq!(app.mode, Mode::Idle);
+    }
+
+    #[test]
+    fn a_turn_ending_under_an_open_prompt_idles_once_it_is_answered() {
+        let mut h = Harness::new();
+        let mut app = App::new_with_access("t", Access::Interactive);
+        app.mode = Mode::Running;
+        let (reply, _answers) = std::sync::mpsc::channel();
+        h.prompts.add(
+            &mut app,
+            UiPrompt::Ask {
+                id: 1,
+                question: "which?".into(),
+                options: Vec::new(),
+                reply,
+            },
+        );
+        h.journal(&mut app, UiEventMsg::TurnDone);
+        assert!(matches!(app.mode, Mode::AwaitingInput(_)));
+        h.prompts.answer_ask(&mut app, "that one".into());
+        assert_eq!(app.mode, Mode::Idle);
+    }
+
+    #[test]
+    fn every_job_state_maps_to_its_own_crew_status() {
+        use crate::agent::jobs::JobState;
+        let cases = [
+            (JobState::Pending, CrewStatus::Pending),
+            (JobState::Running, CrewStatus::Running),
+            (JobState::AwaitingVerdict { seq: 1 }, CrewStatus::Asking),
+            // A job with a question for the foreman is parked, not finished.
+            (JobState::AwaitingAnswer { seq: 1 }, CrewStatus::Waiting),
+            (JobState::Done { ok: true }, CrewStatus::Done),
+            (JobState::Done { ok: false }, CrewStatus::Failed),
+        ];
+        for (state, want) in cases {
+            assert_eq!(crew_status(state.as_str()), want, "{state:?}");
+        }
+        // A newer worker's state is shown as live, not silently as done.
+        assert_eq!(crew_status("some future state"), CrewStatus::Running);
     }
 
     #[test]

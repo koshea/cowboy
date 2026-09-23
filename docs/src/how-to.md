@@ -134,13 +134,19 @@ delegates sub-tasks to specialists; see `/crew` for the routing table.
 Cowboy denies network by default and asks when the agent reaches for something
 new. The prompt shows the destination, the command that asked for it, and each scope:
 
-- **o** once — just this request
+- **o** once — this connection only; the next connection to it asks again
 - **s** session — every request to this host until the session ends
 - **p** project — always allow here (saved for this repo)
-- **g** global — always allow everywhere
-- **d** deny (Esc also denies)
+- **g** global — always allow, in every project on this machine (saved)
+- **d** deny (Esc also denies) — stands for the rest of the session
 
-Project/global approvals persist host-side and apply silently next time. The
+"Once" is deliberately not remembered, so a tool that opens several connections (a
+package manager, a client that retries) asks for each one; answer **s** for those. A
+deny *is* remembered for the session, so a refused retry does not prompt again.
+
+Project/global approvals persist host-side (`~/.config/cowboy/approvals/`: one
+owner-only file per project, plus `global.json` read by every project) and apply
+silently next time. The
 prompt times out to *deny* after two minutes (fail-closed). To skip prompts for
 hosts you already trust, pre-allow them in `.cowboy/security.yaml`. A blocked
 request shows a `🛡 blocked …` note explaining what to allow.

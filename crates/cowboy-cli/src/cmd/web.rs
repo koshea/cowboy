@@ -27,7 +27,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use cowboy_core::config::WebConfig;
 use cowboy_core::daemonproto::{
-    AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg, SessionStatus, UiEventMsg,
+    AttachTarget, ClientMsg, DaemonReq, DaemonResp, ServerMsg, SessionInfo, SessionStatus,
+    UiEventMsg,
 };
 use cowboy_core::netproto::encode_line;
 use futures::{SinkExt, StreamExt};
@@ -40,17 +41,17 @@ use tokio_util::sync::CancellationToken;
 type Resolver =
     Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<AttachTarget>> + Send + Sync>;
 
-/// Resolves a parent session id to `(root, is_live)`, so a subagent watch can
-/// find the child's journal at `<root>/.cowboy/sessions/<sub>/events.jsonl` and
-/// decide whether to follow it live or replay a finished one. Injected for tests.
-type RootResolver = Arc<
-    dyn Fn(String) -> futures::future::BoxFuture<'static, Option<(PathBuf, bool)>> + Send + Sync,
->;
+/// Looks a session's registry record up (`DaemonReq::GetSession`). The bridge
+/// uses it to build a replay's `Snapshot`, to re-resolve a session whose worker
+/// socket stopped answering, and to find (and keep checking the liveness of) a
+/// subagent's parent. Injected for tests; `None` = unknown/unreachable.
+type SessionLookup =
+    Arc<dyn Fn(String) -> futures::future::BoxFuture<'static, Option<SessionInfo>> + Send + Sync>;
 
 struct AppState {
     token: String,
     resolve: Resolver,
-    resolve_root: RootResolver,
+    session: SessionLookup,
 }
 
 // --- `cowboy web on|off|status`: manage the persistent setting ---------------
@@ -165,10 +166,10 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
             }
         })
     });
-    let resolve_root: RootResolver = Arc::new(|id: String| {
+    let session: SessionLookup = Arc::new(|id: String| {
         Box::pin(async move {
             match crate::cmd::daemon::request(DaemonReq::GetSession { id }).await {
-                Ok(DaemonResp::Session { info }) => Some((info.root, !info.status.is_terminal())),
+                Ok(DaemonResp::Session { info }) => Some(info),
                 _ => None,
             }
         })
@@ -176,7 +177,7 @@ pub async fn serve_with(addr: SocketAddr, token: String, cancel: CancellationTok
     let state = Arc::new(AppState {
         token,
         resolve,
-        resolve_root,
+        session,
     });
     // SO_REUSEADDR so a quick restart (daemon roll, `web off`/`on`) can rebind the
     // port while the previous listener is still in TIME_WAIT.
@@ -335,6 +336,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/health", get(health))
         .route("/api/sessions", get(list_sessions))
         .route("/api/session/{id}/ws", get(ws_handler))
+        .route("/api/session/{id}/launchpad", get(launchpad))
         .route("/api/subagent/{parent}/{sub}/ws", get(subagent_ws_handler))
         // Static SPA assets (the trunk-built .js/.wasm). Unauthenticated — they're
         // inert code; the token still gates every /api route. /api/* and / are
@@ -383,7 +385,7 @@ fn guard_bind(ip: IpAddr, allow_lan: bool) -> Result<()> {
     bail!(
         "refusing to bind {ip}: not loopback or a Tailscale address, so the auth token would \
          travel in cleartext. Bind 127.0.0.1 and tunnel in, use your Tailscale IP \
-         (100.64.0.0/10), or pass --insecure-allow-lan if this network is trusted."
+         (100.64.0.0/10), or pass --lan if this network is trusted."
     );
 }
 
@@ -472,6 +474,32 @@ async fn list_sessions(
     }
 }
 
+/// The TUI's welcome openers for a session (Alt-1…9 there, buttons here), derived
+/// from what the project declares. Computed host-side from the session's root, as
+/// the TUI does, so both clients offer the same ones. Empty for an unknown session.
+async fn launchpad(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(info) = (state.session)(id).await else {
+        return Json(Vec::<String>::new()).into_response();
+    };
+    let root = info.root;
+    let openers = tokio::task::spawn_blocking(move || {
+        let paths = cowboy_core::config::ConfigPaths::for_root(&root);
+        let agent = cowboy_core::config::AgentConfig::load(&paths.agent).unwrap_or_default();
+        crate::cmd::session::launchpad(&root, &agent)
+    })
+    .await
+    .unwrap_or_default();
+    Json(openers).into_response()
+}
+
 async fn ws_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -482,40 +510,184 @@ async fn ws_handler(
     if !authed(&state, &headers, q.token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let target = match (state.resolve)(id).await {
+    let target = match (state.resolve)(id.clone()).await {
         Some(t) => t,
         None => return (StatusCode::NOT_FOUND, "no such session").into_response(),
     };
+    let since = q.since_seq;
     match target {
         // Live: bridge to the worker socket (full control).
         AttachTarget::Live { worker_sock } => {
-            let since = q.since_seq;
-            ws.on_upgrade(move |socket| bridge(socket, worker_sock, since))
+            ws.on_upgrade(move |socket| bridge(socket, state, id, worker_sock, since))
         }
         // Terminal: stream the on-disk journal read-only, then end (no worker).
         AttachTarget::Replay {
             journal_path,
             status,
-        } => ws.on_upgrade(move |socket| replay(socket, journal_path, status)),
+        } => {
+            let info = replay_info((state.session)(id.clone()).await, &id, status);
+            ws.on_upgrade(move |socket| async move {
+                let (mut tx, _rx) = socket.split();
+                replay(&mut tx, journal_path, info, since).await;
+                let _ = tx.close().await;
+            })
+        }
     }
 }
 
-/// Stream a finished session's journal to the browser as `Event`s, then `Ended`
-/// — so a completed/failed session renders read-only instead of looping on a
-/// dead worker socket.
-async fn replay(ws: WebSocket, journal_path: PathBuf, status: SessionStatus) {
-    stream_journal(
-        ws,
-        journal_path,
-        false,
-        format!("session {}", status_word(&status)),
-    )
-    .await;
+type WsTx = futures::stream::SplitSink<WebSocket, Message>;
+type WsRx = futures::stream::SplitStream<WebSocket>;
+
+/// The `SessionInfo` a replay's `Snapshot` carries: the daemon's record when it
+/// has one, else a minimal record — either way with the replay's terminal status.
+fn replay_info(info: Option<SessionInfo>, id: &str, status: SessionStatus) -> SessionInfo {
+    let mut info = info.unwrap_or_else(|| SessionInfo {
+        id: id.to_string(),
+        root: PathBuf::new(),
+        task: None,
+        status,
+        pid: None,
+        branch: None,
+        session_name: None,
+        worker_sock: None,
+        journal_path: None,
+        lease_mode: None,
+        started_ms: 0,
+        last_heartbeat_ms: 0,
+        turn: 0,
+        tokens: (0, 0),
+        attached_clients: 0,
+        diffstat: String::new(),
+        running_command: None,
+        blocked_reason: None,
+        ranch_id: None,
+        workstream_id: None,
+    });
+    info.status = status;
+    info
+}
+
+/// Send one `ServerMsg` as a text frame. `false` = the browser has gone.
+async fn send_msg(tx: &mut WsTx, msg: &ServerMsg) -> bool {
+    send_text(tx, encode_line(msg).trim_end().to_string()).await
+}
+
+async fn send_text(tx: &mut WsTx, text: String) -> bool {
+    tx.send(Message::Text(text.into())).await.is_ok()
+}
+
+/// Stream a finished session to the browser: a `Snapshot` (the daemon's record,
+/// `journal_len` = committed line count, no pending prompts — nobody is left to
+/// answer them), the journal's events from `since`, then `Ended` — so a
+/// completed/failed session renders read-only instead of looping on a dead
+/// worker socket, and a reconnecting client resumes where it left off.
+async fn replay(tx: &mut WsTx, journal_path: PathBuf, info: SessionInfo, since: Option<u64>) {
+    let reason = format!("session {}", status_word(&info.status));
+    // A terminal session's journal no longer grows, so one read is the whole of
+    // it. A torn final record (a crash mid-append) has no newline and is not a
+    // committed line, exactly as the worker's own recovery counts it.
+    let mut tail = LineTail::new(journal_path);
+    let lines = tail.poll().await;
+    let snapshot = ServerMsg::Snapshot {
+        info,
+        journal_len: lines.len() as u64,
+        pending_prompts: Vec::new(),
+    };
+    if !send_msg(tx, &snapshot).await {
+        return;
+    }
+    let since = since.unwrap_or(0);
+    for (seq, line) in (0u64..).zip(&lines) {
+        if seq >= since && !send_text(tx, event_frame(seq, line)).await {
+            return;
+        }
+    }
+    let _ = send_msg(tx, &ServerMsg::Ended { reason }).await;
+}
+
+/// Tails a jsonl file by byte offset (not `BufReader::lines`, which stops at
+/// EOF): each poll reads from the last offset to EOF and splits off complete
+/// `\n`-terminated lines, holding any trailing partial until the writer appends
+/// its newline. Opens the file lazily, so it can wait for one not yet created.
+struct LineTail {
+    path: PathBuf,
+    file: Option<tokio::fs::File>,
+    pos: u64,
+    buf: Vec<u8>,
+}
+
+impl LineTail {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            pos: 0,
+            buf: Vec::new(),
+        }
+    }
+
+    fn exists(&self) -> bool {
+        self.file.is_some()
+    }
+
+    /// Every complete line appended since the last poll (without its `\n`).
+    async fn poll(&mut self) -> Vec<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        if self.file.is_none() {
+            self.file = tokio::fs::File::open(&self.path).await.ok();
+        }
+        let Some(f) = self.file.as_mut() else {
+            return Vec::new();
+        };
+        let mut chunk = Vec::new();
+        if f.seek(std::io::SeekFrom::Start(self.pos)).await.is_ok() {
+            if let Ok(read) = f.read_to_end(&mut chunk).await {
+                self.pos += read as u64;
+                self.buf.extend_from_slice(&chunk);
+            }
+        }
+        let mut lines = Vec::new();
+        while let Some(nl) = self.buf.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
+            line.pop();
+            lines.push(line);
+        }
+        lines
+    }
+}
+
+/// The wire frame for journal line `seq`.
+///
+/// The seq accounting is the worker's: seq = line index, so every line yields a
+/// frame and there is never a gap the client would treat as fatal. The worker's
+/// own replay (`read_journal_slice`) refuses a journal with a malformed record
+/// outright — this bridge instead forwards what it can, because a finished or
+/// foreign journal is exactly where a record from a newer (or older) build turns
+/// up:
+/// - a known event → `ServerMsg::Event`, as the worker would send it;
+/// - valid JSON that isn't a known `UiEventMsg` (a newer variant) → the same
+///   envelope around the raw value, for the client to skip by seq;
+/// - not JSON at all → a `Notice` saying so, keeping the seq.
+fn event_frame(seq: u64, line: &[u8]) -> String {
+    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    if let Ok(event) = serde_json::from_slice::<UiEventMsg>(line) {
+        return encode_line(&ServerMsg::Event { seq, event })
+            .trim_end()
+            .to_string();
+    }
+    match serde_json::from_slice::<serde_json::Value>(line) {
+        Ok(raw) => serde_json::json!({ "event": { "seq": seq, "event": raw } }).to_string(),
+        Err(_) => encode_line(&ServerMsg::Event {
+            seq,
+            event: UiEventMsg::Notice("(unreadable journal line)".into()),
+        })
+        .trim_end()
+        .to_string(),
+    }
 }
 
 /// Watch a subagent: resolve the parent's root, then stream the child's journal at
-/// `<root>/.cowboy/sessions/<sub>/events.jsonl`. Follow it live while the parent
-/// is running; replay once (read-only) if the parent has finished.
+/// `<root>/.cowboy/sessions/<sub>/events.jsonl` from `since_seq`.
 async fn subagent_ws_handler(
     State(state): State<Arc<AppState>>,
     Path((parent, sub)): Path<(String, String)>,
@@ -526,7 +698,7 @@ async fn subagent_ws_handler(
     if !authed(&state, &headers, q.token.as_deref()) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Some((root, live)) = (state.resolve_root)(parent).await else {
+    let Some(parent_info) = (state.session)(parent.clone()).await else {
         return (StatusCode::NOT_FOUND, "no such session").into_response();
     };
     // Subagent ids are opaque session ids (no slashes/`..`); reject anything that
@@ -534,103 +706,146 @@ async fn subagent_ws_handler(
     if sub.is_empty() || sub.contains('/') || sub.contains("..") {
         return (StatusCode::BAD_REQUEST, "bad subagent id").into_response();
     }
-    let journal = root
+    let journal = parent_info
+        .root
         .join(".cowboy")
         .join("sessions")
         .join(&sub)
         .join("events.jsonl");
-    ws.on_upgrade(move |socket| stream_journal(socket, journal, live, "subagent ended".into()))
+    let since = q.since_seq;
+    ws.on_upgrade(move |socket| async move {
+        let (mut tx, mut rx) = socket.split();
+        watch_subagent(
+            &mut tx,
+            &mut rx,
+            &state,
+            parent,
+            parent_info,
+            sub,
+            journal,
+            since,
+        )
+        .await;
+        let _ = tx.close().await;
+    })
 }
 
-/// Stream a journal file to the browser as `Event`s then a final `Ended`. With
-/// `follow`, tail the file as it grows (for a live subagent) until the subagent's
-/// `Final` event arrives or it goes idle; without it, read once and end (replay).
+/// How often a tail re-reads its file.
+const TAIL_POLL: std::time::Duration = std::time::Duration::from_millis(200);
+/// How often a subagent watch re-asks the daemon whether the parent is live and
+/// re-reads the parent's journal for the subagent's completion.
+const PARENT_RECHECK: std::time::Duration = std::time::Duration::from_secs(1);
+/// Once the watch has decided to end, keep draining until the child's journal
+/// has been quiet this long — the last records can land just after the parent
+/// reports the job done.
+const DRAIN_QUIET: std::time::Duration = std::time::Duration::from_millis(600);
+
+/// Stream a subagent's journal as `Event`s (from `since`), then `Ended`.
 ///
-/// Tails by byte offset (not `BufReader::lines`, which stops at EOF): each poll
-/// reads from the last offset to EOF and splits off complete `\n`-terminated
-/// lines, holding any trailing partial until the writer appends its newline.
-async fn stream_journal(
-    mut ws: WebSocket,
-    journal_path: PathBuf,
-    follow: bool,
-    end_reason: String,
+/// Mirrors the TUI's watch (`poll_subagent_journal`): it tails with no idle
+/// timeout and no `Final` cutoff — a subagent can say `Final` and still be
+/// granted more turns, and a slow model can be quiet for many minutes. What
+/// bounds it instead is the **parent**: the watch ends, after draining the file,
+/// once the parent session is terminal or gone, or once the parent's journal
+/// reports this subagent done. A pending subagent (file not created yet) is
+/// waited for on the same terms. A browser that goes away ends it immediately.
+#[allow(clippy::too_many_arguments)]
+async fn watch_subagent(
+    tx: &mut WsTx,
+    rx: &mut WsRx,
+    state: &AppState,
+    parent: String,
+    parent_info: SessionInfo,
+    sub: String,
+    journal: PathBuf,
+    since: Option<u64>,
 ) {
-    use std::time::{Duration, Instant};
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-    /// Give up following a quiet journal after this long (the subagent likely died
-    /// without a `Final`). Long enough not to cut off a slow-but-working subagent.
-    const IDLE_GIVE_UP: Duration = Duration::from_secs(300);
-    const POLL: Duration = Duration::from_millis(200);
-
-    // The child may not have created the file yet; wait briefly when following.
-    let mut file = None;
-    for _ in 0..(if follow { 50 } else { 1 }) {
-        if let Ok(f) = tokio::fs::File::open(&journal_path).await {
-            file = Some(f);
-            break;
-        }
-        if !follow {
-            break;
-        }
-        tokio::time::sleep(POLL).await;
-    }
-
+    use std::time::Instant;
+    let since = since.unwrap_or(0);
+    let mut child = LineTail::new(journal);
     let mut seq = 0u64;
-    let mut done = false;
-    if let Some(mut f) = file {
-        let mut pos: u64 = 0;
-        let mut buf: Vec<u8> = Vec::new();
-        let mut last_activity = Instant::now();
-        loop {
-            let mut chunk = Vec::new();
-            if f.seek(std::io::SeekFrom::Start(pos)).await.is_ok() {
-                if let Ok(read) = f.read_to_end(&mut chunk).await {
-                    if read > 0 {
-                        pos += read as u64;
-                        last_activity = Instant::now();
-                        buf.extend_from_slice(&chunk);
-                    }
+    let mut parent_live = !parent_info.status.is_terminal();
+    let mut parent_journal = parent_info.journal_path.map(LineTail::new);
+    let mut sub_done = false;
+    let mut last_check = Instant::now();
+    let mut quiet_since = Instant::now();
+
+    loop {
+        let lines = child.poll().await;
+        if !lines.is_empty() {
+            quiet_since = Instant::now();
+        }
+        for line in lines {
+            if seq >= since && !send_text(tx, event_frame(seq, &line)).await {
+                return;
+            }
+            seq += 1;
+        }
+
+        // Scan the parent's journal every tick (cheap: incremental), so a done
+        // report is noticed promptly; re-ask the daemon about liveness less often.
+        if let Some(pj) = parent_journal.as_mut() {
+            for line in pj.poll().await {
+                if reports_done(&line, &sub) {
+                    sub_done = true;
                 }
             }
-            // Emit every complete line currently buffered.
-            while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
-                let line: Vec<u8> = buf.drain(..=nl).collect();
-                if let Ok(s) = std::str::from_utf8(&line[..line.len() - 1]) {
-                    if let Ok(event) = serde_json::from_str::<UiEventMsg>(s.trim_end()) {
-                        if matches!(event, UiEventMsg::Final(_)) {
-                            done = true;
-                        }
-                        let frame = encode_line(&ServerMsg::Event { seq, event });
-                        if ws
-                            .send(Message::Text(frame.trim_end().to_string().into()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                }
-                seq += 1;
-                if done {
-                    break;
-                }
-            }
-            if done || !follow || last_activity.elapsed() > IDLE_GIVE_UP {
-                break;
-            }
-            tokio::time::sleep(POLL).await;
+        }
+        if parent_live && last_check.elapsed() >= PARENT_RECHECK {
+            last_check = Instant::now();
+            parent_live = (state.session)(parent.clone())
+                .await
+                .is_some_and(|info| !info.status.is_terminal());
+        }
+
+        let ending = !parent_live || sub_done;
+        if ending && quiet_since.elapsed() >= DRAIN_QUIET {
+            break;
+        }
+        if browser_left_within(rx, TAIL_POLL).await {
+            return;
         }
     }
 
-    let _ = ws
-        .send(Message::Text(
-            encode_line(&ServerMsg::Ended { reason: end_reason })
-                .trim_end()
-                .to_string()
-                .into(),
-        ))
-        .await;
-    let _ = ws.close().await;
+    let reason = if child.exists() {
+        "subagent ended"
+    } else {
+        "subagent never started"
+    };
+    let _ = send_msg(
+        tx,
+        &ServerMsg::Ended {
+            reason: reason.into(),
+        },
+    )
+    .await;
+}
+
+/// Does this parent-journal line report subagent `sub` finished?
+fn reports_done(line: &[u8], sub: &str) -> bool {
+    match serde_json::from_slice::<UiEventMsg>(line) {
+        Ok(UiEventMsg::SubagentDone { id, .. }) => id == sub,
+        Ok(UiEventMsg::JobsChanged(jobs)) => jobs
+            .iter()
+            .any(|j| j.id == sub && matches!(j.state.as_str(), "done" | "failed")),
+        _ => false,
+    }
+}
+
+/// Wait `dur`, watching the browser side: `true` if it closed (or errored) in
+/// the meantime. Anything it sends while there is nothing to relay to is dropped.
+async fn browser_left_within(rx: &mut WsRx, dur: std::time::Duration) -> bool {
+    let sleep = tokio::time::sleep(dur);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            msg = rx.next() => match msg {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return true,
+                Some(Ok(_)) => continue,
+            },
+        }
+    }
 }
 
 fn status_word(s: &SessionStatus) -> &'static str {
@@ -642,15 +857,74 @@ fn status_word(s: &SessionStatus) -> &'static str {
     }
 }
 
-/// Relay between a browser WebSocket and a session's worker unix socket: every
-/// worker line becomes a WS text frame; every (well-formed) WS frame becomes a
-/// `ClientMsg` line to the worker.
-async fn bridge(ws: WebSocket, worker_sock: PathBuf, since_seq: Option<u64>) {
-    let stream = match crate::localsock::connect(&worker_sock).await {
-        Ok(s) => s,
-        Err(e) => {
-            ended(ws, &format!("worker unreachable: {e}")).await;
-            return;
+/// How long `bridge` keeps re-resolving a session whose registry record still
+/// says live but whose worker socket refuses connections, before closing the
+/// socket (without `Ended`) for the client to retry.
+const UNREACHABLE_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+const UNREACHABLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Relay between a browser WebSocket and a session's worker unix socket.
+///
+/// A worker socket that refuses connections is not, by itself, the end of the
+/// session: a worker that has just finished removes its socket *before* the
+/// daemon records the terminal status, and a restart can move it. So instead of
+/// reporting a permanent `Ended`, re-resolve through the daemon: a session that
+/// is now terminal is replayed from its journal (honouring `since_seq`), and one
+/// still registered live is waited on (following a changed socket path) for
+/// [`UNREACHABLE_WAIT`], after which the connection closes *without* `Ended`, so
+/// the client reconnects with backoff. `Ended` is sent only when the daemon has
+/// nothing to show — no record, or a terminal one with no journal.
+async fn bridge(
+    ws: WebSocket,
+    state: Arc<AppState>,
+    id: String,
+    worker_sock: PathBuf,
+    since_seq: Option<u64>,
+) {
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut sock = worker_sock;
+    let deadline = tokio::time::Instant::now() + UNREACHABLE_WAIT;
+    let stream = loop {
+        let err = match crate::localsock::connect(&sock).await {
+            Ok(s) => break s,
+            Err(e) => e,
+        };
+        match (state.session)(id.clone()).await {
+            None => {
+                ended(&mut ws_tx, &format!("worker unreachable: {err}")).await;
+                return;
+            }
+            Some(info) if info.status.is_terminal() => {
+                match info.journal_path.clone() {
+                    Some(journal) if journal.exists() => {
+                        let status = info.status;
+                        replay(
+                            &mut ws_tx,
+                            journal,
+                            replay_info(Some(info), &id, status),
+                            since_seq,
+                        )
+                        .await;
+                    }
+                    _ => {
+                        let reason = format!("session {}", status_word(&info.status));
+                        ended(&mut ws_tx, &reason).await;
+                    }
+                }
+                let _ = ws_tx.close().await;
+                return;
+            }
+            Some(info) => {
+                if let Some(s) = info.worker_sock {
+                    sock = s;
+                }
+                if tokio::time::Instant::now() >= deadline
+                    || browser_left_within(&mut ws_rx, UNREACHABLE_POLL).await
+                {
+                    let _ = ws_tx.close().await;
+                    return;
+                }
+            }
         }
     };
     let (sock_r, mut sock_w) = stream.into_split();
@@ -664,7 +938,6 @@ async fn bridge(ws: WebSocket, worker_sock: PathBuf, since_seq: Option<u64>) {
         return;
     }
 
-    let (mut ws_tx, mut ws_rx) = ws.split();
     let mut sock_lines = BufReader::new(sock_r).lines();
 
     // worker → browser
@@ -709,15 +982,16 @@ async fn bridge(ws: WebSocket, worker_sock: PathBuf, since_seq: Option<u64>) {
     }
 }
 
-/// Send a single `Ended` frame and close (used when we can't reach the worker).
-async fn ended(mut ws: WebSocket, reason: &str) {
-    let line = encode_line(&ServerMsg::Ended {
-        reason: reason.to_string(),
-    });
-    let _ = ws
-        .send(Message::Text(line.trim_end().to_string().into()))
-        .await;
-    let _ = ws.close().await;
+/// Send a single `Ended` frame and close (used when there is nothing to show).
+async fn ended(tx: &mut WsTx, reason: &str) {
+    let _ = send_msg(
+        tx,
+        &ServerMsg::Ended {
+            reason: reason.to_string(),
+        },
+    )
+    .await;
+    let _ = tx.close().await;
 }
 
 const INDEX_PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8>\
@@ -785,7 +1059,7 @@ mod tests {
         let state = Arc::new(AppState {
             token: "t".into(),
             resolve: Arc::new(|_| Box::pin(async { None })),
-            resolve_root: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(|_| Box::pin(async { None })),
         });
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
@@ -968,7 +1242,7 @@ mod tests {
                 let ws = ws.clone();
                 Box::pin(async move { Some(AttachTarget::Live { worker_sock: ws }) })
             }),
-            resolve_root: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(|_| Box::pin(async { None })),
         });
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
@@ -1006,7 +1280,7 @@ mod tests {
         let state = Arc::new(AppState {
             token: "t".into(),
             resolve: Arc::new(|_| Box::pin(async { None })),
-            resolve_root: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(|_| Box::pin(async { None })),
         });
         let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = tcp.local_addr().unwrap().port();
@@ -1020,12 +1294,265 @@ mod tests {
         );
     }
 
+    /// Mount the router on an ephemeral port; returns the port.
+    async fn serve_test(state: AppState) -> u16 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(tcp, router(Arc::new(state))).await.unwrap();
+        });
+        port
+    }
+
+    /// Read every frame (as raw JSON, since an unknown event is not a
+    /// `ServerMsg`) until the server closes, with an overall timeout.
+    async fn frames(url: &str) -> Vec<serde_json::Value> {
+        let (mut sock, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while let Some(Ok(frame)) = sock.next().await {
+                if let Ok(text) = frame.into_text() {
+                    if !text.is_empty() {
+                        out.push(serde_json::from_str(&text).unwrap());
+                    }
+                }
+            }
+        })
+        .await
+        .expect("server closed the socket");
+        out
+    }
+
+    fn line(event: &UiEventMsg) -> String {
+        serde_json::to_string(event).unwrap() + "\n"
+    }
+
+    fn seqs(frames: &[serde_json::Value]) -> Vec<u64> {
+        frames
+            .iter()
+            .filter_map(|f| f["event"]["seq"].as_u64())
+            .collect()
+    }
+
+    #[test]
+    fn journal_lines_always_yield_a_frame_at_their_seq() {
+        let known: serde_json::Value =
+            serde_json::from_str(&event_frame(3, br#"{"notice":"hi"}"#)).unwrap();
+        assert_eq!(
+            known,
+            serde_json::json!({"event":{"seq":3,"event":{"notice":"hi"}}})
+        );
+        // A newer build's variant: forwarded raw, for the client to skip by seq.
+        let unknown: serde_json::Value =
+            serde_json::from_str(&event_frame(4, br#"{"from_the_future":{"x":1}}"#)).unwrap();
+        assert_eq!(
+            unknown,
+            serde_json::json!({"event":{"seq":4,"event":{"from_the_future":{"x":1}}}})
+        );
+        // Not JSON: a notice, still at its seq.
+        let garbage: ServerMsg = serde_json::from_str(&event_frame(5, b"not json{")).unwrap();
+        assert_eq!(
+            garbage,
+            ServerMsg::Event {
+                seq: 5,
+                event: UiEventMsg::Notice("(unreadable journal line)".into())
+            }
+        );
+    }
+
+    /// A finished session: Snapshot (daemon record, terminal status, full
+    /// journal_len), then events from `since_seq` with no seq gaps even across
+    /// unparseable lines, then Ended.
+    #[tokio::test]
+    async fn replay_sends_snapshot_and_resumes_at_since_seq() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let journal = tmp.path().join("events.jsonl");
+        let body = [
+            line(&UiEventMsg::Notice("zero".into())),
+            line(&UiEventMsg::Notice("one".into())),
+            "{\"from_the_future\":1}\n".to_string(),
+            "garbage\n".to_string(),
+            line(&UiEventMsg::Final("four".into())),
+            "{\"torn".to_string(), // no newline: not committed
+        ]
+        .concat();
+        std::fs::write(&journal, body).unwrap();
+
+        let jp = journal.clone();
+        let port = serve_test(AppState {
+            token: "t".into(),
+            resolve: Arc::new(move |_| {
+                let journal_path = jp.clone();
+                Box::pin(async move {
+                    Some(AttachTarget::Replay {
+                        journal_path,
+                        status: SessionStatus::Completed,
+                    })
+                })
+            }),
+            session: Arc::new(|id| {
+                Box::pin(async move {
+                    let mut info = replay_info(None, &id, SessionStatus::Running);
+                    info.task = Some("the task".into());
+                    info.tokens = (7, 8);
+                    Some(info)
+                })
+            }),
+        })
+        .await;
+
+        let got = frames(&format!(
+            "ws://127.0.0.1:{port}/api/session/s1/ws?token=t&since_seq=1"
+        ))
+        .await;
+        let snap: ServerMsg = serde_json::from_value(got[0].clone()).unwrap();
+        match snap {
+            ServerMsg::Snapshot {
+                info,
+                journal_len,
+                pending_prompts,
+            } => {
+                assert_eq!(journal_len, 5);
+                assert_eq!(info.status, SessionStatus::Completed);
+                assert_eq!(info.task.as_deref(), Some("the task"));
+                assert_eq!(info.tokens, (7, 8));
+                assert!(pending_prompts.is_empty());
+            }
+            other => panic!("expected Snapshot first, got {other:?}"),
+        }
+        assert_eq!(seqs(&got), vec![1, 2, 3, 4], "from since_seq, no gaps");
+        assert_eq!(
+            got[2]["event"]["event"],
+            serde_json::json!({"from_the_future":1})
+        );
+        assert!(got.last().unwrap().get("ended").is_some(), "{got:?}");
+    }
+
+    /// A worker socket that is gone is re-resolved: the session is now terminal,
+    /// so the browser gets the replay (from since_seq), not "worker unreachable".
+    #[tokio::test]
+    async fn bridge_falls_back_to_replay_when_the_worker_is_gone() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let journal = tmp.path().join("events.jsonl");
+        std::fs::write(
+            &journal,
+            [
+                line(&UiEventMsg::Notice("a".into())),
+                line(&UiEventMsg::Notice("b".into())),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let dead_sock = tmp.path().join("gone.sock");
+        let jp = journal.clone();
+        let port = serve_test(AppState {
+            token: "t".into(),
+            resolve: Arc::new(move |_| {
+                let worker_sock = dead_sock.clone();
+                Box::pin(async move { Some(AttachTarget::Live { worker_sock }) })
+            }),
+            session: Arc::new(move |id| {
+                let jp = jp.clone();
+                Box::pin(async move {
+                    let mut info = replay_info(None, &id, SessionStatus::Failed);
+                    info.journal_path = Some(jp);
+                    Some(info)
+                })
+            }),
+        })
+        .await;
+
+        let got = frames(&format!(
+            "ws://127.0.0.1:{port}/api/session/s1/ws?token=t&since_seq=1"
+        ))
+        .await;
+        assert!(got[0].get("snapshot").is_some(), "{got:?}");
+        assert_eq!(seqs(&got), vec![1]);
+        let end: ServerMsg = serde_json::from_value(got.last().unwrap().clone()).unwrap();
+        assert_eq!(
+            end,
+            ServerMsg::Ended {
+                reason: "session failed".into()
+            }
+        );
+    }
+
+    /// A subagent watch waits for a not-yet-created journal, keeps tailing past
+    /// `Final`, honours since_seq, and ends only once the parent is terminal and
+    /// the file is drained.
+    #[tokio::test]
+    async fn subagent_watch_follows_past_final_until_the_parent_ends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let dir = root.join(".cowboy/sessions/sub1");
+        let parent_live = Arc::new(AtomicBool::new(true));
+        let live = parent_live.clone();
+        let r = root.clone();
+        let port = serve_test(AppState {
+            token: "t".into(),
+            resolve: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(move |id| {
+                let status = if live.load(Ordering::SeqCst) {
+                    SessionStatus::Running
+                } else {
+                    SessionStatus::Completed
+                };
+                let mut info = replay_info(None, &id, status);
+                info.root = r.clone();
+                Box::pin(async move { Some(info) })
+            }),
+        })
+        .await;
+
+        let url = format!("ws://127.0.0.1:{port}/api/subagent/p1/sub1/ws?token=t&since_seq=1");
+        let reader = tokio::spawn(async move { frames(&url).await });
+
+        // Pending: the journal appears a while after the watch starts.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.jsonl");
+        std::fs::write(
+            &path,
+            [
+                line(&UiEventMsg::Notice("0".into())),
+                line(&UiEventMsg::Final("first answer".into())),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        // More work after Final (a granted extra turn).
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(line(&UiEventMsg::Notice("2".into())).as_bytes())
+                .unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !reader.is_finished(),
+            "still following while the parent is live"
+        );
+        parent_live.store(false, Ordering::SeqCst);
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+            .await
+            .expect("watch ends once the parent is terminal")
+            .unwrap();
+        assert_eq!(seqs(&got), vec![1, 2], "{got:?}");
+        assert!(got.last().unwrap().get("ended").is_some(), "{got:?}");
+    }
+
     #[test]
     fn auth_accepts_header_or_query_constant_time() {
         let state = AppState {
             token: "secret-token".into(),
             resolve: Arc::new(|_| Box::pin(async { None })),
-            resolve_root: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(|_| Box::pin(async { None })),
         };
         let mut h = HeaderMap::new();
         // no creds

@@ -2,11 +2,13 @@
 //!
 //! `project`/`global`-scoped approvals from the TUI are saved here and merged
 //! into the network policy at session start, so the gateway allows them in
-//! future sessions. We keep this separate from `security.yaml` so we never
-//! rewrite the user's commented host config.
+//! future sessions. A project approval is saved for that project alone; a global
+//! one goes to a single host-wide file that every project's load also reads. We
+//! keep this separate from `security.yaml` so we never rewrite the user's
+//! commented host config.
 //!
 //! SECURITY: these are stored **host-side**, under `~/.config/cowboy/approvals/`
-//! (keyed by project), NOT inside the project workspace. The workspace is
+//! (one file per project, plus `global.json`), NOT inside the project workspace. The workspace is
 //! bind-mounted read-write into the agent container, so an approvals file there
 //! would let a malicious model/repo widen its own network allow-list by writing
 //! the file — the agent must never be able to grant itself egress.
@@ -65,7 +67,14 @@ fn file_in(dir: &Path, root: &Path) -> PathBuf {
     ))
 }
 
-/// Load persisted approvals (empty if none).
+/// The host-wide approvals file within `dir`, for `global` scope. A project file is
+/// named by a hex hash, so this name cannot collide with one.
+fn global_file_in(dir: &Path) -> PathBuf {
+    dir.join("global.json")
+}
+
+/// Load the approvals in force for a project: its own plus the host-wide ones
+/// (empty if none).
 ///
 /// A store directory we cannot verify as our own yields **no** approvals rather than
 /// whatever it happens to contain: this list decides what the agent may reach.
@@ -109,19 +118,41 @@ fn readable(dir: &Path) -> bool {
     true
 }
 
-/// Append an approval derived from an attempt, de-duplicating.
+/// Append a project-scoped approval derived from an attempt, de-duplicating.
 pub fn append(root: &Path, attempt: &NetworkAttempt) -> std::io::Result<()> {
     append_in(&approvals_dir(), root, attempt)
 }
 
+/// Append a host-wide (`global`-scoped) approval, de-duplicating. It applies to every
+/// project on this host from the next session on.
+pub fn append_global(attempt: &NetworkAttempt) -> std::io::Result<()> {
+    let dir = approvals_dir();
+    append_to(&dir, &global_file_in(&dir), attempt)
+}
+
 fn load_in(dir: &Path, root: &Path) -> Vec<Approval> {
-    std::fs::read_to_string(file_in(dir, root))
+    let mut all = read_file(&file_in(dir, root));
+    for a in read_file(&global_file_in(dir)) {
+        if !all.contains(&a) {
+            all.push(a);
+        }
+    }
+    all
+}
+
+fn read_file(path: &Path) -> Vec<Approval> {
+    std::fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
 fn append_in(dir: &Path, root: &Path, attempt: &NetworkAttempt) -> std::io::Result<()> {
+    append_to(dir, &file_in(dir, root), attempt)
+}
+
+/// Add an approval to one approvals `file` inside the verified store `dir`.
+fn append_to(dir: &Path, file: &Path, attempt: &NetworkAttempt) -> std::io::Result<()> {
     // Creates it 0700 and refuses one owned by anyone else, rather than writing the
     // egress allow-list into a directory another user can rewrite.
     store_dir(dir)?;
@@ -134,7 +165,7 @@ fn append_in(dir: &Path, root: &Path, attempt: &NetworkAttempt) -> std::io::Resu
     // dropped by the rewrite.
     let _lock = lock(&dir.join(".lock"))?;
 
-    let mut all = load_in(dir, root);
+    let mut all = read_file(file);
     let entry = Approval {
         host: attempt.host.clone(),
         cidr: attempt
@@ -146,7 +177,7 @@ fn append_in(dir: &Path, root: &Path, attempt: &NetworkAttempt) -> std::io::Resu
     };
     if !all.contains(&entry) {
         all.push(entry);
-        write_private(&file_in(dir, root), &serde_json::to_string_pretty(&all)?)?;
+        write_private(file, &serde_json::to_string_pretty(&all)?)?;
     }
     Ok(())
 }
@@ -284,6 +315,42 @@ mod tests {
         for h in &hosts {
             assert!(saved.contains(h), "approval for {h} was lost: {saved:?}");
         }
+    }
+
+    /// Project scope stays with its project; global scope reaches every project, and
+    /// is kept in its own owner-only file rather than in whichever project asked.
+    /// Both used to write the asking project's file, so "global" meant "project".
+    #[test]
+    fn global_approvals_apply_to_every_project_and_project_ones_do_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let cfg = assert_fs::TempDir::new().unwrap();
+        let (a, b) = (
+            assert_fs::TempDir::new().unwrap(),
+            assert_fs::TempDir::new().unwrap(),
+        );
+        append_in(cfg.path(), a.path(), &attempt("project.test")).unwrap();
+        let global = global_file_in(cfg.path());
+        append_to(cfg.path(), &global, &attempt("global.test")).unwrap();
+        append_to(cfg.path(), &global, &attempt("global.test")).unwrap(); // dedup
+
+        let hosts = |root: &Path| -> Vec<String> {
+            load_in(cfg.path(), root)
+                .into_iter()
+                .filter_map(|a| a.host)
+                .collect()
+        };
+        assert_eq!(hosts(a.path()), ["project.test", "global.test"]);
+        assert_eq!(hosts(b.path()), ["global.test"]);
+        assert!(
+            !read_file(&file_in(cfg.path(), a.path()))
+                .iter()
+                .any(|a| a.host.as_deref() == Some("global.test")),
+            "a global approval must not be written into the asking project's file"
+        );
+        assert_eq!(
+            std::fs::metadata(&global).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn attempt(host: &str) -> NetworkAttempt {

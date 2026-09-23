@@ -81,6 +81,14 @@ impl Bind {
 pub struct LandlockRules {
     pub read_only: Vec<PathBuf>,
     pub read_write: Vec<PathBuf>,
+    /// Directories that may be opened and listed, and nothing more (`ReadDir`,
+    /// no file reads). Just the sandbox root: without it `/` and the skeleton
+    /// directories bwrap creates to hold bind targets (`/etc`, `/home`, …) can't be
+    /// opened at all, which breaks code that resolves paths from a root dirfd
+    /// (`open("/", O_RDONLY)` then `openat`). Widens nothing: the root is a fresh
+    /// tmpfs holding only what the plan binds, hidden paths are never bound or are
+    /// masked by an overmount, and every bind already carries `ReadDir`.
+    pub list_dirs: Vec<PathBuf>,
     /// Scope the domain against signalling and abstract-socket-connecting outside
     /// it (Landlock ABI 6). Hardening only: no trust boundary depends on it.
     pub scope_ipc: bool,
@@ -401,7 +409,23 @@ pub struct PlanInputs<'a> {
     /// persistent (under the user's cache dir), so caches survive between sessions —
     /// unlike `scratch`, which is reaped with the session.
     pub agent_home: &'a Path,
+    /// A host-written git config carrying the user's identity (`user.name`,
+    /// `user.email` from their global config), bound read-only at
+    /// [`GIT_IDENTITY_AT`] and used as git's *system* config. `None` when the host
+    /// has no identity to lend.
+    pub git_identity: Option<&'a Path>,
 }
+
+/// Where [`PlanInputs::git_identity`] is bound, and what `GIT_CONFIG_SYSTEM` names.
+///
+/// System scope is the lowest precedence git has, which is the point: the agent's
+/// `HOME` is its own directory, so the user's `~/.gitconfig` is never visible and
+/// commits fell back to the account name for uid 0 ("Super User") — while a repo's
+/// own `user.email` still applied, giving a commit half-attributed to you. As a
+/// system default the user's identity fills that gap, and a repo's own
+/// `user.name`/`user.email` or the agent's `git config --global` still win. The file
+/// includes the host's `/etc/gitconfig` so replacing the system file loses nothing.
+pub const GIT_IDENTITY_AT: &str = "/etc/cowboy/gitconfig";
 
 /// Where the sandbox's scratch filesystems are rooted inside `scratch`, and the
 /// targets they are bound at.
@@ -685,6 +709,16 @@ impl SandboxPlan {
             ));
         }
 
+        // 7b. The user's git identity, as git's system config (see GIT_IDENTITY_AT).
+        if let Some(identity) = inputs.git_identity {
+            binds.push(Bind::ro(
+                identity.to_path_buf(),
+                GIT_IDENTITY_AT.to_string(),
+                "your git identity (user.name/user.email only)",
+            ));
+            tool_env.push(("GIT_CONFIG_SYSTEM".to_string(), GIT_IDENTITY_AT.to_string()));
+        }
+
         // 8. Mask host-owned config LAST. It lives under the project directory, so
         //    it is inside a bind the agent can otherwise read; an empty read-only
         //    file over it means the agent cannot learn its own boundary.
@@ -781,6 +815,9 @@ impl SandboxPlan {
             self.landlock.read_only.len(),
             self.landlock.read_write.len()
         ));
+        for d in &self.landlock.list_dirs {
+            s.push_str(&format!("  list-only: {}\n", d.display()));
+        }
         s.push_str("  network: not gated here (port-only rules cannot express it)\n");
         s.push_str(&format!("  ipc scoping: {}\n", self.landlock.scope_ipc));
 
@@ -877,6 +914,7 @@ fn landlock_for(
     LandlockRules {
         read_only,
         read_write,
+        list_dirs: vec![PathBuf::from("/")],
         scope_ipc: true,
     }
 }
@@ -1079,6 +1117,7 @@ mod tests {
             relay_port: 8443,
             scratch: Path::new("/scratch"),
             agent_home: Path::new("/cache/cowboy/home/proj"),
+            git_identity: None,
         }
     }
 

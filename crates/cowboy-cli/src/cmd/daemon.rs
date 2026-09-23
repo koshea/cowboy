@@ -14,7 +14,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
     AttachTarget, BusMessage, DaemonReq, DaemonRequest, DaemonResp, DaemonResponse, LeaseMode,
-    MsgTarget, SessionId, SessionInfo, SessionStatus,
+    MsgTarget, SessionId, SessionInfo, SessionStatus, UiEventMsg,
 };
 use cowboy_core::netproto::encode_line;
 use serde::{Deserialize, Serialize};
@@ -193,11 +193,42 @@ fn load_state(path: &Path) -> State {
     }
 }
 
+/// How far into a journal [`journal_topic`] looks for the first user message.
+/// It is almost always line 1; the bound keeps a huge journal from stalling startup.
+const TOPIC_SCAN_LINES: usize = 500;
+
+/// Give task-less sessions recorded before workers reported a topic a title
+/// from their journal, so the history isn't a wall of "(no task)".
+fn backfill_topics(state: &mut State) {
+    for s in state.sessions.values_mut() {
+        if s.task.is_none() {
+            s.task = s.journal_path.as_deref().and_then(journal_topic);
+        }
+    }
+}
+
+/// The topic of a journaled session: its first real user message.
+fn journal_topic(path: &Path) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    std::io::BufReader::new(file)
+        .lines()
+        .take(TOPIC_SCAN_LINES)
+        .map_while(Result::ok)
+        .filter_map(|line| match serde_json::from_str(&line) {
+            Ok(UiEventMsg::UserMessage(m)) => crate::agent::socket_ui::session_topic(&m),
+            _ => None,
+        })
+        .next()
+}
+
 impl Daemon {
     /// Load the registry from disk.
     fn load(state_path: PathBuf) -> Self {
+        let mut state = load_state(&state_path);
+        backfill_topics(&mut state);
         Self {
-            state: load_state(&state_path),
+            state,
             store: Arc::new(StateStore::new(state_path)),
             next_seq: 0,
             coordinating: std::collections::HashMap::new(),
@@ -1177,6 +1208,7 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
             running_command,
             branch,
             blocked_reason,
+            topic,
         } => {
             let mut d = daemon.lock().await;
             match d.state.sessions.get_mut(&id) {
@@ -1191,6 +1223,9 @@ async fn dispatch(req: DaemonReq, daemon: &Arc<Mutex<Daemon>>) -> DaemonResp {
                     s.blocked_reason = blocked_reason;
                     if branch.is_some() {
                         s.branch = branch;
+                    }
+                    if s.task.is_none() {
+                        s.task = topic;
                     }
                     s.last_heartbeat_ms = now_ms();
                     d.save();
@@ -2012,6 +2047,63 @@ mod tests {
 
     /// Register a session with a given status so its lease holder has known
     /// liveness.
+    /// A task-less session takes the worker's reported topic once — a later
+    /// report (a new first message after a daemon restart) never renames it.
+    #[tokio::test]
+    async fn update_adopts_a_topic_only_while_the_task_is_unset() {
+        let daemon = Arc::new(Mutex::new(daemon()));
+        put_session(&mut *daemon.lock().await, "s1", SessionStatus::Running);
+        let update = |topic: &str| DaemonReq::UpdateSession {
+            id: "s1".into(),
+            status: SessionStatus::Running,
+            turn: 0,
+            tokens: (0, 0),
+            diffstat: String::new(),
+            attached_clients: 0,
+            running_command: None,
+            branch: None,
+            blocked_reason: None,
+            topic: Some(topic.into()),
+        };
+        dispatch(update("fix the flaky test"), &daemon).await;
+        dispatch(update("something else"), &daemon).await;
+        let d = daemon.lock().await;
+        assert_eq!(
+            d.state.sessions["s1"].task.as_deref(),
+            Some("fix the flaky test")
+        );
+    }
+
+    /// Sessions recorded before topics were reported get one from their journal on
+    /// load; a slash command is skipped, and a session with a task keeps it.
+    #[test]
+    fn load_backfills_topics_from_journals() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let journal = tmp.path().join("events.jsonl");
+        std::fs::write(
+            &journal,
+            "\"model_done\"\n{\"user_message\":\"/plan\"}\n{\"user_message\":\"add  a\\nwidget\"}\n",
+        )
+        .unwrap();
+        let mut d = daemon();
+        put_session(&mut d, "old", SessionStatus::Completed);
+        put_session(&mut d, "tasked", SessionStatus::Completed);
+        put_session(&mut d, "lost", SessionStatus::Completed);
+        for id in ["old", "tasked"] {
+            d.state.sessions.get_mut(id).unwrap().journal_path = Some(journal.clone());
+        }
+        d.state.sessions.get_mut("tasked").unwrap().task = Some("given".into());
+        d.state.sessions.get_mut("lost").unwrap().journal_path = Some(tmp.path().join("gone"));
+
+        backfill_topics(&mut d.state);
+        assert_eq!(
+            d.state.sessions["old"].task.as_deref(),
+            Some("add a widget")
+        );
+        assert_eq!(d.state.sessions["tasked"].task.as_deref(), Some("given"));
+        assert_eq!(d.state.sessions["lost"].task, None);
+    }
+
     fn put_session(d: &mut Daemon, id: &str, status: SessionStatus) {
         d.state.sessions.insert(
             id.to_string(),

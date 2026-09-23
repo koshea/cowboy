@@ -40,9 +40,31 @@ pub trait Approver: Send + Sync {
     /// can say something more useful than the destination alone.
     async fn ask(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> Verdict;
 
+    /// As [`ask`](Self::ask), and also whether the answer may stand for the rest of
+    /// the session. The gateway reuses a remembered answer for later connections to
+    /// the same destination instead of asking again; one that is not remembered
+    /// (a user's "allow once") covers only the connection that asked.
+    ///
+    /// Defaults to remembering, which is what every answer used to do — and the safe
+    /// reading for a deny.
+    async fn answer(&self, attempt: &NetworkAttempt, reason: Option<&str>) -> Answer {
+        Answer {
+            verdict: self.ask(attempt, reason).await,
+            remember: true,
+        }
+    }
+
     /// Report a decision the policy made on its own, for logging and the activity
     /// view. Never blocks a connection.
     async fn event(&self, attempt: &NetworkAttempt, verdict: Verdict, reason: String);
+}
+
+/// A decision about one `ask`, and how long it stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Answer {
+    pub verdict: Verdict,
+    /// Reuse this answer for the rest of the session (see [`Approver::answer`]).
+    pub remember: bool,
 }
 
 /// An [`Approver`] that denies everything, for non-interactive runs.

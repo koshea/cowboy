@@ -52,10 +52,18 @@ $ cowboy sandbox plan
   agent resolves a command to the same binary you do. Set
   `sandbox.host_tools: false` for a sandbox that sees only system packages.
 - **The project, read-write**, at the workdir (`/workspace` by default).
+- **Your git identity** — only `user.name` and `user.email` from your global git
+  config, as git's lowest-precedence (system) config, so the agent's commits are
+  attributed to you. A repo's own identity still wins. Nothing else from
+  `~/.gitconfig` (credential helpers, URL rewrites, aliases) is exposed.
 - **Nothing else.** Other projects and the rest of the machine are simply absent.
   Your home directory is not *browsable*: only the directories named above are
-  exposed, and `~` itself cannot even be listed, so an unexposed path under it cannot
-  be discovered — `~/.local/share/uv` is reachable while `~/.local/share` is not.
+  exposed. `~` inside the sandbox is a skeleton that exists only to hold those
+  binds, so listing it (or `~/.local/share`, when `~/.local/share/uv` is bound)
+  shows just the exposed names — nothing else under your home exists in there to
+  be discovered or read. The root and these skeleton directories carry a
+  *list-only* Landlock right, so code that resolves paths from a `/` directory
+  handle works; it grants no file reads.
 - **The root filesystem is remounted read-only** as the last mount operation.
   Without it the synthetic root is writable, which would put `/etc/ld.so.preload`
   within reach.

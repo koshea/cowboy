@@ -379,6 +379,9 @@ pub enum CrewStatus {
     /// `Running` because nothing is happening: the worker is parked, and the reason it
     /// is parked is a decision someone has to make.
     Asking,
+    /// Parked on a question the foreman (not the user) has to answer. Not working and
+    /// not finished — and not the user's decision, so it raises no attention signal.
+    Waiting,
     Done,
     Failed,
 }
@@ -420,6 +423,9 @@ pub struct ApprovalView {
     pub note: Option<String>,
     /// The flat one-line summary, shown when there are no rows.
     pub summary: String,
+    /// The answer covers this request only — a credential grant, which is never
+    /// remembered — so the modal offers allow/deny instead of the scope legend.
+    pub once_only: bool,
 }
 
 /// What the live prompt costs, as last reported by the agent loop.
@@ -1165,6 +1171,7 @@ impl App {
                 CrewStatus::Pending => "queued",
                 CrewStatus::Running => "running",
                 CrewStatus::Asking => "waiting for your decision",
+                CrewStatus::Waiting => "asking the foreman a question",
                 CrewStatus::Done => "done",
                 CrewStatus::Failed => "failed",
             };
@@ -1186,7 +1193,10 @@ impl App {
             .filter(|m| {
                 matches!(
                     m.status,
-                    CrewStatus::Running | CrewStatus::Pending | CrewStatus::Asking
+                    CrewStatus::Running
+                        | CrewStatus::Pending
+                        | CrewStatus::Asking
+                        | CrewStatus::Waiting
                 )
             })
             .count();
@@ -1214,7 +1224,10 @@ impl App {
             .filter(|m| {
                 matches!(
                     m.status,
-                    CrewStatus::Running | CrewStatus::Pending | CrewStatus::Asking
+                    CrewStatus::Running
+                        | CrewStatus::Pending
+                        | CrewStatus::Asking
+                        | CrewStatus::Waiting
                 )
             })
             .count()
@@ -2099,6 +2112,7 @@ mod tests {
                 ],
                 note: Some("3 endpoints are already saved for this project".into()),
                 summary: String::new(),
+                once_only: false,
             }),
         );
         insta::assert_snapshot!(render(&app));
@@ -2119,6 +2133,7 @@ mod tests {
                 ],
                 note: Some("declared in this project's security.yaml".into()),
                 summary: String::new(),
+                once_only: true,
             }),
         );
         insta::assert_snapshot!(render(&app));
@@ -2143,6 +2158,7 @@ mod tests {
                 ],
                 note: Some("y ".repeat(400)),
                 summary: String::new(),
+                once_only: false,
             }),
         );
         let out = render(&app);
