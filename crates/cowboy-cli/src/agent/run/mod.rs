@@ -54,6 +54,15 @@ sandbox. Each `shell` call is a fresh process: `cd` and `export` do not carry to
 the next one — pass `cwd` or chain with `&&`. A server or watcher that never \
 exits must NOT be run in the foreground; start it with `proc` and test against it.
 
+Keep scratch work out of the repo. Throwaway files — probe or repro scripts, \
+captured output, notes, downloads, intermediate data — go under /tmp, which lasts \
+for this whole session (across `shell` calls) and is removed when it ends. Files \
+you leave in /workspace show up in `git status`, trip the project's linters and \
+guards, and risk being committed. Only put something in /workspace if it is part \
+of the change or the user asked for it there; if you did create a temporary file \
+in the repo, delete it before `final`. /tmp is private to you: a subagent has its \
+own, so anything it must read goes in the task text, the repo, or an `artifact`.
+
 Reusable skills are listed below when this project has any; read one with `cowboy \
 skill show <name>` before doing that kind of work and then follow it (skills are \
 discovered from `.cowboy/skills/` and `.claude/skills/`).
