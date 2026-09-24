@@ -1,7 +1,15 @@
 # Harnesses: delegating to other agent CLIs
 
-A **harness** is another vendor's coding agent — today **grok** (Grok Build) — that
-cowboy's crew can hand work to, in addition to the models cowboy's own loop runs.
+A **harness** is another vendor's coding agent that cowboy's crew can hand work to,
+in addition to the models cowboy's own loop runs:
+
+| `kind` | CLI | Login it uses |
+|---|---|---|
+| `grok` | xAI Grok Build (`grok`) | `~/.grok/auth.json` |
+| `claude` | Anthropic Claude Code (`claude`) | `~/.claude/.credentials.json` (+ account state from `~/.claude.json`) |
+| `codex` | OpenAI Codex CLI (`codex`) | `~/.codex/auth.json` |
+| `agy` | Google Antigravity (`agy`) | `~/.gemini/antigravity-cli/antigravity-oauth-token` |
+
 The point is to use your **subscription plans**, which only work inside the vendor's
 own CLI: route a kind of work to it (`exploration: grok`), or ask for it by name
 ("have grok review this PR").
@@ -18,6 +26,13 @@ harnesses:
   grok:
     kind: grok
     model: grok-4.7          # optional; the CLI's default otherwise
+  claude:
+    kind: claude
+  codex:
+    kind: codex
+  agy:
+    kind: agy
+  # every entry takes the same options:
     auth: auth_file          # default; or full_home (see below)
     stall_minutes: 10        # quiet this long → the foreman is told (never killed)
     allow_hosts: []          # extra hosts, on top of grok's own
@@ -25,8 +40,7 @@ harnesses:
 ```
 
 `cowboy harnesses` shows each one and whether it is ready (binary found, logged in);
-`cowboy doctor` checks the same. Log in with the vendor's own CLI on the host first
-(`grok login`).
+`cowboy doctor` checks the same. Log in with each vendor's own CLI on the host first.
 
 ## Use it
 
@@ -60,13 +74,16 @@ safe only because cowboy's kernel boundary is the one that holds.
   unconfined, so a writable mount would let the harness plant code outside the sandbox.
   The vendor homes (`~/.grok`, `~/.claude`, `~/.codex`, `~/.gemini`) are also on the
   denylist, so a runtime grant cannot expose them either.
-- **Your login.** With `auth: auth_file` (the default) the private home gets a copy of
-  the login file alone. With `auth: full_home` it also gets your grok configuration and
+- **Your login.** Each job runs with a private home as its `HOME`, and the login is
+  copied there at the path the CLI already looks in. With `auth: auth_file` (the
+  default) that is the login file alone — for Claude Code also its account state
+  from `~/.claude.json`, minus your MCP server definitions and per-project settings,
+  which would otherwise start your MCP servers inside the sandbox. With `auth: full_home` it also gets your grok configuration and
   credentials (config, MCP credentials, skills, plugins) — not binaries, logs or
   session history. Either way, whatever it is given is readable by the harness's own
   model; treat it as disclosed to it. If the harness refreshes its login, the new
-  token is written back to your real login file (unless your host grok refreshed it
-  meanwhile, in which case yours wins).
+  token is written back to your real login file (unless your host CLI refreshed it
+  meanwhile, in which case yours wins); nothing else is ever written back.
 - **Network.** The harness's own API and login hosts are allowed for its job. Any other
   destination is put to **you**: it appears as a normal network approval in the TUI or
   web UI, labelled with the job that asked, and fails closed if nobody answers.
@@ -74,3 +91,15 @@ safe only because cowboy's kernel boundary is the one that holds.
   tools, `ask_foreman` (a question the foreman answers, as it does for its own
   subagents) and `report_progress` (a job update). Nothing else crosses: the job's
   control channel itself is never exposed to the harness.
+
+## Per-CLI notes
+
+- **grok** gets its own "leader" socket in the private home, never your host grok's.
+- **claude** runs with `IS_SANDBOX=1`: inside the sandbox it is uid 0, and Claude Code
+  refuses to skip its permission prompts as root unless told it is sandboxed.
+- **codex** sees its whole release directory (it runs bundled helpers); its final
+  message is read from `codex exec -o`. Its success-path output format is covered by a
+  constructed test until a live run is recorded.
+- **agy** is registered with the relay via `agy mcp add` in the private home before
+  each run; its startup also needs Google's profile-picture and feature-flag hosts,
+  which are allowed for it.

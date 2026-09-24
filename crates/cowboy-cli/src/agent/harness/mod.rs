@@ -18,6 +18,9 @@
 //! No turn or time limit. A job that goes quiet is reported to the foreman as a job
 //! update; nothing is ever killed for it.
 
+pub mod agy;
+pub mod claude;
+pub mod codex;
 pub mod grok;
 pub mod mcp;
 
@@ -100,14 +103,19 @@ pub fn inspect(def: &HarnessDef) -> Inspection {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .filter(|v| !v.is_empty())
     });
-    let logged_in = cowboy_core::config::expand_path(spec.home)
-        .map(|h| h.join(spec.auth_file).is_file())
+    let logged_in = host_home()
+        .map(|h| h.join(spec.auth_files[0]).is_file())
         .unwrap_or(false);
     Inspection {
         binary,
         version,
         logged_in,
     }
+}
+
+/// The user's real home directory, where the vendor logins live.
+fn host_home() -> Result<PathBuf> {
+    cowboy_core::config::expand_path("~").map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Everything between "we have a task" and "here is the result".
@@ -122,21 +130,21 @@ async fn drive(
     let spec = def.kind.spec();
     let binary = resolve_binary(def, &spec)
         .with_context(|| format!("the `{}` CLI is not installed", spec.binary))?;
-    let vendor_home =
-        cowboy_core::config::expand_path(spec.home).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let host_auth = vendor_home.join(spec.auth_file);
-    if !host_auth.is_file() {
+    let install = install_root(&binary, spec.install_levels);
+    let host = host_home()?;
+    if !host.join(spec.auth_files[0]).is_file() {
         bail!(
-            "not logged in — run `{} login` on the host first (no {})",
+            "not logged in — run `{}` and log in on the host first (no ~/{})",
             spec.binary,
-            host_auth.display()
+            spec.auth_files[0]
         );
     }
 
-    // The job's private home: host-only, removed when the job ends.
+    // The job's private home — the harness's HOME — host-only, removed when the
+    // job ends. The login lands at the same ~-relative path the CLI looks in.
     let home = private_home(session_id)?;
     let _cleanup = RemoveOnDrop(home.clone());
-    let seeded = seed_home(&home, &vendor_home, &spec, def.auth)?;
+    let seeded = seed_home(&home, &host, &spec, def.auth)?;
     let brief = home.join("cowboy-brief.md");
     std::fs::write(&brief, task).context("writing the harness brief")?;
 
@@ -167,11 +175,12 @@ async fn drive(
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
     env.extend(def.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-    env.push((spec.home_env.to_string(), home.display().to_string()));
+    // Last, so it wins over the sandbox's own HOME.
+    env.push(("HOME".to_string(), home.display().to_string()));
     runtime.set_overlay(PlanOverlay {
         binds: vec![
             OverlayBind {
-                path: binary.clone(),
+                path: install.clone(),
                 writable: false,
                 why: format!("the {} CLI", spec.binary),
             },
@@ -188,27 +197,38 @@ async fn drive(
     // this process serves (see `mcp`). Only when there is a foreman to talk to.
     let seqs = mcp::Seqs::default();
     let control = ControlDir::from_env();
-    let _mcp_host = match &control {
+    let (_mcp_host, relay) = match &control {
         Some(c) => {
             let socket = home.join(mcp::SOCKET_NAME);
             let task = mcp::serve_host(&socket, c.clone(), seqs.clone())?;
-            match def.kind {
-                HarnessKind::Grok => {
-                    let config = home.join("config.toml");
-                    let mut toml = std::fs::read_to_string(&config).unwrap_or_default();
-                    toml.push_str(&mcp::grok_config_section(&mcp::shim_in_sandbox(), &socket));
-                    write_private(&config, toml.as_bytes())?;
+            let relay = mcp::Relay {
+                shim: mcp::shim_in_sandbox(),
+                socket,
+            };
+            if def.kind == HarnessKind::Grok {
+                // grok reads MCP servers from its config file.
+                let config = home.join(".grok/config.toml");
+                if let Some(dir) = config.parent() {
+                    std::fs::create_dir_all(dir)?;
                 }
+                let mut toml = std::fs::read_to_string(&config).unwrap_or_default();
+                toml.push_str(&mcp::grok_config_section(&relay.shim, &relay.socket));
+                write_private(&config, toml.as_bytes())?;
             }
-            Some(AbortOnDrop(task))
+            (Some(AbortOnDrop(task)), Some(relay))
         }
-        None => None,
+        None => (None, None),
     };
 
     let baseline = snapshot_tree(root, &home);
     let workdir = runtime.paths().workdir;
-    let stderr_log = home.join("stderr.log");
-    let command = command_line(def, &binary, &brief, &workdir, &home, &stderr_log);
+    let job = JobFiles {
+        brief: brief.clone(),
+        stderr: home.join("stderr.log"),
+        last_message: home.join("last-message.txt"),
+        leader_socket: home.join("leader.sock"),
+    };
+    let command = command_line(def, &binary, &job, &workdir, relay.as_ref());
     ui.notice(&format!(
         "{name}: running {}{} ({})",
         spec.binary,
@@ -227,7 +247,7 @@ async fn drive(
     let cancel = tokio_util::sync::CancellationToken::new();
     let exec = runtime.exec_stream(&command, None, 0, cancel.clone(), tx);
     tokio::pin!(exec);
-    let mut parser = Parser::new(def.kind);
+    let mut parser = parser_for(def.kind);
     let mut buf = String::new();
     let mut last_activity = Instant::now();
     let stall = Duration::from_secs(u64::from(def.stall_minutes.max(1)) * 60);
@@ -238,7 +258,7 @@ async fn drive(
             Some(chunk) = rx.recv() => {
                 last_activity = Instant::now();
                 next_stall_note = stall;
-                feed(&mut buf, &chunk, &mut parser, ui);
+                feed(&mut buf, &chunk, parser.as_mut(), ui);
             }
             _ = tokio::time::sleep(Duration::from_secs(15)) => {
                 let quiet = last_activity.elapsed();
@@ -260,7 +280,7 @@ async fn drive(
         }
     };
     while let Ok(chunk) = rx.try_recv() {
-        feed(&mut buf, &chunk, &mut parser, ui);
+        feed(&mut buf, &chunk, parser.as_mut(), ui);
     }
     if !buf.trim().is_empty() {
         let line = std::mem::take(&mut buf);
@@ -268,15 +288,23 @@ async fn drive(
     }
 
     // Write back a refreshed login before anything can fail the job.
-    write_back_auth(&home, &host_auth, &seeded, spec.auth_file, ui);
-    let stderr = std::fs::read_to_string(&stderr_log).unwrap_or_default();
+    write_back_auth(&home, &host, &seeded, ui);
+    let stderr = std::fs::read_to_string(&job.stderr).unwrap_or_default();
 
     let (exec_result, _) = result.context("running the harness")?;
     let code = exec_result.exit_code;
-    if code != 0 || !parser.saw_events() {
-        bail!("{}", failure_reason(spec.binary, code, &stderr));
+    if code != 0 || !parser.saw_events() || parser.error().is_some() {
+        bail!(
+            "{}",
+            failure_reason(spec.binary, code, parser.error().as_deref(), &stderr)
+        );
     }
-    let answer = parser.answer();
+    // codex writes its final message to a file as well; that copy is authoritative.
+    let answer = std::fs::read_to_string(&job.last_message)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| parser.answer());
     let changed = baseline
         .and_then(|base| snapshot_tree(root, &home).map(|end| (base, end)))
         .map(|(base, end)| diff_stat(root, &base, &end))
@@ -366,7 +394,7 @@ impl cowboy_gateway::Approver for ForwardingApprover {
 }
 
 /// Split streamed chunks into lines for the parser.
-fn feed(buf: &mut String, chunk: &str, parser: &mut Parser, ui: &mut dyn AgentUi) {
+fn feed(buf: &mut String, chunk: &str, parser: &mut dyn StreamParser, ui: &mut dyn AgentUi) {
     buf.push_str(chunk);
     while let Some(i) = buf.find('\n') {
         let line: String = buf.drain(..=i).collect();
@@ -374,71 +402,180 @@ fn feed(buf: &mut String, chunk: &str, parser: &mut Parser, ui: &mut dyn AgentUi
     }
 }
 
-/// The per-kind stream parser.
-enum Parser {
-    Grok(grok::GrokStream),
+/// A CLI's headless output stream, turned into cowboy UI events as it arrives.
+pub trait StreamParser {
+    /// Handle one line. Anything unrecognised is ignored, never fatal: these CLIs
+    /// add event types between releases.
+    fn on_line(&mut self, line: &str, ui: &mut dyn AgentUi);
+    /// Whether any line was understood — "nothing we can read" (a flag or format
+    /// change) is a failure, not an empty answer.
+    fn saw_events(&self) -> bool;
+    /// The run's final answer.
+    fn answer(&self) -> String;
+    /// An error the CLI reported in-band (a usage limit, a failed turn).
+    fn error(&self) -> Option<String>;
 }
 
-impl Parser {
-    fn new(kind: HarnessKind) -> Self {
-        match kind {
-            HarnessKind::Grok => Parser::Grok(grok::GrokStream::default()),
-        }
-    }
-    fn on_line(&mut self, line: &str, ui: &mut dyn AgentUi) {
-        match self {
-            Parser::Grok(s) => s.on_line(line, ui),
-        }
-    }
-    fn saw_events(&self) -> bool {
-        match self {
-            Parser::Grok(s) => s.saw_events,
-        }
-    }
-    fn answer(&self) -> String {
-        match self {
-            Parser::Grok(s) => s.answer(),
-        }
+fn parser_for(kind: HarnessKind) -> Box<dyn StreamParser> {
+    match kind {
+        HarnessKind::Grok => Box::new(grok::GrokStream::default()),
+        HarnessKind::Claude => Box::new(claude::ClaudeStream::default()),
+        HarnessKind::Codex => Box::new(codex::CodexStream::default()),
+        HarnessKind::Agy => Box::new(agy::AgyStream::default()),
     }
 }
 
-/// The command line, as one `sh -c` string (stderr to a file, so stdout is pure
-/// NDJSON). The CLI's approvals are skipped: cowboy's sandbox is the boundary.
+/// Files of one job inside its private home.
+struct JobFiles {
+    brief: PathBuf,
+    stderr: PathBuf,
+    last_message: PathBuf,
+    leader_socket: PathBuf,
+}
+
+/// One word of a command line: literal, or the brief's contents substituted by
+/// the shell (for a CLI that only takes the prompt as an argument).
+enum Word {
+    Lit(String),
+    BriefContents,
+}
+
+/// The command line, as one `sh -c` string: stdout is the CLI's NDJSON stream,
+/// stderr goes to a file, stdin is the brief (or nothing). Every CLI's own
+/// approvals and sandbox are off — cowboy's sandbox is the boundary.
 fn command_line(
     def: &HarnessDef,
     binary: &Path,
-    brief: &Path,
+    job: &JobFiles,
     workdir: &str,
-    home: &Path,
-    stderr_log: &Path,
+    relay: Option<&mcp::Relay>,
 ) -> String {
-    let mut args: Vec<String> = vec![binary.display().to_string()];
+    use Word::{BriefContents, Lit};
+    let lit = |s: &str| Lit(s.to_string());
+    let path = |p: &Path| Lit(p.display().to_string());
+    let bin = path(binary);
+    let mut pre: Vec<Vec<Word>> = Vec::new();
+    // Where stdin comes from: the brief, or /dev/null (claude waits for stdin
+    // otherwise).
+    let mut stdin_brief = false;
+    let mut words: Vec<Word> = vec![bin];
     match def.kind {
         HarnessKind::Grok => {
-            args.extend([
-                "--prompt-file".into(),
-                brief.display().to_string(),
-                "--output-format".into(),
-                "streaming-json".into(),
-                "--always-approve".into(),
-                "--cwd".into(),
-                workdir.to_string(),
+            words.extend([
+                lit("--prompt-file"),
+                path(&job.brief),
+                lit("--output-format"),
+                lit("streaming-json"),
+                lit("--always-approve"),
+                lit("--cwd"),
+                lit(workdir),
                 // Its own leader, in the private home: never a host grok's socket.
-                "--leader-socket".into(),
-                home.join("leader.sock").display().to_string(),
+                lit("--leader-socket"),
+                path(&job.leader_socket),
             ]);
             if let Some(m) = &def.model {
-                args.extend(["-m".into(), m.clone()]);
+                words.extend([lit("-m"), lit(m)]);
+            }
+        }
+        HarnessKind::Claude => {
+            // `-p` with no prompt argument reads the prompt from stdin.
+            stdin_brief = true;
+            words.extend([
+                lit("-p"),
+                lit("--output-format"),
+                lit("stream-json"),
+                lit("--verbose"),
+                lit("--permission-mode"),
+                lit("bypassPermissions"),
+            ]);
+            if let Some(m) = &def.model {
+                words.extend([lit("--model"), lit(m)]);
+            }
+            if let Some(r) = relay {
+                words.extend([lit("--mcp-config"), lit(&r.claude_config())]);
+            }
+        }
+        HarnessKind::Codex => {
+            stdin_brief = true;
+            words.extend([
+                lit("exec"),
+                lit("--json"),
+                lit("--skip-git-repo-check"),
+                lit("--dangerously-bypass-approvals-and-sandbox"),
+                lit("-C"),
+                lit(workdir),
+                lit("-o"),
+                path(&job.last_message),
+            ]);
+            if let Some(m) = &def.model {
+                words.extend([lit("-m"), lit(m)]);
+            }
+            if let Some(r) = relay {
+                for c in r.codex_overrides() {
+                    words.extend([lit("-c"), Lit(c)]);
+                }
+            }
+            // `-` = the prompt comes from stdin.
+            words.push(lit("-"));
+        }
+        HarnessKind::Agy => {
+            if let Some(r) = relay {
+                // Registered in the private home's settings for this run only.
+                let mut add = vec![
+                    Lit(binary.display().to_string()),
+                    lit("mcp"),
+                    lit("add"),
+                    lit("cowboy"),
+                    lit("--"),
+                ];
+                add.extend(r.command_words().into_iter().map(Lit));
+                pre.push(add);
+            }
+            words.extend([
+                lit("-p"),
+                BriefContents,
+                lit("--output-format"),
+                lit("stream-json"),
+                // agy ignores the process cwd; without this it works in its own
+                // scratch directory.
+                lit("--add-dir"),
+                lit(workdir),
+                lit("--dangerously-skip-permissions"),
+                lit("--disable-slash-commands"),
+            ]);
+            if let Some(m) = &def.model {
+                words.extend([lit("--model"), lit(m)]);
             }
         }
     }
-    args.extend(def.extra_args.iter().cloned());
-    let quoted: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
-    format!(
-        "{} 2>{}",
-        quoted.join(" "),
-        shell_quote(&stderr_log.display().to_string())
-    )
+    words.extend(def.extra_args.iter().map(|a| lit(a)));
+    let render = |ws: &[Word]| -> String {
+        ws.iter()
+            .map(|w| match w {
+                Lit(s) => shell_quote(s),
+                BriefContents => format!(
+                    "\"$(cat {})\"",
+                    shell_quote(&job.brief.display().to_string())
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let stderr = shell_quote(&job.stderr.display().to_string());
+    let stdin = if stdin_brief {
+        shell_quote(&job.brief.display().to_string())
+    } else {
+        "/dev/null".to_string()
+    };
+    let mut script = String::new();
+    for p in &pre {
+        script.push_str(&format!(
+            "{} </dev/null >/dev/null 2>>{stderr}; ",
+            render(p)
+        ));
+    }
+    script.push_str(&format!("{} <{stdin} 2>>{stderr}", render(&words)));
+    script
 }
 
 fn shell_quote(s: &str) -> String {
@@ -469,6 +606,18 @@ fn resolve_binary(def: &HarnessDef, spec: &KindSpec) -> Result<PathBuf> {
     std::fs::canonicalize(&found).with_context(|| format!("resolving {}", found.display()))
 }
 
+/// What of the install the sandbox sees: the binary, or the directory `levels`
+/// above it for a CLI that runs sibling helpers.
+fn install_root(binary: &Path, levels: usize) -> PathBuf {
+    let mut p = binary.to_path_buf();
+    for _ in 0..levels {
+        if let Some(parent) = p.parent() {
+            p = parent.to_path_buf();
+        }
+    }
+    p
+}
+
 /// `$XDG_STATE_HOME/cowboy/harness/<session>` (else `~/.local/state/…`), created
 /// owner-only. Host-side and outside the workspace, so the foreman never sees it.
 fn private_home(session_id: &str) -> Result<PathBuf> {
@@ -487,7 +636,9 @@ fn private_home(session_id: &str) -> Result<PathBuf> {
             }
         })
         .collect();
-    let dir = base.join("cowboy/harness").join(safe);
+    let parent = base.join("cowboy/harness");
+    sweep_stale_homes(&parent);
+    let dir = parent.join(safe);
     if dir.exists() {
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -504,6 +655,29 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// How old a leftover private home must be before a later job removes it.
+const STALE_HOME: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Remove private homes a killed or crashed job left behind — each holds a copy of
+/// a vendor login, which must not outlive its job. Anything younger than
+/// [`STALE_HOME`] may belong to a job still running and is left alone.
+fn sweep_stale_homes(parent: &Path) {
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > STALE_HOME);
+        if old {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Removes the private home when the job ends, however it ends.
 struct RemoveOnDrop(PathBuf);
 impl Drop for RemoveOnDrop {
@@ -512,22 +686,76 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// Copy the login (and with `full_home`, the vendor config) into the private
-/// home. Returns the login's bytes as copied, to detect a refresh afterwards.
-fn seed_home(home: &Path, vendor: &Path, spec: &KindSpec, auth: AuthExposure) -> Result<Vec<u8>> {
+/// Copy the login files (and with `full_home`, the vendor config dirs) from the
+/// user's home into the private home, at the same `~`-relative paths. Returns what
+/// was copied for each login file, to detect a refresh afterwards.
+fn seed_home(
+    home: &Path,
+    host: &Path,
+    spec: &KindSpec,
+    auth: AuthExposure,
+) -> Result<Vec<(String, Vec<u8>)>> {
     if auth == AuthExposure::FullHome {
-        for entry in std::fs::read_dir(vendor)?.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if spec.home_skip.contains(&name.as_ref()) || name.ends_with(".lock") {
+        for dir in spec.vendor_dirs {
+            let from = host.join(dir);
+            let Ok(entries) = std::fs::read_dir(&from) else {
                 continue;
+            };
+            let to = home.join(dir);
+            std::fs::create_dir_all(&to)?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if spec.home_skip.contains(&name.as_ref()) || name.ends_with(".lock") {
+                    continue;
+                }
+                copy_tree(&entry.path(), &to.join(&*name))?;
             }
-            copy_tree(&entry.path(), &home.join(&*name))?;
         }
     }
-    let bytes = std::fs::read(vendor.join(spec.auth_file)).context("reading the login file")?;
-    write_private(&home.join(spec.auth_file), &bytes)?;
-    Ok(bytes)
+    let mut seeded = Vec::new();
+    for (i, rel) in spec.auth_files.iter().enumerate() {
+        let bytes = match std::fs::read(host.join(rel)) {
+            Ok(b) => b,
+            // Only the first is the login; the rest are copied when present.
+            Err(_) if i > 0 => continue,
+            Err(e) => return Err(e).context("reading the login file"),
+        };
+        let dest = home.join(rel);
+        if let Some(dir) = dest.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        if i == 0 {
+            write_private(&dest, &bytes)?;
+            // Only the credential is written back after the job.
+            seeded.push((rel.to_string(), bytes));
+        } else {
+            let state = if auth == AuthExposure::AuthFile {
+                strip_json_keys(&bytes, spec.strip_keys)
+            } else {
+                bytes
+            };
+            write_private(&dest, &state)?;
+        }
+    }
+    Ok(seeded)
+}
+
+/// `bytes` as a JSON object without `keys`; unparseable input is dropped to `{}`
+/// rather than passed through with whatever it holds.
+fn strip_json_keys(bytes: &[u8], keys: &[&str]) -> Vec<u8> {
+    if keys.is_empty() {
+        return bytes.to_vec();
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(bytes).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        for k in keys {
+            o.remove(*k);
+        }
+    } else {
+        v = serde_json::json!({});
+    }
+    serde_json::to_vec(&v).unwrap_or_default()
 }
 
 /// Copy a file or directory tree. Symlinks are skipped: one could point anywhere on
@@ -561,32 +789,32 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// If the harness refreshed its login, save it back to the user's real login file
-/// — unless the host's copy changed meanwhile (the user's own grok refreshed it),
-/// in which case the host's newer login wins.
-fn write_back_auth(
-    home: &Path,
-    host_auth: &Path,
-    seeded: &[u8],
-    auth_file: &str,
-    ui: &mut dyn AgentUi,
-) {
-    let Ok(now) = std::fs::read(home.join(auth_file)) else {
-        return;
-    };
-    if now == seeded || now.is_empty() {
-        return;
-    }
-    let host_now = std::fs::read(host_auth).unwrap_or_default();
-    if host_now != seeded {
-        ui.notice("the harness refreshed its login, but the host's changed too; kept the host's");
-        return;
-    }
-    let tmp = host_auth.with_extension("json.cowboy-tmp");
-    if write_private(&tmp, &now).is_ok() && std::fs::rename(&tmp, host_auth).is_ok() {
-        ui.notice("saved the harness's refreshed login back to the host");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+/// If the harness refreshed a login file, save it back to the user's real one —
+/// unless the host's copy changed meanwhile (the user's own CLI refreshed it), in
+/// which case the host's newer login wins.
+fn write_back_auth(home: &Path, host: &Path, seeded: &[(String, Vec<u8>)], ui: &mut dyn AgentUi) {
+    for (rel, before) in seeded {
+        let Ok(now) = std::fs::read(home.join(rel)) else {
+            continue;
+        };
+        if &now == before || now.is_empty() {
+            continue;
+        }
+        let host_file = host.join(rel);
+        if std::fs::read(&host_file).unwrap_or_default() != *before {
+            ui.notice(&format!(
+                "the harness refreshed ~/{rel}, but the host's changed too; kept the host's"
+            ));
+            continue;
+        }
+        let tmp = host_file.with_extension("cowboy-tmp");
+        if write_private(&tmp, &now).is_ok() && std::fs::rename(&tmp, &host_file).is_ok() {
+            ui.notice(&format!(
+                "saved the harness's refreshed ~/{rel} back to the host"
+            ));
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 
@@ -634,8 +862,8 @@ fn diff_stat(root: &Path, base: &str, end: &str) -> String {
 }
 
 /// Why a harness run failed, in words the foreman (and user) can act on.
-fn failure_reason(cli: &str, code: i32, stderr: &str) -> String {
-    let lower = stderr.to_lowercase();
+fn failure_reason(cli: &str, code: i32, reported: Option<&str>, stderr: &str) -> String {
+    let lower = format!("{}\n{stderr}", reported.unwrap_or_default()).to_lowercase();
     let tail: String = stderr
         .lines()
         .rev()
@@ -668,58 +896,206 @@ fn failure_reason(cli: &str, code: i32, stderr: &str) -> String {
     .any(|k| lower.contains(k))
     {
         format!("{cli} hit a subscription or rate limit")
+    } else if let Some(r) = reported {
+        format!("{cli} reported an error: {r}")
     } else if code == 0 {
         format!("{cli} produced no output cowboy understands (a changed output format?)")
     } else {
         format!("{cli} exited with status {code}")
     };
-    if tail.trim().is_empty() {
-        why
-    } else {
-        format!("{why}\n{tail}")
+    // The CLI's own words carry what the classification cannot (when a limit
+    // resets, which account) — keep them.
+    let mut out = why;
+    if let Some(r) = reported.filter(|r| !out.contains(r)) {
+        out.push_str(&format!("\n{r}"));
     }
+    if !tail.trim().is_empty() {
+        out.push_str(&format!("\n{tail}"));
+    }
+    out
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn def() -> HarnessDef {
+    /// Records the UI calls a stream parser makes.
+    #[derive(Default)]
+    pub(crate) struct Rec {
+        pub deltas: String,
+        pub commands: Vec<(String, i32)>,
+        pub tools: Vec<String>,
+        pub diffs: Vec<String>,
+        pub cost: Option<f64>,
+        pub tokens: Option<(u64, u64)>,
+    }
+    impl AgentUi for Rec {
+        fn model_delta(&mut self, t: &str) {
+            self.deltas.push_str(t);
+        }
+        fn command_start(&mut self, c: &str) {
+            self.commands.push((c.to_string(), -1));
+        }
+        fn command_end(&mut self, code: i32, _o: &str) {
+            if let Some(last) = self.commands.last_mut() {
+                last.1 = code;
+            }
+        }
+        fn tool_use(&mut self, s: &str) {
+            self.tools.push(s.to_string());
+        }
+        fn file_diff(&mut self, p: &str, _d: &str) {
+            self.diffs.push(p.to_string());
+        }
+        fn tokens(&mut self, i: u64, o: u64) {
+            self.tokens = Some((i, o));
+        }
+        fn cost(&mut self, c: f64) {
+            self.cost = Some(c);
+        }
+        fn final_message(&mut self, _m: &str) {}
+        fn ask_user(&mut self, _q: &str, _o: &[String]) -> String {
+            String::new()
+        }
+        fn notice(&mut self, _m: &str) {}
+    }
+
+    fn def(kind: &str, extra: &str) -> HarnessDef {
         HarnessesConfig::parse(
-            "harnesses:\n  grok:\n    kind: grok\n    model: grok-4.7\n    extra_args: [\"--no-plan\"]\n",
+            &format!("harnesses:\n  h:\n    kind: {kind}\n    model: m-1\n{extra}"),
             Path::new("harnesses.yaml"),
         )
         .unwrap()
         .harnesses
-        .remove("grok")
+        .remove("h")
         .unwrap()
     }
 
+    fn job() -> JobFiles {
+        JobFiles {
+            brief: "/s/h/cowboy-brief.md".into(),
+            stderr: "/s/h/stderr.log".into(),
+            last_message: "/s/h/last-message.txt".into(),
+            leader_socket: "/s/h/leader.sock".into(),
+        }
+    }
+
+    fn relay() -> mcp::Relay {
+        mcp::Relay {
+            shim: "/.cowboy-shim".into(),
+            socket: "/s/h/cowboy-foreman.sock".into(),
+        }
+    }
+
+    fn has(c: &str, parts: &[&str]) {
+        for p in parts {
+            assert!(c.contains(p), "missing {p:?} in {c}");
+        }
+    }
+
     #[test]
-    fn the_grok_command_skips_its_approvals_and_uses_a_private_leader() {
+    fn grok_skips_its_approvals_and_uses_a_private_leader() {
         let c = command_line(
-            &def(),
+            &def("grok", "    extra_args: [\"--no-plan\"]\n"),
             Path::new("/opt/grok"),
-            Path::new("/state/h/cowboy-brief.md"),
+            &job(),
             "/workspace",
-            Path::new("/state/h"),
-            Path::new("/state/h/stderr.log"),
+            Some(&relay()),
         );
         assert!(
-            c.starts_with("/opt/grok --prompt-file /state/h/cowboy-brief.md"),
+            c.starts_with("/opt/grok --prompt-file /s/h/cowboy-brief.md"),
             "{c}"
         );
-        for part in [
-            "--output-format streaming-json",
-            "--always-approve",
-            "--cwd /workspace",
-            "--leader-socket /state/h/leader.sock",
-            "-m grok-4.7",
-            "--no-plan",
-            "2>/state/h/stderr.log",
-        ] {
-            assert!(c.contains(part), "missing {part:?} in {c}");
-        }
+        has(
+            &c,
+            &[
+                "--output-format streaming-json",
+                "--always-approve",
+                "--cwd /workspace",
+                "--leader-socket /s/h/leader.sock",
+                "-m m-1",
+                "--no-plan",
+                "</dev/null",
+                "2>>/s/h/stderr.log",
+            ],
+        );
+    }
+
+    #[test]
+    fn claude_reads_the_brief_on_stdin_and_gets_the_relay_as_mcp_config() {
+        let c = command_line(
+            &def("claude", ""),
+            Path::new("/opt/claude"),
+            &job(),
+            "/w",
+            Some(&relay()),
+        );
+        has(
+            &c,
+            &[
+                "-p --output-format stream-json --verbose",
+                "--permission-mode bypassPermissions",
+                "--model m-1",
+                "--mcp-config",
+                "x-foreman-mcp",
+                "</s/h/cowboy-brief.md",
+            ],
+        );
+    }
+
+    #[test]
+    fn codex_runs_exec_in_the_workdir_and_writes_its_last_message() {
+        let c = command_line(
+            &def("codex", ""),
+            Path::new("/opt/codex"),
+            &job(),
+            "/w",
+            Some(&relay()),
+        );
+        has(
+            &c,
+            &[
+                "/opt/codex exec --json --skip-git-repo-check",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C /w",
+                "-o /s/h/last-message.txt",
+                "-m m-1",
+                "mcp_servers.cowboy.command=",
+                "</s/h/cowboy-brief.md",
+            ],
+        );
+        assert!(c.contains(" - <"), "the prompt comes from stdin: {c}");
+    }
+
+    #[test]
+    fn agy_registers_the_relay_then_runs_on_the_workdir() {
+        let c = command_line(
+            &def("agy", ""),
+            Path::new("/opt/agy"),
+            &job(),
+            "/w",
+            Some(&relay()),
+        );
+        let (setup, run) = c.split_once("; ").expect("mcp add, then the run");
+        has(
+            setup,
+            &["/opt/agy mcp add cowboy -- /.cowboy-shim x-foreman-mcp"],
+        );
+        has(
+            run,
+            &[
+                "-p \"$(cat /s/h/cowboy-brief.md)\"",
+                "--output-format stream-json",
+                "--add-dir /w",
+                "--dangerously-skip-permissions",
+                "--disable-slash-commands",
+                "--model m-1",
+                "</dev/null",
+            ],
+        );
+        // No foreman, no relay.
+        let c = command_line(&def("agy", ""), Path::new("/opt/agy"), &job(), "/w", None);
+        assert!(!c.contains("mcp add"), "{c}");
     }
 
     #[test]
@@ -730,21 +1106,46 @@ mod tests {
 
     #[test]
     fn failures_are_classified_for_the_foreman() {
-        assert!(failure_reason("grok", 1, "HTTP 401 Unauthorized").contains("not logged in"));
-        assert!(failure_reason("grok", 1, "error: 429 Too Many Requests").contains("limit"));
-        assert!(failure_reason("grok", 0, "").contains("no output"));
-        assert!(failure_reason("grok", 7, "boom").starts_with("grok exited with status 7"));
+        let f = |code, reported, stderr| failure_reason("x", code, reported, stderr);
+        assert!(f(1, None, "HTTP 401 Unauthorized").contains("not logged in"));
+        assert!(f(1, None, "error: 429 Too Many Requests").contains("limit"));
+        let limit = f(
+            1,
+            Some("You've hit your usage limit. Try again at 9:38 AM."),
+            "",
+        );
+        assert!(
+            limit.contains("hit a subscription or rate limit"),
+            "{limit}"
+        );
+        assert!(
+            limit.contains("9:38 AM"),
+            "the CLI's own words are kept: {limit}"
+        );
+        assert!(f(0, Some("status CANCELLED"), "").contains("reported an error"));
+        assert!(f(0, None, "").contains("no output"));
+        assert!(f(7, None, "boom").starts_with("x exited with status 7"));
+    }
+
+    fn names(d: &Path) -> Vec<String> {
+        let mut n: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
     }
 
     /// `full_home` copies config and credentials but not binaries, logs, sessions
-    /// or symlinks; `auth_file` copies the login alone.
+    /// or symlinks; `auth_file` copies the login alone, at its ~-relative path.
     #[test]
     fn seeding_copies_only_what_the_mode_allows() {
-        let vendor = assert_fs::TempDir::new().unwrap();
-        let v = vendor.path();
+        let host = assert_fs::TempDir::new().unwrap();
+        let v = host.path().join(".grok");
+        std::fs::create_dir_all(v.join("bin")).unwrap();
         std::fs::write(v.join("auth.json"), b"{\"t\":1}").unwrap();
         std::fs::write(v.join("config.toml"), b"x=1").unwrap();
-        std::fs::create_dir_all(v.join("bin")).unwrap();
         std::fs::write(v.join("bin/grok"), b"elf").unwrap();
         std::fs::create_dir_all(v.join("sessions/a")).unwrap();
         std::fs::write(v.join("mcp_credentials.json"), b"{}").unwrap();
@@ -752,52 +1153,108 @@ mod tests {
         let spec = HarnessKind::Grok.spec();
 
         let a = assert_fs::TempDir::new().unwrap();
-        seed_home(a.path(), v, &spec, AuthExposure::AuthFile).unwrap();
-        let names = |d: &Path| {
-            let mut n: Vec<String> = std::fs::read_dir(d)
-                .unwrap()
-                .flatten()
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            n.sort();
-            n
-        };
-        assert_eq!(names(a.path()), vec!["auth.json"]);
+        seed_home(a.path(), host.path(), &spec, AuthExposure::AuthFile).unwrap();
+        assert_eq!(names(&a.path().join(".grok")), vec!["auth.json"]);
 
         let f = assert_fs::TempDir::new().unwrap();
-        seed_home(f.path(), v, &spec, AuthExposure::FullHome).unwrap();
+        seed_home(f.path(), host.path(), &spec, AuthExposure::FullHome).unwrap();
         assert_eq!(
-            names(f.path()),
+            names(&f.path().join(".grok")),
             vec!["auth.json", "config.toml", "mcp_credentials.json"]
         );
+    }
+
+    /// Claude's login is two files, one outside its config dir; the second is
+    /// optional. A missing first file is "not logged in".
+    #[test]
+    fn claude_login_is_both_files_when_present() {
+        let host = assert_fs::TempDir::new().unwrap();
+        std::fs::create_dir_all(host.path().join(".claude")).unwrap();
+        std::fs::write(host.path().join(".claude/.credentials.json"), b"c").unwrap();
+        let spec = HarnessKind::Claude.spec();
+        std::fs::write(
+            host.path().join(".claude.json"),
+            br#"{"oauthAccount":{"x":1},"mcpServers":{"s":{"command":"uvx"}},"projects":{}}"#,
+        )
+        .unwrap();
+        let home = assert_fs::TempDir::new().unwrap();
+        let seeded = seed_home(home.path(), host.path(), &spec, AuthExposure::AuthFile).unwrap();
+        assert_eq!(seeded.len(), 1, "only the credential is written back");
+        assert!(home.path().join(".claude/.credentials.json").is_file());
+        let state = std::fs::read_to_string(home.path().join(".claude.json")).unwrap();
+        assert!(state.contains("oauthAccount"), "{state}");
+        assert!(
+            !state.contains("mcpServers") && !state.contains("projects"),
+            "the user's MCP servers must not start in the sandbox: {state}"
+        );
+
+        std::fs::remove_file(host.path().join(".claude.json")).unwrap();
+        let home = assert_fs::TempDir::new().unwrap();
+        seed_home(home.path(), host.path(), &spec, AuthExposure::AuthFile).unwrap();
+        assert!(!home.path().join(".claude.json").exists());
+        std::fs::remove_file(host.path().join(".claude/.credentials.json")).unwrap();
+        assert!(seed_home(home.path(), host.path(), &spec, AuthExposure::AuthFile).is_err());
     }
 
     /// A refreshed login goes back to the host — unless the host's changed too.
     #[test]
     fn a_refreshed_login_is_written_back_only_over_an_unchanged_host_copy() {
-        struct Quiet;
-        impl AgentUi for Quiet {
-            fn model_delta(&mut self, _: &str) {}
-            fn command_start(&mut self, _: &str) {}
-            fn command_end(&mut self, _: i32, _: &str) {}
-            fn final_message(&mut self, _: &str) {}
-            fn ask_user(&mut self, _: &str, _: &[String]) -> String {
-                String::new()
-            }
-            fn notice(&mut self, _: &str) {}
-        }
         let home = assert_fs::TempDir::new().unwrap();
         let host = assert_fs::TempDir::new().unwrap();
-        let host_auth = host.path().join("auth.json");
-        std::fs::write(&host_auth, b"old").unwrap();
-        std::fs::write(home.path().join("auth.json"), b"new").unwrap();
-        write_back_auth(home.path(), &host_auth, b"old", "auth.json", &mut Quiet);
-        assert_eq!(std::fs::read(&host_auth).unwrap(), b"new");
+        let rel = ".grok/auth.json".to_string();
+        for d in [home.path(), host.path()] {
+            std::fs::create_dir_all(d.join(".grok")).unwrap();
+        }
+        std::fs::write(host.path().join(&rel), b"old").unwrap();
+        std::fs::write(home.path().join(&rel), b"new").unwrap();
+        write_back_auth(
+            home.path(),
+            host.path(),
+            &[(rel.clone(), b"old".to_vec())],
+            &mut Rec::default(),
+        );
+        assert_eq!(std::fs::read(host.path().join(&rel)).unwrap(), b"new");
 
-        std::fs::write(&host_auth, b"host-refreshed").unwrap();
-        std::fs::write(home.path().join("auth.json"), b"newer").unwrap();
-        write_back_auth(home.path(), &host_auth, b"new", "auth.json", &mut Quiet);
-        assert_eq!(std::fs::read(&host_auth).unwrap(), b"host-refreshed");
+        std::fs::write(host.path().join(&rel), b"host-refreshed").unwrap();
+        std::fs::write(home.path().join(&rel), b"newer").unwrap();
+        write_back_auth(
+            home.path(),
+            host.path(),
+            &[(rel.clone(), b"new".to_vec())],
+            &mut Rec::default(),
+        );
+        assert_eq!(
+            std::fs::read(host.path().join(&rel)).unwrap(),
+            b"host-refreshed"
+        );
+    }
+
+    /// A leftover home (a killed job's, holding a login copy) is swept once stale;
+    /// a fresh one — possibly a running job's — is kept.
+    #[test]
+    fn stale_private_homes_are_swept() {
+        let parent = assert_fs::TempDir::new().unwrap();
+        let old = parent.path().join("old-job");
+        let fresh = parent.path().join("fresh-job");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&fresh).unwrap();
+        let past = std::time::SystemTime::now() - STALE_HOME - Duration::from_secs(60);
+        std::fs::File::open(&old)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        sweep_stale_homes(parent.path());
+        assert!(!old.exists() && fresh.exists());
+    }
+
+    #[test]
+    fn codex_gets_its_whole_release_directory() {
+        let b = Path::new("/h/.codex/packages/standalone/releases/0.154.0/bin/codex");
+        assert_eq!(
+            install_root(b, HarnessKind::Codex.spec().install_levels),
+            Path::new("/h/.codex/packages/standalone/releases/0.154.0")
+        );
+        assert_eq!(install_root(Path::new("/x/grok"), 0), Path::new("/x/grok"));
     }
 
     /// The measured change summary sees new, modified and deleted files and leaves

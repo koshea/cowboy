@@ -143,6 +143,49 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// How a harness launches the relay: `<shim> x-foreman-mcp <socket>`.
+pub struct Relay {
+    pub shim: PathBuf,
+    pub socket: PathBuf,
+}
+
+impl Relay {
+    /// The command, word by word.
+    pub fn command_words(&self) -> Vec<String> {
+        vec![
+            self.shim.display().to_string(),
+            "x-foreman-mcp".to_string(),
+            self.socket.display().to_string(),
+        ]
+    }
+
+    /// Claude Code's `--mcp-config` JSON.
+    pub fn claude_config(&self) -> String {
+        json!({"mcpServers": {"cowboy": {
+            "type": "stdio",
+            "command": self.shim.display().to_string(),
+            "args": ["x-foreman-mcp", self.socket.display().to_string()],
+        }}})
+        .to_string()
+    }
+
+    /// Codex `-c key=value` overrides (values are TOML).
+    pub fn codex_overrides(&self) -> Vec<String> {
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));
+        vec![
+            format!(
+                "mcp_servers.cowboy.command={}",
+                q(&self.shim.display().to_string())
+            ),
+            format!(
+                "mcp_servers.cowboy.args=[{}, {}]",
+                q("x-foreman-mcp"),
+                q(&self.socket.display().to_string())
+            ),
+        ]
+    }
+}
+
 /// The MCP config entry the vendor CLI is given (grok's `config.toml` format).
 pub fn grok_config_section(shim: &Path, socket: &Path) -> String {
     let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""));

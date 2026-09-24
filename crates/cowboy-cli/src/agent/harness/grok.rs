@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::StreamParser;
 use crate::agent::ui::AgentUi;
 
 /// Accumulated state of one grok run.
@@ -40,9 +41,24 @@ pub struct GrokStream {
     pub saw_events: bool,
 }
 
+impl StreamParser for GrokStream {
+    fn on_line(&mut self, line: &str, ui: &mut dyn AgentUi) {
+        self.handle(line, ui);
+    }
+    fn saw_events(&self) -> bool {
+        self.saw_events
+    }
+    fn answer(&self) -> String {
+        self.final_answer()
+    }
+    fn error(&self) -> Option<String> {
+        None
+    }
+}
+
 impl GrokStream {
     /// Handle one line of the stream.
-    pub fn on_line(&mut self, line: &str, ui: &mut dyn AgentUi) {
+    fn handle(&mut self, line: &str, ui: &mut dyn AgentUi) {
         let line = line.trim();
         if line.is_empty() {
             return;
@@ -159,7 +175,7 @@ impl GrokStream {
     }
 
     /// The run's answer: the text after the last tool call, else all of it.
-    pub fn answer(&self) -> String {
+    fn final_answer(&self) -> String {
         let seg = self.segment.trim();
         if seg.is_empty() {
             self.all_text.trim().to_string()
@@ -200,47 +216,8 @@ fn simple_diff(path: &str, old: &str, new: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::Rec;
     use super::*;
-
-    #[derive(Default)]
-    struct Rec {
-        deltas: String,
-        commands: Vec<(String, i32)>,
-        tools: Vec<String>,
-        diffs: Vec<String>,
-        cost: Option<f64>,
-        tokens: Option<(u64, u64)>,
-    }
-    impl AgentUi for Rec {
-        fn model_delta(&mut self, t: &str) {
-            self.deltas.push_str(t);
-        }
-        fn command_start(&mut self, c: &str) {
-            self.commands.push((c.to_string(), -1));
-        }
-        fn command_end(&mut self, code: i32, _o: &str) {
-            if let Some(last) = self.commands.last_mut() {
-                last.1 = code;
-            }
-        }
-        fn tool_use(&mut self, s: &str) {
-            self.tools.push(s.to_string());
-        }
-        fn file_diff(&mut self, p: &str, _d: &str) {
-            self.diffs.push(p.to_string());
-        }
-        fn tokens(&mut self, i: u64, o: u64) {
-            self.tokens = Some((i, o));
-        }
-        fn cost(&mut self, c: f64) {
-            self.cost = Some(c);
-        }
-        fn final_message(&mut self, _m: &str) {}
-        fn ask_user(&mut self, _q: &str, _o: &[String]) -> String {
-            String::new()
-        }
-        fn notice(&mut self, _m: &str) {}
-    }
 
     /// The recorded 1.0.41 run: `ls`, create b.txt, reply "DONE".
     #[test]

@@ -286,16 +286,16 @@ Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are rea
 host-side. They are never written into a project or bound into the sandbox.")]
     Models(ModelsArgs),
 
-    /// List the external agent CLIs the crew can delegate to (grok, …) and whether
-    /// each is installed and logged in.
+    /// List the external agent CLIs the crew can delegate to (grok, claude, codex,
+    /// agy) and whether each is installed and logged in.
     #[command(after_help = "\
 Harnesses are configured in ~/.config/cowboy/harnesses.yaml (user-level only):
 
   harnesses:
     grok:
-      kind: grok
+      kind: grok             # grok | claude | codex | agy
       model: grok-4.7        # optional; the CLI's default otherwise
-      auth: auth_file        # or full_home — the login plus your grok config
+      auth: auth_file        # or full_home — the login plus the CLI's config
 
 Route a crew category to one in crew.yaml (`exploration: grok`), or ask the agent to
 \"have grok …\". A harness runs inside cowboy's sandbox on your subscription.")]

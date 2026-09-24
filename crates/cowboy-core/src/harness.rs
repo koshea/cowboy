@@ -74,7 +74,14 @@ fn default_stall_minutes() -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HarnessKind {
+    /// xAI's Grok Build (`grok`).
     Grok,
+    /// Anthropic's Claude Code (`claude`).
+    Claude,
+    /// OpenAI's Codex CLI (`codex`).
+    Codex,
+    /// Google's Antigravity CLI (`agy`).
+    Agy,
 }
 
 /// How the vendor login reaches the sandboxed harness. Whatever it gets is
@@ -99,17 +106,28 @@ pub enum AuthExposure {
 }
 
 /// What cowboy knows about a kind of CLI.
+///
+/// Every harness job gets a private home directory as its `HOME`; the vendor's
+/// files are copied there at the same `~`-relative paths, so each CLI finds its
+/// login where it always looks and no per-vendor relocation variable is needed.
 #[derive(Debug, Clone, Copy)]
 pub struct KindSpec {
     /// Default binary name, resolved on the host's `PATH`.
     pub binary: &'static str,
-    /// The vendor's home, `~`-relative.
-    pub home: &'static str,
-    /// The login file, relative to the home.
-    pub auth_file: &'static str,
-    /// The env var that relocates the vendor home.
-    pub home_env: &'static str,
-    /// Entries of the vendor home a `full_home` copy leaves out: binaries, caches,
+    /// How much of the install the sandbox needs: `0` = the binary file alone,
+    /// `n` = the directory `n` levels above it (a CLI that runs sibling helpers).
+    pub install_levels: usize,
+    /// Login files, `~`-relative. The first is the credential itself: its absence
+    /// means "not logged in", and a refresh of it is written back to the host. The
+    /// rest are account state, copied in when present and never written back.
+    pub auth_files: &'static [&'static str],
+    /// Top-level keys stripped from a JSON account-state file for `auth_file`
+    /// exposure — configuration that is not the login (Claude Code keeps the user's
+    /// MCP server definitions in `~/.claude.json`, which would start them).
+    pub strip_keys: &'static [&'static str],
+    /// The vendor's config directories, `~`-relative, copied for `full_home`.
+    pub vendor_dirs: &'static [&'static str],
+    /// Entries of a vendor dir a `full_home` copy leaves out: binaries, caches,
     /// logs, session history, sockets and lock files.
     pub home_skip: &'static [&'static str],
     /// API and login hosts the harness cannot work without.
@@ -123,9 +141,10 @@ impl HarnessKind {
         match self {
             HarnessKind::Grok => KindSpec {
                 binary: "grok",
-                home: "~/.grok",
-                auth_file: "auth.json",
-                home_env: "GROK_HOME",
+                install_levels: 0,
+                auth_files: &[".grok/auth.json"],
+                strip_keys: &[],
+                vendor_dirs: &[".grok"],
                 home_skip: &[
                     "bin",
                     "downloads",
@@ -156,12 +175,115 @@ impl HarnessKind {
                     ("GROK_AGENT_DASHBOARD", "0"),
                 ],
             },
+            HarnessKind::Claude => KindSpec {
+                binary: "claude",
+                install_levels: 0,
+                auth_files: &[".claude/.credentials.json", ".claude.json"],
+                strip_keys: &["mcpServers", "projects"],
+                vendor_dirs: &[".claude"],
+                home_skip: &[
+                    "projects",
+                    "sessions",
+                    "shell-snapshots",
+                    "file-history",
+                    "todos",
+                    "statsig",
+                    "logs",
+                    "debug",
+                    "cache",
+                    "ide",
+                    "local",
+                    "downloads",
+                ],
+                hosts: &[
+                    "api.anthropic.com",
+                    "claude.ai",
+                    "platform.claude.com",
+                    "console.anthropic.com",
+                ],
+                env: &[
+                    // The sandbox runs commands as uid 0 in its user namespace, and
+                    // Claude Code refuses to skip its permission prompts as root unless
+                    // told it is sandboxed — which it is.
+                    ("IS_SANDBOX", "1"),
+                    ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+                    ("DISABLE_TELEMETRY", "1"),
+                    ("DISABLE_ERROR_REPORTING", "1"),
+                    ("DISABLE_AUTOUPDATER", "1"),
+                ],
+            },
+            HarnessKind::Codex => KindSpec {
+                binary: "codex",
+                // `…/releases/<v>/bin/codex` runs siblings (`codex-code-mode-host`)
+                // and resources (`codex-path/rg`) from the release directory.
+                install_levels: 2,
+                auth_files: &[".codex/auth.json"],
+                strip_keys: &[],
+                vendor_dirs: &[".codex"],
+                home_skip: &[
+                    "packages",
+                    "sessions",
+                    "log",
+                    "logs",
+                    "history.jsonl",
+                    "tmp",
+                    "shell_snapshots",
+                ],
+                hosts: &[
+                    "chatgpt.com",
+                    "auth.openai.com",
+                    "api.openai.com",
+                    // OpenAI's content CDN (`sdmntpr*.oaiusercontent.com`), fetched at
+                    // startup; left to prompt, every codex job would ask.
+                    "oaiusercontent.com",
+                ],
+                env: &[("CODEX_DISABLE_UPDATE_CHECK", "1")],
+            },
+            HarnessKind::Agy => KindSpec {
+                binary: "agy",
+                install_levels: 0,
+                auth_files: &[".gemini/antigravity-cli/antigravity-oauth-token"],
+                strip_keys: &[],
+                vendor_dirs: &[".gemini/antigravity-cli"],
+                home_skip: &[
+                    "bin",
+                    "brain",
+                    "cache",
+                    "conversations",
+                    "conversation_summaries.db",
+                    "crashes",
+                    "history.jsonl",
+                    "log",
+                    "cli.log",
+                    "scratch",
+                    "updater",
+                    "presence",
+                ],
+                hosts: &[
+                    "daily-cloudcode-pa.googleapis.com",
+                    "cloudcode-pa.googleapis.com",
+                    "oauth2.googleapis.com",
+                    "accounts.google.com",
+                    "www.googleapis.com",
+                    "antigravity.google.com",
+                    // Its startup "eligibility check" fetches the account's profile
+                    // picture and fails the run if it cannot.
+                    "lh3.googleusercontent.com",
+                    // Its feature-flag service, contacted at startup; left to prompt,
+                    // every agy job would ask before doing anything.
+                    "antigravity-unleash.goog",
+                ],
+                env: &[],
+            },
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             HarnessKind::Grok => "grok",
+            HarnessKind::Claude => "claude",
+            HarnessKind::Codex => "codex",
+            HarnessKind::Agy => "agy",
         }
     }
 }

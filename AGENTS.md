@@ -258,7 +258,8 @@ can't). Concretely:
   no code path that runs one on the host, and there must never be one. A harness sees
   its binary and a **private copy** of its login in a job-scoped home, never the
   user's real vendor home (it holds the vendor binary, hooks and MCP commands the
-  host later runs unconfined). The vendor homes (`~/.grok`, `~/.claude`, …) are
+  host later runs unconfined), and only the credential file is ever written back. The
+  vendor homes (`~/.grok`, `~/.claude`, …) are
   denylisted; `harnesses.yaml` is user-level only. The job control directory is never
   exposed to a harness (its files answer forwarded network approvals) — the harness
   talks to the foreman only through the two-tool MCP relay (`harness/mcp.rs`).
