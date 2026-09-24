@@ -18,15 +18,37 @@ use cowboy_gateway::state::GatewayState;
 use cowboy_sandbox::plan::{Grant, PlanInputs, SandboxPlan};
 use cowboy_sandbox::{Denylist, HostProbe};
 
-use super::bwrap::NetMode;
-use super::exec::{self, ExecRequest};
+use super::backend::Session;
+use super::exec::{self, Ticket};
 use super::grants;
-use super::session::SessionSandbox;
 use super::{ExecResult, Sandbox, StatusRx, StatusTx};
+
+/// What a backend needs to bring a session up.
+pub(crate) struct StartContext<'a> {
+    /// Unique to this sandbox instance (see [`crate::project::cgroup_key`]): it names
+    /// whatever per-session host state the backend creates (Linux: the cgroup).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub instance_key: &'a str,
+    /// The `cowboy` binary, which runs as the shim (and on Linux, the holder).
+    pub exe: &'a Path,
+    pub limits: &'a cowboy_sandbox::ResourceLimits,
+    /// The policy engine every egress decision goes to.
+    pub engine: Arc<GatewayState>,
+    /// This session's host-only scratch directory (macOS: what identifies its
+    /// processes).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub scratch: &'a Path,
+    /// Loopback ports commands may reach directly (`sandbox.loopback_ports`, macOS).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub loopback_ports: &'a [u16],
+    /// Where to send bring-up notices.
+    pub report: &'a (dyn Fn(String) + Sync),
+}
 
 /// A background process started from `agent.yaml`.
 struct Background {
-    /// The bwrap monitor pid. Killing it reaps the process's whole namespace.
+    /// The spawned pid: bwrap on Linux (killing it reaps the process's whole
+    /// namespace), the shim's process group on macOS.
     pid: u32,
     /// The grant generation current when it started.
     ///
@@ -36,6 +58,8 @@ struct Background {
     /// them to debug a dev server that cannot see a folder they just approved.
     grant_generation: u64,
     child: Option<tokio::process::Child>,
+    /// Held for the process's lifetime; see [`exec::Prepared::ticket`].
+    _ticket: Option<Box<dyn Ticket>>,
 }
 
 pub struct NativeSandbox {
@@ -43,7 +67,7 @@ pub struct NativeSandbox {
     security: SecurityConfig,
     /// Started lazily: constructing a sandbox must not create namespaces, so that
     /// `cowboy sandbox plan` and the unit tests stay side-effect free.
-    session: tokio::sync::Mutex<Option<SessionSandbox>>,
+    session: tokio::sync::Mutex<Option<Session>>,
     grants: Mutex<Vec<Grant>>,
     /// Bumped on every grant. Background processes record the value they started
     /// with; a mismatch means their Landlock domain predates a grant.
@@ -186,6 +210,7 @@ impl NativeSandbox {
             scratch: &scratch,
             agent_home: &agent_home,
             git_identity: git_identity.as_deref(),
+            platform: cowboy_sandbox::plan::Platform::host(),
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
     }
@@ -327,65 +352,36 @@ impl NativeSandbox {
     ///
     /// Fails closed: if the namespaces cannot be created, no command runs. There is
     /// no fallback to running on the host.
-    async fn session(&self) -> Result<tokio::sync::MutexGuard<'_, Option<SessionSandbox>>> {
+    async fn session(&self) -> Result<tokio::sync::MutexGuard<'_, Option<Session>>> {
         let mut guard = self.session.lock().await;
-        // A holder that died (OOM, external kill) must not be silently reused: its
-        // namespace paths are gone, so commands would fail confusingly.
+        // A session that died (OOM, external kill) must not be silently reused: its
+        // namespaces or its proxy are gone, so commands would fail confusingly.
         if guard.as_ref().is_some_and(|s| !s.is_alive()) {
-            tracing::warn!("the sandbox session holder died; starting a new session");
+            tracing::warn!("the sandbox session died; starting a new session");
             *guard = None;
         }
         if guard.is_none() {
             self.report("starting the sandbox session…".to_string());
-            // The same binary the plan binds as the lockdown shim, so the two cannot
+            // The same binary the plan runs as the lockdown shim, so the two cannot
             // disagree about which cowboy is running.
             let exe = self
                 .probe
                 .self_exe()
-                .context("cannot locate the cowboy binary to hold the session namespaces")?;
+                .context("cannot locate the cowboy binary for the sandbox session")?;
             // The plan's limits, so what `cowboy sandbox plan` prints is what the
             // session is actually held to.
             let limits = self.plan()?.limits;
-            let (session, channels) = SessionSandbox::start(&self.cgroup_key, &exe, &limits)?;
-            match session.limits_in_force() {
-                Some(s) => self.report(format!("resource limits: {s}")),
-                None if limits.memory_mib.is_some() || limits.cpus.is_some() => self.report(
-                    "resource limits are configured but cannot be enforced here (no delegated \
-                     cgroup v2 subtree). Run `cowboy doctor` for details."
-                        .to_string(),
-                ),
-                None => {}
-            }
-            // Serve both relay channels on dedicated threads. They must be running
-            // before any command does, or the first connection blocks on a verdict
-            // and the first lookup on a response.
-            let handle = tokio::runtime::Handle::current();
-            let engine = self.policy_engine.clone();
-            let connect = channels.connect;
-            std::thread::Builder::new()
-                .name("cowboy-egress-broker".into())
-                .spawn({
-                    let handle = handle.clone();
-                    move || {
-                        crate::sandbox::transport::broker::serve_blocking(connect, engine, handle);
-                    }
-                })
-                .context("spawning the egress policy broker")?;
-
-            // The upstream resolver is read here, on the host, and the sandbox is
-            // never told which one it is: it sends every query to a loopback port and
-            // the answer comes back from this side.
-            let upstream = cowboy_gateway::dns::host_resolver();
-            let engine = self.policy_engine.clone();
-            let resolve = channels.resolve;
-            std::thread::Builder::new()
-                .name("cowboy-dns-broker".into())
-                .spawn(move || {
-                    crate::sandbox::transport::broker::serve_dns_blocking(
-                        resolve, engine, handle, upstream,
-                    );
-                })
-                .context("spawning the dns policy broker")?;
+            let scratch = crate::project::ensure_scratch_dir(&self.scratch_key)?;
+            let report = |msg: String| self.report(msg);
+            let session = Session::start(StartContext {
+                instance_key: &self.cgroup_key,
+                exe: &exe,
+                limits: &limits,
+                engine: self.policy_engine.clone(),
+                scratch: &scratch,
+                loopback_ports: &self.security.sandbox.loopback_ports,
+                report: &report,
+            })?;
             *guard = Some(session);
         }
         Ok(guard)
@@ -403,26 +399,24 @@ impl NativeSandbox {
         let plan = self.plan()?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
-        let req = ExecRequest {
-            plan: &plan,
-            command,
-            cwd,
-            timeout_secs,
-            // Inherit: the session namespace is already entered, and unsharing here
-            // would discard the network namespace the transport is installed in.
-            net: NetMode::Inherit,
-            session: Some(session),
-        };
-        exec::run_streaming(req, cancel, chunks).await
+        let shell_command = exec::with_cwd(&plan.workdir, command, cwd);
+        let prepared = session.prepare(&plan, &shell_command)?;
+        // The guard stays held while the command runs, so `stop` waits for it rather
+        // than tearing the session down underneath it.
+        let result = exec::stream(prepared, &shell_command, timeout_secs, cancel, chunks).await;
+        drop(guard);
+        result
     }
 
     /// Start a background process in this session.
     ///
-    /// It shares the session's network namespace, so later commands can reach it on
-    /// loopback, but gets its own PID namespace so stopping it reaps exactly its own
-    /// processes. `bwrap` stays a child of this (long-lived) process, so
-    /// `--die-with-parent` gives the process the session's lifetime — no pid file to
-    /// trust, and nothing left running after teardown.
+    /// On Linux it shares the session's network namespace, so later commands can
+    /// reach it on loopback, but gets its own PID namespace so stopping it reaps
+    /// exactly its own processes; `bwrap` stays a child of this (long-lived) process,
+    /// so `--die-with-parent` gives the process the session's lifetime. On macOS it
+    /// leads its own process group, which stopping it kills, and the session sweep
+    /// catches anything that left the group. Either way there is no pid file to
+    /// trust.
     ///
     /// Output goes to `.cowboy/proc/<name>.log` in the workspace rather than into the
     /// agent's transcript: a dev server's chatter would swamp it, and a file is
@@ -438,21 +432,23 @@ impl NativeSandbox {
         let session = guard.as_ref().expect("session started");
         let generation = self.grant_generation.load(Ordering::SeqCst);
 
-        let child = exec::spawn_detached(
-            &plan,
+        let script = exec::with_cwd(
+            &plan.workdir,
             &background_script(&plan.workdir, name, command),
             cwd,
-            NetMode::Inherit,
-            Some(session),
-        )
-        .await?;
-        let pid = child.id().context("background process has no pid")?;
+        );
+        let detached = exec::detach(session.prepare(&plan, &script)?).await?;
+        let pid = detached
+            .child
+            .id()
+            .context("background process has no pid")?;
         self.processes.lock().expect("processes poisoned").insert(
             name.to_string(),
             Background {
                 pid,
                 grant_generation: generation,
-                child: Some(child),
+                child: Some(detached.child),
+                _ticket: detached.ticket,
             },
         );
         Ok(())
@@ -463,7 +459,7 @@ impl NativeSandbox {
             .lock()
             .expect("processes poisoned")
             .get(name)
-            .is_some_and(|b| Path::new(&format!("/proc/{}", b.pid)).exists())
+            .is_some_and(|b| crate::project::pid_alive(b.pid))
     }
 
     pub fn running_processes(&self) -> Vec<String> {
@@ -475,8 +471,8 @@ impl NativeSandbox {
             .collect()
     }
 
-    /// Stop a background process. Killing bwrap reaps its whole PID namespace, so
-    /// nothing it spawned survives.
+    /// Stop a background process and everything it spawned: killing bwrap reaps its
+    /// whole PID namespace on Linux; on macOS its process group is killed.
     pub async fn stop_process(&self, name: &str) -> Result<()> {
         let entry = self
             .processes
@@ -487,8 +483,7 @@ impl NativeSandbox {
             anyhow::bail!("process {name} is not running");
         };
         if let Some(child) = b.child.as_mut() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+            exec::stop_detached(child).await;
         }
         Ok(())
     }
@@ -554,6 +549,30 @@ impl Sandbox for NativeSandbox {
 
     fn session_name(&self) -> &str {
         &self.session_name
+    }
+
+    fn paths(&self) -> super::SandboxPaths {
+        match cowboy_sandbox::Platform::host() {
+            cowboy_sandbox::Platform::Linux => super::SandboxPaths {
+                workdir: self.security.sandbox.workdir.clone(),
+                scratch: "/tmp".to_string(),
+            },
+            // Everything at its host path; the scratch directory is the one the plan
+            // points `TMPDIR` at. Named without creating it: this runs before any
+            // command, and construction must stay side-effect free.
+            cowboy_sandbox::Platform::MacOs => super::SandboxPaths {
+                workdir: self.root.to_string_lossy().into_owned(),
+                scratch: crate::project::private_dir()
+                    .map(|d| {
+                        d.join("scratch")
+                            .join(&self.scratch_key)
+                            .join("tmp")
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .unwrap_or_else(|_| "$TMPDIR".to_string()),
+            },
+        }
     }
 
     fn status_channel(&mut self) -> StatusRx {
@@ -635,17 +654,27 @@ impl Sandbox for NativeSandbox {
         let plan = self.plan()?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
-        exec::run_interactive(&plan, "bash -l", NetMode::Inherit, Some(session)).await
+        let prepared = session.prepare(&plan, "bash -l")?;
+        let result = exec::interactive(prepared).await;
+        drop(guard);
+        result
     }
 
     async fn fileop(&self, payload: &str) -> Result<(ExecResult, String)> {
-        // The structured file tools run through the in-sandbox cowboy binary, which
-        // is already bound read-only for the lockdown shim.
-        let command = format!("{} x-fileop", cowboy_sandbox::SHIM_PATH);
+        // The structured file tools run through the cowboy binary inside the sandbox,
+        // confined exactly like any other command.
+        let exe = self
+            .probe
+            .self_exe()
+            .context("cannot locate the cowboy binary for the file tools")?;
         let plan = self.plan()?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
-        exec::run_with_stdin(&plan, &command, payload, NetMode::Inherit, Some(session)).await
+        let command = session.fileop_command(&exe);
+        let prepared = session.prepare(&plan, &command)?;
+        let result = exec::with_stdin(prepared, &command, payload).await;
+        drop(guard);
+        result
     }
 
     async fn stop_all_processes(&self) -> Result<()> {
@@ -975,6 +1004,7 @@ mod tests {
                 pid: 1,
                 grant_generation: 0,
                 child: None,
+                _ticket: None,
             },
         );
 
@@ -1010,6 +1040,7 @@ mod tests {
                     pid,
                     grant_generation: 0,
                     child: None,
+                    _ticket: None,
                 },
             );
         }
@@ -1037,6 +1068,7 @@ mod tests {
                 pid: 1,
                 grant_generation: 0,
                 child: None,
+                _ticket: None,
             },
         );
         assert!(
@@ -1060,6 +1092,7 @@ mod tests {
                 pid: 2,
                 grant_generation: current,
                 child: None,
+                _ticket: None,
             },
         );
         assert!(

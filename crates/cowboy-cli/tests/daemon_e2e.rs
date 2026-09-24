@@ -68,9 +68,13 @@ fn sandbox_ok() -> bool {
 /// networks, or ruleset remnants to chase: they lived in namespaces the worker's exit
 /// released.
 fn reap_session_residue() {
-    let reaped = cowboy_cli::sandbox::cgroup::reap_empty();
-    if reaped > 0 {
-        eprintln!("reaped {reaped} leftover cgroup(s)");
+    // macOS has no cgroups; a worker's session sweeps its own processes as it exits.
+    #[cfg(target_os = "linux")]
+    {
+        let reaped = cowboy_cli::sandbox::cgroup::reap_empty();
+        if reaped > 0 {
+            eprintln!("reaped {reaped} leftover cgroup(s)");
+        }
     }
 }
 

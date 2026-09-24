@@ -46,6 +46,20 @@ pub trait HostProbe {
     /// resolved (it does not exist, or a component is not traversable); a caller binding
     /// a *required* source must treat that as an error rather than trusting the literal.
     fn canonicalize(&self, path: &Path) -> Option<PathBuf>;
+
+    /// The application bundle of the selected Apple developer directory
+    /// (`xcode-select -p`, e.g. `/Applications/Xcode.app`), on macOS. The `/usr/bin`
+    /// developer shims resolve every compiler and `git` through it, so the sandbox
+    /// has to be able to read it.
+    fn developer_bundle(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// The Darwin per-user temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`),
+    /// on macOS. `xcrun` writes its cache there whatever `TMPDIR` says.
+    fn darwin_user_temp(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// A [`HostProbe`] describing a filesystem instead of touching one.
@@ -59,6 +73,10 @@ pub struct FakeHost {
     /// test can point a benign-looking mount source at a denied destination without
     /// touching a real filesystem.
     pub symlinks: Vec<(PathBuf, PathBuf)>,
+    /// See [`HostProbe::developer_bundle`].
+    pub developer_bundle: Option<PathBuf>,
+    /// See [`HostProbe::darwin_user_temp`].
+    pub darwin_user_temp: Option<PathBuf>,
 }
 
 impl FakeHost {
@@ -70,6 +88,8 @@ impl FakeHost {
             home: Some(PathBuf::from("/home/dev")),
             self_exe: Some(PathBuf::from("/usr/bin/cowboy")),
             symlinks: Vec::new(),
+            developer_bundle: None,
+            darwin_user_temp: None,
         }
     }
 
@@ -148,5 +168,13 @@ impl HostProbe for FakeHost {
         } else {
             None
         }
+    }
+
+    fn developer_bundle(&self) -> Option<PathBuf> {
+        self.developer_bundle.clone()
+    }
+
+    fn darwin_user_temp(&self) -> Option<PathBuf> {
+        self.darwin_user_temp.clone()
     }
 }

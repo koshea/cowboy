@@ -628,6 +628,7 @@ dependencies = [
  "cowboy-tui",
  "crossterm",
  "futures",
+ "httparse",
  "insta",
  "landlock",
  "libc",
@@ -713,6 +714,7 @@ version = "0.1.0"
 dependencies = [
  "cowboy-core",
  "insta",
+ "libc",
  "pretty_assertions",
  "serde",
 ]

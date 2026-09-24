@@ -1,27 +1,33 @@
 //! Running one command inside the sandbox.
 //!
 //! The command is a **local child process** rather than a request to a daemon, so
-//! its lifecycle is ours to manage directly. That is a real simplification over the
-//! Docker path, which had to record a pgid in a file inside the container and sweep
-//! `/proc` by env marker to catch descendants that re-`setsid`ed out of the
-//! recorded group.
+//! its lifecycle is ours to manage directly. Each OS backend turns a plan into a
+//! [`Prepared`] command — the spawn and the shim request — and everything after that
+//! (streaming, timeouts, cancellation, attribution) is shared here, so the two
+//! platforms cannot drift in how a command is run once it is confined.
 //!
-//! Here, `--unshare-pid` plus `--die-with-parent` means killing bwrap takes down
-//! PID 1 of the sandbox namespace and the kernel reaps everything in it —
-//! including a process that deliberately escaped its process group. Verified; see
-//! `docs/src/security/sandbox-decisions.md`.
+//! On Linux, `--unshare-pid` plus `--die-with-parent` means killing bwrap takes down
+//! PID 1 of the sandbox namespace and the kernel reaps everything in it — including
+//! a process that deliberately escaped its process group. macOS has no PID
+//! namespace: the command's process group is killed instead, and a process that
+//! `setsid`s out of it is found by the session sweep (`macos::reap`). Both verified;
+//! see `docs/src/security/sandbox-decisions.md`.
 
+#[cfg(target_os = "linux")]
 use std::ffi::OsString;
 use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use cowboy_sandbox::SandboxPlan;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(target_os = "linux")]
 use super::bwrap::{self, NetMode};
+#[cfg(target_os = "linux")]
 use super::session::SessionSandbox;
 use super::shim::ShimRequest;
 use super::stream::LineSplitter;
@@ -34,8 +40,50 @@ pub(crate) const EXIT_TIMEOUT: i32 = 124;
 pub(crate) const EXIT_CANCELLED: i32 = 130;
 /// How long a command gets to exit after `SIGTERM` before `SIGKILL`.
 const GRACE: Duration = Duration::from_secs(2);
+/// How long to keep reading after the command itself has exited.
+///
+/// Only matters without a PID namespace: a process that escaped the command's group
+/// can hold the output pipe open indefinitely, and waiting for its EOF would turn a
+/// finished command into a timeout. What it wrote in time is kept.
+const DRAIN: Duration = Duration::from_millis(500);
+
+/// A confined command, ready to spawn: the backend's process builder plus the request
+/// the shim reads before it `exec`s.
+pub struct Prepared {
+    pub cmd: Command,
+    pub request: ShimRequest,
+    /// Backend state that must live exactly as long as the command — on macOS, its
+    /// proxy credentials, revoked when this is dropped.
+    pub ticket: Option<Box<dyn Ticket>>,
+}
+
+/// Per-command backend state, told the pid once the command is spawned.
+pub trait Ticket: Send + Sync {
+    /// The command is running as `pid`.
+    fn spawned(&self, pid: u32);
+}
+
+/// A background process and the ticket that must outlive it.
+pub struct Detached {
+    pub child: tokio::process::Child,
+    pub ticket: Option<Box<dyn Ticket>>,
+}
+
+/// `command`, prefixed with a `cd` when a working directory other than the plan's
+/// workdir is requested.
+///
+/// Quoted so a directory containing spaces or shell metacharacters cannot break
+/// out into command position, and `&&` so a missing directory fails the command
+/// instead of silently running it somewhere else.
+pub(crate) fn with_cwd(workdir: &str, command: &str, cwd: Option<&str>) -> String {
+    match cwd {
+        Some(cwd) if cwd != workdir => format!("cd {} && {command}", shell_quote(cwd)),
+        _ => command.to_string(),
+    }
+}
 
 /// One command to run in the sandbox.
+#[cfg(target_os = "linux")]
 pub struct ExecRequest<'a> {
     pub plan: &'a SandboxPlan,
     pub command: &'a str,
@@ -54,12 +102,13 @@ pub struct ExecRequest<'a> {
 /// Shared by every spawn path so they cannot drift in how they confine things —
 /// a streaming command, a background process and an interactive shell must all get
 /// the same boundary.
-fn build_command(
+#[cfg(target_os = "linux")]
+pub(crate) fn build_command(
     plan: &SandboxPlan,
     shell_command: &str,
     net: NetMode,
     session: Option<&SessionSandbox>,
-) -> Result<(Command, ShimRequest)> {
+) -> Result<Prepared> {
     let bwrap_path = bwrap::resolve_bwrap()?;
     // The shim runs from inside the sandbox at a fixed path; the plan binds the
     // cowboy binary there (see `cowboy_sandbox::SHIM_PATH`).
@@ -111,14 +160,20 @@ fn build_command(
         scope_ipc: plan.landlock.scope_ipc,
         deny_syscalls: plan.seccomp.denied.iter().map(|s| s.to_string()).collect(),
         deny_raw_sockets: plan.seccomp.deny_raw_sockets,
+        ..ShimRequest::default()
     };
-    Ok((cmd, request))
+    Ok(Prepared {
+        cmd,
+        request,
+        ticket: None,
+    })
 }
 
 /// Whether this kernel offers overlayfs at all.
 ///
 /// Cheap and cached: the answer cannot change while the machine is up, and this is
 /// on the path of every command.
+#[cfg(target_os = "linux")]
 fn overlayfs_available() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
@@ -136,6 +191,7 @@ fn overlayfs_available() -> bool {
 /// Anything that cannot be prepared is left out rather than raised: see the call
 /// site. `upper` and `work` must be on the same filesystem, which they are — both
 /// live under the project root.
+#[cfg(target_os = "linux")]
 fn usable_overlays(plan: &SandboxPlan) -> Vec<cowboy_sandbox::plan::Overlay> {
     if plan.overlays.is_empty() || !overlayfs_available() {
         return Vec::new();
@@ -167,6 +223,7 @@ fn usable_overlays(plan: &SandboxPlan) -> Vec<cowboy_sandbox::plan::Overlay> {
 ///
 /// On the parent rather than inside `upper`: a file in `upper` appears in the
 /// merged view, i.e. as litter inside the user's toolchain store.
+#[cfg(target_os = "linux")]
 fn ignore_marker(o: &cowboy_sandbox::plan::Overlay) -> std::io::Result<()> {
     let Some(parent) = o.upper.parent() else {
         return Ok(());
@@ -183,6 +240,7 @@ fn ignore_marker(o: &cowboy_sandbox::plan::Overlay) -> std::io::Result<()> {
 /// Fails closed either way — without the shim nothing execs — so this exists purely to
 /// replace an error that names the wrong thing with one that names the right thing and
 /// says what to do.
+#[cfg(target_os = "linux")]
 fn ensure_shim_is_bound(plan: &SandboxPlan) -> Result<()> {
     let bound = plan
         .binds
@@ -235,13 +293,33 @@ async fn send_request(
 ///
 /// Returns the exit status and the full accumulated output. Interrupts via
 /// `cancel` or the timeout kill the whole sandbox, not just the leader.
+#[cfg(target_os = "linux")]
 pub async fn run_streaming(
     req: ExecRequest<'_>,
     cancel: CancellationToken,
     chunks: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<(ExecResult, String)> {
-    let shell_command = shell_command_for(&req);
-    let (mut cmd, request) = build_command(req.plan, &shell_command, req.net, req.session)?;
+    let shell_command = with_cwd(&req.plan.workdir, req.command, req.cwd);
+    let prepared = build_command(req.plan, &shell_command, req.net, req.session)?;
+    stream(prepared, &shell_command, req.timeout_secs, cancel, chunks).await
+}
+
+/// Spawn a prepared command and stream its combined output; see [`run_streaming`].
+///
+/// `label` is the command as the host sees it, recorded for network-approval
+/// attribution.
+pub(crate) async fn stream(
+    prepared: Prepared,
+    label: &str,
+    timeout_secs: u64,
+    cancel: CancellationToken,
+    chunks: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<(ExecResult, String)> {
+    let Prepared {
+        mut cmd,
+        request,
+        ticket,
+    } = prepared;
     // Combined output on one pipe keeps interleaving faithful to what the command
     // actually produced; two pipes would reorder it. No PTY: over a plain pipe,
     // tools like cargo and mise emit plain streamable lines instead of
@@ -253,16 +331,20 @@ pub async fn run_streaming(
     cmd.kill_on_drop(true);
 
     let mut child = cmd.spawn().context("spawning the sandbox")?;
+    let pid = child.id();
     // Record what this pid is running, so a network approval can say which command wants
     // the destination instead of only quoting a pid. Held for the life of the call: the
     // guard's `Drop` removes the entry on every exit path, including a timeout or a
     // cancellation, so a later command cannot inherit this label after pid reuse.
     //
-    // SECURITY: the string is the command the *host* passed to bwrap, taken before the
-    // command can run. It is display-only — see `sandbox::attribution`.
+    // SECURITY: the string is the command the *host* spawned, taken before the command
+    // can run. It is display-only — see `sandbox::attribution`.
     let _attributed = child
         .id()
-        .map(|pid| crate::sandbox::attribution::record(pid, &shell_command));
+        .map(|pid| crate::sandbox::attribution::record(pid, label));
+    if let (Some(t), Some(pid)) = (&ticket, child.id()) {
+        t.spawned(pid);
+    }
     send_request(&mut child, &request, None).await?;
 
     let mut stdout = child.stdout.take().context("sandbox stdout unavailable")?;
@@ -275,13 +357,17 @@ pub async fn run_streaming(
     let mut out_done = false;
     let mut err_done = false;
 
-    let timeout = if req.timeout_secs == 0 {
+    let timeout = if timeout_secs == 0 {
         Duration::from_secs(86_400)
     } else {
-        Duration::from_secs(req.timeout_secs)
+        Duration::from_secs(timeout_secs)
     };
     let deadline = tokio::time::sleep(timeout);
     tokio::pin!(deadline);
+    // Armed once the command itself has exited; see [`DRAIN`].
+    let drain = tokio::time::sleep(Duration::MAX / 4);
+    tokio::pin!(drain);
+    let mut exited = false;
 
     let mut interrupted: Option<&str> = None;
     while !(out_done && err_done) {
@@ -294,6 +380,14 @@ pub async fn run_streaming(
                 Ok(0) | Err(_) => err_done = true,
                 Ok(n) => splitter.feed(&buf_err[..n], &mut accumulated, &chunks),
             },
+            _ = child.wait(), if !exited => {
+                exited = true;
+                // Whatever the command left running in its group goes with it, as it
+                // does with a PID namespace; then the pipes close.
+                reap_leftovers(pid);
+                drain.as_mut().reset(tokio::time::Instant::now() + DRAIN);
+            }
+            _ = &mut drain, if exited => break,
             _ = cancel.cancelled() => { interrupted = Some("cancelled"); break; }
             _ = &mut deadline => { interrupted = Some("timed out"); break; }
         }
@@ -301,7 +395,7 @@ pub async fn run_streaming(
     splitter.finish(&mut accumulated, &chunks);
 
     if let Some(why) = interrupted {
-        terminate(&mut child).await;
+        terminate(&mut child, pid).await;
         let note = format!("[command {why}]");
         accumulated.push_str(&note);
         let _ = chunks.send(format!("{note}\n"));
@@ -318,6 +412,7 @@ pub async fn run_streaming(
     }
 
     let status = child.wait().await.context("waiting for the sandbox")?;
+    reap_leftovers(pid);
     Ok((
         ExecResult {
             exit_code: status.code().unwrap_or(-1),
@@ -328,37 +423,60 @@ pub async fn run_streaming(
 
 /// Stop the sandbox: `SIGTERM` for a chance to clean up, then `SIGKILL`.
 ///
-/// Signalling bwrap is sufficient because `--die-with-parent` propagates its death
-/// to PID 1 of the sandbox namespace, after which the kernel kills every remaining
-/// process there. That covers descendants which re-`setsid`ed and so would have
-/// survived a process-group signal.
-async fn terminate(child: &mut tokio::process::Child) {
-    let Some(pid) = child.id() else { return };
-    // SAFETY: `kill` with a valid pid; a race where the child already exited is
-    // reported as ESRCH and ignored.
-    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+/// On Linux, signalling bwrap is sufficient because `--die-with-parent` propagates its
+/// death to PID 1 of the sandbox namespace, after which the kernel kills every
+/// remaining process there. That covers descendants which re-`setsid`ed and so would
+/// have survived a process-group signal. On macOS the whole process group is
+/// signalled, and escapees are left to the session sweep.
+async fn terminate(child: &mut tokio::process::Child, pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    signal_tree(pid, libc::SIGTERM);
     match tokio::time::timeout(GRACE, child.wait()).await {
         Ok(_) => {}
         Err(_) => {
+            signal_tree(pid, libc::SIGKILL);
             let _ = child.start_kill();
             // Reap so the process does not linger as a zombie.
             let _ = tokio::time::timeout(GRACE, child.wait()).await;
         }
     }
+    reap_leftovers(Some(pid));
 }
 
-/// The shell command, prefixed with a `cd` when a working directory is requested.
+/// Signal what a command's pid stands for: bwrap on Linux, the process group the
+/// shim leads on macOS.
+fn signal_tree(pid: u32, sig: libc::c_int) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    // SAFETY: `kill` with a valid pid; a race where the child already exited is
+    // reported as ESRCH and ignored.
+    unsafe {
+        libc::kill(pid, sig)
+    };
+    #[cfg(target_os = "macos")]
+    // SAFETY: as above, for the group the child leads (`process_group(0)`).
+    unsafe {
+        libc::killpg(pid, sig)
+    };
+}
+
+/// Kill anything still in a finished command's process group.
 ///
-/// Quoted so a directory containing spaces or shell metacharacters cannot break
-/// out into command position, and `&&` so a missing directory fails the command
-/// instead of silently running it somewhere else.
-fn shell_command_for(req: &ExecRequest<'_>) -> String {
-    match req.cwd {
-        Some(cwd) if cwd != req.plan.workdir => {
-            format!("cd {} && {}", shell_quote(cwd), req.command)
-        }
-        _ => req.command.to_string(),
+/// A no-op on Linux, where the PID namespace is already gone. On macOS it is what
+/// stands in for one: `sleep 100 &` must not outlive the command that started it.
+///
+/// Takes the pid captured at spawn, not `child.id()`: once the child has been reaped
+/// that is `None`, and the group kill silently did nothing — which is how a
+/// backgrounded job first outlived its command here.
+fn reap_leftovers(pid: Option<u32>) {
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = pid {
+        signal_tree(pid, libc::SIGKILL);
     }
+    #[cfg(target_os = "linux")]
+    let _ = pid;
 }
 
 /// Single-quote a string for POSIX `sh`.
@@ -375,6 +493,7 @@ fn shell_quote(s: &str) -> String {
 ///
 /// Its Landlock domain is fixed here and can never be widened, so a grant approved
 /// later is invisible to it — see `NativeSandbox::warn_about_stale_processes`.
+#[cfg(target_os = "linux")]
 pub async fn spawn_detached(
     plan: &SandboxPlan,
     command: &str,
@@ -382,11 +501,19 @@ pub async fn spawn_detached(
     net: NetMode,
     session: Option<&SessionSandbox>,
 ) -> Result<tokio::process::Child> {
-    let shell_command = match cwd {
-        Some(cwd) if cwd != plan.workdir => format!("cd {} && {command}", shell_quote(cwd)),
-        _ => command.to_string(),
-    };
-    let (mut cmd, request) = build_command(plan, &shell_command, net, session)?;
+    let shell_command = with_cwd(&plan.workdir, command, cwd);
+    Ok(detach(build_command(plan, &shell_command, net, session)?)
+        .await?
+        .child)
+}
+
+/// Spawn a prepared command without waiting for it; see [`spawn_detached`].
+pub(crate) async fn detach(prepared: Prepared) -> Result<Detached> {
+    let Prepared {
+        mut cmd,
+        request,
+        ticket,
+    } = prepared;
     cmd.stdin(Stdio::piped());
     // Output goes nowhere: a background process's logs belong in its own file under
     // the workspace, not interleaved into the agent's transcript.
@@ -397,8 +524,22 @@ pub async fn spawn_detached(
     cmd.kill_on_drop(false);
 
     let mut child = cmd.spawn().context("spawning the background process")?;
+    if let (Some(t), Some(pid)) = (&ticket, child.id()) {
+        t.spawned(pid);
+    }
     send_request(&mut child, &request, None).await?;
-    Ok(child)
+    Ok(Detached { child, ticket })
+}
+
+/// Stop a background process started by [`detach`], and everything it spawned.
+pub(crate) async fn stop_detached(child: &mut tokio::process::Child) {
+    let pid = child.id();
+    if let Some(pid) = pid {
+        signal_tree(pid, libc::SIGKILL);
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    reap_leftovers(pid);
 }
 
 /// Run a command with `payload` on its stdin, capturing output.
@@ -406,6 +547,7 @@ pub async fn spawn_detached(
 /// The structured file tools use this so multi-line content never has to survive
 /// shell quoting. The payload follows the shim's request line on the same pipe; see
 /// [`send_request`].
+#[cfg(target_os = "linux")]
 pub async fn run_with_stdin(
     plan: &SandboxPlan,
     command: &str,
@@ -413,7 +555,25 @@ pub async fn run_with_stdin(
     net: NetMode,
     session: Option<&SessionSandbox>,
 ) -> Result<(ExecResult, String)> {
-    let (mut cmd, request) = build_command(plan, command, net, session)?;
+    with_stdin(
+        build_command(plan, command, net, session)?,
+        command,
+        payload,
+    )
+    .await
+}
+
+/// Run a prepared command with `payload` on its stdin; see [`run_with_stdin`].
+pub(crate) async fn with_stdin(
+    prepared: Prepared,
+    label: &str,
+    payload: &str,
+) -> Result<(ExecResult, String)> {
+    let Prepared {
+        mut cmd,
+        request,
+        ticket,
+    } = prepared;
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -424,13 +584,18 @@ pub async fn run_with_stdin(
     // command wants this?" should not answer "unknown" just because the caller was `write`.
     let _attributed = child
         .id()
-        .map(|pid| crate::sandbox::attribution::record(pid, command));
+        .map(|pid| crate::sandbox::attribution::record(pid, label));
+    if let (Some(t), Some(pid)) = (&ticket, child.id()) {
+        t.spawned(pid);
+    }
     send_request(&mut child, &request, Some(payload)).await?;
 
+    let pid = child.id();
     let out = child
         .wait_with_output()
         .await
         .context("waiting for the sandbox")?;
+    reap_leftovers(pid);
     let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
     combined.push_str(&String::from_utf8_lossy(&out.stderr));
     Ok((
@@ -442,17 +607,30 @@ pub async fn run_with_stdin(
 }
 
 /// Run an interactive command, inheriting the terminal.
+#[cfg(target_os = "linux")]
 pub async fn run_interactive(
     plan: &SandboxPlan,
     command: &str,
     net: NetMode,
     session: Option<&SessionSandbox>,
 ) -> Result<ExecResult> {
+    interactive(build_command(plan, command, net, session)?).await
+}
+
+/// Run a prepared command interactively; see [`run_interactive`].
+pub(crate) async fn interactive(prepared: Prepared) -> Result<ExecResult> {
     use tokio::io::AsyncWriteExt;
-    let (mut cmd, request) = build_command(plan, command, net, session)?;
+    let Prepared {
+        mut cmd,
+        request,
+        ticket,
+    } = prepared;
     cmd.stdin(Stdio::piped());
     // stdout/stderr inherited so the shell is usable.
     let mut child = cmd.spawn().context("spawning the interactive sandbox")?;
+    if let (Some(t), Some(pid)) = (&ticket, child.id()) {
+        t.spawned(pid);
+    }
 
     // The shim reads its one request line off fd 0, then execs the command, which
     // inherits fd 0. So we must send the request line and then keep feeding the
@@ -478,7 +656,9 @@ pub async fn run_interactive(
         let _ = child_stdin.shutdown().await;
     });
 
+    let pid = child.id();
     let status = child.wait().await.context("waiting for the shell")?;
+    reap_leftovers(pid);
     // The shell exited; stop pumping (the copy task may still be blocked on a
     // terminal read). Aborting drops `child_stdin`, closing the pipe.
     pump.abort();
@@ -487,6 +667,7 @@ pub async fn run_interactive(
     })
 }
 
+#[cfg(target_os = "linux")]
 fn to_strings(paths: &[std::path::PathBuf]) -> Vec<String> {
     paths
         .iter()
@@ -497,29 +678,14 @@ fn to_strings(paths: &[std::path::PathBuf]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use cowboy_core::config::SecurityConfig;
+    #[cfg(target_os = "linux")]
     use cowboy_sandbox::plan::PlanInputs;
+    #[cfg(target_os = "linux")]
     use cowboy_sandbox::probe::FakeHost;
+    #[cfg(target_os = "linux")]
     use std::path::{Path, PathBuf};
-
-    fn dummy_plan() -> SandboxPlan {
-        let probe = FakeHost::new().with_existing(["/usr", "/srv/proj"]);
-        let sec = SecurityConfig::default();
-        SandboxPlan::build(
-            &PlanInputs {
-                root: Path::new("/srv/proj"),
-                security: &sec,
-                grants: &[],
-                mask_file: Path::new("/run/mask"),
-                relay_port: 8443,
-                scratch: Path::new("/scratch"),
-                agent_home: Path::new("/cache/cowboy/home/proj"),
-                git_identity: None,
-            },
-            &probe,
-        )
-        .unwrap()
-    }
 
     /// Upgrading cowboy mid-session must say so, not fail as a missing file inside the
     /// sandbox.
@@ -535,6 +701,7 @@ mod tests {
     /// `project::self_exe` resolves the `(deleted)` marker so this should not arise;
     /// this is the backstop that makes it legible if it ever does.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_missing_lockdown_shim_names_the_host_binary_not_the_sandbox_path() {
         // A plan whose shim source does not exist, exactly as a replaced binary leaves it.
         let probe = FakeHost {
@@ -552,6 +719,7 @@ mod tests {
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/cache/cowboy/home/proj"),
                 git_identity: None,
+                platform: cowboy_sandbox::plan::Platform::Linux,
             },
             &probe,
         )
@@ -587,6 +755,7 @@ mod tests {
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/cache/cowboy/home/proj"),
                 git_identity: None,
+                platform: cowboy_sandbox::plan::Platform::Linux,
             },
             &live,
         )
@@ -594,32 +763,16 @@ mod tests {
         assert!(ensure_shim_is_bound(&ok_plan).is_ok());
     }
 
-    fn req<'a>(plan: &'a SandboxPlan, command: &'a str, cwd: Option<&'a str>) -> ExecRequest<'a> {
-        ExecRequest {
-            plan,
-            command,
-            cwd,
-            timeout_secs: 0,
-            net: NetMode::Isolated,
-            session: None,
-        }
-    }
-
     #[test]
     fn no_cd_when_the_cwd_is_the_workdir() {
-        let p = dummy_plan();
-        assert_eq!(shell_command_for(&req(&p, "make", None)), "make");
-        assert_eq!(
-            shell_command_for(&req(&p, "make", Some(&p.workdir.clone()))),
-            "make"
-        );
+        assert_eq!(with_cwd("/workspace", "make", None), "make");
+        assert_eq!(with_cwd("/workspace", "make", Some("/workspace")), "make");
     }
 
     #[test]
     fn cd_is_prepended_for_a_subdirectory() {
-        let p = dummy_plan();
         assert_eq!(
-            shell_command_for(&req(&p, "make", Some("/workspace/sub"))),
+            with_cwd("/workspace", "make", Some("/workspace/sub")),
             "cd '/workspace/sub' && make"
         );
     }
@@ -628,8 +781,7 @@ mod tests {
     /// run in command position.
     #[test]
     fn cwd_cannot_inject_a_command() {
-        let p = dummy_plan();
-        let out = shell_command_for(&req(&p, "make", Some("/tmp/x'; rm -rf /; echo '")));
+        let out = with_cwd("/workspace", "make", Some("/tmp/x'; rm -rf /; echo '"));
         assert!(
             !out.contains("; rm -rf /;") || out.starts_with("cd '/tmp/x'\\''"),
             "cwd must be quoted: {out}"

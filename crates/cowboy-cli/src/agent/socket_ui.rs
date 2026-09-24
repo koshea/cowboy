@@ -2536,10 +2536,13 @@ mod tests {
         let mut rx = ui.inner.live.subscribe();
         {
             let mut state = ui.inner.journal.lock().unwrap();
-            state.file = std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/full")
-                .unwrap();
+            // A device that fails every write (ENOSPC); macOS has none, so there a
+            // handle opened read-only stands in (EBADF).
+            #[cfg(target_os = "linux")]
+            let failing = std::fs::OpenOptions::new().write(true).open("/dev/full");
+            #[cfg(not(target_os = "linux"))]
+            let failing = std::fs::File::open(&journal);
+            state.file = failing.unwrap();
         }
 
         ui.emit(UiEventMsg::ToolUse("fails".into()));

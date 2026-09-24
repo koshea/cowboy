@@ -234,9 +234,11 @@ async fn check_daemon() -> Status {
 fn check_platform() -> Status {
     match std::env::consts::OS {
         "linux" => Status::Ok("linux".into()),
+        // The release and architecture are the sandbox checks' to judge.
+        "macos" => Status::Ok("macos".into()),
         other => Status::Fail(format!(
-            "{other} is not supported: the sandbox is built on Linux namespaces, \
-             Landlock and nftables"
+            "{other} is not supported: the sandbox is built on Linux namespaces or macOS \
+             Seatbelt"
         )),
     }
 }

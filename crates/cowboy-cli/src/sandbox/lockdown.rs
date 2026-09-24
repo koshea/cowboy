@@ -343,6 +343,7 @@ mod tests {
             scope_ipc: false,
             deny_syscalls: Vec::new(),
             deny_raw_sockets: false,
+            seatbelt_profile: None,
         };
         let err = apply_seccomp(&req).expect_err("an empty filter must not be installed");
         assert!(err.to_string().contains("nothing to enforce"), "{err}");

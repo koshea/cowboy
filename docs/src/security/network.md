@@ -14,6 +14,9 @@ container design the namespace had a real route out and the firewall was the onl
 thing standing in front of it; that inversion is the single biggest reason the
 rewrite was worth doing.
 
+On macOS the same thesis holds with different parts — see [On macOS](#on-macos)
+below. The rest of this chapter describes Linux.
+
 ## Topology (per session)
 
 ```
@@ -219,3 +222,47 @@ in-session approval cache already did.
 - Arbitrary UDP is dropped rather than proxied; proxying it would need TPROXY.
 - The `command_pid` shown in a prompt is a **label**, recovered from inside the
   boundary on a best-effort basis. It never authorizes anything.
+
+## On macOS
+
+Seatbelt can deny a connection but cannot redirect one, so there is no transparent
+interception to build on. The thesis is kept by inverting it the same way:
+
+1. The command's profile allows **outbound connections to exactly one place** —
+   this session's proxy, on an ephemeral loopback port — plus any
+   `sandbox.loopback_ports` you list. DNS is denied outright (no resolver socket,
+   no mDNSResponder).
+2. Commands are told about the proxy in `HTTP_PROXY`, `HTTPS_PROXY` and
+   `ALL_PROXY` (both cases). It speaks HTTP `CONNECT`, plain absolute-URL HTTP, and
+   SOCKS5.
+3. The proxy runs in the worker, on the host. For a name, it applies the DNS
+   policy (tunnel detection, denied names), resolves it itself, records the answer
+   for attribution, and evaluates the connection policy for the address it will
+   then dial — so a deny CIDR holds whatever name points at it, and nothing can
+   rebind between the check and the connect.
+
+Step 1 is containment: a dead proxy, or a tool that ignores the proxy variables,
+means **no** egress. A refusal reaches the command as the proxy's `403` — "refused
+by policy" — rather than a timeout.
+
+**Credentials, because loopback is shared.** Every process on the Mac can reach the
+proxy's port, including other sessions. Each command therefore gets its own
+credentials in the proxy URL (`http://c<n>:<token>@127.0.0.1:<port>`); a request
+without valid ones gets a `407`, and a command's credentials are revoked when it
+ends. The username names the command, which is how a connection is attributed. The
+proxy keeps a connection open after a `407` for clients that only authenticate on
+a challenge (Apple's git), and the sandbox sets `GIT_HTTP_PROXY_AUTHMETHOD=basic` so
+it needs no second round trip.
+
+**Loopback is the host's.** Your databases, model servers and Docker are on it, so
+a sandboxed command cannot connect to `localhost` directly. HTTP to `localhost`
+goes through the proxy and is decided by `default_host` like any other host
+address; a port you list in `sandbox.loopback_ports` is reachable directly, for a
+protocol that cannot use a proxy. The agent can bind loopback ports itself.
+
+Honest scope, beyond the Linux list above:
+
+- Only tools that honour the proxy variables reach the network. `curl`, `git`,
+  `cargo`, `npm`, `pip` and Python's `urllib` do; a raw socket does not, by design.
+- Direct loopback connections — including to a server the agent started — need
+  either the proxy (HTTP) or a configured port.

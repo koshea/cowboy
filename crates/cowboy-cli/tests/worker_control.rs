@@ -405,6 +405,7 @@ fn end_terminates_the_worker() {
 /// and hold its `Child`, so an exited daemon stays a zombie for the rest of the test
 /// and `kill(pid, 0)` would report it alive forever. That cost me a false failure
 /// here, and the same trap would hide a genuine shutdown bug.
+#[cfg(target_os = "linux")]
 fn pid_alive(pid: u32) -> bool {
     match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
         // Field 3 is the state, after the (possibly space-containing) comm in parens.
@@ -415,6 +416,21 @@ fn pid_alive(pid: u32) -> bool {
             .unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// macOS has no `/proc`: the pid must exist, and not be a zombie awaiting its reaper.
+#[cfg(not(target_os = "linux"))]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let stat = String::from_utf8_lossy(&o.stdout);
+            !stat.trim().is_empty() && !stat.trim_start().starts_with('Z')
+        })
+        .unwrap_or(false)
 }
 
 /// End-to-end through the REAL client bridge (not raw protocol): connect the
@@ -640,6 +656,7 @@ fn a_client_that_detaches_leaves_the_session_running() {
 /// so a surviving holder is not merely an untidy process — it is a live sandbox with
 /// nobody driving it. `agent.setup` forces the eager bring-up that creates one.
 #[test]
+#[cfg(target_os = "linux")]
 fn end_terminates_a_worker_that_started_a_sandbox_and_its_holder() {
     if !sandbox_available() {
         eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
@@ -691,6 +708,7 @@ fn end_terminates_a_worker_that_started_a_sandbox_and_its_holder() {
 }
 
 /// Whether a sandbox can run here at all.
+#[cfg(target_os = "linux")]
 fn sandbox_available() -> bool {
     Command::new("bwrap")
         .args([
@@ -716,6 +734,7 @@ fn sandbox_available() -> bool {
 ///
 /// Read from `/proc` rather than with `pgrep -f`, whose pattern would also match the
 /// process running the search.
+#[cfg(target_os = "linux")]
 fn holders_of(worker: u32) -> Vec<u32> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir("/proc") else {
@@ -749,6 +768,7 @@ fn holders_of(worker: u32) -> Vec<u32> {
     out
 }
 
+#[cfg(target_os = "linux")]
 fn ppid_of(pid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     status

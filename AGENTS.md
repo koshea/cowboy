@@ -7,9 +7,10 @@ product overview and the security rationale, read `README.md` and the docs site
 ## What this is
 
 `cowboy` (binary `cowboy`, daemon `cowboyd`) is an opinionated local coding agent
-that runs the AI in a **host-native sandbox** — Linux namespaces, Landlock,
-seccomp, an empty capability set — while the **host** enforces security at the
-kernel + network layer.
+that runs the AI in a **host-native sandbox** — on Linux, namespaces, Landlock,
+seccomp, an empty capability set; on macOS, a Seatbelt profile and an
+authenticated egress proxy — while the **host** enforces security at the kernel +
+network layer.
 
 **The one inviolable principle:** the agent is **not** part of the security
 boundary. Security is enforced by the kernel, host-owned config, and a host-side
@@ -77,6 +78,16 @@ over a unix socket.
   worked only because this dev box links `/bin/sh` to bash — in CI one failed and the
   other passed while verifying nothing.
 
+  **On macOS** the counterpart suite is `tests/sandbox_macos.rs` (the Linux suites
+  are `cfg`'d out there, and it is `cfg`'d out on Linux):
+  ```sh
+  COWBOY_SANDBOX_TESTS=required cargo test -p cowboy-cli --test sandbox_macos
+  ```
+  Its own traps: a canary-based check that looks right can match *other programs'*
+  sandboxes — the first process sweep killed Apple's own agents (see the macOS
+  section of `sandbox-decisions.md`); and tokio's `Child::id()` is `None` once the
+  child is reaped, so capture a pid at spawn if you need it afterwards.
+
   Host-capability *unit* tests (`doctor::this_host_reports_no_sandbox_failures`,
   `preflight::the_host_meets_every_requirement`) honour the same switch. They used to
   assert unconditionally, which failed on any host that cannot sandbox — including CI.
@@ -102,10 +113,13 @@ crates/
     src/cli.rs       clap command tree            src/main.rs  dispatch
     src/cmd/         one module per CLI command (daemon.rs, worker.rs, ranch.rs, session.rs, web.rs, …)
     src/agent/       the agent loop (run.rs), tool defs (tools.rs), UI impls (ui.rs/tui.rs/socket_ui.rs)
-    src/sandbox/     THE BOUNDARY: session.rs (namespaces + holder), native.rs (the Sandbox impl),
-                     bwrap.rs, exec.rs, shim.rs, lockdown.rs (Landlock+seccomp+caps), cgroup.rs,
-                     grants.rs, preflight.rs, policy.rs, transport/ (nft.rs, relay.rs, broker.rs,
-                     channel.rs = the enforcement boundary)
+    src/sandbox/     THE BOUNDARY: native.rs (the Sandbox impl; portable core), exec.rs (shared
+                     runner), shim.rs, grants.rs, preflight.rs, policy.rs, then per OS:
+                     Linux — linux/ (backend), session.rs (namespaces + holder), bwrap.rs,
+                       lockdown.rs (Landlock+seccomp+caps), cgroup.rs, transport/ (nft.rs,
+                       relay.rs, broker.rs, channel.rs = the enforcement boundary);
+                     macOS — macos/ (backend: seatbelt.rs applies the profile, proxy.rs = the
+                       egress boundary, reap.rs = the session sweep, preflight.rs)
     src/net/         persisted network approvals, git worktrees
     src/project.rs   project identity + host-side helpers (hash, repo key, private files)
     src/session/     session logging / replay
@@ -114,7 +128,8 @@ crates/
     lifecycle.rs decision.rs memory.rs tokens.rs usersecrets.rs error.rs
   cowboy-proto/    wire types (daemonproto, netproto) — serde-only, also compiles to wasm
   cowboy-tui/      ratatui rendering (snapshot-tested)
-  cowboy-sandbox/  the sandbox plan as PURE LOGIC (binds, Landlock rules, seccomp, denylist)
+  cowboy-sandbox/  the sandbox plan as PURE LOGIC (binds, Landlock rules, seccomp, denylist,
+                   and seatbelt.rs: the plan rendered as a macOS SBPL profile)
   cowboy-gateway/  the policy engine as a LIBRARY (policy, DNS, ip->domain attribution)
   cowboy-web-ui/   Yew/WASM remote-control frontend (NOT a workspace member —
                    wasm32-only; `trunk build` in this dir, embedded by cowboy-cli.
@@ -301,10 +316,20 @@ Two guards keep it honest (both run under `cargo test`):
   second later.
 - The daemon persists state to `$XDG_STATE_HOME/cowboy/daemon/state.json`; sockets
   live under `$XDG_RUNTIME_DIR/cowboy`.
-- **Linux only**, and currently targeted at one host: a current kernel with
-  Landlock ABI 6+, unprivileged user namespaces, and a delegated cgroup v2 subtree.
-  `cowboy doctor` checks each by performing it. Porting to other distributions is a
-  deliberate follow-up — see the notes in `docs/src/security/sandbox-decisions.md`.
+- **Linux and macOS.** Linux is targeted at one host: a current kernel with
+  Landlock ABI 6+, unprivileged user namespaces, and a delegated cgroup v2 subtree;
+  porting to other distributions is a deliberate follow-up. macOS is Apple silicon
+  on macOS 26+. `cowboy doctor` checks each by performing it; see
+  `docs/src/security/sandbox-decisions.md`.
+- **Platform is a plan input, not a `cfg`.** `PlanInputs::platform` and
+  `Denylist::build_for` take it explicitly so the macOS plan and profile are
+  built and snapshot-tested on Linux CI and vice versa. A test that renders a
+  Linux plan must pass `Platform::Linux` — `Denylist::build` uses the *host's*
+  platform, and on a Mac that silently changes a Linux snapshot.
+- **On macOS nothing is remapped.** The project is at its host path, scratch is
+  `$TMPDIR`, and `/tmp` is the host's and not writable. Anything that tells the
+  agent a path goes through `Sandbox::paths()` (the system prompt does), never a
+  hardcoded `/workspace` or `/tmp`.
 - `--die-with-parent` is **load-bearing** for reaping bwrap's process tree, and
   `--remount-ro /` must stay the **last** mount operation. Special filesystems
   (`--proc`/`--dev`/`--tmpfs`) come **before** the binds, or a tmpfs shadows grants

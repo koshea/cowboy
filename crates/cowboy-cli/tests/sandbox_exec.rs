@@ -5,6 +5,9 @@
 //! user namespaces, so they self-skip when those are unavailable rather than
 //! failing — matching the convention that `--ignored` is safe to run anywhere.
 
+// Linux namespaces, bwrap and nftables; the macOS boundary is `sandbox_macos.rs`.
+#![cfg(target_os = "linux")]
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -143,6 +146,7 @@ fn plan_for(root: &Path) -> SandboxPlan {
         scratch: &scratch,
         agent_home: &agent_home,
         git_identity: None,
+        platform: cowboy_sandbox::plan::Platform::Linux,
     };
     SandboxPlan::build(&inputs, &Host).unwrap()
 }
@@ -884,6 +888,7 @@ async fn a_binary_replaced_mid_session_says_so_instead_of_failing_inside_the_san
                 scratch: &scratch,
                 agent_home: &scratch,
                 git_identity: None,
+                platform: cowboy_sandbox::plan::Platform::Linux,
             },
             probe,
         )

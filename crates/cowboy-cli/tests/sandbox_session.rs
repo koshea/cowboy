@@ -8,6 +8,9 @@
 //! `COWBOY_SANDBOX_TESTS=required` turns a skip into a failure, which is the guard
 //! against the whole file silently passing while doing nothing.
 
+// Linux namespaces, bwrap and nftables; the macOS boundary is `sandbox_macos.rs`.
+#![cfg(target_os = "linux")]
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

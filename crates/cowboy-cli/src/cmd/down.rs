@@ -84,7 +84,11 @@ pub async fn run(args: DownArgs) -> Result<()> {
     if killed > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+    #[cfg(target_os = "linux")]
     let reaped = crate::sandbox::cgroup::reap_empty();
+    // No cgroups on macOS; each worker's session sweeps its own processes as it exits.
+    #[cfg(not(target_os = "linux"))]
+    let reaped = 0;
 
     let mut msg = format!("stopped {killed} session(s) in {scope}");
     if reaped > 0 {

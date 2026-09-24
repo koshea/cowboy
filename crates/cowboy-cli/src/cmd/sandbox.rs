@@ -149,6 +149,39 @@ impl HostProbe for RealHost {
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         std::fs::canonicalize(path).ok()
     }
+
+    #[cfg(target_os = "macos")]
+    fn developer_bundle(&self) -> Option<PathBuf> {
+        // `xcode-select -p` names `…/Xcode.app/Contents/Developer`, or the
+        // command-line tools (already under `/Library/Developer`). The bundle is what
+        // the shims load from, so expose that.
+        let out = std::process::Command::new("/usr/bin/xcode-select")
+            .arg("-p")
+            .output()
+            .ok()?;
+        let dev = PathBuf::from(String::from_utf8(out.stdout).ok()?.trim());
+        dev.ancestors()
+            .find(|a| a.extension().is_some_and(|e| e == "app"))
+            .map(Path::to_path_buf)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn darwin_user_temp(&self) -> Option<PathBuf> {
+        let mut buf = vec![0u8; 1024];
+        // SAFETY: a byte buffer and its length; confstr writes a NUL-terminated string.
+        let n = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        if n == 0 || n > buf.len() {
+            return None;
+        }
+        buf.truncate(n - 1);
+        Some(PathBuf::from(String::from_utf8(buf).ok()?))
+    }
 }
 
 fn plan() -> Result<()> {
@@ -196,6 +229,7 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
         scratch: &scratch,
         agent_home: &agent_home,
         git_identity: None,
+        platform: cowboy_sandbox::plan::Platform::host(),
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;
     let mut out = plan.render(&denylist);
@@ -204,12 +238,16 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
     let configured = plan.limits.memory_mib.is_some()
         || plan.limits.cpus.is_some()
         || plan.limits.pids.is_some();
+    // macOS says so in the plan itself: there is no per-session mechanism to lack.
+    #[cfg(target_os = "linux")]
     if configured && !crate::sandbox::cgroup::available() {
         out.push_str(
             "  NOT ENFORCED: no delegated cgroup v2 subtree on this host. \
              Run `cowboy doctor` for what to change.\n",
         );
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = configured;
     out.push_str(&egress_section(root, &security));
     Ok(out)
 }

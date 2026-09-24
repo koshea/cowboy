@@ -202,9 +202,36 @@ pub struct Overlay {
     pub why: String,
 }
 
+/// Which confinement mechanism a plan is built for.
+///
+/// A plan input rather than a `cfg`, so the macOS plan is built and snapshot-tested
+/// on a Linux CI runner and the other way round: what the boundary *is* stays
+/// reviewable wherever the tests run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    /// Namespaces + bwrap + Landlock + seccomp. Paths are remapped (the project
+    /// appears at the workdir).
+    Linux,
+    /// Seatbelt. Nothing can be remapped, so everything appears at its host path;
+    /// exposures become allow rules and the config mask becomes a deny rule.
+    MacOs,
+}
+
+impl Platform {
+    /// The platform this binary runs on.
+    pub const fn host() -> Self {
+        if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::Linux
+        }
+    }
+}
+
 /// Everything needed to confine and run one command.
 #[derive(Debug, Clone)]
 pub struct SandboxPlan {
+    pub platform: Platform,
     pub binds: Vec<Bind>,
     /// Copy-on-write exposures, applied after [`Self::binds`] so an overlay can be
     /// mounted onto a path a bind created.
@@ -220,6 +247,20 @@ pub struct SandboxPlan {
     pub landlock: LandlockRules,
     pub seccomp: SeccompProfile,
     pub limits: ResourceLimits,
+    /// Paths the command may neither read nor write, whatever else allows (macOS: the
+    /// host-owned config, which Linux masks with a bind instead). Rendered **last**.
+    pub masks: Vec<PathBuf>,
+    /// Symlinks to create in the agent's `HOME` before the command runs, as
+    /// `(link, target)` (macOS). Stands in for a bind whose Linux target is under
+    /// [`AGENT_HOME`] — `~/.aws/credentials` from a credential grant — since Seatbelt
+    /// can expose a path but not move it.
+    pub home_links: Vec<(PathBuf, PathBuf)>,
+    /// Where the xcrun developer shims keep their lookup cache, whatever `TMPDIR`
+    /// says (macOS). Readable, never writable: the host's own `xcrun` trusts it.
+    pub xcrun_cache_prefix: Option<PathBuf>,
+    /// Things in the configuration this platform cannot honour, for `cowboy sandbox
+    /// plan` to say out loud rather than silently drop.
+    pub notes: Vec<String>,
 }
 
 /// Where the `cowboy` binary is bound inside the sandbox, for bwrap to exec as
@@ -370,6 +411,50 @@ const ETC_ALLOW: &[&str] = &[
     "/etc/env.d",
 ];
 
+/// macOS directories the toolchain needs, read-only: the system, the command-line
+/// tools, and Homebrew. Verified by running `cc`, `git`, `python3`, `node` and
+/// `cargo` under a profile that allowed only these — see the macOS section of
+/// `docs/src/security/sandbox-decisions.md`.
+///
+/// `/Library/Apple` is not a typo for `/System`: Xcode loads `MobileDevice.framework`
+/// from there, and dyld's error names the `/System` path it tried first.
+const MACOS_TOOLCHAIN_DIRS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library/Apple",
+    "/Library/Developer",
+    "/opt/homebrew",
+    "/private/var/db/dyld",
+    "/private/var/db/timezone",
+    "/private/var/select",
+];
+
+/// macOS configuration files the toolchain reads, as an allowlist for the same reason
+/// as [`ETC_ALLOW`]. The Xcode preference is what the `/usr/bin` developer shims
+/// consult for licence acceptance: without it every one of them refuses to run.
+const MACOS_FILES_ALLOW: &[&str] = &[
+    "/private/etc/hosts",
+    "/private/etc/ssl",
+    "/private/etc/passwd",
+    "/private/etc/group",
+    "/private/etc/services",
+    "/private/etc/protocols",
+    "/private/etc/shells",
+    "/private/etc/profile",
+    "/private/etc/bashrc",
+    "/private/etc/zshenv",
+    "/private/etc/zprofile",
+    "/private/etc/zshrc",
+    "/private/etc/paths",
+    "/private/etc/paths.d",
+    "/private/etc/localtime",
+    "/Library/Preferences/com.apple.dt.Xcode.plist",
+    "/Library/Preferences/.GlobalPreferences.plist",
+    "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
+];
+
 /// A path granted at runtime, after host-side approval.
 ///
 /// Serializable because grants persist between sessions — see
@@ -414,6 +499,8 @@ pub struct PlanInputs<'a> {
     /// [`GIT_IDENTITY_AT`] and used as git's *system* config. `None` when the host
     /// has no identity to lend.
     pub git_identity: Option<&'a Path>,
+    /// Which mechanism the plan is for; see [`Platform`].
+    pub platform: Platform,
 }
 
 /// Where [`PlanInputs::git_identity`] is bound, and what `GIT_CONFIG_SYSTEM` names.
@@ -448,6 +535,11 @@ pub const SCRATCH_DIRS: &[(&str, &str)] =
 /// the workspace the agent can write and the user can commit.
 pub const AGENT_HOME: &str = "/home/agent";
 
+/// Where the container put the agent's `HOME`, and so where the credential presets
+/// still point their targets. Read as home-relative on macOS, which cannot place a
+/// file at an arbitrary target and links it into the agent's `HOME` instead.
+const LEGACY_HOME: &str = "/tmp";
+
 impl SandboxPlan {
     /// Build the plan, or fail if configuration or a grant would breach the
     /// boundary.
@@ -457,26 +549,62 @@ impl SandboxPlan {
     /// **last** — so no later entry can re-expose what the mask hid.
     pub fn build(inputs: &PlanInputs<'_>, probe: &dyn HostProbe) -> Result<Self> {
         let sec = inputs.security;
-        let workdir = sec.sandbox.workdir.clone();
-        let denylist = Denylist::build(probe, inputs.root);
+        let mac = inputs.platform == Platform::MacOs;
+        // Seatbelt cannot remap, so on macOS the project is where it is on the host.
+        let workdir = if mac {
+            inputs.root.to_string_lossy().into_owned()
+        } else {
+            sec.sandbox.workdir.clone()
+        };
+        let configured_workdir = sec.sandbox.workdir.clone();
+        // Where a host path appears inside the sandbox: on Linux, wherever the plan
+        // says; on macOS, necessarily at itself.
+        let at = |host: &Path, linux_target: &str| -> String {
+            if mac {
+                host.to_string_lossy().into_owned()
+            } else {
+                linux_target.to_string()
+            }
+        };
+        let denylist = Denylist::build_for(probe, inputs.root, inputs.platform);
         let mut binds = Vec::new();
+        let mut notes: Vec<String> = Vec::new();
+        let mut home_links: Vec<(PathBuf, PathBuf)> = Vec::new();
 
         // 0. The lockdown shim: the cowboy binary itself, read-only. bwrap cannot
         //    apply Landlock, so it execs this instead of the command directly, and
         //    it must therefore be reachable inside the sandbox. Read-only, and the
-        //    denylist separately prevents any runtime grant making it writable.
+        //    denylist separately prevents any runtime grant making it writable. (On
+        //    macOS the shim runs before the profile applies; the file tools still run
+        //    the binary from inside, so it is readable there too.)
         if let Some(exe) = probe.self_exe() {
-            binds.push(Bind::ro(exe, SHIM_PATH, "lockdown shim (cowboy binary)"));
+            let target = at(&exe, SHIM_PATH);
+            binds.push(Bind::ro(exe, target, "lockdown shim (cowboy binary)"));
         }
 
         // 1. The host's own toolchain, read-only.
-        for dir in HOST_TOOLCHAIN_DIRS {
+        let (toolchain_dirs, config_files) = if mac {
+            (MACOS_TOOLCHAIN_DIRS, MACOS_FILES_ALLOW)
+        } else {
+            (HOST_TOOLCHAIN_DIRS, ETC_ALLOW)
+        };
+        for dir in toolchain_dirs {
             let p = PathBuf::from(dir);
             if probe.exists(&p) {
                 binds.push(Bind::ro(p, *dir, "host toolchain"));
             }
         }
-        for entry in ETC_ALLOW {
+        if mac {
+            if let Some(bundle) = probe.developer_bundle().filter(|b| probe.exists(b)) {
+                let target = bundle.to_string_lossy().into_owned();
+                binds.push(Bind::ro(
+                    bundle,
+                    target,
+                    "the selected Xcode (xcode-select)",
+                ));
+            }
+        }
+        for entry in config_files {
             let p = PathBuf::from(entry);
             if probe.exists(&p) {
                 binds.push(Bind::ro(p, *entry, "toolchain configuration"));
@@ -529,7 +657,16 @@ impl SandboxPlan {
             // The mise store, copy-on-write rather than read-only: see `Overlay`.
             // Only when this project actually uses mise — otherwise there is nothing
             // to install and no reason to create a `.cowboy/mise/` overlay in it.
-            if sec.sandbox.share_mise_store && project_uses_mise(probe, inputs.root) {
+            // macOS has no overlayfs, so mise keeps its own store in the agent's HOME.
+            let wants_mise = sec.sandbox.share_mise_store && project_uses_mise(probe, inputs.root);
+            if wants_mise && mac {
+                notes.push(
+                    "share_mise_store: macOS has no copy-on-write mount, so mise installs into \
+                     the agent's own store instead of reusing yours"
+                        .to_string(),
+                );
+            }
+            if wants_mise && !mac {
                 if let Some(lower) = probe.expand(HOST_MISE_STORE) {
                     let denied = denylist.check(&lower).is_some_and(|r| r.blocks_read_only());
                     if probe.exists(&lower) && !denied {
@@ -555,10 +692,17 @@ impl SandboxPlan {
         //    it. Putting it after the grants was a bug: binding `/tmp` shadows a grant
         //    for a path *under* `/tmp`, which is exactly the hazard the ordering rules
         //    exist to prevent, and the grant tests caught it immediately.
+        //    On macOS there is only `TMPDIR`: the host's `/tmp` cannot be swapped for a
+        //    private one, and it is shared with everything else the user runs.
         for (sub, target) in SCRATCH_DIRS {
+            if mac && *sub != "tmp" {
+                continue;
+            }
+            let source = inputs.scratch.join(sub);
+            let target = at(&source, target);
             binds.push(Bind::rw(
-                inputs.scratch.join(sub),
-                *target,
+                source,
+                target,
                 "session scratch (survives between commands, not between sessions)",
             ));
         }
@@ -566,9 +710,10 @@ impl SandboxPlan {
         //    The agent's HOME, alongside scratch because it is the same class of thing
         //    — a writable directory the agent owns — and differs only in living outside
         //    the workspace and outliving the session.
+        let agent_home = at(inputs.agent_home, AGENT_HOME);
         binds.push(Bind::rw(
             inputs.agent_home.to_path_buf(),
-            AGENT_HOME,
+            agent_home.clone(),
             "the agent's HOME (per-project, persists between sessions)",
         ));
 
@@ -596,7 +741,7 @@ impl SandboxPlan {
             } else {
                 BindMode::ReadWrite
             };
-            if m.target == workdir {
+            if m.target == configured_workdir {
                 mounts_workdir = true;
             }
             let why = if source == inputs.root {
@@ -604,9 +749,22 @@ impl SandboxPlan {
             } else {
                 "configured mount"
             };
+            let target = if mac {
+                if m.target != configured_workdir && Path::new(&m.target) != source {
+                    notes.push(format!(
+                        "mount target {} is ignored: macOS cannot remap paths, so {} \
+                         appears at its own path",
+                        m.target,
+                        source.display()
+                    ));
+                }
+                source.to_string_lossy().into_owned()
+            } else {
+                m.target.clone()
+            };
             binds.push(Bind {
                 source,
-                target: m.target.clone(),
+                target,
                 mode,
                 why: why.into(),
                 required: false,
@@ -616,9 +774,15 @@ impl SandboxPlan {
         // starting a session whose workdir does not exist.
         if !mounts_workdir {
             return Err(Error::Invalid(format!(
-                "no mount targets the workdir {workdir}; the agent would have no project. \
-                 Add a mount with target: {workdir} to .cowboy/security.yaml."
+                "no mount targets the workdir {configured_workdir}; the agent would have no \
+                 project. Add a mount with target: {configured_workdir} to \
+                 .cowboy/security.yaml."
             )));
+        }
+        if mac && configured_workdir != workdir {
+            notes.push(format!(
+                "workdir {configured_workdir} is ignored: on macOS the project is at {workdir}"
+            ));
         }
 
         // 4. A linked worktree's shared git dir, at its own host path so the
@@ -645,9 +809,32 @@ impl SandboxPlan {
                 }
                 continue;
             }
+            let target = if mac {
+                // Exposed where it is, and linked into the agent's HOME when that is
+                // where the tool will look for it (`~/.aws/credentials`). The presets
+                // still write `/tmp/…`, from when the container's HOME was `/tmp`;
+                // either way the tool is looking in its home directory.
+                let home_relative = Path::new(&grant.target)
+                    .strip_prefix(AGENT_HOME)
+                    .or_else(|_| Path::new(&grant.target).strip_prefix(LEGACY_HOME));
+                match home_relative {
+                    Ok(rel) if !rel.as_os_str().is_empty() => {
+                        home_links.push((inputs.agent_home.join(rel), source.clone()));
+                    }
+                    _ => notes.push(format!(
+                        "credential target {} is ignored: macOS cannot remap paths, so {} \
+                         appears at its own path",
+                        grant.target,
+                        source.display()
+                    )),
+                }
+                source.to_string_lossy().into_owned()
+            } else {
+                grant.target.clone()
+            };
             binds.push(Bind {
                 source,
-                target: grant.target.clone(),
+                target,
                 mode: if grant.read_only {
                     BindMode::ReadOnly
                 } else {
@@ -701,7 +888,10 @@ impl SandboxPlan {
         //    last bind (see `mask_binds_come_last`).
         let ranches = inputs.root.join(config::COWBOY_DIR).join("ranches");
         if probe.exists(&ranches) {
-            let target = format!("{workdir}/{}/ranches", config::COWBOY_DIR);
+            let target = at(
+                &ranches,
+                &format!("{workdir}/{}/ranches", config::COWBOY_DIR),
+            );
             binds.push(Bind::ro(
                 ranches,
                 target,
@@ -711,20 +901,27 @@ impl SandboxPlan {
 
         // 7b. The user's git identity, as git's system config (see GIT_IDENTITY_AT).
         if let Some(identity) = inputs.git_identity {
+            let target = at(identity, GIT_IDENTITY_AT);
             binds.push(Bind::ro(
                 identity.to_path_buf(),
-                GIT_IDENTITY_AT.to_string(),
+                target.clone(),
                 "your git identity (user.name/user.email only)",
             ));
-            tool_env.push(("GIT_CONFIG_SYSTEM".to_string(), GIT_IDENTITY_AT.to_string()));
+            tool_env.push(("GIT_CONFIG_SYSTEM".to_string(), target));
         }
 
         // 8. Mask host-owned config LAST. It lives under the project directory, so
         //    it is inside a bind the agent can otherwise read; an empty read-only
-        //    file over it means the agent cannot learn its own boundary.
+        //    file over it means the agent cannot learn its own boundary. On macOS
+        //    the same thing is a deny rule, rendered after every allow.
+        let mut masks = Vec::new();
         for file in [config::SECURITY_FILE, config::MODELS_FILE] {
             let host_path = inputs.root.join(config::COWBOY_DIR).join(file);
-            if probe.exists(&host_path) {
+            if mac {
+                // Unconditionally: a deny on a path that does not exist yet also stops
+                // the agent creating one for the host to read later.
+                masks.push(host_path);
+            } else if probe.exists(&host_path) {
                 binds.push(Bind::ro_required(
                     inputs.mask_file.to_path_buf(),
                     format!("{workdir}/{}/{file}", config::COWBOY_DIR),
@@ -733,10 +930,32 @@ impl SandboxPlan {
             }
         }
 
+        // The xcrun cache: see `PlanInputs`-independent `xcrun_cache_prefix`.
+        let xcrun_cache_prefix = if mac {
+            probe
+                .darwin_user_temp()
+                .map(|t| probe.canonicalize(&t).unwrap_or(t).join("xcrun_db"))
+        } else {
+            None
+        };
+
         let limits = resolve_limits(sec);
-        let env = build_env(sec, &workdir, &limits, &user_bin_dirs, tool_env);
-        let proc_at = "/proc".to_string();
-        let dev_at = "/dev".to_string();
+        let mut env = build_env(sec, &workdir, &limits, &user_bin_dirs, tool_env, mac);
+        if mac {
+            // `HOME` is the agent's own directory at its host path, and `TMPDIR` the
+            // session scratch — the only temporary directory it can write.
+            set_env(&mut env, "HOME", &agent_home);
+            let tmp = at(&inputs.scratch.join("tmp"), "/tmp");
+            set_env(&mut env, "TMPDIR", &tmp);
+            // Apple's git asks the proxy for credentials only after a 407 unless
+            // told otherwise; see the macOS notes in sandbox-decisions.md.
+            set_env(&mut env, "GIT_HTTP_PROXY_AUTHMETHOD", "basic");
+        }
+        let (proc_at, dev_at) = if mac {
+            (String::new(), String::new())
+        } else {
+            ("/proc".to_string(), "/dev".to_string())
+        };
 
         // The special filesystems are mounted *before* the binds, so that a bind for a
         // path under one of them lands inside it rather than being shadowed by it.
@@ -746,6 +965,9 @@ impl SandboxPlan {
         // its choosing.
         for b in &binds {
             for special in [&proc_at, &dev_at] {
+                if special.is_empty() {
+                    continue;
+                }
                 if &b.target == special || Path::new(special).starts_with(&b.target) {
                     return Err(Error::SecurityInvariant(format!(
                         "bind target {} would shadow {special}, which must be the kernel's own. \
@@ -756,22 +978,42 @@ impl SandboxPlan {
             }
         }
 
-        let landlock = landlock_for(&binds, &overlays, &proc_at, &dev_at);
+        let (landlock, seccomp, symlinks) = if mac {
+            (
+                LandlockRules::default(),
+                SeccompProfile {
+                    denied: Vec::new(),
+                    deny_raw_sockets: false,
+                },
+                Vec::new(),
+            )
+        } else {
+            (
+                landlock_for(&binds, &overlays, &proc_at, &dev_at),
+                SeccompProfile::default(),
+                USR_SYMLINKS
+                    .iter()
+                    .map(|(t, l)| (t.to_string(), l.to_string()))
+                    .collect(),
+            )
+        };
 
         Ok(Self {
+            platform: inputs.platform,
             binds,
             overlays,
             proc_at,
             dev_at,
-            symlinks: USR_SYMLINKS
-                .iter()
-                .map(|(t, l)| (t.to_string(), l.to_string()))
-                .collect(),
+            symlinks,
             env,
             workdir,
             landlock,
-            seccomp: SeccompProfile::default(),
+            seccomp,
             limits,
+            masks,
+            home_links,
+            xcrun_cache_prefix,
+            notes,
         })
     }
 
@@ -781,6 +1023,9 @@ impl SandboxPlan {
     /// a summary — this is what the user checks when they want to know what the
     /// agent can actually reach.
     pub fn render(&self, denylist: &Denylist) -> String {
+        if self.platform == Platform::MacOs {
+            return self.render_macos(denylist);
+        }
         let mut s = String::new();
         s.push_str("filesystem\n");
         for b in &self.binds {
@@ -839,6 +1084,74 @@ impl SandboxPlan {
             show(self.limits.pids.map(|p| p.to_string())),
             show(self.limits.jobs.map(|j| j.to_string())),
         ));
+
+        s.push_str(&format!(
+            "\nnever grantable at any approval scope ({} paths)\n",
+            denylist.len()
+        ));
+        for p in denylist.paths() {
+            s.push_str(&format!("  {}\n", p.display()));
+        }
+        s.push_str("  (plus .cowboy/, security.yaml, models.yaml, providers.yaml anywhere)\n");
+        s
+    }
+
+    /// [`Self::render`] for a Seatbelt plan: every path is where it is on the host,
+    /// so there is nothing to show but the access, and the network is a proxy rather
+    /// than an interception.
+    fn render_macos(&self, denylist: &Denylist) -> String {
+        let mut s = String::new();
+        s.push_str("filesystem (Seatbelt; everything else is denied, even to stat)\n");
+        for b in &self.binds {
+            let mode = match b.mode {
+                BindMode::ReadOnly => "ro",
+                BindMode::ReadWrite => "rw",
+            };
+            s.push_str(&format!("  {mode}  {}   ({})\n", b.target, b.why));
+        }
+        for m in &self.masks {
+            s.push_str(&format!(
+                "  --  {}   (host-owned config, masked)\n",
+                m.display()
+            ));
+        }
+        for (link, target) in &self.home_links {
+            s.push_str(&format!(
+                "  ln  {} -> {}   (credential grant, in the agent's HOME)\n",
+                link.display(),
+                target.display()
+            ));
+        }
+        if let Some(p) = &self.xcrun_cache_prefix {
+            s.push_str(&format!(
+                "  ro  {}*   (xcrun's lookup cache; the host trusts it, so never writable)\n",
+                p.display()
+            ));
+        }
+
+        s.push_str("\nnetwork\n");
+        s.push_str("  outbound: only this session's host proxy, which asks the policy engine\n");
+        s.push_str("  loopback: bind and accept allowed; connections go through the proxy\n");
+        s.push_str("  dns: denied inside the sandbox; the proxy resolves on the host\n");
+
+        s.push_str("\nprocesses\n");
+        s.push_str(
+            "  no launchd jobs, AppleEvents, LaunchServices, or signals outside the sandbox\n",
+        );
+
+        s.push_str("\nlimits\n");
+        s.push_str("  not enforced on macOS (no per-session cgroup equivalent)");
+        match self.limits.jobs {
+            Some(j) => s.push_str(&format!("; build jobs {j}\n")),
+            None => s.push('\n'),
+        }
+
+        if !self.notes.is_empty() {
+            s.push_str("\nnot applied on macOS\n");
+            for n in &self.notes {
+                s.push_str(&format!("  {n}\n"));
+            }
+        }
 
         s.push_str(&format!(
             "\nnever grantable at any approval scope ({} paths)\n",
@@ -953,7 +1266,7 @@ fn resolve_limits(sec: &SecurityConfig) -> ResourceLimits {
 /// User directories come **first**, which is where they sit in the user's own `PATH`
 /// and is the point of the exercise: the agent should resolve `cargo` to the same
 /// binary its user does, not to a different version of it further down.
-fn sandbox_path(user_bin_dirs: &[String]) -> String {
+fn sandbox_path(user_bin_dirs: &[String], mac: bool) -> String {
     const SYSTEM: &[&str] = &[
         "/usr/local/sbin",
         "/usr/local/bin",
@@ -962,12 +1275,30 @@ fn sandbox_path(user_bin_dirs: &[String]) -> String {
         "/sbin",
         "/bin",
     ];
+    // Homebrew first, as its own `shellenv` puts it: on Apple Silicon it is where
+    // the user's `python3`, `node` and `git` actually resolve.
+    const MACOS: &[&str] = &[
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ];
     user_bin_dirs
         .iter()
         .map(String::as_str)
-        .chain(SYSTEM.iter().copied())
+        .chain(if mac { MACOS } else { SYSTEM }.iter().copied())
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// Replace (or add) one variable in a built environment, keeping it sorted.
+fn set_env(env: &mut Vec<(String, String)>, key: &str, value: &str) {
+    env.retain(|(k, _)| k != key);
+    env.push((key.to_string(), value.to_string()));
+    env.sort();
 }
 
 fn build_env(
@@ -976,11 +1307,12 @@ fn build_env(
     limits: &ResourceLimits,
     user_bin_dirs: &[String],
     tool_env: Vec<(String, String)>,
+    mac: bool,
 ) -> Vec<(String, String)> {
     let mut env = vec![
         ("HOME".to_string(), AGENT_HOME.to_string()),
         ("COWBOY_SANDBOX".to_string(), "1".to_string()),
-        ("PATH".to_string(), sandbox_path(user_bin_dirs)),
+        ("PATH".to_string(), sandbox_path(user_bin_dirs, mac)),
         // mise refuses to parse a config carrying `[env]` or `[tasks]` until it is
         // trusted, and trust is recorded under $HOME — which is a fresh directory
         // inside every sandbox, so a `mise trust` on the host never carries in and
@@ -1083,8 +1415,32 @@ fn num_cpus() -> usize {
         .unwrap_or(1)
 }
 
+/// Total host memory in MiB, 0 when unreadable (which makes `auto` clamp to its floor
+/// rather than guess high).
+#[cfg(target_os = "macos")]
+fn host_mem_mib() -> u64 {
+    let mut bytes: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    // SAFETY: `hw.memsize` is a u64 sysctl; the buffer and its length describe one.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"hw.memsize".as_ptr(),
+            (&raw mut bytes).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc == 0 {
+        bytes / (1024 * 1024)
+    } else {
+        0
+    }
+}
+
 /// Total host memory in MiB from `/proc/meminfo`, 0 when unreadable (which makes
 /// `auto` clamp to its floor rather than guess high).
+#[cfg(not(target_os = "macos"))]
 fn host_mem_mib() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
@@ -1118,6 +1474,7 @@ mod tests {
             scratch: Path::new("/scratch"),
             agent_home: Path::new("/cache/cowboy/home/proj"),
             git_identity: None,
+            platform: Platform::Linux,
         }
     }
 
@@ -1495,7 +1852,7 @@ mod tests {
 
         // …but a runtime grant for the same path is still refused, because that is the
         // writable route this protects.
-        let denylist = Denylist::build(&probe, Path::new("/srv/proj"));
+        let denylist = Denylist::build_for(&probe, Path::new("/srv/proj"), Platform::Linux);
         let reason = denylist
             .check(Path::new("/home/dev/.cargo/bin"))
             .expect("a grant for it must still be refused");
@@ -1926,7 +2283,11 @@ mod tests {
     fn landlock_does_not_gate_the_network() {
         let plan = plan_with(&SecurityConfig::default(), &[], &host()).unwrap();
         assert!(plan.landlock.scope_ipc, "ipc scoping is still wanted");
-        let rendered = plan.render(&Denylist::build(&host(), Path::new("/srv/proj")));
+        let rendered = plan.render(&Denylist::build_for(
+            &host(),
+            Path::new("/srv/proj"),
+            Platform::Linux,
+        ));
         assert!(rendered.contains("not gated here"), "{rendered}");
     }
 
@@ -1974,7 +2335,171 @@ mod tests {
             read_only: true,
         }];
         let plan = plan_with(&sec, &grants, &probe).unwrap();
-        let denylist = Denylist::build(&probe, Path::new("/srv/proj"));
+        let denylist = Denylist::build_for(&probe, Path::new("/srv/proj"), Platform::Linux);
+        insta::assert_snapshot!(plan.render(&denylist));
+    }
+
+    // ---- macOS: the same plan, rendered for Seatbelt ------------------------------
+
+    fn mac_host() -> FakeHost {
+        FakeHost {
+            developer_bundle: Some(PathBuf::from("/Applications/Xcode.app")),
+            darwin_user_temp: Some(PathBuf::from("/private/var/folders/xy/abc/T")),
+            ..FakeHost::new().with_home("/Users/dev").with_existing([
+                "/usr",
+                "/System",
+                "/opt/homebrew",
+                "/Applications/Xcode.app",
+                "/Users/dev/proj",
+                "/Users/dev/.aws",
+                "/Users/dev/.cargo/bin",
+            ])
+        }
+    }
+
+    fn mac_plan(security: &SecurityConfig, grants: &[Grant]) -> Result<SandboxPlan> {
+        let root = Path::new("/Users/dev/proj");
+        SandboxPlan::build(
+            &PlanInputs {
+                platform: Platform::MacOs,
+                scratch: Path::new("/Users/dev/.cache/cowboy/run/scratch/s"),
+                agent_home: Path::new("/Users/dev/.cache/cowboy/home/proj"),
+                ..inputs(root, security, grants, Path::new("/unused/mask"))
+            },
+            &mac_host(),
+        )
+    }
+
+    /// Nothing can be remapped, so the project is where it is, and a config written
+    /// for Linux (`/workspace`) still works — with a note saying what was ignored.
+    #[test]
+    fn on_macos_the_project_is_at_its_host_path() {
+        let plan = mac_plan(&SecurityConfig::default(), &[]).unwrap();
+        assert_eq!(plan.workdir, "/Users/dev/proj");
+        let project = plan
+            .binds
+            .iter()
+            .find(|b| b.why == "the project")
+            .expect("the project is exposed");
+        assert_eq!(project.target, "/Users/dev/proj");
+        assert_eq!(project.mode, BindMode::ReadWrite);
+        assert!(
+            plan.notes.iter().any(|n| n.contains("/workspace")),
+            "{:?}",
+            plan.notes
+        );
+        for b in &plan.binds {
+            assert_eq!(
+                Path::new(&b.target),
+                b.source,
+                "every exposure is at its own path on macOS: {b:?}"
+            );
+        }
+    }
+
+    /// The config mask is a deny rule, present whether or not the file exists yet —
+    /// so the agent cannot create one for the host to read later — and there is no
+    /// Linux-style mask bind left over.
+    #[test]
+    fn on_macos_host_owned_config_is_masked_by_path() {
+        let plan = mac_plan(&SecurityConfig::default(), &[]).unwrap();
+        assert_eq!(
+            plan.masks,
+            vec![
+                PathBuf::from("/Users/dev/proj/.cowboy/security.yaml"),
+                PathBuf::from("/Users/dev/proj/.cowboy/models.yaml"),
+            ]
+        );
+        assert!(!plan.binds.iter().any(|b| b.required), "{:?}", plan.binds);
+    }
+
+    #[test]
+    fn on_macos_home_and_tmpdir_are_the_agents_own() {
+        let plan = mac_plan(&SecurityConfig::default(), &[]).unwrap();
+        assert_eq!(
+            env_of(&plan, "HOME"),
+            Some("/Users/dev/.cache/cowboy/home/proj")
+        );
+        assert_eq!(
+            env_of(&plan, "TMPDIR"),
+            Some("/Users/dev/.cache/cowboy/run/scratch/s/tmp")
+        );
+        assert_eq!(env_of(&plan, "GIT_HTTP_PROXY_AUTHMETHOD"), Some("basic"));
+        assert!(
+            env_of(&plan, "PATH").unwrap().contains("/opt/homebrew/bin"),
+            "Homebrew is where the user's tools resolve"
+        );
+        // Only `tmp`: `/run` and `/var/tmp` exist to be remapped, which macOS cannot.
+        let scratch: Vec<_> = plan
+            .binds
+            .iter()
+            .filter(|b| b.source.starts_with("/Users/dev/.cache/cowboy/run"))
+            .collect();
+        assert_eq!(scratch.len(), 1, "{scratch:?}");
+    }
+
+    /// A credential grant whose tool looks in `~` is linked into the agent's HOME,
+    /// including the presets' legacy `/tmp/…` targets.
+    #[test]
+    fn on_macos_a_credential_grant_is_linked_into_home() {
+        let mut sec = SecurityConfig::default();
+        sec.secrets.files.push(cowboy_core::config::SecretMount {
+            source: "~/.aws".into(),
+            target: "/tmp/.aws".into(),
+            read_only: true,
+            required: false,
+            approval: None,
+        });
+        let plan = mac_plan(&sec, &[]).unwrap();
+        assert_eq!(
+            plan.home_links,
+            vec![(
+                PathBuf::from("/Users/dev/.cache/cowboy/home/proj/.aws"),
+                PathBuf::from("/Users/dev/.aws")
+            )]
+        );
+        let b = plan
+            .binds
+            .iter()
+            .find(|b| b.source == Path::new("/Users/dev/.aws"))
+            .unwrap();
+        assert_eq!(b.mode, BindMode::ReadOnly);
+    }
+
+    /// The denylist is platform-independent: a runtime grant for a credential store
+    /// is refused on macOS exactly as on Linux.
+    #[test]
+    fn on_macos_a_denylisted_grant_is_still_refused() {
+        let grants = [Grant {
+            path: PathBuf::from("/Users/dev/.aws"),
+            read_only: true,
+        }];
+        let err = mac_plan(&SecurityConfig::default(), &grants).unwrap_err();
+        assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    #[test]
+    fn on_macos_nothing_linux_specific_is_planned() {
+        let plan = mac_plan(&SecurityConfig::default(), &[]).unwrap();
+        assert!(plan.overlays.is_empty());
+        assert!(plan.symlinks.is_empty());
+        assert!(plan.proc_at.is_empty() && plan.dev_at.is_empty());
+        assert!(plan.landlock.read_only.is_empty() && plan.seccomp.denied.is_empty());
+        assert_eq!(
+            plan.xcrun_cache_prefix,
+            Some(PathBuf::from("/private/var/folders/xy/abc/T/xcrun_db"))
+        );
+        assert!(plan
+            .binds
+            .iter()
+            .any(|b| b.source == Path::new("/Applications/Xcode.app")));
+    }
+
+    #[test]
+    fn macos_plan_snapshot() {
+        let plan = mac_plan(&SecurityConfig::default(), &[]).unwrap();
+        let denylist =
+            Denylist::build_for(&mac_host(), Path::new("/Users/dev/proj"), Platform::MacOs);
         insta::assert_snapshot!(plan.render(&denylist));
     }
 }

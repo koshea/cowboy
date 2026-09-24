@@ -39,8 +39,6 @@ futures.workspace = true
 tokio-util.workspace = true
 libc.workspace = true
 nix.workspace = true
-landlock.workspace = true
-seccompiler.workspace = true
 rpassword.workspace = true
 similar.workspace = true
 regex.workspace = true    # `grep` tool engine (no dependency on the host having rg)
@@ -56,6 +54,16 @@ qrcode.workspace = true   # terminal QR of the `cowboy web` access URL
 # Typed Docker API. Default features = `http` + `pipe` (unix socket via hyperlocal
 # / Windows named pipe); `ssl` (rustls) is deliberately left off — cowboy talks to
 # the local daemon, not a TLS-remote one.
+
+# The Linux boundary (Landlock + seccomp, applied by the shim). macOS confines with
+# Seatbelt through `sandbox_init` in libSystem, which needs no crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock.workspace = true
+seccompiler.workspace = true
+
+# The macOS egress proxy parses request heads itself (the gateway already uses it).
+[target.'cfg(target_os = "macos")'.dependencies]
+httparse.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

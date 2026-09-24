@@ -27,9 +27,17 @@ use tokio::sync::Mutex;
 // ---------------------------------------------------------------------------
 
 /// Per-user runtime dir for sockets/lock (`$XDG_RUNTIME_DIR/cowboy`, else
-/// `/tmp/cowboy-$UID`).
+/// `/tmp/cowboy-$UID`; on macOS, which never sets `XDG_RUNTIME_DIR`, else
+/// `$TMPDIR/cowboy`).
+///
+/// macOS periodically deletes old entries from `/tmp`, which would take a
+/// long-running daemon's socket with it; `$TMPDIR` is already per-user and `0700`.
 pub fn runtime_dir() -> PathBuf {
     if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR").filter(|s| !s.is_empty()) {
+        return PathBuf::from(d).join("cowboy");
+    }
+    #[cfg(target_os = "macos")]
+    if let Some(d) = std::env::var_os("TMPDIR").filter(|s| !s.is_empty()) {
         return PathBuf::from(d).join("cowboy");
     }
     let uid = unsafe { libc::getuid() };

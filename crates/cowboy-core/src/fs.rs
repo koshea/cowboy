@@ -21,6 +21,15 @@ fn invalid(context: impl std::fmt::Display, error: impl std::fmt::Display) -> Er
     Error::Invalid(format!("{context}: {error}"))
 }
 
+/// The two atomic renames Ranch's crash-safe publishing depends on.
+#[derive(Clone, Copy)]
+enum RenameMode {
+    /// Fail if the destination exists.
+    NoReplace,
+    /// Swap the two names.
+    Exchange,
+}
+
 fn component(name: &OsStr) -> Result<CString> {
     let path = Path::new(name);
     let mut components = path.components();
@@ -211,7 +220,9 @@ impl Dir {
                 self.file.as_raw_fd(),
                 name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                mode,
+                // Promoted explicitly: `mode_t` is `u16` on macOS, and a variadic
+                // argument narrower than `int` is not allowed.
+                libc::c_uint::from(mode),
             )
         };
         let file = file_from_fd(fd, "creating regular file")?;
@@ -232,7 +243,7 @@ impl Dir {
                     | libc::O_NONBLOCK
                     | libc::O_CLOEXEC
                     | libc::O_NOFOLLOW,
-                mode,
+                libc::c_uint::from(mode),
             )
         };
         let file = file_from_fd(fd, "opening regular file")?;
@@ -351,17 +362,7 @@ impl Dir {
     ) -> Result<()> {
         let old_name = component(old_name.as_ref())?;
         let new_name = component(new_name.as_ref())?;
-        // SAFETY: Linux renameat2 consumes the supplied directory fd and names.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                self.file.as_raw_fd(),
-                old_name.as_ptr(),
-                self.file.as_raw_fd(),
-                new_name.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
+        let rc = self.rename_with(&old_name, &new_name, RenameMode::NoReplace);
         if rc == 0 {
             Ok(())
         } else {
@@ -376,17 +377,7 @@ impl Dir {
     pub fn exchange(&self, first: impl AsRef<OsStr>, second: impl AsRef<OsStr>) -> Result<()> {
         let first = component(first.as_ref())?;
         let second = component(second.as_ref())?;
-        // SAFETY: Linux renameat2 consumes the supplied directory fds and names.
-        let rc = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                self.file.as_raw_fd(),
-                first.as_ptr(),
-                self.file.as_raw_fd(),
-                second.as_ptr(),
-                libc::RENAME_EXCHANGE,
-            )
-        };
+        let rc = self.rename_with(&first, &second, RenameMode::Exchange);
         if rc == 0 {
             Ok(())
         } else {
@@ -394,6 +385,41 @@ impl Dir {
                 "exchanging directory entries",
                 std::io::Error::last_os_error(),
             ))
+        }
+    }
+
+    /// Rename within this directory with an atomic flag the portable `renameat`
+    /// lacks: Linux spells it `renameat2`, macOS `renameatx_np`.
+    fn rename_with(&self, from: &CStr, to: &CStr, mode: RenameMode) -> libc::c_long {
+        let fd = self.file.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        {
+            let flag = match mode {
+                RenameMode::NoReplace => libc::RENAME_NOREPLACE,
+                RenameMode::Exchange => libc::RENAME_EXCHANGE,
+            };
+            // SAFETY: renameat2 consumes the supplied directory fd and names.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    fd,
+                    from.as_ptr(),
+                    fd,
+                    to.as_ptr(),
+                    flag,
+                )
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let flag = match mode {
+                RenameMode::NoReplace => libc::RENAME_EXCL,
+                RenameMode::Exchange => libc::RENAME_SWAP,
+            };
+            // SAFETY: renameatx_np consumes the supplied directory fd and names.
+            libc::c_long::from(unsafe {
+                libc::renameatx_np(fd, from.as_ptr(), fd, to.as_ptr(), flag)
+            })
         }
     }
 

@@ -4,24 +4,52 @@
 //! jail for the commands it asks to run. [`Sandbox`] is the boundary between the
 //! two, so the loop never knows which confinement mechanism is in use.
 //!
-//! Two implementations exist during the migration to host-native isolation:
-//! `project::AgentRuntime` (Docker) and the namespace/Landlock sandbox that
-//! replaces it. The trait is kept after Docker is removed because it is also the
-//! seam the follow-up portability work plugs into.
+//! [`native::NativeSandbox`] is the one implementation. Everything about it that
+//! does not depend on the kernel — grants, the per-command plan, background process
+//! bookkeeping, the policy engine — is shared; what confines a command is chosen per
+//! OS by [`backend`]:
+//!
+//! - **Linux** ([`linux`]): namespaces held by a session process, bwrap per command,
+//!   Landlock + seccomp applied by the shim, egress through an nft-intercepted relay.
+//! - **macOS** ([`macos`]): a Seatbelt profile applied by the shim with
+//!   `sandbox_init`, egress through a per-session authenticated proxy on the host.
+//!
+//! Both fail closed, and both keep every policy decision on the host side.
 
 pub mod attribution;
-pub mod bwrap;
-pub mod cgroup;
 pub mod exec;
 pub mod grants;
-pub mod lockdown;
 pub mod native;
 pub mod policy;
 pub mod preflight;
-pub mod session;
 pub mod shim;
 pub mod stream;
+
+#[cfg(target_os = "linux")]
+pub mod bwrap;
+#[cfg(target_os = "linux")]
+pub mod cgroup;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "linux")]
+pub mod lockdown;
+#[cfg(target_os = "linux")]
+pub mod session;
+#[cfg(target_os = "linux")]
 pub mod transport;
+
+#[cfg(target_os = "macos")]
+pub mod macos;
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("cowboy's sandbox supports Linux and macOS only");
+
+/// The confinement mechanism for this OS: a `Session` type with the same surface on
+/// every platform, so [`native::NativeSandbox`] never names one.
+#[cfg(target_os = "linux")]
+pub(crate) use linux as backend;
+#[cfg(target_os = "macos")]
+pub(crate) use macos as backend;
 
 use std::path::{Path, PathBuf};
 
@@ -29,7 +57,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 /// Loopback port inside the sandbox where the egress relay accepts intercepted
-/// TCP. Fixed rather than per-session: it is only ever reachable from inside one
+/// TCP (Linux). Fixed rather than per-session: it is only ever reachable from inside one
 /// network namespace, so there is nothing for a unique port to protect against,
 /// and a constant keeps the Landlock rule and the nft rule obviously in agreement.
 pub const RELAY_PORT: u16 = 8443;
@@ -48,6 +76,26 @@ pub(crate) use exec::{EXIT_CANCELLED, EXIT_TIMEOUT};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExecResult {
     pub exit_code: i32,
+}
+
+/// Where things are, as a command inside the sandbox sees them — for telling the
+/// agent, which cannot find out any other way that does not cost it a turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxPaths {
+    /// The project.
+    pub workdir: String,
+    /// Scratch space that lasts the session and is not the project.
+    pub scratch: String,
+}
+
+impl Default for SandboxPaths {
+    /// The Linux layout with the default config.
+    fn default() -> Self {
+        Self {
+            workdir: "/workspace".to_string(),
+            scratch: "/tmp".to_string(),
+        }
+    }
 }
 
 /// Sink for human-readable sandbox bring-up status lines.
@@ -73,6 +121,11 @@ pub trait Sandbox: Send + Sync {
 
     /// A stable name identifying this project's sandbox, for logs and teardown.
     fn session_name(&self) -> &str;
+
+    /// Where the project and the session scratch appear to a command.
+    fn paths(&self) -> SandboxPaths {
+        SandboxPaths::default()
+    }
 
     /// Attach a sink for bring-up progress, replacing any previous one. When no
     /// sink is attached, reporting is a no-op.

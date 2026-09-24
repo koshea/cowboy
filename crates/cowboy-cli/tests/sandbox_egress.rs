@@ -11,6 +11,9 @@
 //! doing nothing. Tests needing the internet skip separately, so the offline subset
 //! still means something.
 
+// Linux namespaces, bwrap and nftables; the macOS boundary is `sandbox_macos.rs`.
+#![cfg(target_os = "linux")]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

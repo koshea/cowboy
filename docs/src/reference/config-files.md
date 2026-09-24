@@ -57,7 +57,7 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `$XDG_RUNTIME_DIR/cowboy/` | Daemon + worker sockets, lock (`0700`; the sockets are `0600` and peer-uid checked — see [the boundary](../security/model.md)). |
 | `$XDG_STATE_HOME/cowboy/daemon/state.json` | Session registry + leases. |
 | `$XDG_STATE_HOME/cowboy/jobs/<parent>/<job>/` | The parent↔subagent control channel (`0700`, files `0600`): turn requests, verdicts, [questions and answers](../using/crew.md#a-worker-can-ask-a-question). Deliberately **not** in `.cowboy/`, which is writable from inside the sandbox — a verdict file there could be written by sandboxed content and would then steer another agent. |
-| `$XDG_CACHE_HOME/cowboy/home/<repo-key>/` | The sandboxed agent's `HOME`, bound at `/home/agent` (`0700`). Per-repository, so all worktrees share one warm cache; safe to delete, at the cost of re-downloading. Deliberately **not** `.cowboy/home` in the workspace — see [sandbox decisions](../security/sandbox-decisions.md#the-agents-home-does-not-belong-in-the-workspace). |
+| `$XDG_CACHE_HOME/cowboy/home/<repo-key>/` | The sandboxed agent's `HOME`, bound at `/home/agent` (at its own path on macOS) (`0700`). Per-repository, so all worktrees share one warm cache; safe to delete, at the cost of re-downloading. Deliberately **not** `.cowboy/home` in the workspace — see [sandbox decisions](../security/sandbox-decisions.md#the-agents-home-does-not-belong-in-the-workspace). |
 
 ## Unknown keys are an error
 

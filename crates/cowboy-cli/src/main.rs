@@ -93,7 +93,13 @@ async fn run() -> Result<()> {
         }
         Some(Command::XFileop) => cmd::fileop::run(),
         Some(Command::XSandboxShim) => cowboy_cli::sandbox::shim::run(),
+        #[cfg(target_os = "linux")]
         Some(Command::XSandboxHolder) => cowboy_cli::sandbox::session::run_holder().await,
+        // The session holder is a Linux namespace process; macOS has none.
+        #[cfg(not(target_os = "linux"))]
+        Some(Command::XSandboxHolder) => {
+            anyhow::bail!("x-sandbox-holder exists only on Linux")
+        }
         Some(Command::XSessionWorker(a)) => {
             cmd::worker::run(cmd::worker::WorkerArgs {
                 root: a.root,

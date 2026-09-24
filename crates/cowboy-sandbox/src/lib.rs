@@ -14,9 +14,10 @@
 pub mod denylist;
 pub mod plan;
 pub mod probe;
+pub mod seatbelt;
 
 pub use denylist::{DenyReason, Denylist};
 pub use plan::{
-    Bind, BindMode, LandlockRules, ResourceLimits, SandboxPlan, SeccompProfile, SHIM_PATH,
+    Bind, BindMode, LandlockRules, Platform, ResourceLimits, SandboxPlan, SeccompProfile, SHIM_PATH,
 };
 pub use probe::HostProbe;

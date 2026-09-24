@@ -897,3 +897,173 @@ install — because the reader is being asked to change their machine. A prerequ
 the sandbox cannot run without is a **failure** (so `doctor` exits non-zero);
 resource limits only **warn**, because the boundary does not depend on them. That
 distinction is the reason for having both states, and it is tested.
+
+## macOS: Seatbelt, verified on the target host
+
+The macOS backend confines commands with **Seatbelt**: an SBPL profile generated
+from the same `SandboxPlan` and applied in-process by the shim with
+`sandbox_init()` just before it `exec`s the command. It does not use a VM or a
+privileged helper. Every claim below was verified by running it on:
+
+```
+macOS    27.0 (26A428), arm64
+Xcode    /Applications/Xcode.app (xcode-select), Homebrew at /opt/homebrew
+```
+
+**`sandbox_init` takes a profile string and fails closed.** A C shim that reads
+the profile and calls `sandbox_init(profile, 0, &err)` before `execv` confines
+the exec'd program. A malformed profile makes the call return non-zero with a
+syntax error, so the shim exits without running anything. `sandbox_init` is
+deprecated in the SDK headers but is what `sandbox-exec` uses, and it is present
+and working on the current release.
+
+**The read side is a strict allowlist, and the toolchain still works.** Under
+`(deny default)`, with only these readable, `cc` (via the xcrun shim), `git`,
+`python3` (Homebrew), `node` (nvm, in `~`) and `cargo run` (Homebrew rustc) all
+work:
+
+- `/usr`, `/bin`, `/sbin`, `/System`, `/Library/Apple`, `/Library/Developer`,
+  `/Applications/Xcode.app`, `/opt/homebrew`, `/private/var/db/dyld`,
+  `/private/var/db/timezone` and `/private/var/select`;
+- the `/private/etc` files `hosts`, `ssl/`, `localtime`, `passwd` and `group`,
+  plus the device nodes `null`, `zero`, `random`, `urandom`, `tty` and
+  `dtracehelper`;
+- `/Library/Preferences/com.apple.dt.Xcode.plist` and
+  `.GlobalPreferences.plist`. Without the first, every `/usr/bin` developer
+  shim claims the Xcode licence is unaccepted.
+
+Four surprises came out of this:
+
+- dyld reads the `/` directory itself. As on Linux, the root needs a list-only
+  right.
+- Xcode loads `MobileDevice.framework` from `/Library/Apple`. dyld's error
+  message names the `/System` path, which is misleading.
+- `xcrun` keeps its lookup cache (`xcrun_db-*`) in the **Darwin per-user temp
+  dir** (`confstr(_CS_DARWIN_USER_TEMP_DIR)`) and ignores `TMPDIR`. The first
+  version allowed the sandbox to write there, which was a **sandbox escape**. The
+  host's own `xcrun` trusts that cache to say where `git` and `clang` live, so a
+  command that can write it chooses what the user's next `git` runs, outside the
+  sandbox. The prefix is now **read-only**. Verified: with read-only access `cc`,
+  `git` and `xcrun --find` work cleanly off the host's cache. With no access they
+  still work, but print a cache warning and fall back to a slow `xcodebuild`
+  lookup.
+- The shims also need a few Mach services: `opendirectoryd.libinfo` and
+  `.membership` (`getpwuid`), `bsd.dirhelper`, `notification_center`, `logd` and
+  `diagnosticd`.
+
+**Metadata is not granted globally.** `(allow file-read-metadata)` everywhere
+would let `stat`/`test -e` probe the whole disk. That is an existence oracle the
+Linux mount namespace does not have, where an unexposed path simply does not
+exist. Metadata is therefore granted only on the exposed paths and their
+ancestors (plus `/opt`, which Python's `realpath` walks). With that, `~/.ssh`
+and `~/.aws` are invisible to `stat` and `test -e`, and the toolchain above
+still works.
+
+**A later deny overrides an earlier allow**, so the config mask
+(`security.yaml`, `models.yaml`) is a `deny file-read* file-write*` literal
+emitted last, inside a read-write project subpath. Reading a masked file fails
+with `EPERM`.
+
+**Egress is an explicit proxy, and containment does not depend on it.** Seatbelt
+cannot redirect traffic. It can deny it. The profile allows `network-outbound`
+to exactly one endpoint, `localhost:<this session's proxy port>`, and allows
+loopback `bind`/`inbound` so the agent can run servers. Verified:
+
+- a direct TCP connect to `1.1.1.1:80` fails;
+- UDP to `8.8.8.8:53` fails with `EPERM`;
+- `getaddrinfo("example.com")` fails;
+- a direct connect to a host service on `127.0.0.1` fails.
+
+Because Seatbelt allows the proxy port and nothing else, a dead proxy means no
+egress, which is the same inversion as the Linux netns. `localhost` still
+resolves, from `/etc/hosts`. `curl`, `cargo` and `npm` work through
+`HTTPS_PROXY`. Tools that ignore the proxy environment get no network at all:
+that is the accepted cost of fail-closed without a privileged helper.
+
+**The proxy authenticates each command.** The loopback interface is shared with
+the host and every other session, so a fixed or unauthenticated port would let
+one session ride another's approvals. Each command gets
+`http://c<id>:<token>@127.0.0.1:<port>` in its proxy variables. A wrong token
+gets `407`. The username identifies the command, so attribution needs no pid
+lookup.
+
+Apple's git (2.39, libcurl `anyauth`) sends credentials only after a `407`
+challenge on the same connection. The proxy must therefore keep the connection
+open after a `407`, and the plan also sets `GIT_HTTP_PROXY_AUTHMETHOD=basic`.
+With a proxy that closes after a `407`, `git ls-remote` failed while `curl`
+worked.
+
+**Escape vectors, each attempted and denied under `(deny default)`:**
+
+| Vector | Why it fails |
+|---|---|
+| `open -a` | LaunchServices Mach services (`lsd.*`, `coreservicesd`) are denied |
+| `osascript` driving Terminal | The XPC connection is invalid |
+| `launchctl submit` | `job-creation` is denied |
+| `pbcopy`/`pbpaste` | Pasteboard is denied |
+| `at` | `forbidden-exec-sugid` |
+| `kill -0 <host pid>` | `EPERM`; signals are limited to `same-sandbox` |
+| `ps` | Lists nothing; `process-info` on other processes is denied |
+| ssh-agent socket dir | Unreadable |
+| Docker socket | Unconnectable |
+| mDNS (`dns-sd`) | Unreachable |
+
+Each of these would be a way to get code run *outside* the sandbox by a process
+that was never confined, so each has a test.
+
+**There is no PID namespace, so a command can outlive itself.** A double
+`fork` + `setsid` leaves a process reparented to launchd, in its own session,
+after the command returns. It is still confined, since Seatbelt is inherited
+and cannot be dropped, but it is not reaped by killing the command's process
+group. The sweep identifies the session's processes with checks the agent
+cannot forge, and all three must hold:
+
+1. `sandbox_check(pid, NULL, SANDBOX_FILTER_NONE)` says the process is
+   sandboxed;
+2. `sandbox_check(pid, "file-read-data", SANDBOX_FILTER_PATH, …)` says its
+   profile may read this session's scratch `TMPDIR`;
+3. the same check says its profile may **not** read the scratch directory's
+   parent, which ours only lets it stat.
+
+**The third check was added after the first version killed system processes.**
+With only the first two, run against a canary under `~/.cache`, the sweep
+matched WallpaperAgent, NotificationCenter, `secd`, `trustd` and a dozen other
+Apple agents. Their profiles are broad enough to read anything in the user's
+cache directory. It killed about eight of them over a few test runs; launchd
+restarted them. Docker Desktop quit in the same window, and was most likely
+collateral. The spike had missed this because its canary was under
+`/private/tmp/…`, which those agents cannot read. A profile that can read
+exactly one session's `tmp` and not the directory beside it is written by
+that session only.
+
+Two guards now stand behind it:
+
+- A test builds a fresh scratch directory in the real location and asserts
+  that the check matches **no** running process
+  (`a_fresh_session_canary_matches_no_running_process`).
+- The sweep never signals a binary under `/System`, `/usr/libexec`,
+  `/usr/sbin` or `/Library/Apple`.
+
+An environment marker would not do either: the agent can strip its own
+environment. `sandbox_check` is variadic, so it must be called with the C
+variadic ABI; Python `ctypes` on arm64 silently gets it wrong.
+`SANDBOX_CHECK_NO_REPORT` is an exported *symbol*, not a constant. Without it,
+every probe of another app's sandbox writes a denial to the system log.
+
+**A finished command's process group is killed too.** Without a PID namespace,
+`sleep 300 &` stays in the command's group after the shell exits, and holds its
+output pipe open. The runner kills the group when the leader exits, then
+drains output for half a second, so an escapee holding the pipe cannot turn a
+finished command into a timeout. The kill must use the pid captured at spawn:
+tokio's `Child::id()` is `None` once the child is reaped, and the first version
+silently skipped the kill.
+
+**Resource limits are not available.** There is no cgroup equivalent for an
+unprivileged process tree, and `RLIMIT_NPROC` is per-uid, not per-session. As on
+Linux, limits are not part of the boundary, so `doctor` warns rather than fails.
+
+**The toolchain gap is `/tmp` and nvm, not the boundary.** The host's `/tmp` is
+shared with everything else the user runs (ssh-agent sockets live under
+`/private/tmp`), so it stays unwritable. `TMPDIR` points at session scratch, and
+the system prompt names that path rather than `/tmp`. Node installed with nvm
+under `~/.nvm` is not among the exposed tool directories, on either platform.

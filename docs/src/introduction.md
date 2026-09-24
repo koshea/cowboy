@@ -54,10 +54,14 @@ model behaving, that's a bug in the docs (or the code).
 
 ## Platform support
 
-**Linux only.** The sandbox is namespaces, Landlock, seccomp and nftables — kernel
-features with no equivalent elsewhere, and there is no container or VM in the
-design to borrow one from. macOS support went with the container, deliberately.
+**Linux and macOS.** The boundary is built from the host kernel either way, with no
+container or VM:
 
-Cowboy was built against a current kernel (Landlock ABI 6+, Linux 6.10 or newer).
+- **Linux**: namespaces, Landlock, seccomp and nftables, on a current kernel
+  (Landlock ABI 6+, Linux 6.10 or newer).
+- **macOS**: a Seatbelt profile per command and an authenticated egress proxy, on
+  Apple silicon running macOS 26 or newer. See
+  [the boundary on macOS](security/model.md#on-macos) for what differs.
+
 `cowboy doctor` checks each prerequisite by performing it and names what to change
 if something is missing.

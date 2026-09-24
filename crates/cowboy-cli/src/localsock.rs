@@ -99,6 +99,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<PathBuf> {
 /// unreachable by anyone else — and then the socket is chmod'ed `0600`. Any stale
 /// socket at `path` is removed; callers hold whatever lock makes that safe.
 pub fn bind(path: &Path) -> Result<UnixListener> {
+    check_length(path)?;
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
@@ -158,26 +159,59 @@ pub fn connect_blocking(path: &Path) -> Result<std::os::unix::net::UnixStream> {
         .with_context(|| format!("connecting to {}", path.display()))
 }
 
+/// Refuse a socket path the kernel would truncate or reject, with an error that says
+/// what to do. `sun_path` holds 108 bytes on Linux and only 104 on macOS, whose
+/// `$TMPDIR` alone is about 50 — so a long runtime directory is a real way to fail.
+fn check_length(path: &Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    const MAX: usize = 103;
+    #[cfg(not(target_os = "macos"))]
+    const MAX: usize = 107;
+    let len = path.as_os_str().len();
+    if len > MAX {
+        anyhow::bail!(
+            "the socket path {} is {len} bytes, over this OS's limit of {MAX}; set \
+             XDG_RUNTIME_DIR to a shorter directory",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// The uid on the other end of `stream`, from the kernel rather than from anything
 /// the peer said.
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // SAFETY: `cred` is a correctly sized, owned buffer for SO_PEERCRED on an
-    // `AF_UNIX` socket, and `len` describes it.
-    let rc = unsafe {
-        libc::getsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            (&raw mut cred).cast(),
-            &raw mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
+    #[cfg(target_os = "linux")]
+    {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: `cred` is a correctly sized, owned buffer for SO_PEERCRED on an
+        // `AF_UNIX` socket, and `len` describes it.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&raw mut cred).cast(),
+                &raw mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
     }
-    Ok(cred.uid)
+    #[cfg(target_os = "macos")]
+    {
+        let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+        // SAFETY: `getpeereid` fills two owned integers for a connected `AF_UNIX`
+        // socket; it is the BSD spelling of `SO_PEERCRED`.
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &raw mut uid, &raw mut gid) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
 }
 
 /// Whether `stream`'s peer is this user, logging and rejecting anything else.
@@ -244,6 +278,13 @@ mod tests {
 
     /// A symlink where the socket directory should be is refused outright. Following
     /// it would create a socket somewhere its planter chose.
+    #[test]
+    fn an_overlong_socket_path_is_refused_with_a_remedy() {
+        let long = Path::new("/").join("x".repeat(200)).join("s.sock");
+        let err = bind(&long).expect_err("too long to bind");
+        assert!(err.to_string().contains("XDG_RUNTIME_DIR"), "{err}");
+    }
+
     #[test]
     fn a_symlinked_socket_directory_is_refused() {
         let tmp = assert_fs::TempDir::new().unwrap();

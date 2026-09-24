@@ -1,0 +1,106 @@
+---
+source: crates/cowboy-sandbox/src/seatbelt.rs
+expression: "render(&plan_with(&[]))"
+---
+(version 1)
+(deny default)
+
+;; processes: anything this sandbox runs, and only its own
+(allow process-exec process-fork)
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+(allow sysctl-read)
+(allow pseudo-tty)
+
+;; ipc: what the toolchain needs to look up users and log
+(allow mach-lookup
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.logd")
+  (global-name "com.apple.diagnosticd"))
+(allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
+
+;; the root and every ancestor of an exposed path: listable (the root)
+;; and stat-able, but no more — anything else does not appear to exist
+(allow file-read-data (literal "/"))
+(allow file-read-metadata
+  (literal "/")
+  (literal "/Applications")
+  (literal "/Library")
+  (literal "/Library/Preferences")
+  (literal "/Users")
+  (literal "/Users/dev")
+  (literal "/Users/dev/.cache")
+  (literal "/Users/dev/.cache/cowboy")
+  (literal "/Users/dev/.cache/cowboy/home")
+  (literal "/Users/dev/.cargo")
+  (literal "/Users/dev/proj")
+  (literal "/Users/dev/proj/.cowboy")
+  (literal "/etc")
+  (literal "/opt")
+  (literal "/private")
+  (literal "/private/etc")
+  (literal "/private/var")
+  (literal "/private/var/folders")
+  (literal "/private/var/folders/xy")
+  (literal "/private/var/folders/xy/abc")
+  (literal "/private/var/folders/xy/abc/T")
+  (literal "/scratch")
+  (literal "/tmp")
+  (literal "/usr")
+  (literal "/usr/bin")
+  (literal "/var"))
+
+;; devices
+(allow file-read* file-write* file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/random")
+  (literal "/dev/urandom")
+  (literal "/dev/tty")
+  (literal "/dev/dtracehelper")
+  (subpath "/dev/fd"))
+
+;; read-only
+(allow file-read*
+  (subpath "/usr/bin/cowboy")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/System")
+  (subpath "/opt/homebrew")
+  (subpath "/Applications/Xcode.app")
+  (subpath "/private/etc/hosts")
+  (subpath "/Library/Preferences/com.apple.dt.Xcode.plist")
+  (subpath "/Users/dev/.cargo/bin")
+  (subpath "/Users/dev/.rustup")
+  (subpath "/Users/dev/proj/.cowboy/ranches"))
+
+;; read-write
+(allow file-read* file-write*
+  (subpath "/scratch/tmp")
+  (subpath "/Users/dev/.cache/cowboy/home/proj")
+  (subpath "/Users/dev/proj"))
+
+;; xcrun's lookup cache: read-only, since the host trusts it
+(allow file-read* (prefix "/private/var/folders/xy/abc/T/xcrun_db"))
+
+;; read-only inside a writable path
+(deny file-write*
+  (subpath "/Users/dev/proj/.cowboy/ranches"))
+
+;; network: this session's proxy and nothing else outbound; no DNS
+(allow network-bind network-inbound (local ip "localhost:*"))
+(allow network-outbound
+  (remote ip "localhost:51000")
+  (remote ip "localhost:5432"))
+(allow network-outbound network-bind
+  (remote unix-socket (subpath "/scratch/tmp"))
+  (remote unix-socket (subpath "/Users/dev/.cache/cowboy/home/proj"))
+  (remote unix-socket (subpath "/Users/dev/proj")))
+
+;; host-owned config: masked, and last so nothing above re-exposes it
+(deny file-read* file-write*
+  (literal "/Users/dev/proj/.cowboy/security.yaml")
+  (literal "/Users/dev/proj/.cowboy/models.yaml"))

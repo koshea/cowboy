@@ -42,6 +42,11 @@ jobs:
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
+          # Apple silicon only, macOS 26+: the release the Seatbelt boundary is
+          # verified on. Unsigned beyond the linker's ad-hoc signature; the
+          # Homebrew formula is the supported install (see packaging/homebrew).
+          - target: aarch64-apple-darwin
+            runner: macos-26
     steps:
       - uses: actions/checkout@v7
 
@@ -112,7 +117,9 @@ jobs:
           cp target/release/cowboy target/release/cowboyd "$staging/"
           cp README.md LICENSE "$staging/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
-          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          # `shasum` rather than `sha256sum`: it is on both the Linux and macOS
+          # runners, and writes the same format.
+          ( cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256" )
           echo "name=$name" >> "$GITHUB_OUTPUT"
 
       # A released binary that cannot start is worse than no release. This is not a
@@ -160,13 +167,13 @@ jobs:
           merge-multiple: true
 
       # `fail-fast: false` above means a partial matrix still reaches this job.
-      # Publishing a release that silently lacks an architecture is worse than
-      # failing here, so require both.
-      - name: Check both architectures arrived
+      # Publishing a release that silently lacks a platform is worse than failing
+      # here, so require every one.
+      - name: Check every platform arrived
         run: |
           set -euo pipefail
           ls -l dist
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
             if ! ls dist/*"${target}".tar.gz >/dev/null 2>&1; then
               echo "::error::no archive for ${target}; refusing to publish a partial release" >&2
               exit 1

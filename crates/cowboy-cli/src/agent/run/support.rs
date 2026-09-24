@@ -16,13 +16,13 @@ pub(super) fn self_exe() -> std::result::Result<PathBuf, String> {
 
 /// Whether the process with this pid is gone.
 ///
-/// One direction of this is reliable and that is the direction we use: a missing
-/// `/proc/<pid>` means the process is definitely gone. The converse is not certain (a
+/// One direction of this is reliable and that is the direction we use: a pid that
+/// cannot be signalled at all means the process is definitely gone. The converse is not certain (a
 /// recycled pid could be a different process), and the cost of that is a worker running
 /// slightly longer than it needed to — much cheaper than killing a live worker because
 /// the check guessed wrong.
 pub(super) fn process_is_gone(pid: u32) -> bool {
-    !std::path::Path::new(&format!("/proc/{pid}")).exists()
+    !crate::project::pid_alive(pid)
 }
 
 /// The effective delegation depth limit for a roster: the configured `max_depth`
@@ -116,6 +116,41 @@ pub(super) fn system_prompt(
         system.push_str(TURN_REQUEST_PROMPT);
     }
     system
+}
+
+/// The prompt with the sandbox's real paths in place of the Linux defaults it is
+/// written with (`/workspace`, `/tmp`).
+///
+/// A prompt that names a directory the agent cannot write sends it straight into a
+/// refusal: on macOS the project is at its host path and `/tmp` is the host's own,
+/// which the sandbox cannot touch.
+pub(super) fn with_sandbox_paths(prompt: String, paths: &crate::sandbox::SandboxPaths) -> String {
+    if *paths == crate::sandbox::SandboxPaths::default() {
+        return prompt;
+    }
+    replace_path_token(
+        &replace_path_token(&prompt, "/workspace", &paths.workdir),
+        "/tmp",
+        &paths.scratch,
+    )
+}
+
+/// Replace `token` where it stands as a whole path, not as a prefix of a longer word.
+fn replace_path_token(s: &str, token: &str, with: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find(token) {
+        let after = &rest[i + token.len()..];
+        let whole = after
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '-'));
+        out.push_str(&rest[..i]);
+        out.push_str(if whole { with } else { token });
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A worker's iteration budget for one turn: how many turns it has been granted,
@@ -1150,6 +1185,38 @@ mod tests {
         let solo_prompt = system_prompt(false, 0, false, None);
         assert!(!solo_prompt.contains("foreman of a crew"));
         assert!(!solo_prompt.contains(SUBAGENT_PROMPT));
+    }
+
+    #[test]
+    fn the_prompt_names_the_sandboxs_real_paths() {
+        let base = system_prompt(false, 0, false, None);
+        assert!(base.contains("/workspace") && base.contains("/tmp"));
+        let same = with_sandbox_paths(base.clone(), &crate::sandbox::SandboxPaths::default());
+        assert_eq!(same, base, "the Linux defaults leave the prompt alone");
+
+        let mac = with_sandbox_paths(
+            base,
+            &crate::sandbox::SandboxPaths {
+                workdir: "/Users/dev/proj".into(),
+                scratch: "/Users/dev/.cache/cowboy/run/scratch/s/tmp".into(),
+            },
+        );
+        assert!(!mac.contains("/workspace"), "{mac}");
+        assert!(!mac.contains(" /tmp"), "{mac}");
+        assert!(mac.contains("mounted at /Users/dev/proj"), "{mac}");
+        assert!(
+            mac.contains("go under /Users/dev/.cache/cowboy/run/scratch/s/tmp"),
+            "{mac}"
+        );
+    }
+
+    #[test]
+    fn a_path_token_is_replaced_only_whole() {
+        assert_eq!(
+            replace_path_token("/tmp and /tmpfoo", "/tmp", "/x"),
+            "/x and /tmpfoo"
+        );
+        assert_eq!(replace_path_token("at /tmp.", "/tmp", "/x"), "at /x.");
     }
 
     /// The foreman must be told about exactly the categories that can route, with a

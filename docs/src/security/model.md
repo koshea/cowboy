@@ -1,8 +1,12 @@
 # The boundary
 
 The central principle: **the agent is not part of the security boundary**.
-Controls are enforced by the Linux kernel and by host-owned configuration the
-agent cannot see — never by prompting the model. If the model decides to
+Controls are enforced by the kernel and by host-owned configuration the agent
+cannot see — never by prompting the model.
+
+This chapter describes Linux, where the boundary was first built; macOS enforces
+the same model with different mechanisms, and [On macOS](#on-macos) below says
+exactly what differs. If the model decides to
 misbehave, nothing about the boundary changes.
 
 Cowboy used to get this from Docker. It now gets it from the host directly:
@@ -157,7 +161,8 @@ configured ceiling this host cannot apply.
 ## The local control sockets
 
 The daemon and each live session listen on unix sockets under
-`$XDG_RUNTIME_DIR/cowboy` (or `/tmp/cowboy-$UID` when that is unset). Both are
+`$XDG_RUNTIME_DIR/cowboy` (or `/tmp/cowboy-$UID` when that is unset; on macOS,
+which never sets it, `$TMPDIR/cowboy`). Both are
 **fully privileged interfaces**, and the session one is the more sensitive of the two:
 over it a peer injects messages into the agent's conversation and answers outstanding
 network-approval prompts. Whoever can answer those *is* the `ask` gate.
@@ -168,7 +173,8 @@ They are protected three ways, because each covers a different failure:
   what stops a hostile pre-created path, which no permission on the socket could fix;
 - each socket is **`0600`**, so the mode still says what is intended if the directory
   is later loosened by hand;
-- every accepted connection's **peer uid is checked with `SO_PEERCRED`** and dropped
+- every accepted connection's **peer uid is checked with `SO_PEERCRED`**
+  (`getpeereid` on macOS) and dropped
   unless it is yours. Permissions can be undone by anything that touches the file; the
   kernel's answer to who is on the other end cannot. Clients check the other
   direction too, refusing a socket they do not own rather than handing their project
@@ -191,9 +197,55 @@ Every gate denies when it cannot get an answer:
 - a sandbox whose confinement cannot be established → the command does not run.
   There is no fallback to running on the host.
 
+## On macOS
+
+The model is the same — the kernel and host-owned config enforce, the policy engine
+runs host-side, and every gate fails closed. The mechanisms differ, and so do a few
+things you will see:
+
+| | Linux | macOS |
+|---|---|---|
+| Confinement | mount namespace + Landlock + seccomp | a Seatbelt profile, applied by the shim with `sandbox_init` just before `exec` |
+| Paths | the project at `/workspace`, scratch at `/tmp` | everything at its **host path**; scratch is `$TMPDIR` (the host's `/tmp` is not writable) |
+| What exists | only what is bound | stat-able only along the way to what is exposed; `~/.ssh` does not appear to exist |
+| Config mask | an empty file bound over it, last | a deny rule, last |
+| Egress | transparent interception in a namespace with no device | an **explicit proxy**: outbound is allowed to one loopback port only |
+| Loopback | the sandbox's own | the host's: direct connections are refused; they go through the proxy and `default_host`, or `sandbox.loopback_ports` |
+| Process reaping | the PID namespace | the process group, plus a session sweep by profile |
+| Resource limits | cgroup v2 | none (a `doctor` warning) |
+
+Seatbelt can allow and deny, but not move a path or redirect a packet, and each
+difference follows from that:
+
+- **The profile is derived from the same plan.** `cowboy sandbox plan` renders it;
+  every bind becomes an allow rule on its host path, and a mount `target` or
+  `workdir` in `security.yaml` is ignored with a note, so one config serves both
+  platforms. A credential grant whose tool looks in `~` is linked into the agent's
+  `HOME`.
+- **Egress fails closed without interception.** The profile permits outbound
+  connections to exactly one place: this session's proxy on loopback. Commands are
+  given it as `HTTP(S)_PROXY`/`ALL_PROXY`; a tool that ignores those variables gets
+  no network at all rather than unpoliced network. DNS is denied inside the
+  sandbox — the proxy resolves on the host, and the DNS policy and the connection
+  policy run exactly as on Linux, on the address that is then dialled.
+- **The proxy authenticates every command.** Loopback is shared with everything on
+  the machine, so each command gets its own proxy credentials, revoked when it
+  ends. They also say which command made a connection.
+- **Escapes to unconfined processes are closed.** `open`, AppleScript, `launchctl`,
+  `at`, the pasteboard, and every other host unix socket (ssh-agent, Docker,
+  `cowboyd`) are refused; the profile allows a minimal set of Mach services the
+  toolchain needs and nothing that would act on the agent's behalf outside it.
+  Setuid binaries do not run, so `ps` and `at` are unavailable.
+- **Reaping is by profile.** A command that double-forks and `setsid`s outlives its
+  process group; it stays confined — a profile cannot be dropped — and the session
+  sweep kills it at teardown, identifying it by what its profile may read rather
+  than by anything it could change.
+
 ## Follow-ups
 
 - Log redaction, per-command secret exposure, secret provenance, and integration
   with 1Password/Vault/SOPS.
 - Support for distributions other than the Gentoo target this was built against —
   see [Sandbox design decisions](sandbox-decisions.md) for what is host-specific.
+- macOS on Intel, and releases older than macOS 26: not verified, and refused by
+  `doctor`.

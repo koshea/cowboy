@@ -106,11 +106,19 @@ fn command_for_with(pid: u32, parent: impl Fn(u32) -> Option<u32>) -> Option<Str
 }
 
 /// The parent of `pid` per `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
 fn ppid_of(pid: u32) -> Option<u32> {
     parse_ppid(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
 }
 
+/// The parent of `pid`, from the kernel's BSD process info.
+#[cfg(target_os = "macos")]
+fn ppid_of(pid: u32) -> Option<u32> {
+    crate::sandbox::macos::reap::bsd_info(pid).map(|i| i.pbi_ppid)
+}
+
 /// The ppid field of a `/proc/<pid>/stat` line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 ///
 /// Parsed from the *last* `)` rather than by splitting on whitespace: field 2 is the
 /// executable name in parentheses and may itself contain spaces and parens, so a split

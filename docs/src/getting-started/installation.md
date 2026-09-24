@@ -2,9 +2,12 @@
 
 ## Requirements
 
-**Linux only.** The sandbox is built from Linux kernel features — namespaces,
-Landlock, seccomp, nftables — and there is no container or VM to run it in
-elsewhere.
+**Linux or macOS.** The sandbox is built from the host kernel's own features, and
+there is no container or VM to run it in.
+
+### Linux
+
+The sandbox is namespaces, Landlock, seccomp and nftables.
 
 - A kernel providing **Landlock ABI 6 or newer** (Linux 6.10+), with
   `CONFIG_SECURITY_LANDLOCK` and `landlock` in `CONFIG_LSM`.
@@ -22,6 +25,30 @@ elsewhere.
 namespace, asks the kernel its Landlock ABI, and loads the real interception
 ruleset into a throwaway namespace — and tells you the kernel option or package to
 change for anything missing.
+
+### macOS
+
+The sandbox is a Seatbelt profile applied to every command, and an authenticated
+proxy on the host as its only way out. Seatbelt is part of macOS, so there is
+nothing to install.
+
+- **Apple silicon**, running **macOS 26 (Tahoe) or newer**.
+- The **Xcode command-line tools** or Xcode, as for any development on a Mac —
+  the agent uses the toolchain you have.
+- An **OpenAI-compatible model endpoint** (see below).
+
+`cowboy doctor` applies a real profile to a real command and checks that it
+denies what it should and allows what it should — including that the only port a
+command can reach is its proxy's. Resource limits (memory/CPU ceilings) do not
+apply on macOS, and `doctor` says so as a warning: they are not part of the
+boundary on either platform.
+
+Some things work differently from Linux, because Seatbelt can allow and deny
+paths but not move them, and cannot redirect traffic. The
+[macOS section of the security model](../security/model.md#on-macos) has the
+full list; the ones you will notice are that the project appears at its real
+path rather than `/workspace`, the agent's scratch space is `$TMPDIR` rather than
+`/tmp`, and a tool reaches the network only if it honours `HTTPS_PROXY`.
 
 No Docker. No images to pull or build. The agent uses the toolchain already
 installed on your machine, which is the point.
@@ -50,12 +77,25 @@ you want multiple models, budgets, or failover.
 ## Install the binaries
 
 Every tagged release ships prebuilt `cowboy` + `cowboyd` for `x86_64` and `aarch64`
-Linux, with the web UI already embedded and a `SHA256SUMS` file beside them:
+Linux and Apple silicon macOS, with the web UI already embedded and a `SHA256SUMS`
+file beside them:
 
 ```sh
 tar xzf cowboy-<version>-x86_64-unknown-linux-gnu.tar.gz
 install -Dm755 cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/
 ```
+
+On macOS, the Homebrew tap is simplest:
+
+```sh
+brew install koshea/cowboy/cowboy
+```
+
+or unpack `cowboy-<version>-aarch64-apple-darwin.tar.gz` and copy both binaries
+onto your `PATH` (macOS `install` has no `-D`, so `mkdir -p ~/.local/bin && cp
+cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/`). The binaries carry only the
+linker's ad-hoc signature, so a copy downloaded with a browser is quarantined:
+`xattr -d com.apple.quarantine` on each, or use the tap or `curl`.
 
 There is nothing else to fetch — no image, no runtime. Built against the glibc on
 GitHub's `ubuntu-24.04` runners, so build from source below if yours is older.

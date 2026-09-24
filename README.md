@@ -8,9 +8,10 @@ network layer.
 
 > The agent can run wild because the runtime owns the corral.
 
-The agent is **not** part of the security boundary. Security is enforced by Linux
-namespaces, Landlock, seccomp, host-owned configuration, and a policy engine that
-runs in the host process — never by prompting the model.
+The agent is **not** part of the security boundary. Security is enforced by the
+kernel — Linux namespaces, Landlock and seccomp, or a Seatbelt profile on macOS —
+host-owned configuration, and a policy engine that runs in the host process — never
+by prompting the model.
 
 The agent gets **your** toolchain, read-only: the compilers and CLIs you actually
 installed, at your versions, with no image to build or pull. Need it to see a
@@ -20,12 +21,17 @@ command sees it — no restart.
 ## Quick start
 
 Grab the binaries from the [latest release](https://github.com/koshea/cowboy/releases/latest)
-— `x86_64` or `aarch64` Linux, with the `cowboy web` UI already embedded:
+— `x86_64` or `aarch64` Linux, or Apple silicon macOS — with the `cowboy web` UI
+already embedded:
 
 ```sh
 tar xzf cowboy-<version>-x86_64-unknown-linux-gnu.tar.gz
 install -Dm755 cowboy-*/cowboy cowboy-*/cowboyd ~/.local/bin/
 ```
+
+On macOS, `brew install koshea/cowboy/cowboy`, or unpack
+`cowboy-<version>-aarch64-apple-darwin.tar.gz` and copy both binaries onto your
+`PATH` (macOS `install` has no `-D`).
 
 Or build from source (needs Rust 1.98.1 or newer; a checkout pins it via
 `rust-toolchain.toml`):
@@ -110,12 +116,12 @@ docs/
 
 ## Requirements
 
-**Linux only** — the sandbox is namespaces, Landlock, seccomp and nftables, and
-there is no container or VM in the design to borrow them from.
+**Linux or macOS**, with no container or VM in the design.
 
-- A kernel with **Landlock ABI 6+** (Linux 6.10+), `CONFIG_SECCOMP_FILTER`, and
-  unprivileged user namespaces
-- **bubblewrap** (non-setuid), `unshare`, `ip`, `nft`
+- **Linux**: a kernel with **Landlock ABI 6+** (Linux 6.10+),
+  `CONFIG_SECCOMP_FILTER`, and unprivileged user namespaces; **bubblewrap**
+  (non-setuid), `unshare`, `ip`, `nft`
+- **macOS**: Apple silicon, **macOS 26+** (Seatbelt, built in — nothing to install)
 - An OpenAI-compatible model endpoint
 
 `cowboy doctor` checks each of these *by performing it* and names the kernel option

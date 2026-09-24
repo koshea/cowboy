@@ -108,6 +108,17 @@ pub struct SandboxConfig {
     /// toolchain the host already has (measured at ~2G for one project).
     #[serde(default = "default_true")]
     pub share_mise_store: bool,
+    /// Loopback ports sandboxed commands may connect to directly (macOS).
+    ///
+    /// On Linux the sandbox has its own loopback, so this has nothing to do there. On
+    /// macOS loopback is shared with the host — your databases, model servers and
+    /// Docker are all on it — so a command reaches `localhost` only through the
+    /// session's proxy, where `network_policy.default_host` decides. That covers HTTP;
+    /// list a port here for a protocol that cannot use a proxy (a Postgres the agent
+    /// started, say). Anything listening on the port becomes reachable, whoever
+    /// started it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loopback_ports: Vec<u16>,
 }
 
 /// A CPU limit: an explicit core count, or `auto` (resolved from the host).
@@ -787,6 +798,7 @@ impl Default for SandboxConfig {
             cpus: None,
             host_tools: true,
             share_mise_store: true,
+            loopback_ports: Vec::new(),
         }
     }
 }
@@ -1806,6 +1818,8 @@ sandbox:
     - source: .
       target: /workspace
       mode: rw
+  # On macOS paths cannot be remapped: the project appears at its own path, and
+  # `workdir` and mount targets are ignored (`cowboy sandbox plan` says so).
   # Add a path here to expose it permanently, or grant one as you go with
   # `cowboy grant <path>` — the sandbox picks it up on the next command, with no
   # restart. Credential stores (~/.aws, ~/.ssh, …) are always refused; use
@@ -1825,8 +1839,14 @@ sandbox:
   # parallelism: builds run with `-j{cpus}` (make/cargo/npm/cmake), because not
   # every tool reads the CPU quota. Use `auto` to size from the host
   # (cpus = half the cores [2..8]; memory = a quarter of RAM [4g..16g]).
+  # Not enforced on macOS, which has no per-session equivalent.
   memory: 8g
   cpus: 2
+  # macOS only: loopback is shared with your machine there, so commands reach
+  # localhost through the egress proxy (decided by `default_host`). List a port
+  # to let commands connect to it directly — for a protocol that cannot use a
+  # proxy, like a database the agent started. Linux sandboxes have their own.
+  # loopback_ports: [5432]
 
 network_policy:
   default_external: ask

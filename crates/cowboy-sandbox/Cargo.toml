@@ -11,6 +11,10 @@ repository.workspace = true
 cowboy-core = { workspace = true }
 serde = { workspace = true }
 
+# `hw.memsize` for `memory: auto`; macOS has no /proc/meminfo.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 insta = { workspace = true }
 pretty_assertions = { workspace = true }

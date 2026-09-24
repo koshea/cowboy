@@ -67,6 +67,30 @@ jobs:
       - name: Doctests
         run: cargo test --doc
 
+  # The macOS boundary is a different mechanism (Seatbelt + an egress proxy), so it
+  # gets its own required run: `sandbox_macos.rs` self-skips anywhere it cannot run,
+  # and `required` is what stops it passing here by doing nothing.
+  macos:
+    name: clippy · test (macOS)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (pinned by rust-toolchain.toml + clippy)
+        uses: dtolnay/rust-toolchain@1.98.1
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        env:
+          COWBOY_SANDBOX_TESTS: required
+        run: cargo test --workspace
+
   web-ui:
     name: build web UI (wasm)
     runs-on: ubuntu-latest

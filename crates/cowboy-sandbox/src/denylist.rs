@@ -17,6 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::plan::Platform;
 use crate::probe::HostProbe;
 
 /// Why a path was refused, so the refusal can say something useful.
@@ -131,7 +132,48 @@ const SENSITIVE_STORES: &[(&str, &str)] = &[
     ("~/.cargo/credentials.toml", "your crates.io token"),
 ];
 
+/// macOS secret stores, in addition to [`SENSITIVE_STORES`]. Separate so a Linux
+/// plan does not list paths that cannot exist there; the ancestor rule means each
+/// also refuses a grant of `~/Library` itself.
+const SENSITIVE_STORES_MACOS: &[(&str, &str)] = &[
+    ("~/Library/Keychains", "your login keychain"),
+    ("~/Library/Cookies", "your browser cookies"),
+    (
+        "~/Library/Application Support/Google/Chrome",
+        "a Chrome profile (saved passwords, cookies)",
+    ),
+    (
+        "~/Library/Application Support/Firefox",
+        "a Firefox profile (saved passwords, cookies, session tokens)",
+    ),
+    (
+        "~/Library/Application Support/BraveSoftware",
+        "a Brave profile (saved passwords, cookies)",
+    ),
+    (
+        "~/Library/Application Support/Microsoft Edge",
+        "an Edge profile (saved passwords, cookies)",
+    ),
+    ("~/Library/Safari", "your Safari data"),
+    ("~/Library/Containers/com.apple.Safari", "your Safari data"),
+    ("~/Library/Messages", "your Messages history"),
+    ("~/Library/Mail", "your mail"),
+    (
+        "~/Library/Group Containers/2BUA8C4S2C.com.1password",
+        "your 1Password vault",
+    ),
+    (
+        "~/Library/Application Support/1Password",
+        "your 1Password vault",
+    ),
+];
+
 impl Denylist {
+    /// Build the denylist for this host's platform; see [`Self::build_for`].
+    pub fn build(probe: &dyn HostProbe, project_root: &Path) -> Self {
+        Self::build_for(probe, project_root, Platform::host())
+    }
+
     /// Build the denylist for a host.
     ///
     /// Absolute where possible: entries whose `~` cannot be expanded are dropped,
@@ -140,7 +182,10 @@ impl Denylist {
     ///
     /// `project_root` is needed for one exception — see the `self_exe` handling
     /// below.
-    pub fn build(probe: &dyn HostProbe, project_root: &Path) -> Self {
+    ///
+    /// `platform` adds that platform's own secret stores, and is a parameter rather
+    /// than a `cfg` for the same reason as [`crate::plan::PlanInputs::platform`].
+    pub fn build_for(probe: &dyn HostProbe, project_root: &Path, platform: Platform) -> Self {
         let mut entries = Vec::new();
 
         // Derived from the preset table — the whole point, so the two can't drift.
@@ -155,7 +200,11 @@ impl Denylist {
             }
         }
 
-        for (raw, what) in SENSITIVE_STORES {
+        let platform_stores: &[(&str, &str)] = match platform {
+            Platform::Linux => &[],
+            Platform::MacOs => SENSITIVE_STORES_MACOS,
+        };
+        for (raw, what) in SENSITIVE_STORES.iter().chain(platform_stores) {
             if let Some(path) = probe.expand(raw) {
                 entries.push(Entry {
                     path,
@@ -300,6 +349,25 @@ mod tests {
     /// `..` and `.` are collapsed before any prefix test, and nothing can escape the
     /// root — otherwise normalization itself could turn a denied absolute path into
     /// something that no longer matches.
+    /// macOS keeps its secrets under `~/Library`; each store is refused, and so is
+    /// the directory that holds them all.
+    #[test]
+    fn macos_secret_stores_are_refused_there_and_not_listed_on_linux() {
+        let probe = FakeHost::new().with_home("/Users/dev");
+        let mac = Denylist::build_for(&probe, Path::new("/Users/dev/proj"), Platform::MacOs);
+        for p in [
+            "/Users/dev/Library/Keychains/login.keychain-db",
+            "/Users/dev/Library/Application Support/Google/Chrome/Default",
+            "/Users/dev/Library",
+        ] {
+            assert!(mac.check(Path::new(p)).is_some(), "{p} must be refused");
+        }
+        let linux = Denylist::build_for(&probe, Path::new("/Users/dev/proj"), Platform::Linux);
+        assert!(linux
+            .check(Path::new("/Users/dev/Library/Keychains"))
+            .is_none());
+    }
+
     #[test]
     fn normalize_collapses_traversal_without_escaping_the_root() {
         let n = |s: &str| normalize(Path::new(s));

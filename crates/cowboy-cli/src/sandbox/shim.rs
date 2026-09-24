@@ -1,17 +1,18 @@
 //! `cowboy x-sandbox-shim` — the last thing that runs before the agent's command.
 //!
-//! bwrap sets up namespaces, binds and `pivot_root`, but it cannot apply Landlock
-//! or a seccomp filter of our choosing. This shim runs *inside* the finished
-//! sandbox and applies them immediately before `exec`, which is the only place they
-//! can go: a Landlock domain can never be widened, so it must be installed after
-//! all setup is complete and before any untrusted code runs.
+//! On Linux, bwrap sets up namespaces, binds and `pivot_root`, but it cannot apply
+//! Landlock or a seccomp filter of our choosing. This shim runs *inside* the
+//! finished sandbox and applies them immediately before `exec`, which is the only
+//! place they can go: a Landlock domain can never be widened, so it must be
+//! installed after all setup is complete and before any untrusted code runs.
+//!
+//! On macOS there is no setup to wait for: the shim is spawned directly by the
+//! host, and applies the host-rendered Seatbelt profile with `sandbox_init` — which
+//! likewise can never be undone — immediately before `exec`.
 //!
 //! It receives its instructions on **stdin** as JSON rather than via argv, because
-//! argv is visible in `/proc/<pid>/cmdline` to anything that can see the process,
-//! and a long argv is awkward to get right through two layers of process spawning.
-//!
-//! The lockdown itself lands in the next slice; today the shim establishes the
-//! plumbing and execs the command.
+//! argv is visible to anything that can see the process, and a long argv is awkward
+//! to get right through two layers of process spawning.
 
 use std::os::unix::process::CommandExt;
 
@@ -19,7 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// What the shim must do before exec. Sent on stdin as one JSON object.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ShimRequest {
     /// The command, run via `sh -c` so ordinary shell syntax works.
     pub command: String,
@@ -41,6 +42,10 @@ pub struct ShimRequest {
     /// Refuse raw/datagram inet sockets.
     #[serde(default)]
     pub deny_raw_sockets: bool,
+    /// The Seatbelt profile to apply (macOS). Rendered host-side from the plan; the
+    /// shim applies it verbatim and refuses to run without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seatbelt_profile: Option<String>,
 }
 
 /// Read the request, apply lockdown, and exec the command.
@@ -108,7 +113,14 @@ fn read_request() -> Result<ShimRequest> {
 /// Fails closed: any error here must abort before the command runs, since the
 /// alternative is executing untrusted code with less confinement than intended.
 fn apply_lockdown(req: &ShimRequest) -> Result<()> {
-    super::lockdown::apply(req)
+    #[cfg(target_os = "linux")]
+    {
+        super::lockdown::apply(req)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::seatbelt::apply(req)
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +138,7 @@ mod tests {
             scope_ipc: true,
             deny_syscalls: vec!["io_uring_setup".into()],
             deny_raw_sockets: true,
+            seatbelt_profile: Some("(version 1)".into()),
         };
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(serde_json::from_str::<ShimRequest>(&json).unwrap(), req);

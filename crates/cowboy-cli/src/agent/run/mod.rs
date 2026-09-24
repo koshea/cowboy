@@ -30,8 +30,8 @@ use support::{
     delegation_available, effective_max_depth, emit_delta, fileop_summary, grant_notice,
     grant_stage, is_coordination_only, parse_args, process_is_gone, raw_tool_signature,
     render_plan, render_transcript, reread_notice, self_exe, system_prompt, tool_signature,
-    tool_surface, truncate, truncate_middle, unified_diff, GrantStage, IterationBudget,
-    ProgressTracker, Verification,
+    tool_surface, truncate, truncate_middle, unified_diff, with_sandbox_paths, GrantStage,
+    IterationBudget, ProgressTracker, Verification,
 };
 
 /// Default agent system prompt (see plan §10.3).
@@ -1057,11 +1057,14 @@ impl<'a> AgentLoop<'a> {
         // timeout and be answered by the fallback — worse than not asking.
         let control = crate::agent::jobctl::ControlDir::from_env();
         let can_request_turns = budget.supervised && control.is_some();
-        let system = system_prompt(
-            can_delegate,
-            subagent_depth,
-            can_request_turns,
-            crew_cfg.as_ref(),
+        let system = with_sandbox_paths(
+            system_prompt(
+                can_delegate,
+                subagent_depth,
+                can_request_turns,
+                crew_cfg.as_ref(),
+            ),
+            &runtime.paths(),
         );
         let tools = tool_surface(can_delegate, can_request_turns);
         let stall_window = crew_cfg

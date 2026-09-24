@@ -1,0 +1,67 @@
+---
+source: crates/cowboy-sandbox/src/plan.rs
+expression: plan.render(&denylist)
+---
+filesystem (Seatbelt; everything else is denied, even to stat)
+  ro  /usr/bin/cowboy   (lockdown shim (cowboy binary))
+  ro  /usr   (host toolchain)
+  ro  /System   (host toolchain)
+  ro  /opt/homebrew   (host toolchain)
+  ro  /Applications/Xcode.app   (the selected Xcode (xcode-select))
+  ro  /Users/dev/.cargo/bin   (your tools (read-only))
+  rw  /Users/dev/.cache/cowboy/run/scratch/s/tmp   (session scratch (survives between commands, not between sessions))
+  rw  /Users/dev/.cache/cowboy/home/proj   (the agent's HOME (per-project, persists between sessions))
+  rw  /Users/dev/proj   (the project)
+  --  /Users/dev/proj/.cowboy/security.yaml   (host-owned config, masked)
+  --  /Users/dev/proj/.cowboy/models.yaml   (host-owned config, masked)
+  ro  /private/var/folders/xy/abc/T/xcrun_db*   (xcrun's lookup cache; the host trusts it, so never writable)
+
+network
+  outbound: only this session's host proxy, which asks the policy engine
+  loopback: bind and accept allowed; connections go through the proxy
+  dns: denied inside the sandbox; the proxy resolves on the host
+
+processes
+  no launchd jobs, AppleEvents, LaunchServices, or signals outside the sandbox
+
+limits
+  not enforced on macOS (no per-session cgroup equivalent)
+
+not applied on macOS
+  workdir /workspace is ignored: on macOS the project is at /Users/dev/proj
+
+never grantable at any approval scope (33 paths)
+  /Users/dev/.aws
+  /Users/dev/.cargo/credentials.toml
+  /Users/dev/.config/BraveSoftware
+  /Users/dev/.config/chromium
+  /Users/dev/.config/cowboy
+  /Users/dev/.config/gcloud
+  /Users/dev/.config/gh
+  /Users/dev/.config/google-chrome
+  /Users/dev/.docker/config.json
+  /Users/dev/.git-credentials
+  /Users/dev/.gitconfig
+  /Users/dev/.gnupg
+  /Users/dev/.kube
+  /Users/dev/.local/share/keyrings
+  /Users/dev/.mozilla
+  /Users/dev/.netrc
+  /Users/dev/.npmrc
+  /Users/dev/.password-store
+  /Users/dev/.pypirc
+  /Users/dev/.ssh
+  /Users/dev/Library/Application Support/1Password
+  /Users/dev/Library/Application Support/BraveSoftware
+  /Users/dev/Library/Application Support/Firefox
+  /Users/dev/Library/Application Support/Google/Chrome
+  /Users/dev/Library/Application Support/Microsoft Edge
+  /Users/dev/Library/Containers/com.apple.Safari
+  /Users/dev/Library/Cookies
+  /Users/dev/Library/Group Containers/2BUA8C4S2C.com.1password
+  /Users/dev/Library/Keychains
+  /Users/dev/Library/Mail
+  /Users/dev/Library/Messages
+  /Users/dev/Library/Safari
+  /usr/bin/cowboy
+  (plus .cowboy/, security.yaml, models.yaml, providers.yaml anywhere)

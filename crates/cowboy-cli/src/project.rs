@@ -329,11 +329,30 @@ fn reap_abandoned_scratch(base: &Path, keep: &str) {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        if Path::new(&format!("/proc/{pid}")).exists() {
+        if pid_alive(pid) {
             continue;
         }
         let _ = std::fs::remove_dir_all(entry.path());
     }
+}
+
+/// Whether a process with this pid exists.
+///
+/// `kill(pid, 0)` rather than a `/proc/<pid>` lookup, which macOS does not have: there
+/// the lookup always said "gone", so every subagent decided its parent had died and
+/// every session reaped its siblings' scratch. `EPERM` means the process exists but is
+/// not ours to signal, which is still alive. A recycled pid reads as alive; every
+/// caller treats that as the cheap direction to be wrong in.
+pub fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Delete a session's scratch directory. Best-effort: leftover scratch is untidy,
@@ -474,6 +493,9 @@ fn implausible_root(dir: &Path, home: Option<&Path>) -> bool {
     dir.parent().is_none()
         || dir == Path::new("/tmp")
         || dir == Path::new("/var/tmp")
+        // macOS reports them by their real paths.
+        || dir == Path::new("/private/tmp")
+        || dir == Path::new("/private/var/tmp")
         || home.is_some_and(|h| dir == h)
 }
 

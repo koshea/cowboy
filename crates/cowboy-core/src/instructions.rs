@@ -99,8 +99,12 @@ mod tests {
     use super::*;
 
     fn tmp() -> std::path::PathBuf {
+        // A counter as well as the time: tests run as threads of one process, and
+        // macOS's clock ticks in microseconds, so two could otherwise share a dir.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let p = std::env::temp_dir().join(format!(
-            "cowboy-instr-{}-{:?}",
+            "cowboy-instr-{}-{n}-{:?}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
