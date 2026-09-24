@@ -549,8 +549,13 @@ pub enum PendingPrompt {
     Ask {
         id: u64,
         question: String,
+        /// The choices' labels only — what an older client renders.
         #[serde(default)]
         options: Vec<String>,
+        /// The full choices (label, description, recommended). Empty from an older
+        /// worker, in which case `options` is all there is.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<AskChoice>,
     },
     Approval {
         id: u64,
@@ -558,6 +563,55 @@ pub enum PendingPrompt {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<crate::netproto::ApprovalDetail>,
     },
+}
+
+/// One answer the agent offers for an `ask_user` question. The user can always
+/// type something else instead; that is not an option the agent lists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskChoice {
+    /// Short, what gets sent back as the answer when picked.
+    pub label: String,
+    /// What picking it means, shown under the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The agent's suggestion: marked, and selected to start with.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recommended: bool,
+}
+
+impl AskChoice {
+    /// The full choices for a prompt: `choices` when the worker sent them, else the
+    /// bare `options` labels an older worker sends.
+    pub fn resolve(options: &[String], choices: &[AskChoice]) -> Vec<AskChoice> {
+        if choices.is_empty() {
+            options
+                .iter()
+                .map(|o| AskChoice::from(o.as_str()))
+                .collect()
+        } else {
+            choices.to_vec()
+        }
+    }
+}
+
+impl From<&str> for AskChoice {
+    fn from(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            description: None,
+            recommended: false,
+        }
+    }
+}
+
+impl From<String> for AskChoice {
+    fn from(label: String) -> Self {
+        Self {
+            label,
+            description: None,
+            recommended: false,
+        }
+    }
 }
 
 /// Worker → client messages over the per-session socket.
@@ -583,6 +637,9 @@ pub enum ServerMsg {
         question: String,
         #[serde(default)]
         options: Vec<String>,
+        /// See [`PendingPrompt::Ask`]: the full choices; `options` is their labels.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        choices: Vec<AskChoice>,
     },
     /// A pending approval; reply with [`ClientMsg::ApprovalReply`].
     ///
@@ -785,7 +842,19 @@ mod tests {
             id: 1,
             question: "continue?".into(),
             options: vec!["yes".into(), "no".into()],
+            choices: vec![
+                AskChoice {
+                    label: "yes".into(),
+                    description: Some("keep going".into()),
+                    recommended: true,
+                },
+                "no".into(),
+            ],
         });
+        // An older worker's ask (labels only) still parses, with no choices.
+        let old: ServerMsg =
+            serde_json::from_str(r#"{"ask":{"id":2,"question":"q","options":["a"]}}"#).unwrap();
+        assert!(matches!(old, ServerMsg::Ask { ref choices, .. } if choices.is_empty()));
         roundtrip(&ServerMsg::Snapshot {
             info: sample_info(),
             journal_len: 12,
@@ -794,6 +863,7 @@ mod tests {
                     id: 7,
                     question: "continue?".into(),
                     options: vec!["yes".into()],
+                    choices: Vec::new(),
                 },
                 PendingPrompt::Approval {
                     id: 8,

@@ -78,6 +78,16 @@ pub trait AgentUi {
     /// Ask the user a question and return their answer. `options` (possibly
     /// empty) are suggested choices; the user may still answer freely.
     fn ask_user(&mut self, question: &str, options: &[String]) -> String;
+    /// [`Self::ask_user`] with full choices (description, recommendation). A UI
+    /// that can show them overrides this; the default offers the labels.
+    fn ask_user_rich(
+        &mut self,
+        question: &str,
+        choices: &[cowboy_core::daemonproto::AskChoice],
+    ) -> String {
+        let labels: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
+        self.ask_user(question, &labels)
+    }
     /// Whether someone is there to answer [`Self::ask_user`] right now. The loop
     /// skips its "start converging" budget nudges when so — it will ask instead of
     /// stopping, so hurrying the model would only cut real work short.

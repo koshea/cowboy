@@ -8,7 +8,7 @@ pub mod app;
 pub mod markdown;
 
 pub use app::{
-    draw, Access, App, ApprovalView, Completion, ConnectionState, ContextSnapshot, CrewMember,
-    CrewStatus, HelpSection, HelpView, LineKind, Mode, ModelChoice, ModelForm, ModelPicker,
-    TranscriptLine, REASONING_OPTS,
+    draw, Access, App, ApprovalView, ChoiceOption, Completion, ConnectionState, ContextSnapshot,
+    CrewMember, CrewStatus, HelpSection, HelpView, LineKind, Mode, ModelChoice, ModelForm,
+    ModelPicker, TranscriptLine, REASONING_OPTS,
 };

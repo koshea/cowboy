@@ -7,15 +7,15 @@ expression: render(&app)
 │I need a decision.                             ││no network activity  │
 │                                               ││yet                  │
 │                                               ││                     │
-│   ╭ Question ────────────────────────────────────────────────────╮   │
-│   │Which database should we use?                                 │   │
-│   │                                                              │   │
-│   │  1. PostgreSQL                                               │───╯
-│   │▸ 2. SQLite                                                   │───╮
-│   │  3. MySQL                                                    │vit│
-│   │  (or type a custom answer)                                   │   │
-│   │↑↓ select · 1-9 pick · Enter choose · type for other          │   │
-│   ╰──────────────────────────────────────────────────────────────╯   │
+│  ╭ Question ──────────────────────────────────────────────────────╮  │
+│  │Which database should we use?                                   │  │
+│  │                                                                │  │
+│  │  1. PostgreSQL                                                 │──╯
+│  │▸ 2. SQLite                                                     │──╮
+│  │  3. MySQL                                                      │it│
+│  │  ✎ Type your own answer…                                       │  │
+│  │↑↓ select · 1-9 pick · Enter choose · or just start typing      │  │
+│  ╰────────────────────────────────────────────────────────────────╯  │
 ╰───────────────────────────────────────────────╯╰─────────────────────╯
    ⏳  your turn — pick above · waiting 0s
 ╭ Enter send · Shift+Enter newline · F1 help ──────────────────────────╮

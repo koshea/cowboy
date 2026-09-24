@@ -2,7 +2,7 @@
 //! mutated by the wire `ServerMsg`/`UiEventMsg` stream. Kept free of Yew/web-sys
 //! so it stays pure and mirrors `apply_wire` 1:1.
 
-use cowboy_proto::daemonproto::{PendingPrompt, ServerMsg, SessionStatus, UiEventMsg};
+use cowboy_proto::daemonproto::{AskChoice, PendingPrompt, ServerMsg, SessionStatus, UiEventMsg};
 
 /// One rendered transcript entry.
 #[derive(Clone, PartialEq)]
@@ -47,7 +47,8 @@ pub enum ConnState {
 pub struct Ask {
     pub id: u64,
     pub question: String,
-    pub options: Vec<String>,
+    /// The choices, full or (from an older worker) labels only.
+    pub options: Vec<AskChoice>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -212,10 +213,11 @@ impl Model {
                             id,
                             question,
                             options,
+                            choices,
                         } => self.push_ask(Ask {
                             id,
                             question,
-                            options,
+                            options: AskChoice::resolve(&options, &choices),
                         }),
                         PendingPrompt::Approval { id, dest, detail } => {
                             self.push_approval(Approval::new(id, dest, detail))
@@ -239,10 +241,11 @@ impl Model {
                 id,
                 question,
                 options,
+                choices,
             } => self.push_ask(Ask {
                 id,
                 question,
-                options,
+                options: AskChoice::resolve(&options, &choices),
             }),
             ServerMsg::Approval { id, dest, detail } => {
                 self.push_approval(Approval::new(id, dest, detail))
@@ -689,6 +692,7 @@ mod tests {
             id: 7,
             question: "continue?".into(),
             options: Vec::new(),
+            choices: Vec::new(),
         });
         m.apply(ServerMsg::AskResolved { id: 6 });
         assert_eq!(m.asks.first().map(|ask| ask.id), Some(7));
@@ -703,6 +707,7 @@ mod tests {
             id: 1,
             question: "stale?".into(),
             options: Vec::new(),
+            choices: Vec::new(),
         });
         let snapshot = |pending_prompts| ServerMsg::Snapshot {
             info: serde_json::from_value(serde_json::json!({
@@ -719,11 +724,13 @@ mod tests {
                 id: 2,
                 question: "continue?".into(),
                 options: vec!["yes".into()],
+                choices: Vec::new(),
             },
             PendingPrompt::Ask {
                 id: 3,
                 question: "later".into(),
                 options: Vec::new(),
+                choices: Vec::new(),
             },
             PendingPrompt::Approval {
                 id: 4,
@@ -827,6 +834,7 @@ mod tests {
             id: 1,
             question: "q".into(),
             options: vec![],
+            choices: Vec::new(),
         });
         m.apply(ServerMsg::Ended {
             reason: "done".into(),

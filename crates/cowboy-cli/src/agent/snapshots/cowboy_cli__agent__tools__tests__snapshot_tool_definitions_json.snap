@@ -771,17 +771,46 @@ expression: defs
     }
   },
   {
-    "description": "Ask the user a question when you are genuinely blocked and cannot proceed without their input. Provide `options` (2–4 short choices) when the answer is a clear pick — the user gets a selectable list and can still type their own answer.",
+    "description": "Ask the user a question when you are genuinely blocked and cannot proceed without their input. Whenever you are asking for a decision, give `options`: 2–4 choices, each a short `label` (a few words) with a `description` of what it means, and mark the one you recommend with `recommended: true`. The user picks one from a list — or types their own answer, which is always available, so never add an \"other\" option. Keep the question itself to a few sentences; put the detail in the descriptions.",
     "name": "ask_user",
     "parameters": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "description": "Arguments for the `ask_user` tool.",
       "properties": {
         "options": {
-          "default": null,
-          "description": "Optional suggested answers to present as a pick-list. The user may still\ntype a free-form answer (\"other\").",
+          "description": "The answers to choose between (2–4). The user can always type their own\nanswer instead, so do not add an \"other\" option.",
           "items": {
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "properties": {
+                  "description": {
+                    "default": null,
+                    "description": "One or two sentences on what this choice means or implies.",
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "label": {
+                    "description": "A few words (≤ ~8) — what the user picks and what you get back.",
+                    "type": "string"
+                  },
+                  "recommended": {
+                    "default": false,
+                    "description": "Mark the single option you recommend.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "label"
+                ],
+                "type": "object"
+              }
+            ],
+            "description": "One option for `ask_user`: a short label, optionally with what it means and\nwhether you recommend it. A bare string is accepted as a label."
           },
           "type": [
             "array",
@@ -789,7 +818,7 @@ expression: defs
           ]
         },
         "question": {
-          "description": "A question for the user when the agent is genuinely blocked.",
+          "description": "The question. State the decision and the context needed to make it; keep it\nto a few sentences — detail belongs in each option's `description`.",
           "type": "string"
         }
       },

@@ -1113,24 +1113,43 @@ fn render_ask(ask: &model::Ask, send: impl Fn(ClientMsg) + Clone + 'static) -> H
             }
         })
     };
-    let opts = ask.options.iter().map(|o| {
+    // One row per choice: the label, a "recommended" badge on the agent's pick,
+    // and what it means underneath — the TUI's layout, as buttons.
+    let opts = ask.options.iter().enumerate().map(|(i, o)| {
         let id = ask.id;
-        let o2 = o.clone();
+        let answer = o.label.clone();
         let s = send.clone();
         let onclick = Callback::from(move |_| {
             s(ClientMsg::AskReply {
                 id,
-                answer: o2.clone(),
+                answer: answer.clone(),
             })
         });
-        html! { <button {onclick}>{ o.clone() }</button> }
+        html! {
+            <button class={classes!("choice", o.recommended.then_some("recommended"))} {onclick}>
+                <span class="choice-label">
+                    { format!("{}. {}", i + 1, o.label) }
+                    if o.recommended { <span class="badge">{ "recommended" }</span> }
+                </span>
+                if let Some(d) = &o.description {
+                    <span class="choice-desc">{ d.clone() }</span>
+                }
+            </button>
+        }
     });
+    let placeholder = if ask.options.is_empty() {
+        "Your answer…"
+    } else {
+        "Or type your own answer…"
+    };
     html! {
         <div class="modal">
-            <div class="modal-card">
+            <div class="modal-card ask-card">
                 <p class="q">{ ask.question.clone() }</p>
-                <div class="opts">{ for opts }</div>
-                <textarea id={input_id} placeholder="Type another answer…" rows="2" />
+                if !ask.options.is_empty() {
+                    <div class="choices">{ for opts }</div>
+                }
+                <textarea id={input_id} {placeholder} rows="2" />
                 <div class="opts"><button onclick={submit}>{ "Reply" }</button></div>
             </div>
         </div>

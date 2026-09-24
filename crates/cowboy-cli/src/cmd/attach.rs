@@ -565,11 +565,11 @@ async fn supervise(
                                 backoff.reset();
                             }
                         }
-                        ServerMsg::Ask { id, question, options } => {
+                        ServerMsg::Ask { id, question, options, choices } => {
                             authoritative_prompts.insert(id);
                             if !read_only {
                                 let prompt = make_ui_prompt(
-                                    PendingPrompt::Ask { id, question, options },
+                                    PendingPrompt::Ask { id, question, options, choices },
                                     &reply_tx,
                                 );
                                 if let UiPrompt::Ask { id, question, options, reply } = prompt {
@@ -901,7 +901,10 @@ fn make_ui_prompt(prompt: PendingPrompt, out_tx: &UnboundedSender<ClientMsg>) ->
             id,
             question,
             options,
+            choices,
         } => {
+            // Full choices from a current worker; bare labels from an older one.
+            let options = cowboy_core::daemonproto::AskChoice::resolve(&options, &choices);
             let (reply, answers) = std::sync::mpsc::channel();
             let out = out_tx.clone();
             tokio::task::spawn_blocking(move || {
@@ -1352,6 +1355,7 @@ mod tests {
                     id: 7,
                     question: "ok?".into(),
                     options: Vec::new(),
+                    choices: Vec::new(),
                 })
                 .as_bytes(),
             )
@@ -1481,6 +1485,7 @@ mod tests {
                 id: 7,
                 question: "continue?".into(),
                 options: Vec::new(),
+                choices: Vec::new(),
             };
 
             let (first, _) = listener.accept().await.unwrap();

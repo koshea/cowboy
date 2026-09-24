@@ -1584,10 +1584,112 @@ pub(super) fn draw_approval(f: &mut Frame, area: Rect, view: &ApprovalView) {
 }
 
 /// A multiple-choice question: the prompt, a selectable option list, and a
-/// free-text "other" line reflecting what's been typed.
+/// free-text "type your own" row reflecting what's been typed.
+///
+/// Sized from the *wrapped* text, and when it cannot all fit, the question is what
+/// gets shortened — never the options. It used to size itself as "options + 6"
+/// rows, so a long question with long options wrapped past the bottom edge and the
+/// user saw a question with no choices at all.
 pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
-    let w = area.width.saturating_sub(8).min(70);
-    let h = (c.options.len() as u16 + 6).min(area.height).max(7);
+    let w = area.width.saturating_sub(6).min(80);
+    let inner = w.saturating_sub(2).max(10) as usize;
+    let typing = !typed.trim().is_empty();
+    let dim = Style::default().add_modifier(Modifier::DIM);
+
+    // Options first: they are what must fit.
+    let mut opt_lines: Vec<Line> = Vec::new();
+    for (i, opt) in c.options.iter().enumerate() {
+        let selected = !typing && i == c.selected;
+        let marker = if selected { "▸" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let badge = if opt.recommended {
+            "  (recommended)"
+        } else {
+            ""
+        };
+        // Wrap the label alone and prefix afterwards: `wrap_words` drops leading
+        // whitespace, which would eat the marker column of unselected rows.
+        let num = format!("{}. ", i + 1);
+        let indent = 2 + num.chars().count();
+        let badge_w = badge.chars().count();
+        let wrapped = wrap_words(&opt.label, inner.saturating_sub(indent + badge_w).max(8));
+        let n = wrapped.len();
+        for (k, l) in wrapped.into_iter().enumerate() {
+            let prefix = if k == 0 {
+                format!("{marker} {num}")
+            } else {
+                " ".repeat(indent)
+            };
+            let mut spans = vec![Span::styled(format!("{prefix}{l}"), style)];
+            if k + 1 == n {
+                spans.push(Span::styled(
+                    badge.to_string(),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            opt_lines.push(Line::from(spans));
+        }
+        if let Some(d) = &opt.description {
+            for l in wrap_words(d, inner.saturating_sub(5).max(8)) {
+                opt_lines.push(Line::from(Span::styled(format!("     {l}"), dim)));
+            }
+        }
+    }
+    // The free-form row, always offered and selectable like an option.
+    let own_selected = typing || c.selected >= c.options.len();
+    let own = if typing {
+        Line::from(vec![
+            Span::styled("▸ ✎ ", Style::default().fg(Color::White)),
+            Span::styled(typed.to_string(), Style::default().fg(Color::White)),
+        ])
+    } else {
+        let style = if own_selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            dim
+        };
+        let marker = if own_selected { "▸" } else { " " };
+        Line::from(Span::styled(
+            format!("{marker} ✎ Type your own answer…"),
+            style,
+        ))
+    };
+    opt_lines.push(own);
+    let hint = if c.options.is_empty() {
+        "type your answer · Enter sends"
+    } else {
+        "↑↓ select · 1-9 pick · Enter choose · or just start typing"
+    };
+
+    // Then the question, in whatever height is left (at least two lines).
+    let chrome = 2 + 1 + 1; // borders, the gap under the question, the hint
+    let max_h = area.height as usize;
+    let room = max_h.saturating_sub(chrome + opt_lines.len()).max(2);
+    let mut q_lines = wrap_words(&c.question, inner);
+    if q_lines.len() > room {
+        q_lines.truncate(room);
+        if let Some(last) = q_lines.last_mut() {
+            let keep: String = last.chars().take(inner.saturating_sub(1)).collect();
+            *last = format!("{keep}…");
+        }
+    }
+
+    let mut lines: Vec<Line> = q_lines.into_iter().map(Line::from).collect();
+    lines.push(Line::from(""));
+    lines.extend(opt_lines);
+    lines.push(Line::from(Span::styled(hint, dim)));
+
+    let h = (lines.len() + 2).min(max_h).max(5) as u16;
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let rect = Rect::new(x, y, w, h);
@@ -1602,44 +1704,8 @@ pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().fg(Color::Magenta));
-
-    let typing = !typed.trim().is_empty();
-    let mut lines = vec![Line::from(c.question.clone()), Line::from("")];
-    for (i, opt) in c.options.iter().enumerate() {
-        let selected = !typing && i == c.selected;
-        let marker = if selected { "▸" } else { " " };
-        let style = if selected {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        lines.push(Line::from(Span::styled(
-            format!("{marker} {}. {opt}", i + 1),
-            style,
-        )));
-    }
-    let other = if typing {
-        Line::from(vec![
-            Span::styled("▸ other: ", Style::default().fg(Color::White)),
-            Span::styled(typed.to_string(), Style::default().fg(Color::White)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            "  (or type a custom answer)",
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-    };
-    lines.push(other);
-    lines.push(Line::from(Span::styled(
-        "↑↓ select · 1-9 pick · Enter choose · type for other",
-        Style::default().add_modifier(Modifier::DIM),
-    )));
-    let para = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
-    f.render_widget(para, rect);
+    // Pre-wrapped above, so no `Wrap`: its re-flow is what made the height a guess.
+    f.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 pub(super) fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) {

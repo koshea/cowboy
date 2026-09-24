@@ -13,7 +13,7 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
 use anyhow::Result;
-use cowboy_core::daemonproto::{SessionStatus, UiEventMsg};
+use cowboy_core::daemonproto::{AskChoice, SessionStatus, UiEventMsg};
 use cowboy_core::netproto::{ApprovalDetail, ApprovalKind, ApprovalScope, Verdict};
 use cowboy_tui::{
     draw, Access, App, ConnectionState, CrewMember, CrewStatus, LineKind, Mode, ModelChoice,
@@ -74,7 +74,7 @@ pub enum UiPrompt {
     Ask {
         id: u64,
         question: String,
-        options: Vec<String>,
+        options: Vec<AskChoice>,
         reply: Sender<String>,
     },
     Approval {
@@ -105,7 +105,7 @@ pub enum UiEvent {
     /// A journaled display event (the shared [`UiEventMsg`] payload).
     Wire(UiEventMsg),
     /// A question for the user: id, prompt, suggested options, and reply channel.
-    Ask(u64, String, Vec<String>, Sender<String>),
+    Ask(u64, String, Vec<AskChoice>, Sender<String>),
     /// An approval request: id, display state, and reply channel.
     Approval(
         u64,
@@ -241,7 +241,17 @@ impl PendingPrompts {
             }
             UiPrompt::Ask {
                 question, options, ..
-            } => app.begin_choice(question.clone(), options.clone()),
+            } => app.begin_choice(
+                question.clone(),
+                options
+                    .iter()
+                    .map(|o| cowboy_tui::ChoiceOption {
+                        label: o.label.clone(),
+                        description: o.description.clone(),
+                        recommended: o.recommended,
+                    })
+                    .collect(),
+            ),
             UiPrompt::Approval { dest, detail, .. } => {
                 app.begin_approval(dest.clone(), detail.clone().map(approval_view));
             }
@@ -321,10 +331,14 @@ impl AgentUi for TuiUi {
         self.wire(UiEventMsg::Final(message.to_string()));
     }
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
+        let choices: Vec<AskChoice> = options.iter().map(|o| o.as_str().into()).collect();
+        self.ask_user_rich(question, &choices)
+    }
+    fn ask_user_rich(&mut self, question: &str, choices: &[AskChoice]) -> String {
         let (rtx, rrx) = std::sync::mpsc::channel();
         if self
             .tx
-            .send(UiEvent::Ask(0, question.to_string(), options.to_vec(), rtx))
+            .send(UiEvent::Ask(0, question.to_string(), choices.to_vec(), rtx))
             .is_err()
         {
             return String::new();
@@ -1807,6 +1821,10 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
                 ctx.prompts.answer_ask(app, answer);
                 app.status = "running".into();
             }
+        }
+        // "Type your own answer" is highlighted but nothing's typed: nothing to send.
+        (Mode::AwaitingChoice, KeyCode::Enter) if app.choice_awaiting_text() => {
+            app.status = "type your answer, then Enter".into();
         }
         (Mode::AwaitingChoice, KeyCode::Enter) => {
             let answer = app.choice_answer();

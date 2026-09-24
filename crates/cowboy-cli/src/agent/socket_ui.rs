@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cowboy_core::daemonproto::{
-    ClientMsg, PendingPrompt, ServerMsg, SessionInfo, SessionStatus, UiEventMsg,
+    AskChoice, ClientMsg, PendingPrompt, ServerMsg, SessionInfo, SessionStatus, UiEventMsg,
 };
 use cowboy_core::netproto::{encode_line, ApprovalDetail, ApprovalScope, Verdict};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -63,7 +63,7 @@ type Live = ServerMsg;
 
 struct PendingAsk {
     question: String,
-    options: Vec<String>,
+    choices: Vec<AskChoice>,
     reply: std::sync::mpsc::Sender<String>,
 }
 
@@ -72,9 +72,15 @@ impl PendingAsk {
         PendingPrompt::Ask {
             id,
             question: self.question.clone(),
-            options: self.options.clone(),
+            options: labels(&self.choices),
+            choices: self.choices.clone(),
         }
     }
+}
+
+/// The labels alone — what an older client, which knows no `choices`, renders.
+fn labels(choices: &[AskChoice]) -> Vec<String> {
+    choices.iter().map(|c| c.label.clone()).collect()
 }
 
 struct PendingApproval {
@@ -901,6 +907,10 @@ impl AgentUi for SocketUi {
         self.attached() > 0
     }
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {
+        let choices: Vec<AskChoice> = options.iter().map(|o| o.as_str().into()).collect();
+        self.ask_user_rich(question, &choices)
+    }
+    fn ask_user_rich(&mut self, question: &str, choices: &[AskChoice]) -> String {
         // A new prompt with nobody attached has never been published, so it fails
         // immediately according to the non-interactive/subagent contract.
         if self.attached() == 0 {
@@ -918,14 +928,15 @@ impl AgentUi for SocketUi {
                 id,
                 PendingAsk {
                     question: question.to_string(),
-                    options: options.to_vec(),
+                    choices: choices.to_vec(),
                     reply: tx,
                 },
             );
             let _ = self.inner.live.send(ServerMsg::Ask {
                 id,
                 question: question.to_string(),
-                options: options.to_vec(),
+                options: labels(choices),
+                choices: choices.to_vec(),
             });
             self.publish_status_locked(&mut publication);
         }
@@ -2107,6 +2118,7 @@ mod tests {
                             id: ask_id,
                             question: "continue?".into(),
                             options: vec!["yes".into(), "no".into()],
+                            choices: vec!["yes".into(), "no".into()],
                         },
                         PendingPrompt::Approval {
                             id: approval_id,
@@ -2197,6 +2209,7 @@ mod tests {
                     id,
                     question: "still there?".into(),
                     options: Vec::new(),
+                    choices: Vec::new(),
                 }]
             ),
             other => panic!("expected reconnect Snapshot, got {other:?}"),
@@ -2360,7 +2373,7 @@ mod tests {
                 1,
                 PendingAsk {
                     question: "question".into(),
-                    options: Vec::new(),
+                    choices: Vec::new(),
                     reply: ask_tx,
                 },
             );

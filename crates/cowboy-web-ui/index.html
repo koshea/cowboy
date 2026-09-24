@@ -142,6 +142,14 @@
     .composer.ended { justify-content: center; font-size: .9em; }
     button.end { color: var(--red); }
     .approval-opts button { min-width: 5rem; }
+    .ask-card { max-height: calc(var(--app-height, 100dvh) - 2rem); overflow-y: auto; }
+    .ask-card .q { white-space: pre-wrap; }
+    .choices { display: flex; flex-direction: column; gap: .45rem; margin: .7rem 0; }
+    .choice { display: flex; flex-direction: column; align-items: flex-start; gap: .2rem; text-align: left; }
+    .choice-label { font-weight: 600; }
+    .choice-desc { font-size: .85em; color: var(--muted); }
+    .choice.recommended { border-color: var(--accent); }
+    .badge { margin-left: .5rem; font-size: .72em; font-weight: 600; padding: .05rem .4rem; border-radius: 999px; background: var(--accent); color: #04162e; vertical-align: middle; }
     .openers { display: flex; flex-direction: column; gap: .4rem; align-items: flex-start; }
     .opener { text-align: left; font-size: .9em; color: var(--accent); }
     button.ghost { background: transparent; }

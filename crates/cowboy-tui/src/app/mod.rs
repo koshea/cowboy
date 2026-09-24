@@ -269,9 +269,30 @@ impl ModelForm {
 #[derive(Debug, Clone, Default)]
 pub struct Choice {
     pub question: String,
-    pub options: Vec<String>,
-    /// Highlighted option index.
+    pub options: Vec<ChoiceOption>,
+    /// Highlighted row: an option index, or `options.len()` for the "type your own
+    /// answer" row that always follows them.
     pub selected: usize,
+}
+
+/// One answer offered for a question.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChoiceOption {
+    /// What is sent back when picked.
+    pub label: String,
+    /// What picking it means, shown under the label.
+    pub description: Option<String>,
+    /// The agent's suggestion: marked, and highlighted to start with.
+    pub recommended: bool,
+}
+
+impl From<&str> for ChoiceOption {
+    fn from(label: &str) -> Self {
+        Self {
+            label: label.to_string(),
+            ..Default::default()
+        }
+    }
 }
 
 /// Full renderable TUI state.
@@ -1637,24 +1658,24 @@ impl App {
 
     // --- multiple-choice question (ask_user pick-list) ---
 
-    /// Enter choice mode for a question + its options.
-    pub fn begin_choice(&mut self, question: String, options: Vec<String>) {
+    /// Enter choice mode for a question + its options. The recommended option, if
+    /// any, starts highlighted; with no options, the "type your own" row does.
+    pub fn begin_choice(&mut self, question: String, options: Vec<ChoiceOption>) {
         self.textarea = TextArea::default();
+        let selected = options.iter().position(|o| o.recommended).unwrap_or(0);
         self.choice = Some(Choice {
             question,
             options,
-            selected: 0,
+            selected,
         });
         self.mode = Mode::AwaitingChoice;
     }
 
-    /// Move the highlighted option by `delta` (wrapping).
+    /// Move the highlighted row by `delta` (wrapping), over the options and the
+    /// trailing "type your own answer" row.
     pub fn choice_move(&mut self, delta: isize) {
         if let Some(c) = &mut self.choice {
-            let n = c.options.len();
-            if n == 0 {
-                return;
-            }
+            let n = c.options.len() + 1;
             c.selected = ((c.selected as isize + delta).rem_euclid(n as isize)) as usize;
         }
     }
@@ -1663,7 +1684,17 @@ impl App {
     pub fn choice_option(&self, idx: usize) -> Option<String> {
         self.choice
             .as_ref()
-            .and_then(|c| c.options.get(idx).cloned())
+            .and_then(|c| c.options.get(idx).map(|o| o.label.clone()))
+    }
+
+    /// Whether the "type your own answer" row is highlighted with nothing typed —
+    /// Enter then has nothing to send and should prompt for text instead.
+    pub fn choice_awaiting_text(&self) -> bool {
+        self.input_is_empty()
+            && self
+                .choice
+                .as_ref()
+                .is_some_and(|c| c.selected >= c.options.len())
     }
 
     /// The answer to submit: a typed custom answer if present, else the
@@ -1675,7 +1706,7 @@ impl App {
         } else {
             self.choice
                 .as_ref()
-                .and_then(|c| c.options.get(c.selected).cloned())
+                .and_then(|c| c.options.get(c.selected).map(|o| o.label.clone()))
                 .unwrap_or_default()
         };
         self.choice = None;
@@ -1763,6 +1794,47 @@ mod tests {
         }
     }
 
+    /// The observed failure: a six-line question with four paragraph-long options
+    /// rendered as the question alone — every option was below the modal's edge. The
+    /// options (and the free-form row) must always show; the question gets cut.
+    #[test]
+    fn a_long_question_never_hides_its_options() {
+        let mut app = App::new("cowboy");
+        let long = "Blocker 1 — the clean-lifecycle evidence. ".repeat(12);
+        let opt = |label: &str, rec: bool| ChoiceOption {
+            label: label.into(),
+            description: Some("what it means, at some length, so it wraps ".repeat(2)),
+            recommended: rec,
+        };
+        app.begin_choice(
+            long,
+            vec![
+                opt("Successor V2 record", false),
+                opt("V1 evidence fixture", true),
+                opt("Restate the deliverable", false),
+                opt("Park the lifecycle work", false),
+            ],
+        );
+        let frame = render(&app);
+        for label in [
+            "Successor V2 record",
+            "V1 evidence fixture",
+            "Restate the deliverable",
+            "Park the lifecycle work",
+        ] {
+            assert!(
+                frame.contains(label),
+                "option {label:?} not visible:\n{frame}"
+            );
+        }
+        assert!(frame.contains("(recommended)"), "{frame}");
+        assert!(frame.contains("Type your own answer"), "{frame}");
+        assert!(
+            frame.contains('…'),
+            "the question should be the part cut:\n{frame}"
+        );
+    }
+
     #[test]
     fn choice_selection_and_custom_answer() {
         let mut app = App::new("cowboy");
@@ -1771,7 +1843,8 @@ mod tests {
             vec!["postgres".into(), "sqlite".into(), "mysql".into()],
         );
         assert_eq!(app.mode, Mode::AwaitingChoice);
-        // Move selection: down twice, up once -> index 1.
+        // Move selection: down twice, up once -> index 1. (Rows wrap over the
+        // three options plus the "type your own" row.)
         app.choice_move(1);
         app.choice_move(1);
         app.choice_move(-1);
@@ -1788,6 +1861,21 @@ mod tests {
         // Digit shortcut maps 1-based to the option.
         app.begin_choice("x".into(), vec!["a".into(), "b".into()]);
         assert_eq!(app.choice_option(1).as_deref(), Some("b"));
+
+        // The recommended option starts highlighted; the row after the options
+        // is "type your own", which has nothing to send until something is typed.
+        let rec = ChoiceOption {
+            label: "b".into(),
+            description: Some("the safe one".into()),
+            recommended: true,
+        };
+        app.begin_choice("x".into(), vec!["a".into(), rec]);
+        assert_eq!(app.choice.as_ref().unwrap().selected, 1);
+        app.choice_move(1);
+        assert!(app.choice_awaiting_text());
+        app.textarea.insert_str("neither");
+        assert!(!app.choice_awaiting_text());
+        assert_eq!(app.choice_answer(), "neither");
     }
 
     #[test]

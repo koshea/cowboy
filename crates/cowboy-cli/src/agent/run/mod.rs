@@ -4252,9 +4252,7 @@ impl<'a> AgentLoop<'a> {
                     let Some(args) = self.parse_or_report::<AskUserArgs>(call) else {
                         continue;
                     };
-                    let answer = self
-                        .ui
-                        .ask_user(&args.question, &args.options.clone().unwrap_or_default());
+                    let answer = self.ui.ask_user_rich(&args.question, &args.choices());
                     self.push_tool_result(&call.id, &answer);
                 }
                 tools::TOOL_SUBAGENT => {

@@ -98,12 +98,70 @@ pub struct FinalArgs {
 /// Arguments for the `ask_user` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AskUserArgs {
-    /// A question for the user when the agent is genuinely blocked.
+    /// The question. State the decision and the context needed to make it; keep it
+    /// to a few sentences — detail belongs in each option's `description`.
     pub question: String,
-    /// Optional suggested answers to present as a pick-list. The user may still
-    /// type a free-form answer ("other").
+    /// The answers to choose between (2–4). The user can always type their own
+    /// answer instead, so do not add an "other" option.
     #[serde(default)]
-    pub options: Option<Vec<String>>,
+    pub options: Option<Vec<AskOptionArg>>,
+}
+
+/// One option for `ask_user`: a short label, optionally with what it means and
+/// whether you recommend it. A bare string is accepted as a label.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum AskOptionArg {
+    Label(String),
+    Full {
+        /// A few words (≤ ~8) — what the user picks and what you get back.
+        label: String,
+        /// One or two sentences on what this choice means or implies.
+        #[serde(default)]
+        description: Option<String>,
+        /// Mark the single option you recommend.
+        #[serde(default)]
+        recommended: bool,
+    },
+}
+
+impl AskOptionArg {
+    fn into_choice(self) -> cowboy_core::daemonproto::AskChoice {
+        match self {
+            AskOptionArg::Label(label) => label.into(),
+            AskOptionArg::Full {
+                label,
+                description,
+                recommended,
+            } => cowboy_core::daemonproto::AskChoice {
+                label,
+                description: description.filter(|d| !d.trim().is_empty()),
+                recommended,
+            },
+        }
+    }
+}
+
+impl AskUserArgs {
+    /// The options as wire choices, with at most one recommendation (the first
+    /// marked) so the pre-selection is unambiguous.
+    pub fn choices(&self) -> Vec<cowboy_core::daemonproto::AskChoice> {
+        let mut seen = false;
+        self.options
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(AskOptionArg::into_choice)
+            .filter(|c| !c.label.trim().is_empty())
+            .map(|mut c| {
+                if c.recommended {
+                    c.recommended = !seen;
+                    seen = true;
+                }
+                c
+            })
+            .collect()
+    }
 }
 
 /// Arguments for the `subagent` tool.
@@ -722,9 +780,13 @@ pub fn definitions() -> Vec<ToolDef> {
         ToolDef {
             name: TOOL_ASK_USER.into(),
             description: "Ask the user a question when you are genuinely blocked and cannot \
-                          proceed without their input. Provide `options` (2–4 short choices) when \
-                          the answer is a clear pick — the user gets a selectable list and can \
-                          still type their own answer."
+                          proceed without their input. Whenever you are asking for a decision, \
+                          give `options`: 2–4 choices, each a short `label` (a few words) with a \
+                          `description` of what it means, and mark the one you recommend with \
+                          `recommended: true`. The user picks one from a list — or types their \
+                          own answer, which is always available, so never add an \"other\" \
+                          option. Keep the question itself to a few sentences; put the detail in \
+                          the descriptions."
                 .into(),
             parameters: schema_for::<AskUserArgs>(),
         },
@@ -797,6 +859,28 @@ pub fn definitions() -> Vec<ToolDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Options may be bare labels or full objects; only the first recommendation
+    /// stands, and blank labels are dropped.
+    #[test]
+    fn ask_options_accept_labels_and_objects() {
+        let args: AskUserArgs = serde_json::from_value(serde_json::json!({
+            "question": "Which route?",
+            "options": [
+                "plain",
+                {"label": "rich", "description": "does more", "recommended": true},
+                {"label": "also", "recommended": true},
+                {"label": "  "}
+            ]
+        }))
+        .unwrap();
+        let c = args.choices();
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[0].label, "plain");
+        assert_eq!(c[1].description.as_deref(), Some("does more"));
+        assert!(c[1].recommended);
+        assert!(!c[2].recommended, "only one option may be recommended");
+    }
 
     #[test]
     fn definitions_cover_the_tool_surface() {
