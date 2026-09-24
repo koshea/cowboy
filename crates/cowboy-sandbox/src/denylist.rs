@@ -130,6 +130,14 @@ const SENSITIVE_STORES: &[(&str, &str)] = &[
     ("~/.npmrc", "your npm tokens"),
     ("~/.pypirc", "your PyPI tokens"),
     ("~/.cargo/credentials.toml", "your crates.io token"),
+    // Coding-agent CLIs: each home holds a subscription login, and Claude Code's
+    // also holds OAuth tokens for every connector it is linked to. A harness gets
+    // its own login through `harnesses.yaml`, never by a grant of the whole store.
+    ("~/.claude", "your Claude Code login and connector tokens"),
+    ("~/.claude.json", "your Claude Code account state"),
+    ("~/.codex", "your Codex login"),
+    ("~/.grok", "your Grok login"),
+    ("~/.gemini", "your Gemini / Antigravity login"),
 ];
 
 /// macOS secret stores, in addition to [`SENSITIVE_STORES`]. Separate so a Linux
@@ -505,6 +513,12 @@ mod tests {
             "/home/dev/.mozilla/firefox",
             "/home/dev/.netrc",
             "/home/dev/.npmrc",
+            // Agent-CLI logins: a `request_path` to one must not be approvable.
+            "/home/dev/.claude/.credentials.json",
+            "/home/dev/.claude.json",
+            "/home/dev/.codex",
+            "/home/dev/.grok/auth.json",
+            "/home/dev/.gemini/antigravity-cli",
         ] {
             assert!(d.check(Path::new(p)).is_some(), "{p} should be refused");
         }

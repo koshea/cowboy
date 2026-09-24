@@ -252,6 +252,16 @@ can't). Concretely:
   sandbox-internal (bind *target*) paths. A missing rule path is a hard error — an
   earlier `filter_map(ok)` silently produced a zero-rule domain that looked like
   working confinement.
+- **External agent harnesses run only inside the sandbox** (`agent/harness/`). They
+  are launched with their own approvals and sandbox turned off (`--always-approve`
+  …), which is safe *only* because cowboy's kernel boundary confines them — there is
+  no code path that runs one on the host, and there must never be one. A harness sees
+  its binary and a **private copy** of its login in a job-scoped home, never the
+  user's real vendor home (it holds the vendor binary, hooks and MCP commands the
+  host later runs unconfined). The vendor homes (`~/.grok`, `~/.claude`, …) are
+  denylisted; `harnesses.yaml` is user-level only. The job control directory is never
+  exposed to a harness (its files answer forwarded network approvals) — the harness
+  talks to the foreman only through the two-tool MCP relay (`harness/mcp.rs`).
 - **Runtime grants and network approvals are stored host-side**
   (`~/.config/cowboy/{grants,approvals}/`), never in the workspace — it is writable
   from inside, so a file there would let a hostile repo widen its own access. The

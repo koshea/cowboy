@@ -61,6 +61,12 @@ impl GatewayState {
         &self.policy
     }
 
+    /// Who this engine asks — so a request a subagent's own sandbox cannot answer
+    /// (an external harness job's) can be put to the same person, the same way.
+    pub fn approver(&self) -> std::sync::Arc<dyn Approver> {
+        self.approver.clone()
+    }
+
     pub fn dns(&self) -> &DnsMap {
         &self.dns
     }

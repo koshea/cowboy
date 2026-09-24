@@ -503,8 +503,33 @@ pub struct PlanInputs<'a> {
     /// [`GIT_IDENTITY_AT`] and used as git's *system* config. `None` when the host
     /// has no identity to lend.
     pub git_identity: Option<&'a Path>,
+    /// Extra paths and environment for one kind of sandbox — an external agent
+    /// harness (see `cowboy_core::harness`). `None` for everything else.
+    pub overlay: Option<&'a PlanOverlay>,
     /// Which mechanism the plan is for; see [`Platform`].
     pub platform: Platform,
+}
+
+/// Paths and environment added to a plan for an external agent harness: its binary,
+/// its private home (holding its login), and the env that points it there.
+///
+/// Every path is exposed **at its own host path**, so the same overlay means the
+/// same thing on every platform. The paths come only from the user-level,
+/// host-owned `harnesses.yaml` and are deliberately *not* denylist-checked: the one
+/// case where a vendor login (a denylisted store) is lent is this one, scoped to
+/// exactly the configured paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanOverlay {
+    pub binds: Vec<OverlayBind>,
+    pub env: Vec<(String, String)>,
+}
+
+/// One path in a [`PlanOverlay`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlayBind {
+    pub path: PathBuf,
+    pub writable: bool,
+    pub why: String,
 }
 
 /// Where [`PlanInputs::git_identity`] is bound, and what `GIT_CONFIG_SYSTEM` names.
@@ -912,6 +937,20 @@ impl SandboxPlan {
                 "your git identity (user.name/user.email only)",
             ));
             tool_env.push(("GIT_CONFIG_SYSTEM".to_string(), target));
+        }
+
+        // 7c. A harness overlay: its binary and private home, at their host paths.
+        //     Before the masks, which must stay last.
+        if let Some(overlay) = inputs.overlay {
+            for b in &overlay.binds {
+                let target = b.path.to_string_lossy().into_owned();
+                binds.push(if b.writable {
+                    Bind::rw(b.path.clone(), target, &b.why)
+                } else {
+                    Bind::ro(b.path.clone(), target, &b.why)
+                });
+            }
+            tool_env.extend(overlay.env.iter().cloned());
         }
 
         // 8. Mask host-owned config LAST. It lives under the project directory, so
@@ -1478,6 +1517,7 @@ mod tests {
             scratch: Path::new("/scratch"),
             agent_home: Path::new("/cache/cowboy/home/proj"),
             git_identity: None,
+            overlay: None,
             platform: Platform::Linux,
         }
     }

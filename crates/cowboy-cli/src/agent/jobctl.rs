@@ -126,6 +126,34 @@ pub struct Question {
     pub options: Vec<String>,
 }
 
+/// An update from a worker that needs no answer (a stalled harness, a progress
+/// report). Numbered like the rest so the watcher reads each exactly once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub seq: u32,
+    pub text: String,
+}
+
+/// A network destination an external harness job's sandbox wants, forwarded to the
+/// foreman's approver (the person attached to the session) because the job's own
+/// sandbox has nobody to ask.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalAsk {
+    pub seq: u32,
+    pub attempt: cowboy_core::netproto::NetworkAttempt,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The answer to an [`ApprovalAsk`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalReply {
+    pub seq: u32,
+    pub allow: bool,
+    /// Whether the answer stands for the rest of the job (not "allow once").
+    pub remember: bool,
+}
+
 /// The reply to a [`Question`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -149,6 +177,11 @@ impl ControlDir {
         // 0700: the verdicts here shape another agent's instructions.
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
         Some(Self { path })
+    }
+
+    /// A directory the caller already knows exists (the parent's watcher).
+    pub fn open(path: PathBuf) -> Self {
+        Self { path }
     }
 
     /// Wrap an existing directory, for tests and for a worker that was handed one.
@@ -198,6 +231,27 @@ impl ControlDir {
     /// Worker side: ask a question and wait to be answered.
     pub fn write_question(&self, q: &Question) -> std::io::Result<()> {
         write_private(&self.path.join(format!("question-{}.json", q.seq)), q)
+    }
+
+    /// Worker side: post an update for the foreman.
+    pub fn write_note(&self, n: &Note) -> std::io::Result<()> {
+        write_private(&self.path.join(format!("note-{}.json", n.seq)), n)
+    }
+
+    /// Worker side: forward a network approval request.
+    pub fn write_approval(&self, a: &ApprovalAsk) -> std::io::Result<()> {
+        write_private(&self.path.join(format!("approval-{}.json", a.seq)), a)
+    }
+
+    /// Parent side: answer a forwarded approval request.
+    pub fn write_approval_reply(&self, r: &ApprovalReply) -> std::io::Result<()> {
+        write_private(&self.path.join(format!("approval-reply-{}.json", r.seq)), r)
+    }
+
+    /// Worker side: the reply to approval request `seq`, if it has arrived.
+    pub fn read_approval_reply(&self, seq: u32) -> Option<ApprovalReply> {
+        let r: ApprovalReply = read_json(&self.path.join(format!("approval-reply-{seq}.json")))?;
+        (r.seq == seq).then_some(r)
     }
 
     /// Parent side: read an outstanding question.

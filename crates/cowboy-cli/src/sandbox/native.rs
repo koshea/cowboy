@@ -93,6 +93,8 @@ pub struct NativeSandbox {
     cgroup_key: String,
     /// The user's git identity, read from their global git config once per session.
     git_identity: crate::project::GitIdentity,
+    /// Extra paths/env for a harness job's sandbox (see [`Self::set_overlay`]).
+    overlay: Mutex<Option<cowboy_sandbox::plan::PlanOverlay>>,
     /// The policy engine that answers the relay.
     ///
     /// Constructed up front rather than attached later: a sandbox with no engine
@@ -142,6 +144,7 @@ impl NativeSandbox {
             scratch_key,
             cgroup_key,
             git_identity: crate::project::GitIdentity::from_host(),
+            overlay: Mutex::new(None),
         })
     }
 
@@ -168,6 +171,13 @@ impl NativeSandbox {
     /// authority on what is being enforced.
     pub fn policy(&self) -> &cowboy_core::config::NetworkPolicy {
         self.policy_engine.policy()
+    }
+
+    /// Give every command in this sandbox a harness overlay (its binary, private
+    /// home and env). Only a harness job's own sandbox gets one — the foreman's
+    /// plan never contains another process's login.
+    pub fn set_overlay(&self, overlay: cowboy_sandbox::plan::PlanOverlay) {
+        *self.overlay.lock().unwrap() = Some(overlay);
     }
 
     /// Build the plan for the *next* command, from the current grant set.
@@ -201,6 +211,7 @@ impl NativeSandbox {
         // Beside the mask: the scratch root is host-only (the agent sees only its
         // subdirectories), so nothing inside can swap this file for a symlink.
         let git_identity = crate::project::write_git_identity(&scratch, &self.git_identity);
+        let overlay = self.overlay.lock().unwrap().clone();
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -210,6 +221,7 @@ impl NativeSandbox {
             scratch: &scratch,
             agent_home: &agent_home,
             git_identity: git_identity.as_deref(),
+            overlay: overlay.as_ref(),
             platform: cowboy_sandbox::plan::Platform::host(),
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
@@ -608,6 +620,10 @@ impl Sandbox for NativeSandbox {
         // `SessionSandbox::stop` because the sandbox owns the session name, and a
         // sandbox that never started a session still has scratch to clean up.
         crate::project::remove_scratch_dir(&self.scratch_key);
+    }
+
+    fn approver(&self) -> Option<Arc<dyn cowboy_gateway::Approver>> {
+        Some(self.policy_engine.approver())
     }
 
     async fn exec_stream(

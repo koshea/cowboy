@@ -279,7 +279,20 @@ fn show() -> Result<()> {
 fn validate() -> Result<()> {
     let cfg = load_or_explain()?;
     let models = merged_models()?;
-    let names = model_names(&models);
+    let mut names = model_names(&models);
+    // A slot may name a harness (harnesses.yaml) as well as a model — but never a
+    // name that is both, which would make the route ambiguous.
+    let harnesses =
+        cowboy_core::harness::HarnessesConfig::load_user().context("loading harnesses.yaml")?;
+    let clash = cowboy_core::harness::colliding_names(names.iter().map(String::as_str), &harnesses);
+    if !clash.is_empty() {
+        bail!(
+            "crew roster invalid: {} defined in both models.yaml and harnesses.yaml — \
+             rename one so a crew slot is unambiguous",
+            clash.join(", ")
+        );
+    }
+    names.extend(harnesses.names().map(str::to_string));
     match cfg.validate(&names) {
         Ok(()) => {
             crate::ui::ok(&format!(

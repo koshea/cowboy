@@ -202,6 +202,13 @@ pub struct SubagentArgs {
     /// `cowboy agents list`. (The crew still picks the model from category/effort.)
     #[serde(default)]
     pub agent: Option<String>,
+    /// Run this on an external agent harness (one listed under "Harnesses" in your
+    /// system prompt, e.g. "grok") instead of a crew model. ONLY when the user
+    /// explicitly asks for that harness — otherwise leave it out and let the roster
+    /// route. The harness works in the same workspace and reports back like any
+    /// subagent.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 /// Arguments for the `jobs` tool — no arguments; it lists everything.

@@ -13,6 +13,7 @@ pub mod fileop;
 pub mod firstrun;
 pub mod grant;
 pub mod handoff;
+pub mod harnesses;
 pub mod init;
 pub mod logs;
 pub mod mcp;

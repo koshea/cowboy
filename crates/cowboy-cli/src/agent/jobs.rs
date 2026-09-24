@@ -161,6 +161,9 @@ pub enum JobEvent {
         ok: bool,
         result: String,
     },
+    /// An informational update that needs no answer — an external harness that has
+    /// gone quiet, or one reporting its progress.
+    Note { id: String, text: String },
 }
 
 impl JobEvent {
@@ -169,7 +172,8 @@ impl JobEvent {
             JobEvent::Started { id }
             | JobEvent::TurnRequest { id, .. }
             | JobEvent::Question { id, .. }
-            | JobEvent::Finished { id, .. } => id,
+            | JobEvent::Finished { id, .. }
+            | JobEvent::Note { id, .. } => id,
         }
     }
 }
@@ -194,6 +198,8 @@ pub struct Job {
     pub report: Option<String>,
     /// The outstanding question and its suggested answers, if the job is asking one.
     pub question: Option<(String, Vec<String>)>,
+    /// Updates not yet delivered to the foreman (see [`JobEvent::Note`]).
+    pub notes: Vec<String>,
     /// How many turns the outstanding request asked for.
     pub requested: u32,
     /// Whether the finished result has been handed to the conversation.
@@ -236,6 +242,12 @@ pub enum JobNews {
         ok: bool,
         result: String,
     },
+    /// An update from a running job, for the foreman's information.
+    Note {
+        id: String,
+        label: String,
+        text: String,
+    },
     /// A job is blocked on a question about the work.
     Question {
         id: String,
@@ -263,7 +275,8 @@ impl JobNews {
             JobNews::Started { id, .. }
             | JobNews::Finished { id, .. }
             | JobNews::Question { id, .. }
-            | JobNews::TurnRequest { id, .. } => id,
+            | JobNews::TurnRequest { id, .. }
+            | JobNews::Note { id, .. } => id,
         }
     }
 }
@@ -323,6 +336,7 @@ impl JobRegistry {
             task: spec.task,
             question: None,
             delivered_question: None,
+            notes: Vec::new(),
             // Pending, not Running: with a per-provider cap a dispatched job may wait
             // for a permit, and reporting it as running would misrepresent both the
             // UI and the elapsed time.
@@ -379,6 +393,12 @@ impl JobRegistry {
             } => {
                 job.state = JobState::AwaitingAnswer { seq };
                 job.question = Some((question, options));
+            }
+            JobEvent::Note { text, .. } => {
+                // Queued, not overwritten: two updates between drains are two updates.
+                if !matches!(job.state, JobState::Done { .. }) {
+                    job.notes.push(text);
+                }
             }
             JobEvent::Finished { ok, result, .. } => {
                 job.state = JobState::Done { ok };
@@ -447,6 +467,13 @@ impl JobRegistry {
                     });
                 }
                 _ => {}
+            }
+            for text in std::mem::take(&mut job.notes) {
+                news.push(JobNews::Note {
+                    id: job.id.clone(),
+                    label: job.label.clone(),
+                    text,
+                });
             }
             match &job.state {
                 JobState::Done { ok } if !job.delivered_result => {

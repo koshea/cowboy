@@ -273,6 +273,7 @@ mod tests {
                 scratch: Path::new("/scratch"),
                 agent_home: Path::new("/Users/dev/.cache/cowboy/home/proj"),
                 git_identity: None,
+                overlay: None,
                 platform: Platform::MacOs,
             },
             &host(),

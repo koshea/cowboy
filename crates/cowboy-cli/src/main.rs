@@ -43,6 +43,7 @@ async fn run() -> Result<()> {
         Some(Command::Patch(args)) => cmd::patch::run(args).await,
         Some(Command::Proc(args)) => cmd::proc::run(args).await,
         Some(Command::Models(args)) => cmd::models::run(args).await,
+        Some(Command::Harnesses) => cmd::harnesses::run(),
         Some(Command::Skill(args)) => cmd::skill::run(args),
         Some(Command::Agents(args)) => cmd::agents::run(args),
         Some(Command::Down(args)) => cmd::down::run(args).await,
@@ -92,6 +93,9 @@ async fn run() -> Result<()> {
             Ok(())
         }
         Some(Command::XFileop) => cmd::fileop::run(),
+        Some(Command::XForemanMcp { socket }) => {
+            cowboy_cli::agent::harness::mcp::serve_stdio(socket).await
+        }
         Some(Command::XSandboxShim) => cowboy_cli::sandbox::shim::run(),
         #[cfg(target_os = "linux")]
         Some(Command::XSandboxHolder) => cowboy_cli::sandbox::session::run_holder().await,

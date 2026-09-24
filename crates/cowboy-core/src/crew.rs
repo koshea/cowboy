@@ -444,7 +444,7 @@ impl CrewConfig {
                 Ok(())
             } else {
                 Err(Error::Invalid(format!(
-                    "crew references unknown model `{m}` (not in models.yaml)"
+                    "crew references unknown model `{m}` (not in models.yaml or harnesses.yaml)"
                 )))
             }
         };

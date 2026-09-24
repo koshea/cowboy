@@ -30,9 +30,12 @@ seccomp
 limits
   memory 4096 MiB, cpu 2 cores, processes 4096, build jobs 2
 
-never grantable at any approval scope (21 paths)
+never grantable at any approval scope (26 paths)
   /home/dev/.aws
   /home/dev/.cargo/credentials.toml
+  /home/dev/.claude
+  /home/dev/.claude.json
+  /home/dev/.codex
   /home/dev/.config/BraveSoftware
   /home/dev/.config/chromium
   /home/dev/.config/cowboy
@@ -40,9 +43,11 @@ never grantable at any approval scope (21 paths)
   /home/dev/.config/gh
   /home/dev/.config/google-chrome
   /home/dev/.docker/config.json
+  /home/dev/.gemini
   /home/dev/.git-credentials
   /home/dev/.gitconfig
   /home/dev/.gnupg
+  /home/dev/.grok
   /home/dev/.kube
   /home/dev/.local/share/keyrings
   /home/dev/.mozilla

@@ -286,6 +286,21 @@ Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are rea
 host-side. They are never written into a project or bound into the sandbox.")]
     Models(ModelsArgs),
 
+    /// List the external agent CLIs the crew can delegate to (grok, …) and whether
+    /// each is installed and logged in.
+    #[command(after_help = "\
+Harnesses are configured in ~/.config/cowboy/harnesses.yaml (user-level only):
+
+  harnesses:
+    grok:
+      kind: grok
+      model: grok-4.7        # optional; the CLI's default otherwise
+      auth: auth_file        # or full_home — the login plus your grok config
+
+Route a crew category to one in crew.yaml (`exploration: grok`), or ask the agent to
+\"have grok …\". A harness runs inside cowboy's sandbox on your subscription.")]
+    Harnesses,
+
     /// List or show agent skills (reusable instructions under .cowboy/skills/).
     #[command(alias = "skills")]
     Skill(SkillArgs),
@@ -450,6 +465,11 @@ Examples:
     /// request on stdin). Not for direct use.
     #[command(name = "x-fileop", hide = true)]
     XFileop,
+
+    /// Internal: the MCP server an external harness (grok, …) is given, relaying
+    /// `ask_foreman`/`report_progress` to the foreman over `socket`. Not for direct use.
+    #[command(name = "x-foreman-mcp", hide = true)]
+    XForemanMcp { socket: std::path::PathBuf },
 
     /// Internal: the in-sandbox shim that applies Landlock + seccomp then execs
     /// the agent's command. Reads its request from stdin as JSON.

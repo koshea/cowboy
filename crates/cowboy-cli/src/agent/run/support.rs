@@ -118,6 +118,32 @@ pub(super) fn system_prompt(
     system
 }
 
+/// What the foreman is told about the configured external harnesses: that they
+/// exist, and that they are for when the user asks for one by name. Routing to them
+/// otherwise is the roster's job, not the model's. Empty when none are configured.
+pub(super) fn harness_prompt(harnesses: &cowboy_core::harness::HarnessesConfig) -> String {
+    if harnesses.harnesses.is_empty() {
+        return String::new();
+    }
+    let list = harnesses
+        .harnesses
+        .iter()
+        .map(|(name, def)| match &def.model {
+            Some(m) => format!("`{name}` ({} CLI, model {m})", def.kind.as_str()),
+            None => format!("`{name}` ({} CLI)", def.kind.as_str()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\nHarnesses: other coding agents you can delegate to — {list}. When the user \
+         asks for one by name (\"have grok review this\"), pass `harness` to `subagent`; \
+         otherwise never set it — the roster already routes some categories to them. A \
+         harness works in the same workspace, runs until it finishes (no turn grants, so \
+         it never asks you for turns), and its result includes a measured summary of what \
+         it changed. Brief it fully: it starts with none of your context."
+    )
+}
+
 /// The prompt with the sandbox's real paths in place of the Linux defaults it is
 /// written with (`/workspace`, `/tmp`).
 ///

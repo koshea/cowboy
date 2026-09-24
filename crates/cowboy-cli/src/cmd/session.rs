@@ -30,6 +30,11 @@ pub async fn run(
     flags: StartFlags,
     resume: Option<crate::cli::ResumeSpec>,
 ) -> Result<()> {
+    // A crew job the foreman routed to an external harness: no model, no provider —
+    // the harness driver does the whole run (see `agent::harness`).
+    if let Some(name) = crate::agent::harness::requested() {
+        return crate::agent::harness::run_child(&name, task).await;
+    }
     let root = crate::cmd::project_root()?;
     let paths = ConfigPaths::for_root(&root);
 
@@ -302,7 +307,7 @@ pub async fn run(
 /// Drop credential grants that require explicit approval. Used on the headless
 /// (piped) path, which has no interactive client to prompt — so such grants
 /// fail closed rather than being exposed silently. A notice is printed for each.
-fn drop_approval_required_grants(security: &mut SecurityConfig) {
+pub(crate) fn drop_approval_required_grants(security: &mut SecurityConfig) {
     security.secrets.env.retain(|e| {
         if e.needs_approval() {
             eprintln!(
@@ -693,7 +698,7 @@ pub(crate) fn git_branch(root: &std::path::Path) -> Option<String> {
 }
 
 /// Resolve the task: use the provided one, or prompt for it (console mode only).
-fn resolve_task(task: Option<String>) -> Result<Option<String>> {
+pub(crate) fn resolve_task(task: Option<String>) -> Result<Option<String>> {
     if let Some(t) = task {
         return Ok(Some(t));
     }
@@ -793,7 +798,7 @@ pub(crate) fn verdict_str(v: Verdict) -> &'static str {
 /// Previously this bound a TCP listener and waited for the in-container gateway to
 /// connect and authenticate; now the engine runs in this process, so it is just two
 /// channels and the loops that drain them.
-fn autodeny_approver(session_dir: Option<PathBuf>) -> std::sync::Arc<ChannelApprover> {
+pub(crate) fn autodeny_approver(session_dir: Option<PathBuf>) -> std::sync::Arc<ChannelApprover> {
     // Annotated: `log_network` takes `&str`, so without this the event channel's
     // payload infers as the unsized `str` rather than `String`.
     let (approvals_tx, mut approvals_rx) =

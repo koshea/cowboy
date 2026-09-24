@@ -23,6 +23,7 @@
 - [The web UI (remote control)](using/web.md)
 - [The agent & its tools](using/agent-and-tools.md)
 - [The crew (model routing)](using/crew.md)
+- [Harnesses (grok and other agent CLIs)](using/harnesses.md)
 - [Skills, agents & subagents](using/skills-and-subagents.md)
 
 # Ranch Plans

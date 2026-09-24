@@ -1,6 +1,7 @@
 //! The Cowboy-owned agent loop and its tool surface.
 
 pub mod commands;
+pub mod harness;
 pub mod help;
 pub mod jobctl;
 pub mod jobs;

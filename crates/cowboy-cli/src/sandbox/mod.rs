@@ -127,6 +127,13 @@ pub trait Sandbox: Send + Sync {
         SandboxPaths::default()
     }
 
+    /// Who this sandbox's network policy asks about an `ask` verdict, when it has
+    /// one. Used to forward an external harness job's network requests to the
+    /// person attached to the foreman.
+    fn approver(&self) -> Option<std::sync::Arc<dyn cowboy_gateway::Approver>> {
+        None
+    }
+
     /// Attach a sink for bring-up progress, replacing any previous one. When no
     /// sink is attached, reporting is a no-op.
     fn status_channel(&mut self) -> StatusRx;

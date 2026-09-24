@@ -876,6 +876,14 @@ expression: defs
             "null"
           ]
         },
+        "harness": {
+          "default": null,
+          "description": "Run this on an external agent harness (one listed under \"Harnesses\" in your\nsystem prompt, e.g. \"grok\") instead of a crew model. ONLY when the user\nexplicitly asks for that harness — otherwise leave it out and let the roster\nroute. The harness works in the same workspace and reports back like any\nsubagent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "reason": {
           "default": null,
           "description": "Why you're delegating this (one line) — recorded with the routing decision.",

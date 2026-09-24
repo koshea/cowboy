@@ -226,6 +226,24 @@ Print a session's handoff summary (defaults to the most recent)
 | `<SESSION>` |  |
 
 
+## `cowboy harnesses`
+
+List the external agent CLIs the crew can delegate to (grok, …) and whether each is installed and logged in
+
+```text
+Harnesses are configured in ~/.config/cowboy/harnesses.yaml (user-level only):
+
+  harnesses:
+    grok:
+      kind: grok
+      model: grok-4.7        # optional; the CLI's default otherwise
+      auth: auth_file        # or full_home — the login plus your grok config
+
+Route a crew category to one in crew.yaml (`exploration: grok`), or ask the agent to
+"have grok …". A harness runs inside cowboy's sandbox on your subscription.
+```
+
+
 ## `cowboy inbox`
 
 Read a session's message inbox (defaults to the most recent). Reading drains the inbox unless --peek is given
@@ -971,6 +989,15 @@ Summarize a branch's changes + mergeability vs HEAD (read-only)
 ## `cowboy x-fileop`
 
 Internal: in-sandbox worker for the structured file tools (reads a JSON request on stdin). Not for direct use
+
+
+## `cowboy x-foreman-mcp`
+
+Internal: the MCP server an external harness (grok, …) is given, relaying `ask_foreman`/`report_progress` to the foreman over `socket`. Not for direct use
+
+| Arg | Description |
+|-----|-------------|
+| `<SOCKET>` |  |
 
 
 ## `cowboy x-sandbox-holder`

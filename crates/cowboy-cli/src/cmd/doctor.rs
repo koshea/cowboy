@@ -135,6 +135,12 @@ pub async fn run() -> Result<()> {
         check_models(&providers, &user_models, &project_models),
     );
     report.check(
+        "harnesses",
+        Category::Config,
+        Remedy::Fix,
+        check_harnesses(&cowboy_core::harness::HarnessesConfig::load_user()),
+    );
+    report.check(
         "config separation",
         Category::Config,
         Remedy::Fix,
@@ -326,6 +332,42 @@ fn check_models(
         Err(error) => Status::Fail(format!(
             "{error}; add one with `cowboy models add <model-id>`"
         )),
+    }
+}
+
+/// External agent harnesses are optional: none configured is fine, and one that is
+/// not installed or logged in is a warning (only the jobs routed to it will fail).
+fn check_harnesses(cfg: &cowboy_core::Result<cowboy_core::harness::HarnessesConfig>) -> Status {
+    let cfg = match cfg {
+        Ok(c) => c,
+        Err(e) => return Status::Fail(e.to_string()),
+    };
+    if cfg.harnesses.is_empty() {
+        return Status::Ok("none configured (optional)".into());
+    }
+    let mut problems = Vec::new();
+    for (name, def) in &cfg.harnesses {
+        let i = crate::agent::harness::inspect(def);
+        if i.binary.is_err() {
+            problems.push(format!(
+                "{name}: `{}` not installed",
+                def.kind.spec().binary
+            ));
+        } else if !i.logged_in {
+            problems.push(format!(
+                "{name}: not logged in (run `{} login`)",
+                def.kind.spec().binary
+            ));
+        }
+    }
+    if problems.is_empty() {
+        Status::Ok(format!(
+            "{} ready: {}",
+            cfg.harnesses.len(),
+            cfg.names().collect::<Vec<_>>().join(", ")
+        ))
+    } else {
+        Status::Warn(problems.join("; "))
     }
 }
 

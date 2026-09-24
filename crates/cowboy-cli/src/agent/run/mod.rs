@@ -28,10 +28,10 @@ use support::{
 };
 use support::{
     delegation_available, effective_max_depth, emit_delta, fileop_summary, grant_notice,
-    grant_stage, is_coordination_only, parse_args, process_is_gone, raw_tool_signature,
-    render_plan, render_transcript, reread_notice, self_exe, system_prompt, tool_signature,
-    tool_surface, truncate, truncate_middle, unified_diff, with_sandbox_paths, GrantStage,
-    IterationBudget, ProgressTracker, Verification,
+    grant_stage, harness_prompt, is_coordination_only, parse_args, process_is_gone,
+    raw_tool_signature, render_plan, render_transcript, reread_notice, self_exe, system_prompt,
+    tool_signature, tool_surface, truncate, truncate_middle, unified_diff, with_sandbox_paths,
+    GrantStage, IterationBudget, ProgressTracker, Verification,
 };
 
 /// Default agent system prompt (see plan §10.3).
@@ -307,6 +307,10 @@ pub struct AgentLoop<'a> {
     /// The highest grant-depletion stage already announced this turn, so each nudge
     /// fires once instead of on every iteration past the threshold.
     grant_stage_seen: GrantStage,
+    /// Job-news notes held back while a batch of tool calls is being answered, so
+    /// none lands between a tool call and its result (see [`Self::push_user_note`]).
+    /// `Some` while a batch is open.
+    held_notes: Option<Vec<String>>,
     /// What this session has actually read, edited and run — the host's own measure of
     /// whether the worker is making progress, independent of what it claims.
     progress: ProgressTracker,
@@ -536,6 +540,24 @@ struct SubagentPlan {
     control_dir: Option<std::path::PathBuf>,
     /// (category, effort, model, fell_back) for the lifecycle event.
     routed: Option<(String, String, String, bool)>,
+    /// The external harness (harnesses.yaml) this job runs on instead of a model —
+    /// routed there by the roster, or named explicitly. Passed as `COWBOY_HARNESS`.
+    harness: Option<String>,
+}
+
+impl SubagentPlan {
+    /// The concurrency-throttle key: a harness is its own provider (each CLI has its
+    /// own subscription limits), else the model's provider.
+    fn provider_key(
+        &self,
+        defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
+        foreman: Option<&str>,
+    ) -> String {
+        match &self.harness {
+            Some(h) => format!("harness:{h}"),
+            None => provider_key(self.model.as_deref(), defs, foreman),
+        }
+    }
 }
 
 /// A stable hash of the configured `setup` commands, written to the per-worktree
@@ -576,7 +598,11 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         .stderr(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true);
-    if let Some(model) = &plan.model {
+    // A harness job runs an external agent CLI instead of cowboy's own loop, so it
+    // gets no model — the child resolves the harness from harnesses.yaml itself.
+    if let Some(harness) = &plan.harness {
+        cmd.env(crate::agent::harness::ENV_HARNESS, harness);
+    } else if let Some(model) = &plan.model {
         cmd.env("COWBOY_MODEL", model);
     }
     if let Some(t) = plan.temperature {
@@ -646,6 +672,7 @@ async fn watch_turn_requests(
         String,
         tokio::sync::mpsc::UnboundedSender<crate::agent::jobs::JobEvent>,
     )>,
+    approver: Option<(std::sync::Arc<dyn cowboy_gateway::Approver>, String)>,
 ) {
     let Some((dir, id, tx)) = watch else {
         std::future::pending::<()>().await;
@@ -658,6 +685,8 @@ async fn watch_turn_requests(
     // conversation, and a worker can ask one without having asked for turns.
     let mut next_seq = 1u32;
     let mut next_question = 1u32;
+    let mut next_note = 1u32;
+    let mut next_approval = 1u32;
     loop {
         tokio::time::sleep(REQUEST_POLL).await;
         let path = dir.join(format!("request-{next_seq}.json"));
@@ -672,6 +701,57 @@ async fn watch_turn_requests(
                     used: req.used,
                 });
                 next_seq = req.seq + 1;
+            }
+        }
+        // A harness job's network request, which its own sandbox had nobody to ask:
+        // put it to the foreman's approver — the person attached to this session —
+        // labelled as the job's, and write the answer back. Each on its own task, so
+        // a prompt waiting on the user never stalls the rest of this watcher.
+        let apath = dir.join(format!("approval-{next_approval}.json"));
+        if let Ok(text) = tokio::fs::read_to_string(&apath).await {
+            if let Ok(ask) = serde_json::from_str::<crate::agent::jobctl::ApprovalAsk>(&text) {
+                next_approval = ask.seq + 1;
+                let control = crate::agent::jobctl::ControlDir::open(dir.clone());
+                match &approver {
+                    Some((approver, label)) => {
+                        let approver = approver.clone();
+                        let reason = match &ask.reason {
+                            Some(r) => format!("{label} (subagent job {id}) — {r}"),
+                            None => format!("{label} (subagent job {id})"),
+                        };
+                        tokio::spawn(async move {
+                            let mut attempt = ask.attempt.clone();
+                            // A pid from the job's own PID namespace means nothing here.
+                            attempt.command_pid = None;
+                            let answer = approver.answer(&attempt, Some(&reason)).await;
+                            let _ = control.write_approval_reply(
+                                &crate::agent::jobctl::ApprovalReply {
+                                    seq: ask.seq,
+                                    allow: answer.verdict == cowboy_core::netproto::Verdict::Allow,
+                                    remember: answer.remember,
+                                },
+                            );
+                        });
+                    }
+                    None => {
+                        let _ =
+                            control.write_approval_reply(&crate::agent::jobctl::ApprovalReply {
+                                seq: ask.seq,
+                                allow: false,
+                                remember: true,
+                            });
+                    }
+                }
+            }
+        }
+        let npath = dir.join(format!("note-{next_note}.json"));
+        if let Ok(text) = tokio::fs::read_to_string(&npath).await {
+            if let Ok(n) = serde_json::from_str::<crate::agent::jobctl::Note>(&text) {
+                let _ = tx.send(crate::agent::jobs::JobEvent::Note {
+                    id: id.clone(),
+                    text: n.text,
+                });
+                next_note = n.seq + 1;
             }
         }
         let qpath = dir.join(format!("question-{next_question}.json"));
@@ -766,7 +846,7 @@ fn concurrency_notice(
 ) -> String {
     let keys: Vec<String> = plans
         .iter()
-        .map(|(_, plan)| provider_key(plan.model.as_deref(), defs, foreman))
+        .map(|(_, plan)| plan.provider_key(defs, foreman))
         .collect();
     concurrency_notice_from_keys(&keys, per_provider, max_parallel)
 }
@@ -1057,15 +1137,19 @@ impl<'a> AgentLoop<'a> {
         // timeout and be answered by the fallback — worse than not asking.
         let control = crate::agent::jobctl::ControlDir::from_env();
         let can_request_turns = budget.supervised && control.is_some();
-        let system = with_sandbox_paths(
-            system_prompt(
-                can_delegate,
-                subagent_depth,
-                can_request_turns,
-                crew_cfg.as_ref(),
-            ),
-            &runtime.paths(),
+        let mut system = system_prompt(
+            can_delegate,
+            subagent_depth,
+            can_request_turns,
+            crew_cfg.as_ref(),
         );
+        if can_delegate {
+            // A broken harnesses.yaml must not break the session; delegation to a
+            // harness then reports the parse error when it is actually attempted.
+            let harnesses = cowboy_core::harness::HarnessesConfig::load_user().unwrap_or_default();
+            system.push_str(&harness_prompt(&harnesses));
+        }
+        let system = with_sandbox_paths(system, &runtime.paths());
         let tools = tool_surface(can_delegate, can_request_turns);
         let stall_window = crew_cfg
             .as_ref()
@@ -1091,6 +1175,7 @@ impl<'a> AgentLoop<'a> {
             reasoning_shed_notified: false,
             budget,
             grant_stage_seen: GrantStage::Fine,
+            held_notes: None,
             progress: ProgressTracker::default(),
             verification: Verification::default(),
             seen_files: SeenFiles::default(),
@@ -2916,7 +3001,11 @@ impl<'a> AgentLoop<'a> {
                     }
                 }
 
+                // News that arrives while the calls are answered (a `wait`, the
+                // auto-wait before `final`) is held until every result is in place.
+                self.held_notes = Some(Vec::new());
                 let outcome = self.handle_tool_calls(&response).await;
+                self.release_held_notes();
                 // Record what this batch actually returned, so the next iteration can
                 // tell "same call, same result" (a loop) from "same call, new result"
                 // (polling). Done here — after a real execution — and never on the
@@ -4827,6 +4916,8 @@ impl<'a> AgentLoop<'a> {
             ));
         }
 
+        // Harness jobs forward the network requests their own sandbox cannot ask about.
+        let foreman_approver = self.runtime.approver();
         for (call_id, plan) in plans {
             let label = plan
                 .label
@@ -4844,7 +4935,7 @@ impl<'a> AgentLoop<'a> {
                     .clone()
                     .unwrap_or_else(|| "<default>".to_string()),
                 task: plan.display_task.clone(),
-                provider: provider_key(plan.model.as_deref(), &model_defs, foreman.as_deref()),
+                provider: plan.provider_key(&model_defs, foreman.as_deref()),
                 granted,
                 ceiling,
             };
@@ -4856,6 +4947,11 @@ impl<'a> AgentLoop<'a> {
             let tx = self.job_tx.clone();
             let fanout = self.fanout_sem.clone();
             let stop = self.job_stopper.token();
+            // A harness job's network requests go to this session's approver.
+            let forward = plan
+                .harness
+                .clone()
+                .and_then(|h| foreman_approver.clone().map(|a| (a, h)));
             self.jobs.dispatch(spec, move |_, provider_sem| {
                 let handle = tokio::spawn(async move {
                     // Two throttles, acquired in a fixed order: the session-wide
@@ -4900,7 +4996,7 @@ impl<'a> AgentLoop<'a> {
                             });
                             return;
                         }
-                        _ = watch_turn_requests(watch) => unreachable!("the watcher never ends"),
+                        _ = watch_turn_requests(watch, forward) => unreachable!("the watcher never ends"),
                         r = exec_subagent(plan) => r,
                     };
                     let status = classify_subagent_result(&result).to_string();
@@ -4998,6 +5094,11 @@ impl<'a> AgentLoop<'a> {
                     let body = format!("[subagent {label} · job {id}] finished:\n{capped}");
                     self.push_user_note(body);
                 }
+                JobNews::Note { id, label, text } => {
+                    self.ui
+                        .notice(&format!("↳ subagent {label} ({id}): {text}"));
+                    self.push_user_note(format!("[subagent {label} · job {id}] update: {text}"));
+                }
                 JobNews::Question {
                     id,
                     label,
@@ -5061,11 +5162,31 @@ impl<'a> AgentLoop<'a> {
     /// Append a synthetic user message (job news, steering, a directive) to the
     /// conversation and the session log.
     fn push_user_note(&mut self, body: String) {
+        // Mid-batch: a user message between an assistant's tool call and its result
+        // breaks the pairing providers require (the loop used to repair it, and log a
+        // warning, on every `wait` that returned news). Deliver it after the results.
+        if let Some(held) = &mut self.held_notes {
+            held.push(body);
+            return;
+        }
         let msg = Message::user(body);
         if let Some(l) = &mut self.logger {
             l.log_message(&msg);
         }
         self.messages.push(msg);
+    }
+
+    /// Messages delivered to the conversation, counting notes held for the end of
+    /// the current tool batch — they are delivered, just not placed yet.
+    fn delivered_count(&self) -> usize {
+        self.messages.len() + self.held_notes.as_ref().map_or(0, Vec::len)
+    }
+
+    /// Close a tool-call batch and deliver the notes it held back, in order.
+    fn release_held_notes(&mut self) {
+        for body in self.held_notes.take().unwrap_or_default() {
+            self.push_user_note(body);
+        }
     }
 
     /// Wait for a running job to report something, bounded and interruptible. Reports
@@ -5108,9 +5229,9 @@ impl<'a> AgentLoop<'a> {
             while let Ok(e) = self.job_rx.try_recv() {
                 self.jobs.apply_event(e);
             }
-            let before = self.messages.len();
+            let before = self.delivered_count();
             self.deliver_job_news();
-            if self.messages.len() > before {
+            if self.delivered_count() > before {
                 return Woke::News;
             }
             // A `Started` event is not news the foreman needs; keep waiting.
@@ -5156,14 +5277,47 @@ impl<'a> AgentLoop<'a> {
             .as_ref()
             .map(|c| c.resolve(&category, effort, &foreman));
         let temperature = crew_cfg.as_ref().and_then(|c| c.temperature_for(&category));
+        // An external harness, when the user named one or the roster routes to one.
+        let harnesses = cowboy_core::harness::HarnessesConfig::load_user()
+            .map_err(|e| format!("error: {e}"))?;
+        let harness = match args
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(name) if harnesses.get(name).is_some() => Some(name.to_string()),
+            Some(name) => {
+                let known: Vec<&str> = harnesses.names().collect();
+                return Err(if known.is_empty() {
+                    format!(
+                        "error: no harness `{name}` — none are configured \
+                         (~/.config/cowboy/harnesses.yaml)"
+                    )
+                } else {
+                    format!(
+                        "error: no harness `{name}`; configured: {}",
+                        known.join(", ")
+                    )
+                });
+            }
+            None => routed
+                .as_ref()
+                .filter(|r| harnesses.get(&r.model).is_some())
+                .map(|r| r.model.clone()),
+        };
         // The child's iteration budget: an effort-scaled grant plus the ceiling it
         // can be granted up to. `max_total_iterations: 0` opts out of supervision,
         // and with no roster at all there is nothing to scale from — either way the
         // child falls back to `agent.max_iterations`, as it did before.
-        let budget = crew_cfg.as_ref().and_then(|c| {
-            let d = &c.delegation;
-            (d.max_total_iterations > 0).then(|| (d.grant_for(effort), d.max_total_iterations))
-        });
+        // A harness has no turn budget: it runs until done or stopped (by design).
+        let budget = crew_cfg
+            .as_ref()
+            .filter(|_| harness.is_none())
+            .and_then(|c| {
+                let d = &c.delegation;
+                (d.max_total_iterations > 0).then(|| (d.grant_for(effort), d.max_total_iterations))
+            });
 
         // Worker brief: an optional adopted agent persona, then context, the task,
         // then the expected artifact.
@@ -5206,9 +5360,10 @@ impl<'a> AgentLoop<'a> {
             .as_deref()
             .map(|a| format!("{a} "))
             .unwrap_or_default();
-        let label = match &routed {
-            Some(r) => format!("{who}{category}/{} → {}", effort.as_str(), r.model),
-            None => format!("{who}{category}/{}", effort.as_str()),
+        let label = match (&harness, &routed) {
+            (Some(h), _) => format!("{who}{category}/{} → {h}", effort.as_str()),
+            (None, Some(r)) => format!("{who}{category}/{} → {}", effort.as_str(), r.model),
+            (None, None) => format!("{who}{category}/{}", effort.as_str()),
         };
         let id = format!(
             "{}-sub{}",
@@ -5219,12 +5374,16 @@ impl<'a> AgentLoop<'a> {
         // the directory already exists when the child looks for it — and only when the
         // child actually has a budget to ask about. Keyed by *this* session's id, so
         // both ends derive the same path without passing one another a path to trust.
-        let control_dir = budget.and_then(|_| {
-            self.logger.as_ref().and_then(|l| {
-                crate::agent::jobctl::ControlDir::create(l.id(), &id)
-                    .map(|d| d.path().to_path_buf())
-            })
-        });
+        // A harness job gets one too, without a budget: it is how the job's stall
+        // notices and its questions for the foreman travel.
+        let control_dir = (budget.is_some() || harness.is_some())
+            .then_some(())
+            .and_then(|_| {
+                self.logger.as_ref().and_then(|l| {
+                    crate::agent::jobctl::ControlDir::create(l.id(), &id)
+                        .map(|d| d.path().to_path_buf())
+                })
+            });
         Ok(SubagentPlan {
             exe,
             root: self.runtime.root().to_path_buf(),
@@ -5233,11 +5392,14 @@ impl<'a> AgentLoop<'a> {
             task,
             display_task: args.task.clone(),
             label,
-            model: routed.as_ref().map(|r| r.model.clone()),
-            temperature,
+            model: harness
+                .clone()
+                .or_else(|| routed.as_ref().map(|r| r.model.clone())),
+            temperature: temperature.filter(|_| harness.is_none()),
             budget,
             control_dir,
             routed: routed.map(|r| (category, effort.as_str().to_string(), r.model, r.fell_back)),
+            harness,
         })
     }
 
@@ -5662,6 +5824,120 @@ mod tests {
             name: name.into(),
             arguments: args.into(),
         }
+    }
+
+    /// A harness job's network request crosses to the foreman's approver and back:
+    /// labelled as the job's, with its meaningless pid dropped, and the answer —
+    /// including "allow once" — written where the job waits for it.
+    #[tokio::test]
+    async fn a_harness_jobs_network_request_is_forwarded_to_the_foremans_approver() {
+        struct Recording(std::sync::Mutex<Vec<(Option<u32>, Option<String>)>>);
+        #[async_trait::async_trait]
+        impl cowboy_gateway::Approver for Recording {
+            async fn ask(
+                &self,
+                a: &cowboy_core::netproto::NetworkAttempt,
+                r: Option<&str>,
+            ) -> cowboy_core::netproto::Verdict {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((a.command_pid, r.map(str::to_string)));
+                cowboy_core::netproto::Verdict::Allow
+            }
+            async fn answer(
+                &self,
+                a: &cowboy_core::netproto::NetworkAttempt,
+                r: Option<&str>,
+            ) -> cowboy_gateway::Answer {
+                cowboy_gateway::Answer {
+                    verdict: self.ask(a, r).await,
+                    remember: false,
+                }
+            }
+            async fn event(
+                &self,
+                _: &cowboy_core::netproto::NetworkAttempt,
+                _: cowboy_core::netproto::Verdict,
+                _: String,
+            ) {
+            }
+        }
+        let dir = assert_fs::TempDir::new().unwrap();
+        let control = crate::agent::jobctl::ControlDir::open(dir.path().to_path_buf());
+        control
+            .write_approval(&crate::agent::jobctl::ApprovalAsk {
+                seq: 1,
+                attempt: cowboy_core::netproto::NetworkAttempt {
+                    protocol: cowboy_core::netproto::Protocol::Tls,
+                    host: Some("pypi.org".into()),
+                    ip: None,
+                    port: 443,
+                    command_pid: Some(42),
+                },
+                reason: Some("not in the allowlist".into()),
+            })
+            .unwrap();
+        let rec = std::sync::Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let watcher = tokio::spawn(watch_turn_requests(
+            Some((dir.path().to_path_buf(), "job-1".into(), tx)),
+            Some((
+                rec.clone() as std::sync::Arc<dyn cowboy_gateway::Approver>,
+                "grok".into(),
+            )),
+        ));
+        let mut reply = None;
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            reply = control.read_approval_reply(1);
+            if reply.is_some() {
+                break;
+            }
+        }
+        watcher.abort();
+        let reply = reply.expect("the foreman answered");
+        assert!(reply.allow && !reply.remember);
+        let asked = rec.0.lock().unwrap().clone();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(
+            asked[0].0, None,
+            "the job's own pid must not reach the prompt"
+        );
+        let reason = asked[0].1.clone().unwrap();
+        assert!(
+            reason.contains("grok") && reason.contains("job-1"),
+            "{reason}"
+        );
+    }
+
+    /// News delivered while a tool batch is open waits until the batch's results are
+    /// in, so no user message sits between a tool call and its result.
+    #[tokio::test]
+    async fn job_news_during_a_tool_batch_is_held_until_its_results_are_in() {
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![])),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let before = agent.messages.len();
+        agent.held_notes = Some(Vec::new());
+        agent.push_user_note("[subagent x · job 1] finished: ok".into());
+        assert_eq!(agent.messages.len(), before, "held while the batch is open");
+        agent.push_tool_result("call-1", "1 job update(s) arrived");
+        agent.release_held_notes();
+        let tail: Vec<_> = agent.messages[before..].iter().map(|m| m.role).collect();
+        assert_eq!(tail, vec![Role::Tool, Role::User]);
+        agent.push_user_note("later".into());
+        assert_eq!(
+            agent.messages.last().unwrap().content,
+            "later",
+            "not held outside a batch"
+        );
     }
 
     fn empty_reply() -> ChatResponse {
@@ -8322,6 +8598,7 @@ mod tests {
                     reason: None,
                     expected_artifact: None,
                     agent: None,
+                    harness: None,
                 },
                 &None,
             )

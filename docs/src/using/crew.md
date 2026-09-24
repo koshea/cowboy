@@ -304,3 +304,9 @@ A subagent that fails outright — rather than ending with partial work — repo
 the cause (e.g. the host ran out of memory running too many at once, or the
 [gateway](../security/network.md) returned a rate-limit/quota error), so the right
 lever (lower `delegation.max_parallel`, or a gateway limit) is obvious.
+
+## Harnesses
+
+A category can route to another vendor's agent CLI instead of a model — e.g.
+`exploration: grok` — to use your subscription with it. See
+[Harnesses](harnesses.md).

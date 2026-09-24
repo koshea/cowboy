@@ -30,9 +30,12 @@ limits
 not applied on macOS
   workdir /workspace is ignored: on macOS the project is at /Users/dev/proj
 
-never grantable at any approval scope (33 paths)
+never grantable at any approval scope (38 paths)
   /Users/dev/.aws
   /Users/dev/.cargo/credentials.toml
+  /Users/dev/.claude
+  /Users/dev/.claude.json
+  /Users/dev/.codex
   /Users/dev/.config/BraveSoftware
   /Users/dev/.config/chromium
   /Users/dev/.config/cowboy
@@ -40,9 +43,11 @@ never grantable at any approval scope (33 paths)
   /Users/dev/.config/gh
   /Users/dev/.config/google-chrome
   /Users/dev/.docker/config.json
+  /Users/dev/.gemini
   /Users/dev/.git-credentials
   /Users/dev/.gitconfig
   /Users/dev/.gnupg
+  /Users/dev/.grok
   /Users/dev/.kube
   /Users/dev/.local/share/keyrings
   /Users/dev/.mozilla
