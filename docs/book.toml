@@ -1,6 +1,6 @@
 [book]
 title = "Cowboy"
-description = "An opinionated local coding agent that runs wild inside a Docker corral, while the host enforces security."
+description = "An opinionated local coding agent that runs wild inside a host-native sandbox (Linux namespaces + Landlock, or macOS Seatbelt), while the host enforces security."
 authors = ["cowboycode"]
 language = "en"
 src = "src"

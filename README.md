@@ -111,6 +111,8 @@ crates/
   cowboy-sandbox/  # the sandbox plan as pure logic (binds, Landlock, seccomp, denylist)
   cowboy-tui/      # ratatui rendering (snapshot-tested)
   cowboy-gateway/  # the policy engine: proxy, DNS, ip→domain attribution (a library)
+  cowboy-proto/    # wire types shared by the daemon, sessions and gateway (serde-only)
+  cowboy-web-ui/   # Yew/WASM frontend for `cowboy web` (built with trunk, embedded)
 docs/
 ```
 

@@ -6,7 +6,8 @@ prints and what to do when the agent asks for the network — see
 
 ```sh
 cd your-project
-cowboy init                 # writes .cowboy/{security,agent,models}.yaml
+cowboy init                 # writes .cowboy/{security,agent}.yaml
+cowboy models setup         # model endpoint + key (stored host-side)
 cowboy doctor               # kernel prerequisites, model config, daemon
 cowboy "run the tests and fix one simple failure"
 ```
@@ -31,7 +32,7 @@ the box, including non-interactively.
 ```
 cowboy                       # interactive conversational TUI (multi-turn)
 cowboy "fix the tests"       # seed the conversation (TTY) / one-shot (piped)
-cowboy init [--git]          # write .cowboy/{security,agent,models}.yaml
+cowboy init [--git]          # write .cowboy/{security,agent}.yaml
 cowboy doctor                # environment checks
 cowboy run <cmd>             # run a command in the sandbox
 cowboy shell                 # interactive shell in the sandbox
