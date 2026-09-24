@@ -450,6 +450,10 @@ const MACOS_FILES_ALLOW: &[&str] = &[
     "/private/etc/paths",
     "/private/etc/paths.d",
     "/private/etc/localtime",
+    // Where the `/usr/bin` developer shims find the active Xcode once anyone has
+    // run `xcode-select -s` (every CI image has). Without it every shim — `git`,
+    // `python3`, `cc` — fails with "unable to read data link".
+    "/private/var/db/xcode_select_link",
     "/Library/Preferences/com.apple.dt.Xcode.plist",
     "/Library/Preferences/.GlobalPreferences.plist",
     "/Library/Preferences/Logging/com.apple.diagnosticd.filter.plist",
@@ -2476,6 +2480,32 @@ mod tests {
         }];
         let err = mac_plan(&SecurityConfig::default(), &grants).unwrap_err();
         assert!(err.to_string().contains("refused"), "{err}");
+    }
+
+    /// The active-Xcode link is exposed when it exists, so the shims can follow it.
+    #[test]
+    fn on_macos_the_xcode_select_link_is_readable_when_present() {
+        let probe = FakeHost {
+            existing: {
+                let mut e = mac_host().existing;
+                e.push(PathBuf::from("/private/var/db/xcode_select_link"));
+                e
+            },
+            ..mac_host()
+        };
+        let root = Path::new("/Users/dev/proj");
+        let sec = SecurityConfig::default();
+        let plan = SandboxPlan::build(
+            &PlanInputs {
+                platform: Platform::MacOs,
+                scratch: Path::new("/Users/dev/.cache/cowboy/run/scratch/s"),
+                agent_home: Path::new("/Users/dev/.cache/cowboy/home/proj"),
+                ..inputs(root, &sec, &[], Path::new("/unused/mask"))
+            },
+            &probe,
+        )
+        .unwrap();
+        assert!(ro_targets(&plan).contains(&"/private/var/db/xcode_select_link"));
     }
 
     #[test]

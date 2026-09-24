@@ -64,10 +64,19 @@ pub fn profile(plan: &SandboxPlan, net: &Network<'_>, canon: &dyn Fn(&Path) -> P
     let mut ro: Vec<PathBuf> = Vec::new();
     let mut rw: Vec<PathBuf> = Vec::new();
     for b in &plan.binds {
-        let p = canon(Path::new(&b.target));
+        let target = Path::new(&b.target);
+        let real = canon(target);
+        // A symlink needs a rule on its own path as well as on what it resolves to:
+        // Seatbelt checks `readlink` against the link, so exposing only the target
+        // left `/var/db/xcode_select_link` unreadable and every developer shim broken.
+        let paths = if real == target {
+            vec![real]
+        } else {
+            vec![real, target.to_path_buf()]
+        };
         match b.mode {
-            BindMode::ReadOnly => ro.push(p),
-            BindMode::ReadWrite => rw.push(p),
+            BindMode::ReadOnly => ro.extend(paths),
+            BindMode::ReadWrite => rw.extend(paths),
         }
     }
     let masks: Vec<PathBuf> = plan.masks.iter().map(|m| canon(m)).collect();
@@ -379,6 +388,31 @@ mod tests {
         let p = render(&plan_with(std::slice::from_ref(&grant)));
         let rw = &p[p.find(";; read-write").unwrap()..];
         assert!(rw.contains("(subpath \"/Users/dev/other\")"), "{p}");
+    }
+
+    /// Canonicalizing a symlink must not drop the link itself: `readlink` is checked
+    /// against the link's path, which is how the developer shims broke on any Mac
+    /// that had run `xcode-select -s`.
+    #[test]
+    fn a_symlinked_exposure_keeps_the_link_and_its_target() {
+        let plan = plan_with(&[]);
+        let p = profile(
+            &plan,
+            &Network {
+                proxy_port: 1,
+                loopback_ports: &[],
+            },
+            &|p| {
+                if p == Path::new("/usr") {
+                    PathBuf::from("/System/usr-real")
+                } else {
+                    p.to_path_buf()
+                }
+            },
+        );
+        let ro = &p[p.find(";; read-only").unwrap()..];
+        assert!(ro.contains("(subpath \"/System/usr-real\")"), "{p}");
+        assert!(ro.contains("(subpath \"/usr\")"), "{p}");
     }
 
     #[test]
