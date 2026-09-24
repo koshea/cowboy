@@ -57,8 +57,15 @@ impl HostProbe for Host {
     fn canonicalize(&self, path: &Path) -> Option<PathBuf> {
         std::fs::canonicalize(path).ok()
     }
+    // The Mac-specific facts come from the real probe, so these tests see the Xcode
+    // the host actually selected. A probe of its own that left them out passed on a
+    // Mac using the default Xcode and failed on every one that had run
+    // `xcode-select -s` — which is where the bug it hid would have been caught.
+    fn developer_bundle(&self) -> Option<PathBuf> {
+        cowboy_cli::cmd::sandbox::RealHost.developer_bundle()
+    }
     fn darwin_user_temp(&self) -> Option<PathBuf> {
-        Some(std::env::temp_dir())
+        cowboy_cli::cmd::sandbox::RealHost.darwin_user_temp()
     }
 }
 
