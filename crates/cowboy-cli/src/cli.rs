@@ -997,6 +997,13 @@ pub enum ArtifactCommand {
     },
 }
 
+/// `cowboy crew new --preset …`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CrewPreset {
+    /// OpenAI models on a ChatGPT subscription.
+    Chatgpt,
+}
+
 #[derive(Debug, Args)]
 pub struct CrewArgs {
     #[command(subcommand)]
@@ -1030,12 +1037,29 @@ pub enum CrewCommand {
     /// Turn crew mode off: the foreman does everything itself. `cowboy crew use`
     /// turns it back on.
     Solo,
-    /// Add a crew: a copy of `--from`, or tiers derived from your models' prices.
+    /// Add a crew: a copy of `--from`, a built-in `--preset`, or tiers derived
+    /// from your models' prices.
+    #[command(after_help = "\
+Presets:
+  chatgpt   An all-OpenAI crew on your ChatGPT subscription: the newest luna (fast),
+            terra (Codex), sol (workhorse, and the foreman) and astra (frontier) models
+            your account lists. Missing models are imported first.
+
+Examples:
+  cowboy crew new openai --preset chatgpt
+  cowboy crew new premium --from default")]
     New {
         name: String,
         /// Start from this crew's roster.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "preset")]
         from: Option<String>,
+        /// Build it from a preset (see below).
+        #[arg(long, value_enum)]
+        preset: Option<CrewPreset>,
+        /// The provider a preset uses (default: the only one it fits, e.g. the only
+        /// `auth: chatgpt` provider).
+        #[arg(long, requires = "preset")]
+        provider: Option<String>,
     },
     /// Copy a crew under a new name.
     Copy { from: String, to: String },

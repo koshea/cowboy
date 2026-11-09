@@ -136,6 +136,7 @@ every request gets a model, worst case the foreman.
 ```sh
 cowboy crew init                  # write crew.yaml with a `default` crew (tiers from model prices)
 cowboy crew new <name> [--from c] # add a crew: a copy of c, or price tiers
+cowboy crew new openai --preset chatgpt   # the built-in all-OpenAI crew (see How-to)
 cowboy crew copy <from> <to>      # duplicate a crew to tweak it
 cowboy crew rename <from> <to>    # (the active pointer follows)
 cowboy crew remove <name>         # not the active one

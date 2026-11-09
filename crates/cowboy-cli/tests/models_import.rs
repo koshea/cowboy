@@ -116,3 +116,75 @@ async fn refresh_corrects_windows_and_keeps_user_settings() {
         .success()
         .stdout(predicate::str::contains("up to date"));
 }
+
+/// A ChatGPT provider with a signed-in record and the catalogue shape recorded
+/// from a real account.
+async fn chatgpt_home() -> (MockServer, assert_fs::TempDir) {
+    let server = MockServer::start().await;
+    let m = |slug: &str, w: u64| {
+        json!({"slug": slug, "display_name": slug, "visibility": "list",
+        "context_window": w, "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [{"effort": "low"}, {"effort": "medium"}, {"effort": "high"}]})
+    };
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [
+            m("gpt-6.1-sol", 500000), m("gpt-6-astra", 272000), m("gpt-6.1-terra", 500000),
+            m("gpt-6-sol", 272000), m("gpt-6-luna", 272000), m("gpt-5.6-luna", 272000),
+        ]})))
+        .mount(&server)
+        .await;
+    let home = assert_fs::TempDir::new().unwrap();
+    home.child("cowboy/providers.yaml")
+        .write_str(&format!(
+            "version: 1\nproviders:\n  chatgpt:\n    base_url: {}/v1\n    api: responses\n    \
+             auth: chatgpt\n",
+            server.uri()
+        ))
+        .unwrap();
+    let far = cowboy_core::time::now_ms() + 3_600_000;
+    home.child("cowboy/auth/chatgpt.yaml")
+        .write_str(&format!(
+            "client_id: oaiapp_1\naccess_token: tok\nrefresh_token: r\nexpires_at_ms: {far}\n\
+             saved_at_ms: {far}\nscopes: [chatgpt.tokens.use.direct]\n"
+        ))
+        .unwrap();
+    (server, home)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_chatgpt_preset_imports_its_models_and_adds_a_valid_crew() {
+    let (_server, home) = chatgpt_home().await;
+    cowboy(&home)
+        .args(["crew", "new", "openai", "--preset", "chatgpt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "luna chatgpt/gpt-6-luna, terra chatgpt/gpt-6.1-terra, sol chatgpt/gpt-6.1-sol (foreman), astra chatgpt/gpt-6-astra",
+        ));
+    let m = models(&home);
+    assert_eq!(m.models["chatgpt"].len(), 4, "only the four the crew uses");
+    let sol = m
+        .get(&cowboy_core::config::ModelRef::parse("chatgpt/gpt-6.1-sol").unwrap())
+        .unwrap();
+    assert_eq!(sol.context_window, 500_000);
+    let f = cowboy_core::crew::load_file_at(&home.path().join("cowboy/crew.yaml"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        f.active.as_deref(),
+        Some("openai"),
+        "the first crew is active"
+    );
+    assert_eq!(
+        f.crews["openai"].foreman.as_ref().unwrap().to_string(),
+        "chatgpt/gpt-6.1-sol"
+    );
+    cowboy(&home).args(["crew", "validate"]).assert().success();
+    // A second preset crew reuses the configured models instead of importing again.
+    cowboy(&home)
+        .args(["crew", "new", "openai2", "--preset", "chatgpt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("importing").not());
+}

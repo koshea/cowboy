@@ -6,10 +6,15 @@ flow for open-source apps. The provider sits beside any others — a local gatew
 open models, say — so `/model` and the [crew](crew.md) can mix them.
 
 ```sh
-cowboy providers add chatgpt --chatgpt     # writes the provider, then signs in
-cowboy models available                    # your account's models
-cowboy models add gpt-6.1-sol --name chatgpt/gpt-6.1-sol
+cowboy providers add chatgpt --chatgpt     # writes the provider, signs in, then offers
+                                           # to import your models and add an `openai` crew
+cowboy models import chatgpt               # later: your account's models
+cowboy crew new openai --preset chatgpt    # later: the built-in all-OpenAI crew
 ```
+
+The import reads each model's context window and reasoning levels from your
+account's catalogue. The preset crew is described in
+[How-to](../how-to.md#the-built-in-chatgpt-crew).
 
 Then use it like any model: `/model chatgpt/gpt-6.1-sol` in a session, `cowboy models
 use -g chatgpt/gpt-6.1-sol` as the default, a crew slot (`deep: chatgpt/gpt-6.1-sol`),

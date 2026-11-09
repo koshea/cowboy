@@ -138,10 +138,16 @@ serves it.
 
 ```sh
 cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
-cowboy models available                          # every provider's catalogue
-cowboy models add zai/glm-4.7 --name bifrost/glm # or pick from /models in a session
+                                                 # …then offers to import its models
+cowboy models import bifrost --match 'glm*'      # or later: all, a pattern, or a pick list
+cowboy models add zai/glm-4.7 --name bifrost/glm # one model by hand
 cowboy providers                                 # endpoint, API, auth, models per provider
 ```
+
+An import saves each model with the context window the catalogue reports (Bifrost
+and the ChatGPT catalogue report one) and the output cap, reasoning level and prices
+from Cowboy's shipped table. When a gateway changes a model's window, `cowboy models
+refresh` brings yours in line; it shows the diff first and keeps a `.bak`.
 
 `--api responses` is for endpoints that speak the OpenAI Responses API (OpenAI,
 Bifrost, …); leave it off for Chat Completions. `cowboy providers remove <name>`
@@ -152,8 +158,14 @@ refuses while models or crew slots still use the provider. See
 
 ```sh
 cowboy providers add chatgpt --chatgpt           # opens the browser: "Continue with ChatGPT"
-cowboy models available                          # the models your account offers
-cowboy models add gpt-6.1-sol --name chatgpt/gpt-6.1-sol
+```
+
+After you sign in, Cowboy offers to import your account's models and to add an
+`openai` crew built from them (below). Either can be done later:
+
+```sh
+cowboy models import chatgpt                     # the models your account offers
+cowboy crew new openai --preset chatgpt          # the built-in all-OpenAI crew
 ```
 
 Then `/model chatgpt/gpt-6.1-sol` in a session, or `cowboy models use -g
@@ -161,6 +173,17 @@ chatgpt/gpt-6.1-sol`. On a remote machine, forward the callback port first
 (`ssh -L 1455:127.0.0.1:1455 <host>`). `cowboy providers login chatgpt` renews an
 expired sign-in; `cowboy providers logout chatgpt` signs out. Usage limits, tokens
 and what plan usage supports: [ChatGPT sign-in](using/chatgpt.md).
+
+### The built-in ChatGPT crew
+
+`--preset chatgpt` fills a fixed shape with the newest model of each family your
+account lists: **luna** (fast) for small work, **terra** (the Codex model) for the
+middle, **sol** (the workhorse) as the foreman and for larger work, and **astra**
+(frontier) for the hardest. Debugging, e2e and review start a step stronger. It
+picks by family rather than by fixed model ids, so it keeps working when OpenAI
+ships a new generation. When your account lacks a family, the nearest stronger one
+stands in (then the nearest weaker), and Cowboy says so. Models it needs that you
+haven't configured are imported first.
 
 ## Switch between crews
 

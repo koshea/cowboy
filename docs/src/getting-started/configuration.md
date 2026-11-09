@@ -227,6 +227,31 @@ cowboy providers remove bifrost       # refused while models or crew slots still
 
 `cowboy models setup` also adds one, or reuses an existing one, when you add a model.
 
+### Importing models from a catalogue
+
+Rather than writing `models.yaml` by hand, import from a provider's catalogue:
+
+```sh
+cowboy models import <provider>              # asks: all, a pattern, or pick from a list
+cowboy models import <provider> --match 'glm*' --yes
+cowboy models refresh [<provider>]           # update context windows from the catalogue
+```
+
+Each imported model is named `provider/<last part of its id>` (the whole id, with `/`
+turned into `-`, if that name is taken). Image, audio and embedding models are
+skipped, and so are models already configured on that provider. Values come from:
+
+| Field | Source |
+|---|---|
+| `context_window` | the catalogue, when it reports one; else Cowboy's shipped table |
+| `reasoning_effort` | the catalogue's default level, else the shipped table — never a level the catalogue says the model refuses |
+| `max_tokens`, `temperature`, prices | the shipped table (`max_tokens` capped at half the window) |
+
+`refresh` changes only the context window, and the reasoning level when yours is one
+the model refuses. Prices, temperature and output caps are yours and stay. Models a
+catalogue no longer lists are reported, not removed. `providers add`, `models setup`
+and a ChatGPT sign-in all end by offering an import.
+
 ```yaml
 version: 1
 providers:

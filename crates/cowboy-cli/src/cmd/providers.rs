@@ -140,6 +140,7 @@ async fn add_chatgpt(name: &str, base_url: Option<&str>) -> Result<()> {
     crate::ui::ok(&format!("added provider `{name}` (Sign in with ChatGPT)"));
     crate::cmd::providers_login::login(name).await?;
     crate::cmd::models_import::offer(name).await;
+    crate::cmd::crew::offer_chatgpt_crew(name).await;
     Ok(())
 }
 

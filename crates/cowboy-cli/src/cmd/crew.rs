@@ -33,7 +33,13 @@ pub async fn run(command: CrewCommand) -> Result<()> {
         CrewCommand::Validate => validate(),
         CrewCommand::Use { name } => use_crew(&name),
         CrewCommand::Solo => solo(),
-        CrewCommand::New { name, from } => new_crew(&name, from.as_deref()),
+        CrewCommand::New {
+            name,
+            preset: Some(crate::cli::CrewPreset::Chatgpt),
+            provider,
+            ..
+        } => add_chatgpt_crew(&name, provider.as_deref()).await,
+        CrewCommand::New { name, from, .. } => new_crew(&name, from.as_deref()),
         CrewCommand::Copy { from, to } => new_crew(&to, Some(&from)),
         CrewCommand::Rename { from, to } => rename(&from, &to),
         CrewCommand::Remove { name } => remove(&name),
@@ -528,6 +534,143 @@ fn new_crew(name: &str, from: Option<&str>) -> Result<()> {
     }
     println!("  edit it in crew.yaml; try it in a session with /crew {name}");
     Ok(())
+}
+
+/// The only provider that signs in with ChatGPT, or `name` if it is one.
+fn chatgpt_provider(name: Option<&str>) -> Result<String> {
+    use cowboy_core::config::ProviderAuth;
+    let providers = cowboy_core::config::ProvidersConfig::load_global()?;
+    let chat: Vec<&String> = providers
+        .providers
+        .iter()
+        .filter(|(_, p)| p.auth == ProviderAuth::Chatgpt)
+        .map(|(n, _)| n)
+        .collect();
+    match name {
+        Some(n) if chat.iter().any(|c| *c == n) => Ok(n.to_string()),
+        Some(n) => bail!("provider `{n}` does not sign in with ChatGPT"),
+        None => match chat.as_slice() {
+            [one] => Ok((*one).clone()),
+            [] => {
+                bail!("no ChatGPT provider; add one with `cowboy providers add chatgpt --chatgpt`")
+            }
+            many => bail!(
+                "several ChatGPT providers ({}); pick one with --provider",
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    }
+}
+
+/// `crew new <name> --preset chatgpt`: the built-in all-OpenAI crew, filled with
+/// the newest model of each family the account lists. Models it needs that are
+/// not configured yet are imported first.
+pub async fn add_chatgpt_crew(name: &str, provider: Option<&str>) -> Result<()> {
+    use cowboy_core::config::{commit_model_setup_pair, load_model_setup_state, ProvidersConfig};
+    use cowboy_core::crew_presets::{chatgpt_crew, chatgpt_models};
+    let provider = chatgpt_provider(provider)?;
+    let mut f = crew::load_file()?.unwrap_or_default();
+    check_new_name(&f, name)?;
+    let providers = ProvidersConfig::load_global()?;
+    let p = &providers.providers[&provider];
+    let entries = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        cowboy_core::model::list_models(&provider, p),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("`{provider}`'s catalogue did not answer in 20s"))?
+    .with_context(|| format!("reading `{provider}`'s model catalogue"))?;
+    let (ids, notes) = chatgpt_models(&entries).with_context(|| {
+        format!("`{provider}` lists no luna, terra, sol or astra model, so the preset has nothing to use")
+    })?;
+
+    // Make sure each model the crew names is configured.
+    let providers_path = ProvidersConfig::global_path().context("no home config dir")?;
+    let models_path = ModelsConfig::user_path().context("no home config dir")?;
+    let state = load_model_setup_state(&providers_path, &models_path)?;
+    let wanted: Vec<_> = entries
+        .iter()
+        .filter(|e| ids.values().any(|id| *id == e.id))
+        .cloned()
+        .collect();
+    let plan = cowboy_core::model_import::plan_import(&provider, &wanted, &state.models);
+    let mut models = state.models.clone();
+    if !plan.is_empty() {
+        for (r, d) in &plan {
+            println!("  importing {r} ({})", d.model);
+            models.insert(r.clone(), d.clone());
+        }
+        commit_model_setup_pair(
+            &providers_path,
+            &models_path,
+            &state.generation,
+            &state.providers,
+            &models,
+        )?;
+    }
+    let mut refs = BTreeMap::new();
+    for (family, id) in &ids {
+        let r = models
+            .iter()
+            .find(|(r, d)| r.provider == provider && d.model == *id)
+            .map(|(r, _)| r)
+            .with_context(|| format!("{id} is not configured on `{provider}`"))?;
+        refs.insert(*family, r);
+    }
+    let def = chatgpt_crew(&refs);
+    let body = serde_yaml_ng::to_string(&def)?;
+    if f.crews.is_empty() {
+        f.active = Some(name.to_string());
+    }
+    f.crews.insert(name.to_string(), def);
+    crew::save_file(&f, |t| crew_text::append_crew(t, name, &body))?;
+    for n in &notes {
+        println!("  note: {n}");
+    }
+    crate::ui::ok(&format!(
+        "added crew `{name}`: luna {}, terra {}, sol {} (foreman), astra {}",
+        refs["luna"], refs["terra"], refs["sol"], refs["astra"]
+    ));
+    if let Ok(problems) = crew_problems(&f) {
+        for p in problems
+            .iter()
+            .filter(|p| p.contains(&format!("crew `{name}`")))
+        {
+            crate::ui::warn(p);
+        }
+    }
+    println!("  try it with /crew {name}; make it the default with `cowboy crew use {name}`");
+    Ok(())
+}
+
+/// Offer the ChatGPT crew after a ChatGPT sign-in (interactive only; never an
+/// error — the sign-in already succeeded).
+pub async fn offer_chatgpt_crew(provider: &str) {
+    use std::io::IsTerminal;
+    let name = "openai";
+    if crew_names().iter().any(|n| n == name) {
+        return; // already set up; nothing to offer
+    }
+    if !std::io::stdin().is_terminal() {
+        println!("  add an all-OpenAI crew with `cowboy crew new {name} --preset chatgpt`");
+        return;
+    }
+    match crate::prompt::confirm(
+        &format!("Add an `{name}` crew made of your ChatGPT models?"),
+        true,
+    ) {
+        Ok(true) => {
+            if let Err(e) = add_chatgpt_crew(name, Some(provider)).await {
+                crate::ui::warn(&format!(
+                    "could not add the crew ({e:#}); retry with `cowboy crew new {name} --preset chatgpt`"
+                ));
+            }
+        }
+        _ => println!("  later: `cowboy crew new {name} --preset chatgpt`"),
+    }
 }
 
 fn rename(from: &str, to: &str) -> Result<()> {

@@ -153,12 +153,25 @@ List the crews, then show a crew's routing matrix (category × effort → model)
 
 ### `cowboy crew new`
 
-Add a crew: a copy of `--from`, or tiers derived from your models' prices
+Add a crew: a copy of `--from`, a built-in `--preset`, or tiers derived from your models' prices
 
 | Arg | Description |
 |-----|-------------|
 | `<NAME>` |  |
 | `--from` | Start from this crew's roster |
+| `--preset` | Build it from a preset (see below) |
+| `--provider` | The provider a preset uses (default: the only one it fits, e.g. the only `auth: chatgpt` provider) |
+
+```text
+Presets:
+  chatgpt   An all-OpenAI crew on your ChatGPT subscription: the newest luna (fast),
+            terra (Codex), sol (workhorse, and the foreman) and astra (frontier) models
+            your account lists. Missing models are imported first.
+
+Examples:
+  cowboy crew new openai --preset chatgpt
+  cowboy crew new premium --from default
+```
 
 
 ### `cowboy crew recommend`
