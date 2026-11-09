@@ -203,7 +203,10 @@ fn apply_seccomp(req: &ShimRequest) -> Result<()> {
     for name in &req.deny_syscalls {
         match syscall_number(name) {
             // An empty rule vec means "match this syscall unconditionally".
-            Some(nr) => rules.push((nr, vec![])),
+            Some(Syscall::Number(nr)) => rules.push((nr, vec![])),
+            // The syscall does not exist on this architecture (e.g. `uselib` on aarch64),
+            // so the kernel already refuses it and there is no number to filter.
+            Some(Syscall::AbsentOnArch) => {}
             // An unknown name is a bug in our own table, not user input. Fail
             // rather than silently enforcing less than the plan describes.
             None => bail!(
@@ -272,13 +275,26 @@ fn target_arch() -> seccompiler::TargetArch {
     compile_error!("the sandbox seccomp filter needs a syscall table for this architecture");
 }
 
+/// How a named syscall resolves on the target architecture.
+#[derive(Debug, PartialEq, Eq)]
+enum Syscall {
+    /// Syscall number on this architecture.
+    Number(i64),
+    /// The syscall does not exist in this architecture's ABI at all (for example,
+    /// `uselib` is x86_64/32-bit legacy and was omitted when the generic/aarch64
+    /// syscall table was created). There is no number to block because the kernel
+    /// has no entry for it.
+    #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+    AbsentOnArch,
+}
+
 /// Syscall name to number.
 ///
 /// Hand-maintained rather than pulled from `libseccomp`, to avoid a C dependency.
 /// The numbers were taken from this machine's `asm/unistd_64.h`, not from memory.
 /// `libc::SYS_*` is used wherever the constant exists so the values are checked by
 /// the libc crate rather than by us.
-fn syscall_number(name: &str) -> Option<i64> {
+fn syscall_number(name: &str) -> Option<Syscall> {
     let nr = match name {
         // io_uring: the reason the deny-list exists at all. Operations are
         // submitted as ring entries, not syscalls, so IORING_OP_CONNECT and
@@ -308,7 +324,10 @@ fn syscall_number(name: &str) -> Option<i64> {
         "clock_adjtime" => libc::SYS_clock_adjtime,
         "adjtimex" => libc::SYS_adjtimex,
         // Legacy or rarely-used interfaces with a poor security record.
+        #[cfg(target_arch = "x86_64")]
         "uselib" => libc::SYS_uselib,
+        #[cfg(target_arch = "aarch64")]
+        "uselib" => return Some(Syscall::AbsentOnArch),
         "userfaultfd" => libc::SYS_userfaultfd,
         "personality" => libc::SYS_personality,
         // Process inspection. yama ptrace_scope=1 already limits ptrace to
@@ -319,7 +338,7 @@ fn syscall_number(name: &str) -> Option<i64> {
         "process_vm_writev" => libc::SYS_process_vm_writev,
         _ => return None,
     };
-    Some(nr)
+    Some(Syscall::Number(nr))
 }
 
 #[cfg(test)]
@@ -380,7 +399,11 @@ mod tests {
             ("ptrace", 101),
             ("userfaultfd", 323),
         ] {
-            assert_eq!(syscall_number(name), Some(expected), "{name}");
+            assert_eq!(
+                syscall_number(name),
+                Some(Syscall::Number(expected)),
+                "{name}"
+            );
         }
     }
 
