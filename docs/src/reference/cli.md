@@ -523,6 +523,25 @@ List models offered by the configured provider endpoints (chat models only unles
 | `--all` | Include non-chat models (image/audio/embedding/etc) |
 
 
+### `cowboy models import`
+
+Save models from a provider's catalogue to your home models.yaml, with the context window and reasoning level the catalogue reports and output caps and prices from Cowboy's shipped table. Skips non-chat models and ones already configured on that provider
+
+| Arg | Description |
+|-----|-------------|
+| `<PROVIDER>` | The provider whose catalogue to read |
+| `--match` | Only ids matching this pattern (case-insensitive; `*` matches anything) |
+| `--all` | Every new chat model, without asking which |
+| `--yes` | Save without confirming |
+
+```text
+Examples:
+  cowboy models import bifrost                 # asks: all, a pattern, or pick from a list
+  cowboy models import bifrost --match 'glm*'  # `*` is a wildcard; otherwise a substring
+  cowboy models import chatgpt --all --yes
+```
+
+
 ### `cowboy models list`
 
 List configured providers and models, and the effective default
@@ -535,6 +554,16 @@ Convert models.yaml (home and this project) and crew.yaml from bare model names 
 | Arg | Description |
 |-----|-------------|
 | `--yes` | Rewrite without asking |
+
+
+### `cowboy models refresh`
+
+Update configured models from their providers' catalogues: the context window, and the reasoning level when yours is one the model refuses. Prices, temperature and output caps are left alone. Shows a diff; keeps a `.bak`
+
+| Arg | Description |
+|-----|-------------|
+| `<PROVIDER>` | Only this provider's models |
+| `--yes` | Save without confirming |
 
 
 ### `cowboy models setup`

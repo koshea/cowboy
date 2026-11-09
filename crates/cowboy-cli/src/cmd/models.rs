@@ -28,6 +28,21 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
         None | Some(ModelsCommand::List) => list(),
         Some(ModelsCommand::Setup) => setup().await,
         Some(ModelsCommand::Migrate { yes }) => crate::cmd::models_migrate::run(yes),
+        Some(ModelsCommand::Import {
+            provider,
+            pattern,
+            all,
+            yes,
+        }) => crate::cmd::models_import::import(
+            &provider,
+            crate::cmd::models_import::Select::from_flags(pattern, all),
+            yes,
+        )
+        .await
+        .map(|_| ()),
+        Some(ModelsCommand::Refresh { provider, yes }) => {
+            crate::cmd::models_import::refresh(provider.as_deref(), yes).await
+        }
         Some(ModelsCommand::Use { name, global }) => use_default(&name, global),
         Some(ModelsCommand::Available { all }) => available(all).await,
         Some(ModelsCommand::Add {
@@ -173,6 +188,7 @@ async fn setup() -> Result<()> {
     ));
     println!("  credentials: {} (mode 0600)", providers_path.display());
     println!("  models: {}", models_path.display());
+    crate::cmd::models_import::offer(&provider_name).await;
     println!("\n{}", style::success("Done — you can run `cowboy` now."));
     println!("  review it with `cowboy models`, or verify the host with `cowboy doctor`");
     Ok(())

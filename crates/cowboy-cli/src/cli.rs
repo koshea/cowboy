@@ -735,6 +735,38 @@ are never overwritten; repair them first. Advanced tuning is optional.")]
         #[arg(long)]
         yes: bool,
     },
+    /// Save models from a provider's catalogue to your home models.yaml, with the
+    /// context window and reasoning level the catalogue reports and output caps and
+    /// prices from Cowboy's shipped table. Skips non-chat models and ones already
+    /// configured on that provider.
+    #[command(after_help = "\
+Examples:
+  cowboy models import bifrost                 # asks: all, a pattern, or pick from a list
+  cowboy models import bifrost --match 'glm*'  # `*` is a wildcard; otherwise a substring
+  cowboy models import chatgpt --all --yes")]
+    Import {
+        /// The provider whose catalogue to read.
+        provider: String,
+        /// Only ids matching this pattern (case-insensitive; `*` matches anything).
+        #[arg(long = "match", value_name = "PATTERN")]
+        pattern: Option<String>,
+        /// Every new chat model, without asking which.
+        #[arg(long)]
+        all: bool,
+        /// Save without confirming.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Update configured models from their providers' catalogues: the context
+    /// window, and the reasoning level when yours is one the model refuses. Prices,
+    /// temperature and output caps are left alone. Shows a diff; keeps a `.bak`.
+    Refresh {
+        /// Only this provider's models.
+        provider: Option<String>,
+        /// Save without confirming.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Set the default model. Writes to the project unless `--global`.
     Use {
         /// The model to make default, as `provider/name`.

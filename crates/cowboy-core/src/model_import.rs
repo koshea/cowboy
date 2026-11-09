@@ -90,7 +90,9 @@ pub fn plan_import(
     let configured: BTreeSet<&str> = group
         .map(|g| g.values().map(|d| d.model.as_str()).collect())
         .unwrap_or_default();
-    let mut taken: BTreeSet<String> = group.map(|g| g.keys().cloned().collect()).unwrap_or_default();
+    let mut taken: BTreeSet<String> = group
+        .map(|g| g.keys().cloned().collect())
+        .unwrap_or_default();
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for e in entries {
@@ -177,7 +179,9 @@ pub fn refresh(
                 model: r.clone(),
                 field: "reasoning_effort",
                 from: cur.as_str().to_string(),
-                to: to.map(|t| t.as_str().to_string()).unwrap_or_else(|| "none".into()),
+                to: to
+                    .map(|t| t.as_str().to_string())
+                    .unwrap_or_else(|| "none".into()),
             });
             def.reasoning_effort = to;
         }
@@ -200,7 +204,12 @@ mod tests {
 
     #[test]
     fn the_catalogue_wins_where_it_speaks() {
-        let e = chatgpt("gpt-6.1-sol", 500_000, "low", &["low", "medium", "high", "xhigh"]);
+        let e = chatgpt(
+            "gpt-6.1-sol",
+            500_000,
+            "low",
+            &["low", "medium", "high", "xhigh"],
+        );
         let d = def_from_entry(&e);
         assert_eq!(d.context_window, 500_000);
         assert_eq!(d.reasoning_effort, Some(ReasoningEffort::Low));
@@ -219,7 +228,10 @@ mod tests {
         // The catalogue's default is above Cowboy's range: mapped to high.
         let e = chatgpt("x", 1000, "xhigh", &["low", "xhigh"]);
         // `high` itself is not listed, so the lowest accepted level is used.
-        assert_eq!(def_from_entry(&e).reasoning_effort, Some(ReasoningEffort::Low));
+        assert_eq!(
+            def_from_entry(&e).reasoning_effort,
+            Some(ReasoningEffort::Low)
+        );
         assert_eq!(map_reasoning("ultra"), Some(ReasoningEffort::High));
         assert_eq!(map_reasoning("none"), None);
     }
@@ -236,11 +248,11 @@ mod tests {
         let glm: ModelDef = serde_yaml_ng::from_str("model: fireworks/glm-5p3\n").unwrap();
         existing.insert(ModelRef::parse("bifrost/glm-5p3").unwrap(), glm);
         let entries = [
-            ModelEntry::bare("fireworks/glm-5p3"),         // configured: skipped
-            ModelEntry::bare("cerebras/zai-glm-4.7"),     // new
-            ModelEntry::bare("other/glm-5p3"),            // name taken: full id
-            ModelEntry::bare("openai/text-embedding-3"),  // not chat
-            ModelEntry::bare("cerebras/zai-glm-4.7"),     // duplicate
+            ModelEntry::bare("fireworks/glm-5p3"),    // configured: skipped
+            ModelEntry::bare("cerebras/zai-glm-4.7"), // new
+            ModelEntry::bare("other/glm-5p3"),        // name taken: full id
+            ModelEntry::bare("openai/text-embedding-3"), // not chat
+            ModelEntry::bare("cerebras/zai-glm-4.7"), // duplicate
         ];
         let plan = plan_import("bifrost", &entries, &existing);
         let names: Vec<String> = plan.iter().map(|(r, _)| r.to_string()).collect();
@@ -262,10 +274,17 @@ mod tests {
 
         let (changes, missing) = refresh("chatgpt", &entries, &mut cfg);
         let fields: Vec<_> = changes.iter().map(|c| (c.field, c.to.as_str())).collect();
-        assert_eq!(fields, [("context_window", "500000"), ("reasoning_effort", "low")]);
+        assert_eq!(
+            fields,
+            [("context_window", "500000"), ("reasoning_effort", "low")]
+        );
         assert_eq!(missing, [ModelRef::parse("chatgpt/old").unwrap()]);
         let sol = cfg.get(&ModelRef::parse("chatgpt/sol").unwrap()).unwrap();
-        assert_eq!((sol.max_tokens, sol.temperature), (8192, 0.7), "user settings kept");
+        assert_eq!(
+            (sol.max_tokens, sol.temperature),
+            (8192, 0.7),
+            "user settings kept"
+        );
         // Up to date: nothing to do.
         assert!(refresh("chatgpt", &entries, &mut cfg).0.is_empty());
     }

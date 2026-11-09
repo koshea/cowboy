@@ -2025,6 +2025,7 @@ mod tests {
         // The only client lives on a plain OS thread with its own runtime, so nothing
         // about the reply path can borrow the server runtime's single worker.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let sock2 = sock.clone();
         let replier = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2046,6 +2047,10 @@ mod tests {
                             },
                         )
                         .await;
+                        // Keep the socket open until `ask_user` returns so the server's
+                        // single worker processes `AskReply` rather than racing EOF on a
+                        // busy host.
+                        let _ = done_rx.recv();
                         return;
                     }
                 }
@@ -2059,6 +2064,7 @@ mod tests {
             "yes",
             "the reply task must still be schedulable while the loop blocks"
         );
+        let _ = done_tx.send(());
         replier.join().unwrap();
     }
 

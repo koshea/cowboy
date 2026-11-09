@@ -70,4 +70,5 @@ insta.workspace = true
 tokio.workspace = true
 libc.workspace = true
 tokio-tungstenite.workspace = true  # WS client for `cowboy web` bridge tests
+wiremock.workspace = true   # provider catalogues for `models import`/`refresh`
 futures.workspace = true

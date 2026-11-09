@@ -31,7 +31,11 @@ pub async fn run(args: ProvidersArgs) -> Result<()> {
             api,
             no_key,
             ..
-        }) => add(&name, base_url.as_deref().unwrap_or_default(), api, no_key),
+        }) => {
+            add(&name, base_url.as_deref().unwrap_or_default(), api, no_key)?;
+            crate::cmd::models_import::offer(&name).await;
+            Ok(())
+        }
         Some(ProvidersCommand::Login { name }) => crate::cmd::providers_login::login(&name).await,
         Some(ProvidersCommand::Logout { name }) => crate::cmd::providers_login::logout(&name).await,
         Some(ProvidersCommand::Remove { name, force }) => remove(&name, force),
@@ -134,7 +138,9 @@ async fn add_chatgpt(name: &str, base_url: Option<&str>) -> Result<()> {
     };
     insert_provider(name, provider)?;
     crate::ui::ok(&format!("added provider `{name}` (Sign in with ChatGPT)"));
-    crate::cmd::providers_login::login(name).await
+    crate::cmd::providers_login::login(name).await?;
+    crate::cmd::models_import::offer(name).await;
+    Ok(())
 }
 
 fn add(name: &str, base_url: &str, api: WireApiArg, no_key: bool) -> Result<()> {
@@ -155,8 +161,10 @@ fn add(name: &str, base_url: &str, api: WireApiArg, no_key: bool) -> Result<()> 
     };
     insert_provider(name, provider)?;
     crate::ui::ok(&format!("added provider `{name}`"));
-    println!("  add a model with `cowboy models add <model-id> --name {name}/<name>`,");
-    println!("  or pick one from its catalogue with /models in a session");
+    println!(
+        "  models: `cowboy models import {name}`, `cowboy models add <id> --name {name}/<name>`,"
+    );
+    println!("  or /models in a session");
     Ok(())
 }
 
