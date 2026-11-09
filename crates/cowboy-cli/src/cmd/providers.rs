@@ -22,9 +22,18 @@ pub async fn run(args: ProvidersArgs) -> Result<()> {
         Some(ProvidersCommand::Add {
             name,
             base_url,
+            chatgpt: true,
+            ..
+        }) => add_chatgpt(&name, base_url.as_deref()).await,
+        Some(ProvidersCommand::Add {
+            name,
+            base_url,
             api,
             no_key,
-        }) => add(&name, &base_url, api, no_key),
+            ..
+        }) => add(&name, base_url.as_deref().unwrap_or_default(), api, no_key),
+        Some(ProvidersCommand::Login { name }) => crate::cmd::providers_login::login(&name).await,
+        Some(ProvidersCommand::Logout { name }) => crate::cmd::providers_login::logout(&name).await,
         Some(ProvidersCommand::Remove { name, force }) => remove(&name, force),
     }
 }
@@ -83,12 +92,49 @@ fn list() -> Result<()> {
 }
 
 /// How a provider authenticates, without ever printing a secret.
-pub(crate) fn auth_summary(_name: &str, p: &Provider) -> String {
+pub(crate) fn auth_summary(name: &str, p: &Provider) -> String {
+    use crate::cmd::providers_login::{sign_in_status, SignIn};
     match p.auth {
         ProviderAuth::ApiKey if p.api_key.is_empty() => "none (keyless)".into(),
         ProviderAuth::ApiKey => "api key (set)".into(),
-        ProviderAuth::Chatgpt => "Sign in with ChatGPT".into(),
+        ProviderAuth::Chatgpt => match sign_in_status(name) {
+            SignIn::Ready(who) => format!(
+                "Sign in with ChatGPT — signed in as {}, plan usage enabled",
+                who.as_deref().unwrap_or("your account")
+            ),
+            SignIn::NoPlanUsage(who) => format!(
+                "Sign in with ChatGPT — signed in as {}, plan usage NOT granted \
+                 (`cowboy providers login {name}`)",
+                who.as_deref().unwrap_or("your account")
+            ),
+            SignIn::None => {
+                format!("Sign in with ChatGPT — not signed in (`cowboy providers login {name}`)")
+            }
+            SignIn::Unreadable(e) => {
+                format!("Sign in with ChatGPT — sign-in record unreadable: {e}")
+            }
+        },
     }
+}
+
+/// `providers add <name> --chatgpt`: the provider entry, then the sign-in. The
+/// entry is written first so a sign-in that fails can simply be retried with
+/// `providers login`.
+async fn add_chatgpt(name: &str, base_url: Option<&str>) -> Result<()> {
+    if !valid_ref_part(name) {
+        bail!("provider name {name:?} must be non-empty with no `/` (models are `{name}/<model>`)");
+    }
+    let provider = Provider {
+        api: WireApi::Responses,
+        auth: ProviderAuth::Chatgpt,
+        ..Provider::api_key(
+            base_url.unwrap_or(cowboy_core::oauth::chatgpt::RESOURCE),
+            String::new(),
+        )
+    };
+    insert_provider(name, provider)?;
+    crate::ui::ok(&format!("added provider `{name}` (Sign in with ChatGPT)"));
+    crate::cmd::providers_login::login(name).await
 }
 
 fn add(name: &str, base_url: &str, api: WireApiArg, no_key: bool) -> Result<()> {

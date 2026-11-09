@@ -23,6 +23,7 @@ pub mod models_migrate;
 pub mod patch;
 pub mod proc;
 pub mod providers;
+pub mod providers_login;
 pub mod ranch;
 pub mod review;
 pub mod run;

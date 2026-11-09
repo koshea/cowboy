@@ -597,12 +597,13 @@ Keys are prompted for without echo and stored only in ~/.config/cowboy/providers
 
 ### `cowboy providers add`
 
-Add a provider. Asks for its API key without echo unless `--no-key`
+Add a provider. Asks for its API key without echo unless `--no-key`; with `--chatgpt`, signs in with your ChatGPT account instead
 
 | Arg | Description |
 |-----|-------------|
 | `<NAME>` | Its name — the `provider` half of `provider/name`. No `/` |
-| `--base-url` | Endpoint base URL, e.g. `http://localhost:8080/v1` (supports `${VAR}`) |
+| `--base-url` | Endpoint base URL, e.g. `http://localhost:8080/v1` (supports `${VAR}`). Required unless `--chatgpt` |
+| `--chatgpt` | Use your ChatGPT subscription for OpenAI models: the OpenAI Responses API, authenticated by Sign in with ChatGPT (opens your browser) |
 | `--api` | Which API the endpoint speaks |
 | `--no-key` | The endpoint needs no key (a local gateway) |
 
@@ -610,6 +611,30 @@ Add a provider. Asks for its API key without echo unless `--no-key`
 ### `cowboy providers list`
 
 List providers: endpoint, wire API, auth, and how many models use each
+
+
+### `cowboy providers login`
+
+Sign in with ChatGPT for an `auth: chatgpt` provider ("Continue with ChatGPT" in your browser). Also renews an expired sign-in, and re-asks for plan-usage consent if it was declined
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+```text
+The browser returns to http://127.0.0.1:1455/auth/callback (or 1457, or another free
+port). On a remote machine, forward that port first: ssh -L 1455:127.0.0.1:1455 host.
+Tokens are kept in ~/.config/cowboy/auth/<name>.yaml (mode 0600), host-side only.
+```
+
+
+### `cowboy providers logout`
+
+Sign out of a ChatGPT provider: revoke the session and delete its tokens. The registration is kept, so the next login skips the consent screen
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
 
 
 ### `cowboy providers remove`

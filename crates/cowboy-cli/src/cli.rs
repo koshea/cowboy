@@ -675,13 +675,19 @@ pub enum WireApiArg {
 pub enum ProvidersCommand {
     /// List providers: endpoint, wire API, auth, and how many models use each.
     List,
-    /// Add a provider. Asks for its API key without echo unless `--no-key`.
+    /// Add a provider. Asks for its API key without echo unless `--no-key`; with
+    /// `--chatgpt`, signs in with your ChatGPT account instead.
     Add {
         /// Its name — the `provider` half of `provider/name`. No `/`.
         name: String,
         /// Endpoint base URL, e.g. `http://localhost:8080/v1` (supports `${VAR}`).
-        #[arg(long, value_name = "URL")]
-        base_url: String,
+        /// Required unless `--chatgpt`.
+        #[arg(long, value_name = "URL", required_unless_present = "chatgpt")]
+        base_url: Option<String>,
+        /// Use your ChatGPT subscription for OpenAI models: the OpenAI Responses
+        /// API, authenticated by Sign in with ChatGPT (opens your browser).
+        #[arg(long, conflicts_with_all = ["api", "no_key"])]
+        chatgpt: bool,
         /// Which API the endpoint speaks.
         #[arg(long, value_enum, default_value = "chat-completions")]
         api: WireApiArg,
@@ -689,6 +695,17 @@ pub enum ProvidersCommand {
         #[arg(long)]
         no_key: bool,
     },
+    /// Sign in with ChatGPT for an `auth: chatgpt` provider ("Continue with
+    /// ChatGPT" in your browser). Also renews an expired sign-in, and re-asks for
+    /// plan-usage consent if it was declined.
+    #[command(after_help = "\
+The browser returns to http://127.0.0.1:1455/auth/callback (or 1457, or another free
+port). On a remote machine, forward that port first: ssh -L 1455:127.0.0.1:1455 host.
+Tokens are kept in ~/.config/cowboy/auth/<name>.yaml (mode 0600), host-side only.")]
+    Login { name: String },
+    /// Sign out of a ChatGPT provider: revoke the session and delete its tokens.
+    /// The registration is kept, so the next login skips the consent screen.
+    Logout { name: String },
     /// Remove a provider. Refused while models or crew slots still use it, unless
     /// `--force` (which also removes its models from your home models.yaml).
     Remove {

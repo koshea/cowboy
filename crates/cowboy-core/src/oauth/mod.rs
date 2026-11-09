@@ -6,6 +6,7 @@
 //! host-side worker that makes model requests.
 
 pub mod chatgpt;
+pub mod login;
 
 use std::path::PathBuf;
 

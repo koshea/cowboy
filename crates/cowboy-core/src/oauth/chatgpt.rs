@@ -162,6 +162,16 @@ pub struct TokenResponse {
     pub earliest_refresh_at: Option<serde_json::Value>,
 }
 
+/// Never print a token.
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
 /// `earliest_refresh_at` as epoch ms: seconds, milliseconds, or an RFC 3339 string.
 fn timestamp_ms(v: &serde_json::Value) -> Option<u64> {
     match v {

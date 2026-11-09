@@ -60,6 +60,9 @@ async-openai = { version = "0.41", features = ["chat-completion"] }
 tiktoken-rs = "0.12"
 sha2 = "0.10"          # CSP hashes for the web UI's trunk-injected loader
 base64 = "0.22"
+# Sign in with ChatGPT: verify the ID token against OpenAI's JWKS. aws-lc-rs is
+# already in the tree (rustls); `use_pem` only for test keys.
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13", features = ["form"] }  # match async-openai's reqwest so the Client type unifies; `form` for OAuth token requests
 
 # MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess

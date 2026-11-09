@@ -175,3 +175,73 @@ fn forced_removal_prunes_its_home_models_and_default() {
     home.child("cowboy/models.yaml")
         .assert(predicate::str::contains("sonnet").not());
 }
+
+fn seed_chatgpt(home: &assert_fs::TempDir) {
+    home.child("cowboy/providers.yaml")
+        .write_str(
+            "version: 1\nproviders:\n  chatgpt:\n    base_url: https://api.openai.com/v1\n    \
+             api: responses\n    auth: chatgpt\n",
+        )
+        .unwrap();
+    home.child("cowboy/crew.yaml")
+        .write_str("version: 1\ncrew:\n  general: chatgpt/gpt\n")
+        .unwrap();
+    home.child("cowboy/models.yaml")
+        .write_str("default: chatgpt/gpt\nmodels:\n  chatgpt:\n    gpt:\n      model: gpt-6\n")
+        .unwrap();
+}
+
+#[test]
+fn a_chatgpt_provider_reports_its_sign_in_state() {
+    let (home, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    seed_chatgpt(&home);
+    cowboy(&home, &proj)
+        .args(["providers", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("not signed in"))
+        .stdout(predicate::str::contains("cowboy providers login chatgpt"));
+    // A roster routed there is flagged before any subagent is sent to it.
+    cowboy(&home, &proj)
+        .args(["crew", "validate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("is not signed in"));
+
+    // Signed in, with plan usage.
+    home.child("cowboy/auth/chatgpt.yaml")
+        .write_str(
+            "client_id: oaiapp_1\nemail: u@example.com\naccess_token: a\nrefresh_token: r\n\
+             expires_at_ms: 1\nscopes: [openid, chatgpt.tokens.use.direct]\n",
+        )
+        .unwrap();
+    cowboy(&home, &proj)
+        .args(["providers", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "signed in as u@example.com, plan usage enabled",
+        ))
+        .stdout(predicate::str::contains("a\n").not());
+    cowboy(&home, &proj)
+        .args(["crew", "validate"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn login_refuses_a_provider_that_is_not_chatgpt() {
+    let (home, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    seed(&home);
+    cowboy(&home, &proj)
+        .args(["providers", "login", "litellm"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("does not sign in with ChatGPT"));
+}

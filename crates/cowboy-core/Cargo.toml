@@ -23,6 +23,9 @@ tiktoken-rs.workspace = true
 reqwest.workspace = true
 libc.workspace = true
 uuid.workspace = true      # the OAuth agent-host id (`urn:uuid:…`)
+sha2.workspace = true      # PKCE S256
+base64.workspace = true
+jsonwebtoken.workspace = true
 
 [dev-dependencies]
 insta.workspace = true

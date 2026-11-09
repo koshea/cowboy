@@ -344,8 +344,21 @@ pub fn provider_problems(
 }
 
 /// Why a configured provider cannot authenticate right now, if it cannot.
-fn sign_in_problem(_name: &str, _provider: &cowboy_core::config::Provider) -> Option<String> {
-    None
+fn sign_in_problem(name: &str, provider: &cowboy_core::config::Provider) -> Option<String> {
+    use crate::cmd::providers_login::{sign_in_status, SignIn};
+    if provider.auth != cowboy_core::config::ProviderAuth::Chatgpt {
+        return None;
+    }
+    match sign_in_status(name) {
+        SignIn::Ready(_) => None,
+        SignIn::NoPlanUsage(_) => Some(format!(
+            "is signed in without ChatGPT plan usage (`cowboy providers login {name}`)"
+        )),
+        SignIn::None => Some(format!(
+            "is not signed in (`cowboy providers login {name}`)"
+        )),
+        SignIn::Unreadable(e) => Some(format!("has an unreadable sign-in record: {e}")),
+    }
 }
 
 fn usage() -> Result<()> {

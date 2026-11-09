@@ -1,0 +1,5 @@
+---
+source: crates/cowboy-core/tests/chatgpt_login.rs
+expression: url
+---
+https://auth.openai.com/api/accounts/authorize?response_type=code&client_id=dynamic_agent_client&redirect_uri=http%3A%2F%2F127.0.0.1%3A1455%2Fauth%2Fcallback&scope=openid+profile+email+offline_access+resource.invoke+chatgpt.tokens.use.direct&resource=https%3A%2F%2Fapi.openai.com%2Fv1&state=STATE&nonce=NONCE&code_challenge_method=S256&code_challenge=1ZFbuK0Ne3hHlkq-Nt4Np5yVyQYUggOSAX6XvIwOabI&ext_agent_host_id=urn%3Auuid%3Ahost&agent_name_hint=Cowboy
