@@ -54,10 +54,11 @@ impl ChatGptFailures {
         let p = &self.provider;
         Some(match code {
             "subscription_sharing_usage_limit_exceeded" => Error::Model(format!(
-                "ChatGPT plan usage limit reached for provider `{p}` ({code}). Requests on your \
-                 plan are paused until it resets — see ChatGPT → Settings → Usage. On Plus, the \
-                 five-hour limit is shared with every app using your plan. Other providers \
-                 keep working."
+                "ChatGPT plan usage limit reached for provider `{p}` ({code}). Either your \
+                 plan's limit (shared with Codex and every app using your plan) or Cowboy's own \
+                 app limit is used up — see ChatGPT → Settings → Usage for which, and when it \
+                 resets. Credits are not used unless you have allowed apps to use credits \
+                 there (and Cowboy's app limit is 100%). Other providers keep working."
             )),
             "subscription_sharing_user_not_eligible" => Error::Model(format!(
                 "ChatGPT plan usage is not available for this account, workspace or policy \

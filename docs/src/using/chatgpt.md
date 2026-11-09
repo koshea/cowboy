@@ -104,9 +104,17 @@ Plan usage is a preview with these limits, which Cowboy applies for you:
 Plan usage errors stop the request. OpenAI never silently bills another way.
 
 - **Usage limit reached**: Cowboy does not retry. Check ChatGPT → Settings → Usage.
-  On Plus, the five-hour limit is shared across every app that uses your plan,
-  including other open-source clients. Your other providers keep working, so `/model`
-  to one of them, or let the crew route around it.
+  The plan limits there (five-hour on Plus, and weekly) are shared with Codex and
+  every app that uses your plan, so Codex use counts against Cowboy too. The
+  percentage next to Cowboy under *App limits* is a **cap**, not usage left: 100%
+  means Cowboy may use all of what remains.
+- **Credits are opt-in.** Once the plan limit is used up, an app draws on your
+  ChatGPT credits only if you have allowed apps to use credits in Settings → Usage
+  (that switch is separate from buying credits or automatic reload, and Cowboy's app
+  limit must be 100%). Codex itself uses credits without that switch, which is why a
+  tool signed in through Codex's own login can keep working when Cowboy can't.
+- In either case your other providers keep working, so `/model` to one of them, or
+  switch to a crew that doesn't use ChatGPT.
 - **Temporarily unavailable**: Cowboy retries with backoff and keeps your sign-in.
 - **Not eligible, unsupported request, or wrong route**: reported with OpenAI's
   error code and request id, and not retried.
