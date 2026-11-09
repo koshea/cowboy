@@ -253,7 +253,10 @@ async fn the_account_catalogue_keeps_listed_models_in_server_order() {
         .and(path("/v1/models"))
         .and(header("authorization", "Bearer tok"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"models": [
-            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list"},
+            {"slug": "gpt-6.1-sol", "display_name": "GPT-6.1 Sol", "visibility": "list",
+             "context_window": 500000, "default_reasoning_level": "low", "priority": 1,
+             "description": "Latest workhorse model.",
+             "supported_reasoning_levels": [{"effort": "low"}, {"effort": "xhigh"}]},
             {"slug": "internal-x", "display_name": "X", "visibility": "hide"},
             {"slug": "gpt-6-luna", "display_name": "GPT-6 Luna", "visibility": "list"},
         ]})))

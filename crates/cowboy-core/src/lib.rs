@@ -16,6 +16,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod model_defaults;
+pub mod model_import;
 pub mod models_migrate;
 pub mod oauth;
 pub mod policy;

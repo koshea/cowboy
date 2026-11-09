@@ -455,6 +455,33 @@ pub struct ModelEntry {
     pub owned_by: String,
     /// A display name, when the catalogue offers one (the ChatGPT catalogue does).
     pub label: Option<String>,
+    /// The context window the endpoint serves the model with, when it says so
+    /// (Bifrost and the ChatGPT catalogue do; plain OpenAI-shape lists don't).
+    pub context_window: Option<u32>,
+    /// The reasoning level the catalogue recommends, as it spells it.
+    pub default_reasoning: Option<String>,
+    /// Every reasoning level the model accepts, as the catalogue spells them;
+    /// empty when the catalogue doesn't say.
+    pub supported_reasoning: Vec<String>,
+    pub description: Option<String>,
+    /// The catalogue's own ordering hint (lower first), when it has one.
+    pub priority: Option<i64>,
+}
+
+impl ModelEntry {
+    /// An entry with only an id (what most catalogues give).
+    pub fn bare(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            owned_by: String::new(),
+            label: None,
+            context_window: None,
+            default_reasoning: None,
+            supported_reasoning: Vec::new(),
+            description: None,
+            priority: None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -467,6 +494,10 @@ struct ModelEntryWire {
     id: String,
     #[serde(default)]
     owned_by: String,
+    /// Non-standard but common: Bifrost sends `context_window`; OpenRouter-style
+    /// lists send `context_length`.
+    #[serde(default, alias = "context_length")]
+    context_window: Option<u64>,
 }
 
 /// List a provider's available models via `GET {base_url}/models`. Reused by the
@@ -503,6 +534,25 @@ struct ChatGptModel {
     display_name: Option<String>,
     #[serde(default)]
     visibility: Option<String>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    default_reasoning_level: Option<String>,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<ReasoningLevel>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+}
+#[derive(Deserialize)]
+struct ReasoningLevel {
+    effort: String,
+}
+
+fn window(n: Option<u64>) -> Option<u32> {
+    n.filter(|n| *n > 0)
+        .map(|n| n.min(u64::from(u32::MAX)) as u32)
 }
 
 /// The signed-in account's own catalogue: `GET {base_url}/models` with the OAuth
@@ -541,6 +591,15 @@ pub async fn list_chatgpt_models(
             id: m.slug,
             owned_by: "openai".into(),
             label: m.display_name,
+            context_window: window(m.context_window),
+            default_reasoning: m.default_reasoning_level,
+            supported_reasoning: m
+                .supported_reasoning_levels
+                .into_iter()
+                .map(|l| l.effort)
+                .collect(),
+            description: m.description,
+            priority: m.priority,
         })
         .collect())
 }
@@ -573,9 +632,9 @@ async fn list_openai_models(
         .data
         .into_iter()
         .map(|e| ModelEntry {
-            id: e.id,
+            context_window: window(e.context_window),
             owned_by: e.owned_by,
-            label: None,
+            ..ModelEntry::bare(e.id)
         })
         .collect())
 }

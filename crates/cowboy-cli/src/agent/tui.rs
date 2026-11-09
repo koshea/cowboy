@@ -2609,11 +2609,7 @@ mod tests {
     fn the_same_model_id_on_two_providers_is_two_choices() {
         use cowboy_core::config::{ModelDef, ModelRef};
         use cowboy_core::model::ModelEntry;
-        let entry = |id: &str| ModelEntry {
-            id: id.into(),
-            owned_by: String::new(),
-            label: None,
-        };
+        let entry = |id: &str| ModelEntry::bare(id);
         let mut merged = std::collections::BTreeMap::new();
         let def: ModelDef = serde_yaml_ng::from_str("model: glm-4.7\n").unwrap();
         merged.insert(ModelRef::parse("bifrost/glm").unwrap(), def.clone());

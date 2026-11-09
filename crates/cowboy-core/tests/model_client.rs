@@ -268,7 +268,7 @@ async fn list_models_parses_the_catalogue() {
         "object": "list",
         "data": [
             {"id": "anthropic/claude-opus-4-8", "owned_by": "anthropic"},
-            {"id": "cerebras/zai-glm-4.7", "owned_by": "Cerebras"},
+            {"id": "cerebras/zai-glm-4.7", "owned_by": "Cerebras", "context_window": 131072},
         ]
     });
     Mock::given(method("GET"))
@@ -284,6 +284,9 @@ async fn list_models_parses_the_catalogue() {
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].id, "anthropic/claude-opus-4-8");
     assert_eq!(entries[1].owned_by, "Cerebras");
+    // A gateway that reports the window (Bifrost does) has it read.
+    assert_eq!(entries[1].context_window, Some(131072));
+    assert_eq!(entries[0].context_window, None);
 }
 
 #[tokio::test]
