@@ -6,15 +6,17 @@
 
 use std::collections::BTreeMap;
 
-use cowboy_core::config::{ReasoningEffort, ResolvedModel};
+use cowboy_core::config::{ReasoningEffort, ResolvedAuth, ResolvedModel, WireApi};
 use cowboy_core::model::{list_models, Delta, Message, ModelClient, OpenAiClient, ToolDef};
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn profile(base_url: String) -> ResolvedModel {
     ResolvedModel {
+        provider_name: "p".into(),
         base_url,
-        api_key: "test-key".into(),
+        api: WireApi::ChatCompletions,
+        auth: ResolvedAuth::ApiKey("test-key".into()),
         model: "test-model".into(),
         temperature: 0.0,
         max_tokens: 256,
@@ -625,4 +627,20 @@ async fn usage_is_none_when_the_stream_omits_it() {
         .await
         .unwrap();
     assert_eq!(resp.usage, None, "no usage chunk → estimate fallback");
+}
+
+#[test]
+fn build_client_refuses_unsupported_providers_clearly() {
+    use cowboy_core::model::build_client;
+    let mut p = profile("https://x/v1".into());
+    assert!(build_client(&p).is_ok(), "chat completions + key works");
+
+    p.provider_name = "chatgpt".into();
+    p.api = WireApi::Responses;
+    p.auth = ResolvedAuth::Chatgpt;
+    let err = build_client(&p).err().unwrap().to_string();
+    assert!(
+        err.contains("chatgpt"),
+        "the error names the provider: {err}"
+    );
 }

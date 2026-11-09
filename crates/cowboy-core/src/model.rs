@@ -20,8 +20,27 @@ use tokio::sync::mpsc::UnboundedSender;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use crate::config::{ReasoningEffort, ResolvedModel};
+use crate::config::{ReasoningEffort, ResolvedAuth, ResolvedModel, WireApi};
 use crate::error::{Error, Result};
+
+/// Build the client for a resolved model — the one place a provider's `api` and
+/// `auth` are turned into a transport, so every caller (main model, summarizer,
+/// fallback, `/model`) gets the same one.
+pub fn build_client(model: &ResolvedModel) -> Result<Box<dyn ModelClient>> {
+    match (model.api, &model.auth) {
+        (WireApi::ChatCompletions, ResolvedAuth::ApiKey(_)) => {
+            Ok(Box::new(OpenAiClient::from_resolved(model)?))
+        }
+        (WireApi::Responses, _) => Err(Error::Invalid(format!(
+            "provider {:?} uses `api: responses`, which this build does not support yet",
+            model.provider_name
+        ))),
+        (WireApi::ChatCompletions, ResolvedAuth::Chatgpt) => Err(Error::Invalid(format!(
+            "provider {:?}: `auth: chatgpt` requires `api: responses`",
+            model.provider_name
+        ))),
+    }
+}
 
 /// How many times to retry a rate-limited / transiently-failed chat request
 /// before giving up.
@@ -355,6 +374,12 @@ impl OpenAiClient {
     /// Build from a fully-resolved model (provider credentials joined with the
     /// model definition by [`crate::config::resolve_model`]).
     pub fn from_resolved(model: &ResolvedModel) -> Result<Self> {
+        let ResolvedAuth::ApiKey(api_key) = &model.auth else {
+            return Err(Error::Invalid(format!(
+                "provider {:?} signs in with ChatGPT, which only works over `api: responses`",
+                model.provider_name
+            )));
+        };
         // Forward custom headers (provider defaults + per-model overrides).
         let mut headers = reqwest::header::HeaderMap::new();
         for (k, v) in &model.headers {
@@ -373,7 +398,7 @@ impl OpenAiClient {
         Ok(Self {
             http,
             base_url: model.base_url.trim_end_matches('/').to_string(),
-            api_key: model.api_key.clone(),
+            api_key: api_key.clone(),
             model: model.model.clone(),
             temperature: model.temperature,
             max_tokens: model.max_tokens,

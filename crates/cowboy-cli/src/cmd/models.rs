@@ -81,11 +81,7 @@ async fn setup() -> Result<()> {
         }
         crate::ui::warn("an API key is required; try again");
     };
-    let provider = Provider {
-        base_url,
-        api_key,
-        headers: BTreeMap::new(),
-    };
+    let provider = Provider::api_key(base_url, api_key);
 
     println!("\nChecking the endpoint model catalogue (up to 8 seconds)…");
     let model_id = choose_model_id(&provider).await?;
@@ -678,11 +674,7 @@ mod tests {
     use super::*;
 
     fn provider(url: &str) -> Provider {
-        Provider {
-            base_url: url.into(),
-            api_key: "secret".into(),
-            headers: BTreeMap::new(),
-        }
+        Provider::api_key(url, "secret")
     }
 
     fn model(provider_name: &str, id: &str) -> ModelDef {

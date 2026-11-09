@@ -313,11 +313,7 @@ fn warnings_flag_a_mount_that_exposes_most_of_the_machine() {
 }
 
 fn provider(base_url: &str) -> Provider {
-    Provider {
-        base_url: base_url.into(),
-        api_key: "sk-test".into(),
-        headers: BTreeMap::new(),
-    }
+    Provider::api_key(base_url, "sk-test")
 }
 
 fn model_def(provider: &str, model: &str) -> ModelDef {
@@ -365,7 +361,9 @@ fn resolve_model_merges_and_picks_default() {
     let r = resolve_model(&providers, Some(&user), Some(&project), None).unwrap();
     assert_eq!(r.model, "project/override");
     assert_eq!(r.base_url, "https://api/v1");
-    assert_eq!(r.api_key, "sk-test");
+    assert_eq!(r.auth, ResolvedAuth::ApiKey("sk-test".into()));
+    assert_eq!(r.provider_name, "p");
+    assert_eq!(r.api, WireApi::ChatCompletions);
 
     // Explicit name beats both defaults; user model still reachable.
     let r = resolve_model(&providers, Some(&user), Some(&project), Some("sonnet")).unwrap();
@@ -525,11 +523,7 @@ fn provider_base_url_resolves_from_env() {
     let mut providers = ProvidersConfig::default();
     providers.providers.insert(
         "p".into(),
-        Provider {
-            base_url: "${COWBOY_TEST_PROVIDER_URL}".into(),
-            api_key: "sk-test".into(),
-            headers: BTreeMap::new(),
-        },
+        Provider::api_key("${COWBOY_TEST_PROVIDER_URL}", "sk-test"),
     );
     let mut user = ModelsConfig::default();
     user.default = Some("m".into());
@@ -739,4 +733,88 @@ fn model_setup_recovers_an_interrupted_prepared_pair() {
     assert_eq!(recovered.providers, old_providers);
     assert_eq!(recovered.models, old_models);
     assert!(!tmp.path().join(".model-setup.transaction").exists());
+}
+
+// --- provider `api` / `auth` ---
+
+#[test]
+fn a_legacy_providers_file_parses_and_writes_back_unchanged() {
+    let tmp = tempdir();
+    let yaml = "version: 1\nproviders:\n  p:\n    base_url: https://x/v1\n    api_key: k\n";
+    let p = write(tmp.path(), PROVIDERS_FILE, yaml);
+    let cfg = ProvidersConfig::load(&p).unwrap();
+    let prov = &cfg.providers["p"];
+    assert_eq!(prov.api, WireApi::ChatCompletions);
+    assert_eq!(prov.auth, ProviderAuth::ApiKey);
+    // Defaults are not written, so an older cowboy can still read the file.
+    let out = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert!(!out.contains("api:") && !out.contains("auth:"), "{out}");
+}
+
+#[test]
+fn provider_api_and_auth_parse_and_resolve() {
+    let tmp = tempdir();
+    let p = write(
+        tmp.path(),
+        PROVIDERS_FILE,
+        "providers:\n  bifrost:\n    base_url: http://localhost:8080/v1\n    api: responses\n  \
+         chatgpt:\n    base_url: https://api.openai.com/v1\n    api: responses\n    auth: chatgpt\n",
+    );
+    let providers = ProvidersConfig::load(&p).unwrap();
+    assert_eq!(providers.providers["bifrost"].api, WireApi::Responses);
+    assert_eq!(
+        providers.providers["bifrost"].api_key, "",
+        "a keyless gateway is allowed"
+    );
+    assert_eq!(providers.providers["chatgpt"].auth, ProviderAuth::Chatgpt);
+
+    let mut user = ModelsConfig::default();
+    user.default = Some("g".into());
+    user.models
+        .insert("g".into(), model_def("chatgpt", "gpt-x"));
+    let r = resolve_model(&providers, Some(&user), None, None).unwrap();
+    assert_eq!(r.provider_name, "chatgpt");
+    assert_eq!(r.api, WireApi::Responses);
+    assert_eq!(r.auth, ResolvedAuth::Chatgpt);
+}
+
+#[test]
+fn impossible_provider_combinations_are_refused_at_load() {
+    let tmp = tempdir();
+    let chat = write(
+        tmp.path(),
+        PROVIDERS_FILE,
+        "providers:\n  c:\n    base_url: https://api.openai.com/v1\n    auth: chatgpt\n",
+    );
+    let err = ProvidersConfig::load(&chat).unwrap_err().to_string();
+    assert!(err.contains("requires `api: responses`"), "{err}");
+
+    let keyed = write(
+        tmp.path(),
+        PROVIDERS_FILE,
+        "providers:\n  c:\n    base_url: https://api.openai.com/v1\n    api: responses\n    \
+         auth: chatgpt\n    api_key: sk-x\n",
+    );
+    let err = ProvidersConfig::load(&keyed).unwrap_err().to_string();
+    assert!(err.contains("takes no `api_key`"), "{err}");
+
+    let slash = write(
+        tmp.path(),
+        PROVIDERS_FILE,
+        "providers:\n  a/b:\n    base_url: https://x/v1\n",
+    );
+    assert!(ProvidersConfig::load(&slash).is_err());
+
+    let typo = write(
+        tmp.path(),
+        PROVIDERS_FILE,
+        "providers:\n  c:\n    base_url: https://x/v1\n    api: grpc\n",
+    );
+    assert!(ProvidersConfig::load(&typo).is_err());
+}
+
+#[test]
+fn a_resolved_key_never_appears_in_debug_output() {
+    let dbg = format!("{:?}", ResolvedAuth::ApiKey("sk-very-secret".into()));
+    assert!(!dbg.contains("sk-very-secret"), "{dbg}");
 }

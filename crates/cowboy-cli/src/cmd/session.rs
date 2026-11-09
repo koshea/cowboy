@@ -12,7 +12,7 @@ use cowboy_core::config::{
 use cowboy_core::daemonproto::{
     AttachTarget, DaemonReq, DaemonResp, LeaseMode, SessionInfo, SessionStatus,
 };
-use cowboy_core::model::OpenAiClient;
+use cowboy_core::model::build_client;
 use cowboy_core::netproto::{ApprovalScope, NetworkAttempt, Verdict};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
@@ -196,7 +196,7 @@ pub async fn run(
             .with_context(|| format!("loading {}", paths.agent.display()))?
             .unwrap_or_default();
         let context_window = resolved.context_window as usize;
-        let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
+        let model = build_client(&resolved).context("building model client")?;
         let logger = crate::session::SessionLogger::create(&root).ok();
         let id = logger
             .as_ref()
@@ -268,7 +268,7 @@ pub async fn run(
             ));
         }
         let mut agent = AgentLoop::new(
-            Box::new(model),
+            model,
             runtime,
             agent_cfg.agent,
             context_window,

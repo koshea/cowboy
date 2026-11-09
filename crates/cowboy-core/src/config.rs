@@ -538,17 +538,89 @@ impl Default for ProvidersConfig {
     }
 }
 
-/// A single OpenAI-compatible provider: where to send requests and the key.
+/// A single model provider: where to send requests, which wire API it speaks,
+/// and how requests are authenticated.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
     /// Endpoint base URL (supports `${VAR}` expansion from the host env).
     pub base_url: String,
-    /// The API key, stored literally (the file is `0600`, home-owned).
+    /// The API key, stored literally (the file is `0600`, home-owned). Empty for a
+    /// keyless local gateway, and always empty for `auth: chatgpt`, whose tokens
+    /// live in their own record under `~/.config/cowboy/auth/`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
+    /// Which request/stream protocol the endpoint speaks.
+    ///
+    /// Defaults are skipped when writing, so a provider that uses neither new field
+    /// round-trips to the same file an older cowboy can still read.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub api: WireApi,
+    /// How requests are authenticated.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub auth: ProviderAuth,
     /// Optional default headers (e.g. for an internal gateway).
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+}
+
+impl Provider {
+    /// A plain API-key provider speaking Chat Completions — what every provider was
+    /// before `api`/`auth` existed.
+    pub fn api_key(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            api_key: api_key.into(),
+            api: WireApi::default(),
+            auth: ProviderAuth::default(),
+            headers: BTreeMap::new(),
+        }
+    }
+}
+
+/// The wire protocol a provider speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApi {
+    /// `POST {base_url}/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// `POST {base_url}/responses` (the OpenAI Responses API).
+    Responses,
+}
+
+impl WireApi {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WireApi::ChatCompletions => "chat_completions",
+            WireApi::Responses => "responses",
+        }
+    }
+}
+
+/// How a provider's requests are authenticated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    /// A static bearer key from `api_key` (or none, for a keyless gateway).
+    #[default]
+    ApiKey,
+    /// Sign in with ChatGPT: OAuth tokens kept in
+    /// `~/.config/cowboy/auth/<provider>.yaml`, refreshed host-side.
+    Chatgpt,
+}
+
+impl ProviderAuth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProviderAuth::ApiKey => "api_key",
+            ProviderAuth::Chatgpt => "chatgpt",
+        }
+    }
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 /// Model definitions. Lives at both the user level
@@ -671,8 +743,11 @@ fn is_false(b: &bool) -> bool {
 /// layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResolvedModel {
+    /// The provider's name in `providers.yaml` (also keys its OAuth record).
+    pub provider_name: String,
     pub base_url: String,
-    pub api_key: String,
+    pub api: WireApi,
+    pub auth: ResolvedAuth,
     pub model: String,
     pub temperature: f32,
     pub max_tokens: u32,
@@ -687,6 +762,26 @@ pub struct ResolvedModel {
     pub cached_input_cost_per_mtok: Option<f64>,
     pub anthropic_cache: bool,
     pub stream_idle_timeout_seconds: Option<u64>,
+}
+
+/// The credential a resolved model authenticates with.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ResolvedAuth {
+    /// A static bearer key; empty means send no `Authorization` header.
+    ApiKey(String),
+    /// Sign in with ChatGPT; the token comes from the provider's OAuth record.
+    Chatgpt,
+}
+
+/// Never print a key, even in a debug dump.
+impl std::fmt::Debug for ResolvedAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolvedAuth::ApiKey(k) if k.is_empty() => f.write_str("ApiKey(none)"),
+            ResolvedAuth::ApiKey(_) => f.write_str("ApiKey(<redacted>)"),
+            ResolvedAuth::Chatgpt => f.write_str("Chatgpt"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1159,9 +1254,41 @@ fn write_yaml<T: Serialize>(value: &T, path: &Path) -> Result<()> {
 }
 
 impl ProvidersConfig {
-    /// Load a providers file from a specific path.
+    /// Load a providers file from a specific path (validated).
     pub fn load(path: &Path) -> Result<Self> {
-        read_yaml(path)
+        let cfg: Self = read_yaml(path)?;
+        cfg.validate()
+            .map_err(|e| Error::Invalid(format!("{}: {e}", path.display())))?;
+        Ok(cfg)
+    }
+
+    /// Refuse provider combinations that cannot work, at load rather than at the
+    /// first request: a ChatGPT sign-in only authorizes the Responses API, and a
+    /// literal key beside it would be silently ignored.
+    pub fn validate(&self) -> Result<()> {
+        for (name, p) in &self.providers {
+            if name.is_empty() || name.contains('/') {
+                return Err(Error::Invalid(format!(
+                    "provider name {name:?} must be non-empty and contain no `/` \
+                     (models are named `provider/name`)"
+                )));
+            }
+            if p.auth == ProviderAuth::Chatgpt {
+                if p.api != WireApi::Responses {
+                    return Err(Error::Invalid(format!(
+                        "provider {name:?}: `auth: chatgpt` requires `api: responses` \
+                         (ChatGPT plan usage is only offered on the Responses API)"
+                    )));
+                }
+                if !p.api_key.is_empty() {
+                    return Err(Error::Invalid(format!(
+                        "provider {name:?}: `auth: chatgpt` takes no `api_key` — its tokens \
+                         come from `cowboy providers login {name}`; remove the key"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The home-only providers file (`~/.config/cowboy/providers.yaml`).
@@ -1175,7 +1302,7 @@ impl ProvidersConfig {
             Some(path) => {
                 recover_global_model_pair_if_needed(&path)?;
                 if path.exists() {
-                    read_yaml(&path)
+                    Self::load(&path)
                 } else {
                     Ok(Self::default())
                 }
@@ -1718,8 +1845,13 @@ pub fn resolve_model(
     headers.extend(def.headers.clone());
 
     Ok(ResolvedModel {
+        provider_name: def.provider.clone(),
         base_url: expand_env(&provider.base_url)?,
-        api_key: provider.api_key.clone(),
+        api: provider.api,
+        auth: match provider.auth {
+            ProviderAuth::ApiKey => ResolvedAuth::ApiKey(provider.api_key.clone()),
+            ProviderAuth::Chatgpt => ResolvedAuth::Chatgpt,
+        },
         model: def.model.clone(),
         temperature: def.temperature,
         max_tokens: def.max_tokens,

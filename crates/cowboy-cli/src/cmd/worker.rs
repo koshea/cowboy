@@ -15,7 +15,7 @@ use cowboy_core::config::{
 use cowboy_core::daemonproto::{
     ClientMsg, DaemonReq, InterruptKind, LeaseMode, SessionInfo, SessionStatus, UiEventMsg,
 };
-use cowboy_core::model::{ModelClient, OpenAiClient};
+use cowboy_core::model::{build_client, ModelClient};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::socket_ui::SocketUi;
@@ -109,7 +109,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         resolved.temperature = t;
     }
     let context_window = resolved.context_window as usize;
-    let model = OpenAiClient::from_resolved(&resolved).context("building model client")?;
+    let model = build_client(&resolved).context("building model client")?;
 
     let logger = match &args.id {
         Some(id) => crate::session::SessionLogger::create_with_id(&root, id).ok(),
@@ -297,9 +297,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             project_models.as_ref(),
             Some(&name),
         )
-        .and_then(|r| OpenAiClient::from_resolved(&r))
+        .and_then(|r| build_client(&r))
         {
-            Ok(c) => Some(Box::new(c) as Box<dyn ModelClient>),
+            Ok(c) => Some(c),
             Err(e) => {
                 emitter.emit(UiEventMsg::Notice(format!(
                     "summarizer model {name:?} unavailable ({e}); using the main model for summaries"
@@ -342,7 +342,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let session_budget = behavior.max_iterations;
     emitter.set_budget(true, session_budget);
     let mut agent = AgentLoop::new(
-        Box::new(model),
+        model,
         runtime,
         behavior,
         context_window,
@@ -368,7 +368,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(n))?;
                 let cw = r.context_window as usize;
                 let pricing = pricing_of(&r);
-                let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
+                let client: Box<dyn ModelClient> = build_client(&r)?;
                 Ok((client, cw, pricing))
             }),
         );
@@ -431,7 +431,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
             let cw = r.context_window as usize;
             let pricing = pricing_of(&r);
-            let client: Box<dyn ModelClient> = Box::new(OpenAiClient::from_resolved(&r)?);
+            let client: Box<dyn ModelClient> = build_client(&r)?;
             Ok((client, cw, pricing))
         })
     };
