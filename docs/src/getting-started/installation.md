@@ -55,10 +55,10 @@ installed on your machine, which is the point.
 
 ## Recommended: an LLM gateway
 
-Cowboy talks to one OpenAI-compatible endpoint, and by design it does **not**
-handle quotas, rate limits, spend caps, retries, or failover — those belong to an
-**LLM gateway** in front of your providers. Before you get started, the smoothest
-setup is to stand one up:
+Cowboy talks to as many providers as you configure, each speaking Chat Completions
+or the Responses API, but by design it does **not** handle quotas, spend caps, or
+failover — those belong to an **LLM gateway** in front of your providers. Before you
+get started, the smoothest setup is to stand one up:
 
 - **[LiteLLM](https://github.com/BerriAI/litellm)** or
   **[Bifrost](https://github.com/maximhq/bifrost)** — point Cowboy at the gateway,
@@ -69,10 +69,11 @@ A gateway is what makes the [crew](../using/crew.md) shine: your roster names
 logical models, the gateway resolves them — including routing aliases and
 failover — and owns the rate/quota/spend policy.
 
-**Just want one provider?** That's fine too — Cowboy works with any single
-OpenAI-compatible endpoint directly (OpenAI, OpenRouter, a local Ollama or vLLM,
-an internal gateway). You don't need to run a gateway to start; reach for one when
-you want multiple models, budgets, or failover.
+**A gateway and something else?** Providers sit side by side: your gateway for open
+models, OpenAI directly, a local Ollama or vLLM, and your **ChatGPT subscription**
+through [Sign in with ChatGPT](../using/chatgpt.md). Every model is named
+`provider/name`, so `/model` and the crew roster can mix them freely. You don't need
+a gateway to start; reach for one when you want budgets or failover.
 
 ## Install the binaries
 

@@ -238,12 +238,22 @@ providers:
     base_url: http://localhost:8080/v1
     api: responses             # chat_completions (default) | responses
                                # no api_key: a keyless local gateway
+  chatgpt:
+    base_url: https://api.openai.com/v1
+    api: responses
+    auth: chatgpt              # api_key (default) | chatgpt — see below
 ```
 
 `api` selects the wire protocol: `chat_completions` (`POST /chat/completions`, what
 nearly every OpenAI-compatible endpoint speaks) or `responses` (the OpenAI Responses
 API). A file that uses neither new field is written back exactly as an older Cowboy
 expects; one that sets `api` (or `auth`) cannot be read by an older binary.
+
+`auth: chatgpt` uses your ChatGPT subscription instead of a key: sign in with
+`cowboy providers add chatgpt --chatgpt` (or `cowboy providers login <name>`), and the
+OAuth tokens live in their own `0600` record under `~/.config/cowboy/auth/`. It
+requires `api: responses` and takes no `api_key`; both mistakes are refused when the
+file loads. See [ChatGPT sign-in](../using/chatgpt.md).
 
 ### `models.yaml` — user (`~/.config/cowboy/`) and/or project (`.cowboy/`)
 

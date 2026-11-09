@@ -225,3 +225,99 @@ fn e2e_a_tool_turn_on_chatgpt_plan_usage() {
     };
     tool_turn(&model, &dir);
 }
+
+/// The models every subagent of the session was routed to (lifecycle logs).
+fn routed_models(project: &Path) -> Vec<String> {
+    let mut routed = Vec::new();
+    let sessions = project.join(".cowboy/sessions");
+    for e in std::fs::read_dir(sessions).into_iter().flatten().flatten() {
+        let Ok(text) = std::fs::read_to_string(e.path().join("lifecycle.jsonl")) else {
+            continue;
+        };
+        for line in text.lines() {
+            if let Ok(rec) = serde_json::from_str::<cowboy_core::lifecycle::LifecycleRecord>(line) {
+                if let cowboy_core::lifecycle::LifecycleEvent::SubagentRouted { model, .. } =
+                    rec.event
+                {
+                    routed.push(model);
+                }
+            }
+        }
+    }
+    routed
+}
+
+/// One crew, two providers: the roster sends one category to a model on each,
+/// the foreman delegates one job to each, and both run to completion — each on
+/// the `provider/name` the roster named.
+///
+/// Uses the first two providers that each have a model, or the pair named by
+/// `COWBOY_E2E_CREW=provider/a,provider/b` (e.g. a Bifrost model and a ChatGPT
+/// one).
+#[test]
+#[ignore = "real sandbox + models on two providers: a crew spanning both"]
+fn e2e_a_crew_routes_to_two_providers() {
+    if !sandbox_ok() {
+        eprintln!("skipping: the sandbox cannot run here (see `cowboy doctor`)");
+        return;
+    }
+    let (dir, providers, models) = match real_config() {
+        Ok(c) => c,
+        Err(why) => return eprintln!("skipping: {why}"),
+    };
+    let pair: Option<(ModelRef, ModelRef)> = match std::env::var("COWBOY_E2E_CREW") {
+        Ok(s) => s.split_once(',').and_then(|(a, b)| {
+            Some((
+                ModelRef::parse(a.trim()).ok()?,
+                ModelRef::parse(b.trim()).ok()?,
+            ))
+        }),
+        Err(_) => {
+            let mut first_per_provider: Vec<ModelRef> = Vec::new();
+            for r in merged_models(Some(&models), None).into_keys() {
+                if providers.providers.contains_key(&r.provider)
+                    && !first_per_provider.iter().any(|f| f.provider == r.provider)
+                {
+                    first_per_provider.push(r);
+                }
+            }
+            (first_per_provider.len() >= 2)
+                .then(|| (first_per_provider[0].clone(), first_per_provider[1].clone()))
+        }
+    };
+    let Some((a, b)) = pair.filter(|(a, b)| a.provider != b.provider) else {
+        return eprintln!(
+            "skipping: needs models on two different providers (or COWBOY_E2E_CREW=p/a,q/b)"
+        );
+    };
+
+    let home = copy_config(&dir);
+    home.child("cowboy/crew.yaml")
+        .write_str(&format!(
+            "version: 1\ncrew:\n  general: {a}\n  exploration: {a}\n  docs: {b}\n\
+             delegation:\n  enabled: true\n  max_parallel: 4\n  max_parallel_per_provider: 2\n  \
+             max_depth: 1\n"
+        ))
+        .unwrap();
+    let project = make_project();
+    let task = "Delegate exactly two subagents with the `subagent` tool, in one batch: one with \
+                category=exploration effort=small and task 'create a file a.txt containing the \
+                letter a', and one with category=docs effort=small and task 'create a file b.txt \
+                containing the letter b'. Wait for both, then finish.";
+    let (ok, _stdout, stderr) = run_turn(home.path(), project.path(), &a, task);
+    assert!(ok, "the crew session failed:\n{stderr}");
+
+    let routed = routed_models(project.path());
+    for want in [&a, &b] {
+        assert!(
+            routed.iter().any(|m| m == &want.to_string()),
+            "expected a subagent routed to {want}, got {routed:?}"
+        );
+    }
+    for (file, by) in [("a.txt", &a), ("b.txt", &b)] {
+        assert!(
+            project.path().join(file).is_file(),
+            "the subagent on {by} did not finish its job ({file} missing); routed {routed:?}"
+        );
+    }
+}

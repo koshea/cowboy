@@ -382,17 +382,12 @@ fn list() -> Result<()> {
         println!("  {}", style::dim("(none — run `cowboy models setup`)"));
     } else {
         for (name, p) in &providers.providers {
-            // Never print the key, only whether one is set.
-            let key = if p.api_key.is_empty() {
-                "MISSING"
-            } else {
-                "set"
-            };
+            // Never print the key, only how the provider authenticates.
             println!(
-                "  {name:<14} {}  api: {}  auth: {}  key: {key}",
+                "  {name:<14} {}  api: {}  auth: {}",
                 p.base_url,
                 p.api.as_str(),
-                p.auth.as_str()
+                crate::cmd::providers::auth_summary(name, p)
             );
         }
     }

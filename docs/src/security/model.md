@@ -92,7 +92,15 @@ Endpoint URLs and API keys live only in `~/.config/cowboy/providers.yaml`
 (`0600`), are consumed host-side when building the model client, and are never
 written into a project or bound into the sandbox — the agent cannot reach them by
 construction. A project `models.yaml` references a provider by name and is
-forbidden from carrying credentials.
+forbidden from carrying credentials; it cannot define a provider either, so a
+repository cannot point its models at an endpoint of its choosing.
+
+The same holds for [ChatGPT sign-in](../using/chatgpt.md). Its OAuth tokens live in
+`~/.config/cowboy/auth/<provider>.yaml` (`0600`, written atomically), inside the
+config directory the denylist already refuses, and are read and refreshed only by the
+host-side worker that makes model requests. The agent's commands never see a token,
+and no grant can expose one. Tokens are never printed or logged; `cowboy providers
+list` reports only who is signed in.
 
 ### Credential stores can never be granted
 

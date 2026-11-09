@@ -38,7 +38,7 @@ fn list_shows_providers_and_models_without_leaking_the_key() {
         .success()
         .stdout(predicate::str::contains("litellm"))
         .stdout(predicate::str::contains("https://gw.local/v1"))
-        .stdout(predicate::str::contains("key: set"))
+        .stdout(predicate::str::contains("auth: api key (set)"))
         .stdout(predicate::str::contains("litellm/sonnet"))
         .stdout(predicate::str::contains("default: litellm/sonnet"))
         // The actual key value must never be printed.

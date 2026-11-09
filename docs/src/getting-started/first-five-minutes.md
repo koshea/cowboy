@@ -50,9 +50,14 @@ Commit both; `security.yaml` is a reviewable artifact of what you allowed.
 
 ## 3. `cowboy models setup`
 
-Cowboy talks to one OpenAI-compatible endpoint and ships no keys. This asks for an
-endpoint and a key, then a model that uses it. Both steps are required — a provider
+Cowboy ships no keys. This asks for a provider — an endpoint and its key — then a
+model that uses it, saved as `provider/name`. Both steps are required — a provider
 with no model leaves you with an error at the first turn instead of at setup.
+
+You can configure several providers side by side (a local gateway beside a hosted
+API) with `cowboy providers add`, and use a ChatGPT subscription for OpenAI models
+with `cowboy providers add chatgpt --chatgpt` — see
+[ChatGPT sign-in](../using/chatgpt.md).
 
 Credentials go to `~/.config/cowboy/providers.yaml` (mode `0600`), read host-side.
 They are never written into your project and never bound into the sandbox, so the

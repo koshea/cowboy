@@ -7,8 +7,10 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 
 | Path | Purpose |
 |------|---------|
-| `~/.config/cowboy/providers.yaml` | Provider endpoints + API keys (`0600`). The agent can't reach this. |
-| `~/.config/cowboy/models.yaml` | User-level model definitions + default. |
+| `~/.config/cowboy/providers.yaml` | Provider endpoints, wire API (`api`), auth (`auth`) + API keys (`0600`). The agent can't reach this. |
+| `~/.config/cowboy/auth/<provider>.yaml` | [ChatGPT sign-in](../using/chatgpt.md) record for an `auth: chatgpt` provider: issued client id, account, OAuth tokens (`0600`). Refreshed host-side under `auth/<provider>.lock`. |
+| `~/.config/cowboy/auth/host_id` | This machine's opaque agent-host id (`urn:uuid:…`) sent at sign-in. Not a credential. |
+| `~/.config/cowboy/models.yaml` | User-level model definitions + default, grouped by provider (`provider/name`). |
 | `~/.config/cowboy/crew.yaml` | [Crew](../using/crew.md) roster — delegated-work routing by category/effort. |
 | `~/.config/cowboy/crew-history.jsonl` | Recorded delegation outcomes (append-only; powers `cowboy crew usage`). |
 | `~/.config/cowboy/mcp.yaml` | [MCP](../how-to.md) server definitions (host-owned; the agent can call but not edit). |
@@ -25,7 +27,7 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 |------|----------|---------|
 | `.cowboy/security.yaml` | **masked** | Sandbox mounts + limits, networks, policy, secrets (host-owned). |
 | `.cowboy/agent.yaml` | yes | Non-security agent behavior, processes, command aliases. |
-| `.cowboy/models.yaml` | **masked** | Project model definitions (no credentials). |
+| `.cowboy/models.yaml` | **masked** | Project model definitions, grouped by provider (no credentials; only names providers from the home `providers.yaml`). |
 | `.mcp.json` | — | Project-declared [MCP](../how-to.md) servers (trust-gated; the format other MCP clients use). |
 | `.cowboy/skills/` | yes | Project skills. |
 | `.cowboy/sessions/<id>/` | — | Per-session logs (gitignored). |
