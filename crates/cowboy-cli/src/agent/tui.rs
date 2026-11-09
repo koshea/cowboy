@@ -2242,92 +2242,117 @@ fn spawn_model_fetch(ui_tx: Sender<UiEvent>, current_name: String) {
     });
 }
 
-/// Query every configured provider's `/models`, filter to chat models, and join
-/// with the shipped defaults + existing config into picker choices.
+/// Query every configured provider's catalogue and turn it into picker choices.
 fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
-    use cowboy_core::config::{expand_env, ConfigPaths, ModelsConfig, ProvidersConfig};
+    use cowboy_core::config::{merged_models, ConfigPaths, ModelsConfig, ProvidersConfig};
     use cowboy_core::model::list_models;
-    use cowboy_core::model_defaults;
 
     let providers = ProvidersConfig::load_global()?;
     if providers.providers.is_empty() {
-        anyhow::bail!("no providers configured; run `cowboy models setup`");
+        anyhow::bail!("no providers configured; run `cowboy providers add`");
     }
     // Existing config (user + project) for the configured/current markers.
     let user = ModelsConfig::user_path().and_then(|p| ModelsConfig::load_opt(&p).ok().flatten());
     let project = ConfigPaths::for_root(crate::cmd::project_root().unwrap_or_default());
     let project = ModelsConfig::load_opt(&project.models).ok().flatten();
-    let mut id_to_name: std::collections::BTreeMap<String, String> = Default::default();
-    let mut name_to_id: std::collections::BTreeMap<String, String> = Default::default();
-    for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
-        for (k, d) in cfg.iter() {
-            id_to_name
-                .entry(d.model.clone())
-                .or_insert_with(|| k.to_string());
-            name_to_id.insert(k.to_string(), d.model.clone());
-        }
-    }
-    let current_id = name_to_id.get(current_name).cloned();
+    let merged = merged_models(user.as_ref(), project.as_ref());
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let catalogues = providers
+        .providers
+        .iter()
+        .map(|(name, p)| (name.clone(), rt.block_on(list_models(p))))
+        .collect::<Vec<_>>();
+    model_choices(catalogues, &merged, current_name)
+}
+
+/// Picker choices from each provider's catalogue joined with the shipped defaults
+/// and existing config. Choices are keyed by `(provider, id)`: the same id offered
+/// by two providers is two models. One unreachable provider does not hide the
+/// others, and configured models are always listed even if no catalogue has them.
+fn model_choices(
+    catalogues: Vec<(
+        String,
+        cowboy_core::Result<Vec<cowboy_core::model::ModelEntry>>,
+    )>,
+    merged: &std::collections::BTreeMap<
+        cowboy_core::config::ModelRef,
+        cowboy_core::config::ModelDef,
+    >,
+    current_name: &str,
+) -> Result<Vec<ModelChoice>> {
+    use cowboy_core::config::ModelRef;
+    use cowboy_core::model_defaults;
+
+    let mut configured: std::collections::BTreeMap<(String, String), ModelRef> = Default::default();
+    for (r, d) in merged {
+        configured
+            .entry((r.provider.clone(), d.model.clone()))
+            .or_insert_with(|| r.clone());
+    }
+    let current_key = ModelRef::parse(current_name).ok().and_then(|r| {
+        merged
+            .get(&r)
+            .map(|d| (r.provider.clone(), d.model.clone()))
+    });
+
+    let choice = |provider: &str, id: &str, configured_name: Option<String>| {
+        let d = model_defaults::lookup(id);
+        let key = (provider.to_string(), id.to_string());
+        ModelChoice {
+            provider: provider.to_string(),
+            label: configured_name.clone().unwrap_or_else(|| d.name.clone()),
+            configured: configured_name.is_some(),
+            current: current_key.as_ref() == Some(&key),
+            configured_name,
+            suggested_name: d.name.trim().replace('/', "-"),
+            context_window: d.context_window,
+            max_tokens: d.max_tokens,
+            temperature: d.temperature,
+            reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
+            id: id.to_string(),
+        }
+    };
+
     let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<ModelChoice> = Vec::new();
-    for p in providers.providers.values() {
-        let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
-        let entries = rt.block_on(list_models(&base, &p.api_key, &p.headers))?;
-        for e in entries {
-            if !model_defaults::is_chat(&e.id) || !seen.insert(e.id.clone()) {
+    let mut failures = Vec::new();
+    for (pname, entries) in catalogues {
+        let entries = match entries {
+            Ok(e) => e,
+            Err(e) => {
+                failures.push(format!("{pname}: {e}"));
                 continue;
             }
-            let d = model_defaults::lookup(&e.id);
-            let configured_name = id_to_name.get(&e.id).cloned();
-            let current = current_id.as_deref() == Some(e.id.as_str());
-            out.push(ModelChoice {
-                label: configured_name.clone().unwrap_or_else(|| d.name.clone()),
-                configured: configured_name.is_some(),
-                current,
-                configured_name,
-                suggested_name: d.name,
-                context_window: d.context_window,
-                max_tokens: d.max_tokens,
-                temperature: d.temperature,
-                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
-                id: e.id,
-            });
-        }
-    }
-    // Configured models the provider catalogue didn't return (a stale
-    // `/v1/models` that omits a model you've set up — common with some gateways/
-    // providers). Include them so they're always selectable.
-    for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
-        for (name, def) in cfg.iter() {
-            let name = name.to_string();
-            if !seen.insert(def.model.clone()) {
-                continue; // already listed from a provider catalogue
+        };
+        for e in entries {
+            let key = (pname.clone(), e.id.clone());
+            if !model_defaults::is_chat(&e.id) || !seen.insert(key.clone()) {
+                continue;
             }
-            let d = model_defaults::lookup(&def.model);
-            let current = current_id.as_deref() == Some(def.model.as_str());
-            out.push(ModelChoice {
-                label: name.clone(),
-                configured: true,
-                current,
-                configured_name: Some(name.clone()),
-                suggested_name: d.name,
-                context_window: d.context_window,
-                max_tokens: d.max_tokens,
-                temperature: d.temperature,
-                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
-                id: def.model.clone(),
-            });
+            let name = configured.get(&key).map(ToString::to_string);
+            out.push(choice(&pname, &e.id, name));
         }
     }
-    // Current first, then configured, then alphabetical.
+    if out.is_empty() && !failures.is_empty() && merged.is_empty() {
+        anyhow::bail!("no provider catalogue loaded ({})", failures.join("; "));
+    }
+    // Configured models a provider catalogue didn't return (a stale `/v1/models`
+    // that omits a model you've set up — common with some gateways — or a provider
+    // that could not be reached). Include them so they're always selectable.
+    for (r, def) in merged {
+        if seen.insert((r.provider.clone(), def.model.clone())) {
+            out.push(choice(&r.provider, &def.model, Some(r.to_string())));
+        }
+    }
+    // Current first, then configured, then by provider and label.
     out.sort_by(|a, b| {
         b.current
             .cmp(&a.current)
             .then(b.configured.cmp(&a.configured))
+            .then(a.provider.cmp(&b.provider))
             .then(a.label.cmp(&b.label))
     });
     Ok(out)
@@ -2459,7 +2484,10 @@ fn save_model_form(app: &mut App, ctx: &mut KeyCtx) {
     let reasoning = form.reasoning().to_string();
     let id = form.id.clone();
 
-    match crate::cmd::models::save_user_model(&name, &id, temp, context, max_output, &reasoning) {
+    let provider = form.provider.clone();
+    match crate::cmd::models::save_user_model(
+        &provider, &name, &id, temp, context, max_output, &reasoning,
+    ) {
         Ok(saved) => {
             let name = saved.to_string();
             if let Some(tx) = ctx.task_tx.as_ref() {
@@ -2544,6 +2572,44 @@ fn history_recall_next(app: &mut App, history: &[String], hist_pos: &mut Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_model_id_on_two_providers_is_two_choices() {
+        use cowboy_core::config::{ModelDef, ModelRef};
+        use cowboy_core::model::ModelEntry;
+        let entry = |id: &str| ModelEntry {
+            id: id.into(),
+            owned_by: String::new(),
+        };
+        let mut merged = std::collections::BTreeMap::new();
+        let def: ModelDef = serde_yaml_ng::from_str("model: glm-4.7\n").unwrap();
+        merged.insert(ModelRef::parse("bifrost/glm").unwrap(), def.clone());
+        merged.insert(ModelRef::parse("offline/kept").unwrap(), def);
+        let catalogues = vec![
+            ("bifrost".to_string(), Ok(vec![entry("glm-4.7")])),
+            ("openai".to_string(), Ok(vec![entry("glm-4.7")])),
+            (
+                "down".to_string(),
+                Err(cowboy_core::Error::Model("unreachable".into())),
+            ),
+        ];
+        let choices = model_choices(catalogues, &merged, "bifrost/glm").unwrap();
+        let glm: Vec<(&str, bool, bool)> = choices
+            .iter()
+            .filter(|c| c.id == "glm-4.7")
+            .map(|c| (c.provider.as_str(), c.configured, c.current))
+            .collect();
+        // bifrost's is the configured, current one; openai's is a separate, new one;
+        // the unreachable provider's configured model is still offered.
+        assert!(glm.contains(&("bifrost", true, true)), "{glm:?}");
+        assert!(glm.contains(&("openai", false, false)), "{glm:?}");
+        assert!(glm.contains(&("offline", true, false)), "{glm:?}");
+        let configured = choices.iter().find(|c| c.provider == "bifrost").unwrap();
+        assert_eq!(configured.configured_name.as_deref(), Some("bifrost/glm"));
+        // A new model's form saves under the provider whose catalogue it came from.
+        let openai = choices.iter().find(|c| c.provider == "openai").unwrap();
+        assert_eq!(ModelForm::from_choice(openai).provider, "openai");
+    }
 
     /// Everything `KeyCtx` borrows, owned, so tests can drive the real key/command
     /// handlers and then feed the journal back through the event loop's own path.

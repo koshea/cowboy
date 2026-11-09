@@ -22,6 +22,7 @@ pub mod models;
 pub mod models_migrate;
 pub mod patch;
 pub mod proc;
+pub mod providers;
 pub mod ranch;
 pub mod review;
 pub mod run;

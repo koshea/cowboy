@@ -43,6 +43,7 @@ async fn run() -> Result<()> {
         Some(Command::Patch(args)) => cmd::patch::run(args).await,
         Some(Command::Proc(args)) => cmd::proc::run(args).await,
         Some(Command::Models(args)) => cmd::models::run(args).await,
+        Some(Command::Providers(args)) => cmd::providers::run(args).await,
         Some(Command::Harnesses) => cmd::harnesses::run(),
         Some(Command::Skill(args)) => cmd::skill::run(args),
         Some(Command::Agents(args)) => cmd::agents::run(args),

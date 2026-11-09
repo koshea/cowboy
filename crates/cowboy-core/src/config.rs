@@ -2066,7 +2066,7 @@ pub fn resolve_model(
         let known: Vec<&str> = providers.providers.keys().map(String::as_str).collect();
         Error::Invalid(format!(
             "model `{chosen}` names provider `{}`, which is not in providers.yaml \
-             (configured: {}); add it with `cowboy models setup`",
+             (configured: {}); add it with `cowboy providers add`",
             chosen.provider,
             if known.is_empty() {
                 "none".to_string()

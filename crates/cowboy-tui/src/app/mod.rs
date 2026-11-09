@@ -161,13 +161,16 @@ pub const REASONING_OPTS: [&str; 5] = ["none", "minimal", "low", "medium", "high
 /// (if any) and the shipped defaults used to prefill a new model's form.
 #[derive(Debug, Clone)]
 pub struct ModelChoice {
+    /// The provider (in `providers.yaml`) whose catalogue offered it. The same id
+    /// from two providers is two choices.
+    pub provider: String,
     /// Provider-side id, e.g. `cerebras/zai-glm-4.7`.
     pub id: String,
     /// Display label (configured friendly name, else the suggested name).
     pub label: String,
     pub configured: bool,
     pub current: bool,
-    /// The existing config key, if this model is already configured.
+    /// The existing `provider/name`, if this model is already configured.
     pub configured_name: Option<String>,
     // Prefill for a new model's form:
     pub suggested_name: String,
@@ -190,7 +193,8 @@ pub struct ModelPicker {
 }
 
 impl ModelPicker {
-    /// Entries matching the current filter (case-insensitive over id + label).
+    /// Entries matching the current filter (case-insensitive over provider, id
+    /// and label).
     pub fn filtered(&self) -> Vec<&ModelChoice> {
         let f = self.filter.to_lowercase();
         self.entries
@@ -199,6 +203,7 @@ impl ModelPicker {
                 f.is_empty()
                     || e.id.to_lowercase().contains(&f)
                     || e.label.to_lowercase().contains(&f)
+                    || e.provider.to_lowercase().contains(&f)
             })
             .collect()
     }
@@ -227,6 +232,8 @@ impl ModelPicker {
 /// (name, temperature, context window, max output); focus 4 is reasoning effort.
 #[derive(Debug, Clone, Default)]
 pub struct ModelForm {
+    /// The provider the model is saved under (`provider/<name>`).
+    pub provider: String,
     pub id: String,
     /// [name, temperature, context_window, max_output] as edited text.
     pub fields: [String; 4],
@@ -248,6 +255,7 @@ impl ModelForm {
             .position(|r| Some(*r) == c.reasoning.as_deref())
             .unwrap_or(0);
         ModelForm {
+            provider: c.provider.clone(),
             id: c.id.clone(),
             fields: [
                 c.suggested_name.clone(),
@@ -2378,6 +2386,7 @@ mod tests {
 
     fn sample_choice(id: &str, label: &str, configured: bool, current: bool) -> ModelChoice {
         ModelChoice {
+            provider: "bifrost".into(),
             id: id.into(),
             label: label.into(),
             configured,
@@ -2405,6 +2414,11 @@ mod tests {
                     false,
                 ),
                 sample_choice("anthropic/claude-opus-4-8", "Claude Opus 4.8", false, false),
+                // The same id from a second provider is its own entry.
+                ModelChoice {
+                    provider: "openai".into(),
+                    ..sample_choice("anthropic/claude-opus-4-8", "Claude Opus 4.8", false, false)
+                },
             ],
             filter: String::new(),
             selected: 1,

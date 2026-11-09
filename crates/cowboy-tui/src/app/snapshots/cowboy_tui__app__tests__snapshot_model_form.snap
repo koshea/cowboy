@@ -4,7 +4,7 @@ expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
 │› configure a model                            ││no network activity  │
-│╭ Configure fireworks/accounts/fireworks/models/glm… ────────────────╮│
+│╭ Configure bifrost: fireworks/accounts/fireworks/models/glm… ───────╮│
 ││› Name            Fireworks: GLM 5.1                                ││
 ││  Temperature     0.6                                               ││
 ││  Context window  131072                                            ││

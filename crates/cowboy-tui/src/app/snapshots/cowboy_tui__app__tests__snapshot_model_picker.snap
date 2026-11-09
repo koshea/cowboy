@@ -1,14 +1,14 @@
 ---
-source: crates/cowboy-tui/src/app.rs
+source: crates/cowboy-tui/src/app/mod.rs
 expression: render(&app)
 ---
 ╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
 │╭ Select a model ────────────────────────────────────────────────────╮│
 ││type to filter…                                                     ││
-││  cerebras/zai-glm-4.7                           ◉ current          ││
-││› fireworks/accounts/fireworks/models/glm-5p1                       ││
-││  anthropic/claude-opus-4-8                                         ││
-││                                                                    ││
+││  bifrost      cerebras/zai-glm-4.7                   ◉ current     ││
+││› bifrost      fireworks/accounts/fireworks/models/g…               ││
+││  bifrost      anthropic/claude-opus-4-8                            ││
+││  openai       anthropic/claude-opus-4-8                            ││
 ││                                                                    │╯
 ││                                                                    │╮
 ││                                                                    ││

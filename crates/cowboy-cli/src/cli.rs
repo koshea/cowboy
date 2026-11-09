@@ -287,6 +287,20 @@ Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are rea
 host-side. They are never written into a project or bound into the sandbox.")]
     Models(ModelsArgs),
 
+    /// Manage model providers — the endpoints in the home-only providers.yaml.
+    /// Several can be configured at once (a local gateway beside a hosted API);
+    /// each model is named `provider/name` under the provider that serves it.
+    #[command(after_help = "\
+Examples:
+  cowboy providers                                  # list them
+  cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
+  cowboy providers add openai --base-url https://api.openai.com/v1
+  cowboy providers remove bifrost
+
+Keys are prompted for without echo and stored only in ~/.config/cowboy/providers.yaml
+(mode 0600); they are never printed, written into a project, or bound into the sandbox.")]
+    Providers(ProvidersArgs),
+
     /// List the external agent CLIs the crew can delegate to (grok, claude, codex,
     /// agy) and whether each is installed and logged in.
     #[command(after_help = "\
@@ -640,6 +654,49 @@ Use `cowboy models setup` for guided provider and model setup."
 pub struct ModelsArgs {
     #[command(subcommand)]
     pub command: Option<ModelsCommand>,
+}
+
+#[derive(Debug, Args)]
+pub struct ProvidersArgs {
+    #[command(subcommand)]
+    pub command: Option<ProvidersCommand>,
+}
+
+/// `--api` for `cowboy providers add`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum WireApiArg {
+    /// `POST /chat/completions` — what nearly every OpenAI-compatible endpoint speaks.
+    ChatCompletions,
+    /// `POST /responses` — the OpenAI Responses API (OpenAI, Bifrost, …).
+    Responses,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProvidersCommand {
+    /// List providers: endpoint, wire API, auth, and how many models use each.
+    List,
+    /// Add a provider. Asks for its API key without echo unless `--no-key`.
+    Add {
+        /// Its name — the `provider` half of `provider/name`. No `/`.
+        name: String,
+        /// Endpoint base URL, e.g. `http://localhost:8080/v1` (supports `${VAR}`).
+        #[arg(long, value_name = "URL")]
+        base_url: String,
+        /// Which API the endpoint speaks.
+        #[arg(long, value_enum, default_value = "chat-completions")]
+        api: WireApiArg,
+        /// The endpoint needs no key (a local gateway).
+        #[arg(long)]
+        no_key: bool,
+    },
+    /// Remove a provider. Refused while models or crew slots still use it, unless
+    /// `--force` (which also removes its models from your home models.yaml).
+    Remove {
+        name: String,
+        /// Remove it anyway, along with its home models.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

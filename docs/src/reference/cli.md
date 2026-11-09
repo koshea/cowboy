@@ -579,6 +579,49 @@ Stop a process by name (only reaches a stale one; session processes end with the
 | `<NAME>` |  |
 
 
+## `cowboy providers`
+
+Manage model providers — the endpoints in the home-only providers.yaml. Several can be configured at once (a local gateway beside a hosted API); each model is named `provider/name` under the provider that serves it
+
+```text
+Examples:
+  cowboy providers                                  # list them
+  cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
+  cowboy providers add openai --base-url https://api.openai.com/v1
+  cowboy providers remove bifrost
+
+Keys are prompted for without echo and stored only in ~/.config/cowboy/providers.yaml
+(mode 0600); they are never printed, written into a project, or bound into the sandbox.
+```
+
+
+### `cowboy providers add`
+
+Add a provider. Asks for its API key without echo unless `--no-key`
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` | Its name — the `provider` half of `provider/name`. No `/` |
+| `--base-url` | Endpoint base URL, e.g. `http://localhost:8080/v1` (supports `${VAR}`) |
+| `--api` | Which API the endpoint speaks |
+| `--no-key` | The endpoint needs no key (a local gateway) |
+
+
+### `cowboy providers list`
+
+List providers: endpoint, wire API, auth, and how many models use each
+
+
+### `cowboy providers remove`
+
+Remove a provider. Refused while models or crew slots still use it, unless `--force` (which also removes its models from your home models.yaml)
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+| `--force` | Remove it anyway, along with its home models |
+
+
 ## `cowboy ranch`
 
 Create or inspect Ranch Plans (multi-workstream tasks)

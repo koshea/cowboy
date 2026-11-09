@@ -381,17 +381,8 @@ impl OpenAiClient {
             )));
         };
         // Forward custom headers (provider defaults + per-model overrides).
-        let mut headers = reqwest::header::HeaderMap::new();
-        for (k, v) in &model.headers {
-            if let (Ok(name), Ok(val)) = (
-                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-                reqwest::header::HeaderValue::from_str(v),
-            ) {
-                headers.insert(name, val);
-            }
-        }
         let http = reqwest::Client::builder()
-            .default_headers(headers)
+            .default_headers(header_map(&model.headers))
             .build()
             .map_err(oa_err)?;
 
@@ -435,32 +426,38 @@ struct ModelEntryWire {
 }
 
 /// List a provider's available models via `GET {base_url}/models`. Reused by the
-/// `/models` picker and `cowboy models available`.
-pub async fn list_models(
+/// `/models` picker, `cowboy models available` and setup. Takes the provider, not
+/// a URL and key, because how its catalogue is fetched (and authenticated)
+/// depends on the provider's `auth`.
+pub async fn list_models(provider: &crate::config::Provider) -> Result<Vec<ModelEntry>> {
+    use crate::config::ProviderAuth;
+    let base_url = crate::config::expand_env(&provider.base_url)?;
+    match provider.auth {
+        ProviderAuth::ApiKey => {
+            list_openai_models(&base_url, &provider.api_key, &provider.headers).await
+        }
+        ProviderAuth::Chatgpt => Err(Error::Invalid(
+            "listing a ChatGPT provider's models is not supported by this build yet".into(),
+        )),
+    }
+}
+
+/// `GET {base_url}/models` returning the OpenAI `{data: [{id, owned_by}]}` shape.
+async fn list_openai_models(
     base_url: &str,
     api_key: &str,
     headers: &BTreeMap<String, String>,
 ) -> Result<Vec<ModelEntry>> {
-    let mut hmap = reqwest::header::HeaderMap::new();
-    for (k, v) in headers {
-        if let (Ok(name), Ok(val)) = (
-            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
-            reqwest::header::HeaderValue::from_str(v),
-        ) {
-            hmap.insert(name, val);
-        }
-    }
     let http = reqwest::Client::builder()
-        .default_headers(hmap)
+        .default_headers(header_map(headers))
         .build()
         .map_err(oa_err)?;
     let url = format!("{}/models", base_url.trim_end_matches('/'));
-    let resp = http
-        .get(&url)
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .map_err(oa_err)?;
+    let mut req = http.get(&url);
+    if !api_key.is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await.map_err(oa_err)?;
     if !resp.status().is_success() {
         let code = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -477,6 +474,21 @@ pub async fn list_models(
             owned_by: e.owned_by,
         })
         .collect())
+}
+
+/// Custom headers as a reqwest map; names or values that are not valid HTTP are
+/// skipped (they could never have been sent).
+fn header_map(headers: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
+    let mut hmap = reqwest::header::HeaderMap::new();
+    for (k, v) in headers {
+        if let (Ok(name), Ok(val)) = (
+            reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+            reqwest::header::HeaderValue::from_str(v),
+        ) {
+            hmap.insert(name, val);
+        }
+    }
+    hmap
 }
 
 fn to_openai_messages(messages: &[Message]) -> Result<Vec<ChatCompletionRequestMessage>> {

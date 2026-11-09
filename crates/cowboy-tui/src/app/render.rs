@@ -447,7 +447,12 @@ pub(super) fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
         } else {
             Style::default()
         };
-        let line = format!("{marker}{:<46}{}", trunc(&e.id, 46), tag);
+        let line = format!(
+            "{marker}{:<12} {:<38}{}",
+            trunc(&e.provider, 12),
+            trunc(&e.id, 38),
+            tag
+        );
         lines.push(Line::from(Span::styled(line, base)));
     }
     if entries.is_empty() {
@@ -486,7 +491,7 @@ pub(super) fn draw_model_form(f: &mut Frame, area: Rect, form: &ModelForm) {
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .title(Span::styled(
-            format!(" Configure {} ", trunc(&form.id, 40)),
+            format!(" Configure {}: {} ", form.provider, trunc(&form.id, 40)),
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),

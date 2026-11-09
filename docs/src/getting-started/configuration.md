@@ -213,8 +213,19 @@ host-owned and the agent can never reach them.**
 
 ### `~/.config/cowboy/providers.yaml` (home-only, `0600`)
 
-Endpoint + key pairs. This file lives only in your home dir — never in a project,
-never reachable from the sandbox. Manage it with `cowboy models setup`.
+Endpoints and their credentials. This file lives only in your home dir — never in a
+project, never reachable from the sandbox. Configure as many providers as you use —
+a local gateway for open models beside a hosted API — and manage them with
+`cowboy providers`:
+
+```sh
+cowboy providers                      # list: endpoint, API, auth, models per provider
+cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
+cowboy providers add openai --base-url https://api.openai.com/v1   # prompts for the key
+cowboy providers remove bifrost       # refused while models or crew slots still use it
+```
+
+`cowboy models setup` also adds one, or reuses an existing one, when you add a model.
 
 ```yaml
 version: 1
@@ -223,7 +234,16 @@ providers:
     base_url: https://your-openai-compatible-endpoint/v1   # supports ${VAR}
     api_key: sk-...                                         # stored literally; file is 0600
     headers: {}                                             # optional
+  bifrost:
+    base_url: http://localhost:8080/v1
+    api: responses             # chat_completions (default) | responses
+                               # no api_key: a keyless local gateway
 ```
+
+`api` selects the wire protocol: `chat_completions` (`POST /chat/completions`, what
+nearly every OpenAI-compatible endpoint speaks) or `responses` (the OpenAI Responses
+API). A file that uses neither new field is written back exactly as an older Cowboy
+expects; one that sets `api` (or `auth`) cannot be read by an older binary.
 
 ### `models.yaml` — user (`~/.config/cowboy/`) and/or project (`.cowboy/`)
 

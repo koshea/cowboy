@@ -68,22 +68,35 @@ async fn setup() -> Result<()> {
     let models_path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let state = load_model_setup_state(&providers_path, &models_path)?;
 
-    println!("Configure a model provider (saved to your home dir, never a project).\n");
-    let provider_name = prompt_required("Provider name", Some("default"), valid_part)?;
-    let base_url = prompt_required(
-        "Endpoint base URL (e.g. https://host/v1)",
-        None,
-        validate_base_url,
-    )?;
-    let api_key = loop {
-        let value = read_secret(&format!("API key for {provider_name}"))?;
-        if !value.trim().is_empty() {
-            break value.trim().to_string();
-        }
-        crate::ui::warn("an API key is required; try again");
+    println!("Configure a model (saved to your home dir, never a project).\n");
+    // Reuse a configured provider, or add a new one. Never replaces a provider:
+    // with several endpoints configured, re-running setup to add a model must not
+    // clobber the endpoint (and key) another set of models depends on.
+    let existing: Vec<&String> = state.providers.providers.keys().collect();
+    let provider_name = if existing.is_empty() {
+        prompt_required("Provider name", Some("default"), valid_part)?
+    } else {
+        println!(
+            "Configured providers: {}",
+            existing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        prompt_required(
+            "Provider (one of those, or a new name to add one)",
+            Some(existing[0].as_str()),
+            valid_part,
+        )?
     };
-    let provider = Provider::api_key(base_url, api_key);
-
+    let provider = match state.providers.providers.get(&provider_name) {
+        Some(p) => {
+            println!("Using provider `{provider_name}` ({}).", p.base_url);
+            p.clone()
+        }
+        None => prompt_new_provider(&provider_name)?,
+    };
     println!("\nChecking the endpoint model catalogue (up to 8 seconds)…");
     let model_id = choose_model_id(&provider).await?;
     let defaults = model_defaults::lookup(&model_id);
@@ -199,12 +212,7 @@ fn apply_setup(
 }
 
 async fn choose_model_id(provider: &Provider) -> Result<String> {
-    let base_url = expand_env(&provider.base_url)?;
-    let entries = tokio::time::timeout(
-        CATALOGUE_TIMEOUT,
-        list_models(&base_url, &provider.api_key, &provider.headers),
-    )
-    .await;
+    let entries = tokio::time::timeout(CATALOGUE_TIMEOUT, list_models(provider)).await;
     let mut entries = match entries {
         Ok(Ok(entries)) => entries
             .into_iter()
@@ -270,7 +278,7 @@ fn sanitize_part(name: &str) -> String {
     name.trim().replace('/', "-")
 }
 
-fn validate_base_url(value: &str) -> std::result::Result<(), String> {
+pub(crate) fn validate_base_url(value: &str) -> std::result::Result<(), String> {
     let expanded = expand_env(value).map_err(|error| error.to_string())?;
     let url =
         reqwest::Url::parse(&expanded).map_err(|_| "enter a valid absolute URL".to_string())?;
@@ -330,6 +338,33 @@ fn prompt_value<T: std::fmt::Display>(
             Err(error) => crate::ui::warn(&format!("{error}; try again")),
         }
     }
+}
+
+/// Ask for a new provider's endpoint, wire API and key.
+fn prompt_new_provider(name: &str) -> Result<Provider> {
+    let base_url = prompt_required(
+        "Endpoint base URL (e.g. https://host/v1)",
+        None,
+        validate_base_url,
+    )?;
+    let api = loop {
+        let raw = prompt(
+            "API it speaks (chat_completions or responses)",
+            Some("chat_completions"),
+        )?;
+        match raw.trim() {
+            "chat_completions" | "chat" => break cowboy_core::config::WireApi::ChatCompletions,
+            "responses" => break cowboy_core::config::WireApi::Responses,
+            _ => crate::ui::warn("enter chat_completions or responses"),
+        }
+    };
+    let api_key = read_secret(&format!(
+        "API key for {name} (leave empty if the endpoint needs none)"
+    ))?;
+    Ok(Provider {
+        api,
+        ..Provider::api_key(base_url, api_key.trim())
+    })
 }
 
 // --- list ---
@@ -476,7 +511,7 @@ async fn available(all: bool) -> Result<()> {
     for (pname, p) in &providers.providers {
         let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
         println!("{}", style::bold(&format!("provider {pname} ({base}):")));
-        match list_models(&base, &p.api_key, &p.headers).await {
+        match list_models(p).await {
             Ok(mut entries) => {
                 entries.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut shown = 0;
@@ -603,10 +638,12 @@ fn sole_provider(providers: &ProvidersConfig) -> Result<String> {
     }
 }
 
-/// Write a model to the user config (used by the TUI `/models` form). Picks the
-/// sole/`default` provider, applies the given settings, and makes it the default
-/// if it's the first model. `reasoning` is `none|minimal|low|medium|high`.
+/// Write a model to the user config as `provider/name` (used by the TUI `/models`
+/// form, which knows which provider's catalogue the model came from), and make it
+/// the default if it's the first model. `reasoning` is
+/// `none|minimal|low|medium|high`. Returns the saved reference.
 pub fn save_user_model(
+    provider: &str,
     name: &str,
     id: &str,
     temperature: f32,
@@ -615,10 +652,10 @@ pub fn save_user_model(
     reasoning: &str,
 ) -> Result<ModelRef> {
     let providers = ProvidersConfig::load_global()?;
-    if providers.providers.is_empty() {
-        bail!("no providers configured; run `cowboy models setup`");
+    if !providers.providers.contains_key(provider) {
+        bail!("unknown provider `{provider}`; see `cowboy providers list`");
     }
-    let r = ModelRef::new(sole_provider(&providers)?, name)?;
+    let r = ModelRef::new(provider, name)?;
     let d = model_defaults::lookup(id);
     let def = ModelDef {
         model: id.to_string(),
@@ -657,7 +694,7 @@ fn project_models() -> Result<Option<ModelsConfig>> {
 
 /// Read a secret. On a real terminal, use a no-echo prompt; otherwise (piped /
 /// CI) read a plain line from stdin so the command stays scriptable.
-fn read_secret(label: &str) -> Result<String> {
+pub(crate) fn read_secret(label: &str) -> Result<String> {
     if std::io::stdin().is_terminal() {
         rpassword::prompt_password(format!("{label} (input hidden): ")).context("reading secret")
     } else {

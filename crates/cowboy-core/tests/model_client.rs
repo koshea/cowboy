@@ -278,13 +278,9 @@ async fn list_models_parses_the_catalogue() {
         .mount(&server)
         .await;
 
-    let entries = list_models(
-        &format!("{}/v1", server.uri()),
-        "test-key",
-        &BTreeMap::new(),
-    )
-    .await
-    .unwrap();
+    let provider =
+        cowboy_core::config::Provider::api_key(format!("{}/v1", server.uri()), "test-key");
+    let entries = list_models(&provider).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].id, "anthropic/claude-opus-4-8");
     assert_eq!(entries[1].owned_by, "Cerebras");
