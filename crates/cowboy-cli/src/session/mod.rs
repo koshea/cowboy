@@ -468,6 +468,7 @@ mod tests {
             Message::user("go"),
             Message {
                 reasoning: None,
+                reasoning_items: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,
@@ -498,6 +499,7 @@ mod tests {
             Message::user("go"),
             Message {
                 reasoning: None,
+                reasoning_items: None,
                 role: Role::Assistant,
                 content: String::new(),
                 tool_call_id: None,

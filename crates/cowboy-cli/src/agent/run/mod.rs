@@ -1454,17 +1454,36 @@ impl<'a> AgentLoop<'a> {
     /// overflowed the context window.
     fn message_tokens(m: &Message) -> usize {
         let mut n = cowboy_core::tokens::count(&m.content) + 4;
-        n += m
-            .reasoning
-            .as_deref()
-            .map(cowboy_core::tokens::count)
-            .unwrap_or(0);
+        n += Self::reasoning_tokens(m);
         for tc in &m.tool_calls {
             n += cowboy_core::tokens::count(&tc.arguments)
                 + cowboy_core::tokens::count(&tc.name)
                 + 4;
         }
         n
+    }
+
+    /// Tokens of a message's reasoning as it is re-sent: the text form
+    /// (`reasoning_content`) plus any opaque Responses reasoning items. Those are
+    /// encrypted, so the tokenizer cannot see inside them; a quarter of their
+    /// serialized size is a deliberately generous stand-in.
+    fn reasoning_tokens(m: &Message) -> usize {
+        let text = m
+            .reasoning
+            .as_deref()
+            .map(cowboy_core::tokens::count)
+            .unwrap_or(0);
+        let items = m
+            .reasoning_items
+            .as_ref()
+            .map(|r| {
+                r.items
+                    .iter()
+                    .map(|i| i.to_string().len() / 4)
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        text + items
     }
 
     /// Approximate token count of a message, memoized. See [`Self::token_memo`].
@@ -1474,6 +1493,11 @@ impl<'a> AgentLoop<'a> {
         // Exactly the fields `message_tokens` reads.
         m.content.hash(&mut h);
         m.reasoning.hash(&mut h);
+        if let Some(r) = &m.reasoning_items {
+            for i in &r.items {
+                i.to_string().hash(&mut h);
+            }
+        }
         for tc in &m.tool_calls {
             tc.name.hash(&mut h);
             tc.arguments.hash(&mut h);
@@ -1520,15 +1544,16 @@ impl<'a> AgentLoop<'a> {
         let mut kept = 0usize;
         let mut freed = 0usize;
         for m in self.messages.iter_mut().rev() {
-            let Some(r) = m.reasoning.as_deref() else {
+            if m.reasoning.is_none() && m.reasoning_items.is_none() {
                 continue;
-            };
+            }
             if kept < REASONING_TURNS_KEPT {
                 kept += 1;
                 continue;
             }
-            freed += cowboy_core::tokens::count(r);
+            freed += Self::reasoning_tokens(m);
             m.reasoning = None;
+            m.reasoning_items = None;
         }
         freed
     }
@@ -1589,11 +1614,7 @@ impl<'a> AgentLoop<'a> {
         let mut system = 0u64;
         for m in &self.messages {
             let total = self.tokens_of(m) as u64;
-            let r = m
-                .reasoning
-                .as_deref()
-                .map(cowboy_core::tokens::count)
-                .unwrap_or(0) as u64;
+            let r = Self::reasoning_tokens(m) as u64;
             reasoning += r;
             let rest = total.saturating_sub(r);
             match m.role {
@@ -2751,6 +2772,7 @@ impl<'a> AgentLoop<'a> {
                     tool_call_id: None,
                     tool_calls: response.tool_calls.clone(),
                     reasoning: response.reasoning.clone(),
+                    reasoning_items: response.reasoning_items.clone(),
                 };
                 if let Some(l) = &mut self.logger {
                     l.log_message(&assistant);
@@ -5508,6 +5530,8 @@ mod tests {
         responses: Arc<Mutex<std::collections::VecDeque<ChatResponse>>>,
         low_effort_calls: Arc<Mutex<usize>>,
         minimal: bool,
+        /// Every request's messages, in call order.
+        requests: Arc<Mutex<Vec<Vec<Message>>>>,
     }
     impl ScriptedModel {
         fn new(responses: Vec<ChatResponse>) -> Self {
@@ -5515,6 +5539,7 @@ mod tests {
                 responses: Arc::new(Mutex::new(responses.into())),
                 low_effort_calls: Arc::new(Mutex::new(0)),
                 minimal: false,
+                requests: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -5522,10 +5547,11 @@ mod tests {
     impl ModelClient for ScriptedModel {
         async fn chat(
             &self,
-            _messages: &[Message],
+            messages: &[Message],
             _tools: &[ToolDef],
             deltas: Option<tokio::sync::mpsc::UnboundedSender<Delta>>,
         ) -> Result<ChatResponse, cowboy_core::Error> {
+            self.requests.lock().unwrap().push(messages.to_vec());
             if self.minimal {
                 *self.low_effort_calls.lock().unwrap() += 1;
             }
@@ -5818,6 +5844,50 @@ mod tests {
         }
     }
 
+    /// Opaque reasoning items a Responses model returned with a tool call are kept
+    /// on the assistant turn and are in the very next request — under
+    /// `store: false` that replay is the model's only memory of its reasoning.
+    #[tokio::test]
+    async fn reasoning_items_reach_the_next_request() {
+        let items = cowboy_core::model::ReasoningItems {
+            origin: "https://x/v1#gpt".into(),
+            items: vec![serde_json::json!({"type": "reasoning", "encrypted_content": "gAAA"})],
+        };
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
+                reasoning_items: Some(items.clone()),
+                ..Default::default()
+            },
+            ChatResponse {
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+                ..Default::default()
+            },
+        ]);
+        let requests = model.requests.clone();
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::new(),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        );
+        let r = agent
+            .run_turn("go", CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(r.as_deref(), Some("done"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replayed = requests[1]
+            .iter()
+            .find(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+            .and_then(|m| m.reasoning_items.clone());
+        assert_eq!(replayed, Some(items));
+    }
+
     fn tool_call(id: &str, name: &str, args: &str) -> ToolCall {
         ToolCall {
             id: id.into(),
@@ -5942,6 +6012,7 @@ mod tests {
 
     fn empty_reply() -> ChatResponse {
         ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -5955,6 +6026,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_reply_is_retried_before_giving_up() {
         let finish = ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -6011,6 +6083,7 @@ mod tests {
     async fn a_silent_command_reports_no_output() {
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6018,6 +6091,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"grep nope x"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6051,6 +6125,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6058,6 +6133,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6109,6 +6185,7 @@ mod tests {
                     format!(" ; echo \\\"probe {i}\\\" 2>&1")
                 };
                 ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -6261,6 +6338,7 @@ mod tests {
         // pricing is $3/Mtok in, $0.30/Mtok cached, $15/Mtok out. Expected:
         // 200*3/1e6 + 800*0.30/1e6 + 100*15/1e6 = 0.0006 + 0.00024 + 0.0015.
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: Some(cowboy_core::model::Usage {
                 prompt_tokens: 1000,
@@ -6298,6 +6376,7 @@ mod tests {
     #[tokio::test]
     async fn provider_usage_without_a_cache_price_bills_full_input_rate() {
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: Some(cowboy_core::model::Usage {
                 prompt_tokens: 1000,
@@ -6353,6 +6432,7 @@ mod tests {
     #[tokio::test]
     async fn a_configured_cache_price_produces_no_warning() {
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: Some(cowboy_core::model::Usage {
                 prompt_tokens: 1000,
@@ -6392,6 +6472,7 @@ mod tests {
         // once the provider reports, only counted tokens are billed.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6399,6 +6480,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: Some(cowboy_core::model::Usage {
                     prompt_tokens: 500,
@@ -6435,6 +6517,7 @@ mod tests {
         // The model keeps asking for shell (never finals); only the budget stops it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6442,6 +6525,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"ls"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6548,6 +6632,7 @@ mod tests {
     async fn plan_tool_records_steps_and_normalizes_status() {
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6561,6 +6646,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6625,6 +6711,7 @@ mod tests {
     async fn artifact_tool_publishes_to_the_session_store() {
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6637,6 +6724,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6674,6 +6762,7 @@ mod tests {
     async fn decision_tool_records_the_answer() {
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6685,6 +6774,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6732,6 +6822,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6743,6 +6834,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6750,6 +6842,7 @@ mod tests {
                 tool_calls: vec![tool_call("2", "unblock", "{}")],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6794,6 +6887,7 @@ mod tests {
 
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6805,6 +6899,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6816,6 +6911,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6859,6 +6955,7 @@ mod tests {
     async fn handoff_tool_writes_handoff_md_and_artifact() {
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6871,6 +6968,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -6914,6 +7012,7 @@ mod tests {
             let mut q = m.responses.lock().unwrap();
             for i in 0..12 {
                 q.push_back(ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -6963,6 +7062,7 @@ mod tests {
             let mut q = m.responses.lock().unwrap();
             for i in 0..10 {
                 q.push_back(ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -6976,6 +7076,7 @@ mod tests {
             }
             // Then it finishes normally.
             q.push_back(ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7012,6 +7113,7 @@ mod tests {
     #[tokio::test]
     async fn final_answers_its_own_call_and_any_batched_after_it() {
         let m = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -7055,6 +7157,7 @@ mod tests {
     #[tokio::test]
     async fn wrapping_up_refuses_investigation_and_leaves_only_reporting_tools() {
         let m = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -7149,6 +7252,7 @@ mod tests {
     async fn plan_mode_blocks_shell_and_subagent_not_just_edits() {
         // The gate must stop the command before it ever reaches the container.
         let m = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -7256,6 +7360,7 @@ mod tests {
             Box::new(|_name| {
                 // The healthy fallback answers immediately.
                 let m = ScriptedModel::new(vec![ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -7333,6 +7438,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             // 1. Edit a file.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7345,6 +7451,7 @@ mod tests {
             },
             // 2. Claim done without checking — must be refused.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7353,6 +7460,7 @@ mod tests {
             },
             // 3. Run the check.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7361,6 +7469,7 @@ mod tests {
             },
             // 4. Now finishing is allowed.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7405,6 +7514,7 @@ mod tests {
         let sandbox = FakeSandbox::printing("     1\tfn main() {}\n");
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7412,6 +7522,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "read", r#"{"path":"main.rs"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7446,6 +7557,7 @@ mod tests {
         // test is that the agent never runs the check and insists on finishing.
         let sandbox = FakeSandbox::printing("ok\n").with_file("main.rs", "foo\n");
         let mut script = vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -7459,6 +7571,7 @@ mod tests {
         // Insist on finishing more times than the refusal budget allows.
         for i in 0..6 {
             script.push(ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7557,6 +7670,7 @@ mod tests {
         let root = sandbox.root_path();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7568,6 +7682,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7613,6 +7728,7 @@ mod tests {
         let model = ScriptedModel::new(vec![
             // 1. Blind overwrite — refused.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7625,6 +7741,7 @@ mod tests {
             },
             // 2. Read it…
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7633,6 +7750,7 @@ mod tests {
             },
             // 3. …and now the same write is allowed.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7644,6 +7762,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7688,6 +7807,7 @@ mod tests {
         let root = sandbox.root_path();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7695,6 +7815,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "read", r#"{"path":"shared.rs"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7738,6 +7859,7 @@ mod tests {
             FakeSandbox::printing("").with_file("m.rs", "fn a() {}\nfn b() {}\nfn c() {}\n");
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7749,6 +7871,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7788,6 +7911,7 @@ mod tests {
         let sandbox = FakeSandbox::failing(crate::sandbox::EXIT_TIMEOUT, "listening on :3000\n");
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7795,6 +7919,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"npm run dev"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7888,6 +8013,7 @@ mod tests {
     async fn auto_start_processes_are_running_before_the_first_turn() {
         let sandbox = FakeSandbox::printing("");
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -7952,6 +8078,7 @@ mod tests {
         );
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -7963,6 +8090,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8008,6 +8136,7 @@ mod tests {
         );
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8015,6 +8144,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "read", r#"{"path":"long.rs"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8053,6 +8183,7 @@ mod tests {
         // actually prevents the mutation rather than merely discouraging it.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8064,6 +8195,7 @@ mod tests {
                 )],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8103,6 +8235,7 @@ mod tests {
             let mut q = looping.responses.lock().unwrap();
             for i in 0..10 {
                 q.push_back(ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -8161,6 +8294,7 @@ mod tests {
                 let w = WORDS[i % WORDS.len()];
                 let suffix = "z".repeat(i / WORDS.len());
                 q.push_back(ChatResponse {
+                    reasoning_items: None,
                     truncated: false,
                     usage: None,
                     reasoning: None,
@@ -8364,6 +8498,7 @@ mod tests {
         // spends its whole budget re-reading files.
         let responses: Vec<ChatResponse> = (0..3)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8421,6 +8556,7 @@ mod tests {
         // to admit it is stuck.
         let responses: Vec<ChatResponse> = (0..6)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8469,6 +8605,7 @@ mod tests {
         // every "wait for the thing to come up" loop.
         let responses: Vec<ChatResponse> = (0..6)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8506,6 +8643,7 @@ mod tests {
         // Two turns on the same loop; the conversation must accumulate.
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8513,6 +8651,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "final", r#"{"message":"done 1"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8625,6 +8764,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8666,6 +8806,7 @@ mod tests {
         // after the turn that asked for it.
         let responses: Vec<ChatResponse> = (0..2)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8719,6 +8860,7 @@ mod tests {
         // through.
         let responses: Vec<ChatResponse> = (0..3)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8851,6 +8993,7 @@ mod tests {
         // instead of hitting a cap and returning `[partial]`.
         let mut responses: Vec<ChatResponse> = (0..2)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8863,6 +9006,7 @@ mod tests {
             })
             .collect();
         responses.push(ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -8898,6 +9042,7 @@ mod tests {
         // worker still ends with a real answer.
         let responses: Vec<ChatResponse> = (0..40)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8936,6 +9081,7 @@ mod tests {
         // result this mechanism exists to prevent.
         let responses = vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8943,6 +9089,7 @@ mod tests {
                 tool_calls: vec![tool_call("0", "read", r#"{"path":"a.rs"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8978,6 +9125,7 @@ mod tests {
         // told and finishes, so the redirect is the only request.
         let mut responses: Vec<ChatResponse> = (0..2)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -8986,6 +9134,7 @@ mod tests {
             })
             .collect();
         responses.push(ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -9027,6 +9176,7 @@ mod tests {
     async fn a_stop_verdict_ends_the_work_with_a_report_not_silence() {
         let responses = vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9034,6 +9184,7 @@ mod tests {
                 tool_calls: vec![tool_call("0", "read", r#"{"path":"a.rs"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9164,6 +9315,7 @@ mod tests {
         // worker process leaves children spending on results nobody will read.
         let responses: Vec<ChatResponse> = (0..4)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9205,6 +9357,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9253,6 +9406,7 @@ mod tests {
         // message lands on the next iteration — without cancelling anything.
         let responses: Vec<ChatResponse> = vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9260,6 +9414,7 @@ mod tests {
                 tool_calls: vec![tool_call("0", "shell", r#"{"command":"echo one"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9267,6 +9422,7 @@ mod tests {
                 tool_calls: vec![tool_call("1", "shell", r#"{"command":"echo two"}"#)],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9372,6 +9528,7 @@ mod tests {
         // commands — and a one-iteration stall window, with one stall already recorded.
         let responses: Vec<ChatResponse> = (0..4)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9795,6 +9952,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let mut agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -9978,6 +10136,7 @@ mod tests {
         // crew would end the turn.
         let responses: Vec<ChatResponse> = (0..8)
             .map(|i| ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -10165,6 +10324,7 @@ mod tests {
     async fn compaction_carries_the_task_through_verbatim() {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -10372,6 +10532,7 @@ mod tests {
         // The "summary" is longer than the conversation it is meant to condense.
         let essay = "and then a great many further details followed. ".repeat(4_000);
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -10796,6 +10957,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         // The model serves the compaction summary.
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -10847,6 +11009,7 @@ mod tests {
         // summary to script: MAX_REPRIME_ATTEMPTS retries then the verdict.
         let mut ui = RecordingUi::default();
         let trunc = || ChatResponse {
+            reasoning_items: None,
             truncated: true,
             usage: None,
             reasoning: None,
@@ -10892,6 +11055,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         // Four tool-using turns, each with reasoning, then a final answer.
         let thinking = |n: usize| ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: Some(format!("thinking about step {n} ").repeat(50)),
@@ -10908,6 +11072,7 @@ mod tests {
             thinking(3),
             thinking(4),
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: Some("final thought".into()),
@@ -10963,6 +11128,7 @@ mod tests {
     async fn shedding_keeps_the_most_recent_reasoning_intact() {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -11005,6 +11171,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: None, // provider billed the thinking but returned none
@@ -11014,6 +11181,7 @@ mod tests {
             // No summary call is made (nothing to summarize), so the very next
             // response is the retry answering.
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11056,6 +11224,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: Some("thinking at length".into()),
@@ -11064,6 +11233,7 @@ mod tests {
             },
             // The summary call itself yields nothing usable.
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: None,
@@ -11071,6 +11241,7 @@ mod tests {
                 tool_calls: vec![],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11099,6 +11270,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: None,
@@ -11106,6 +11278,7 @@ mod tests {
                 tool_calls: vec![],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11127,6 +11300,7 @@ mod tests {
 
         // A second, healthy turn goes out at the configured effort.
         agent.model = Box::new(ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -11151,6 +11325,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: Some("I should edit foo.rs and run the tests".into()),
@@ -11158,6 +11333,7 @@ mod tests {
                 tool_calls: vec![],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11165,6 +11341,7 @@ mod tests {
                 tool_calls: vec![],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11202,6 +11379,7 @@ mod tests {
         // truncated turn plus its (main-model) summary call.
         let mut ui = RecordingUi::default();
         let trunc = || ChatResponse {
+            reasoning_items: None,
             truncated: true,
             usage: None,
             reasoning: Some("still thinking hard".into()),
@@ -11209,6 +11387,7 @@ mod tests {
             tool_calls: vec![],
         };
         let summ = || ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -11250,6 +11429,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let model = ScriptedModel::new(vec![
             ChatResponse {
+                reasoning_items: None,
                 truncated: true,
                 usage: None,
                 reasoning: Some("raw thinking".into()),
@@ -11257,6 +11437,7 @@ mod tests {
                 tool_calls: vec![],
             },
             ChatResponse {
+                reasoning_items: None,
                 truncated: false,
                 usage: None,
                 reasoning: None,
@@ -11265,6 +11446,7 @@ mod tests {
             },
         ]);
         let summarizer = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -11461,6 +11643,7 @@ mod tests {
             tool_call_id: None,
             tool_calls: vec![],
             reasoning: None,
+            reasoning_items: None,
         });
         agent.plan = vec![
             ("Review auth".into(), "done".into()),
@@ -11571,6 +11754,7 @@ mod tests {
 
     fn request_path_response(path: &std::path::Path, read_only: bool) -> ChatResponse {
         ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,
@@ -11590,6 +11774,7 @@ mod tests {
 
     fn finished(message: &str) -> ChatResponse {
         ChatResponse {
+            reasoning_items: None,
             truncated: false,
             usage: None,
             reasoning: None,

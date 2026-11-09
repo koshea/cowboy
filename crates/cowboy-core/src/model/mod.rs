@@ -231,6 +231,22 @@ pub struct Message {
     /// tool-use turns — without it they re-derive the same step and loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// For `Assistant` turns from a Responses API reasoning model: the opaque
+    /// reasoning items (`encrypted_content`) it returned. Requests are sent with
+    /// `store: false`, so the provider keeps nothing between turns; replaying these
+    /// is the only way the model keeps its reasoning across tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_items: Option<ReasoningItems>,
+}
+
+/// Opaque reasoning items, tagged with the endpoint + model that produced them.
+/// Encrypted reasoning can only be decrypted by the model that wrote it, so after a
+/// `/model` switch the items of earlier turns are dropped from requests rather
+/// than sent somewhere they would fail the whole call.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReasoningItems {
+    pub origin: String,
+    pub items: Vec<serde_json::Value>,
 }
 
 impl Message {
@@ -247,6 +263,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: Vec::new(),
             reasoning: None,
+            reasoning_items: None,
         }
     }
     /// A tool-result message answering `tool_call_id`.
@@ -257,6 +274,7 @@ impl Message {
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
             reasoning: None,
+            reasoning_items: None,
         }
     }
 }
@@ -297,6 +315,9 @@ pub struct ChatResponse {
     /// tokenizer estimate for cost accounting: it is the billing ground truth,
     /// including prompt-cache hits the estimate cannot see.
     pub usage: Option<Usage>,
+    /// Opaque reasoning items to replay on the next request (Responses API only;
+    /// see [`Message::reasoning_items`]).
+    pub reasoning_items: Option<ReasoningItems>,
 }
 
 /// Provider-reported token usage for one call (the `usage` object of an
@@ -930,6 +951,7 @@ impl ModelClient for OpenAiClient {
         }
 
         Ok(ChatResponse {
+            reasoning_items: None,
             content: (!content.is_empty()).then_some(content),
             tool_calls: acc.finish(),
             reasoning: (!reasoning.is_empty()).then_some(reasoning),
@@ -942,6 +964,26 @@ impl ModelClient for OpenAiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_from_before_reasoning_items_still_loads_and_new_items_round_trip() {
+        // A transcript line written before the field existed.
+        let old = r#"{"role":"assistant","content":"hi","reasoning":"r"}"#;
+        let m: Message = serde_json::from_str(old).unwrap();
+        assert!(m.reasoning_items.is_none());
+        // Absent items are not written, so older readers see the same shape.
+        assert!(!serde_json::to_string(&m)
+            .unwrap()
+            .contains("reasoning_items"));
+
+        let mut m = Message::new(Role::Assistant, "");
+        m.reasoning_items = Some(ReasoningItems {
+            origin: "u#m".into(),
+            items: vec![serde_json::json!({"type": "reasoning", "encrypted_content": "x"})],
+        });
+        let back: Message = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
 
     #[test]
     fn parse_reset_value_handles_seconds_and_unit_strings() {

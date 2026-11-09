@@ -1,0 +1,36 @@
+---
+source: crates/cowboy-core/src/model/responses.rs
+expression: pretty(&body)
+---
+{
+  "include": [
+    "reasoning.encrypted_content"
+  ],
+  "input": [
+    {
+      "content": "go",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "encrypted_content": "gAAA",
+      "id": "rs_1",
+      "summary": [],
+      "type": "reasoning"
+    },
+    {
+      "arguments": "{}",
+      "call_id": "c1",
+      "name": "shell",
+      "type": "function_call"
+    },
+    {
+      "call_id": "c1",
+      "output": "ok",
+      "type": "function_call_output"
+    }
+  ],
+  "model": "gpt-x",
+  "store": false,
+  "stream": true
+}

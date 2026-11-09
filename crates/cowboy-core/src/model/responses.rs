@@ -18,7 +18,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use super::transport::{self, FailurePolicy, SseStream, TokenSource};
 use super::{
-    header_map, oa_err, ChatResponse, Delta, Message, ModelClient, Role, ToolCall, ToolDef, Usage,
+    header_map, oa_err, ChatResponse, Delta, Message, ModelClient, ReasoningItems, Role, ToolCall,
+    ToolDef, Usage,
 };
 use crate::config::{ReasoningEffort, ResolvedModel};
 use crate::error::{Error, Result};
@@ -37,6 +38,14 @@ pub struct RequestOptions {
     /// Omit every field ChatGPT plan usage rejects (see [`STRICT_OMITTED`]).
     pub strict: bool,
     pub tool_layout: ToolLayout,
+    /// Ask for (and replay) encrypted reasoning items. Only reasoning models
+    /// produce them, and some endpoints reject the `include` for other models, so
+    /// this is on when a reasoning effort is configured or in strict mode (every
+    /// ChatGPT-plan model reasons).
+    pub include_reasoning: bool,
+    /// Which endpoint + model produced reasoning items; only matching items are
+    /// replayed (see [`ReasoningItems`]).
+    pub origin: String,
 }
 
 /// Fields the ChatGPT-plan route refuses, per OpenAI's preview limitations. The
@@ -74,7 +83,8 @@ pub enum ToolLayout {
 
 /// The JSON body for one Responses request (`stream: true`).
 pub fn build_body(opts: &RequestOptions, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
-    let (instructions, input) = to_input(messages)?;
+    let replay = opts.include_reasoning.then_some(opts.origin.as_str());
+    let (instructions, input) = to_input(messages, replay)?;
     let mut body = json!({
         "model": opts.model,
         "input": input,
@@ -89,6 +99,9 @@ pub fn build_body(opts: &RequestOptions, messages: &[Message], tools: &[ToolDef]
     }
     if let Some(effort) = opts.reasoning_effort {
         body["reasoning"] = json!({ "effort": effort.as_str() });
+    }
+    if opts.include_reasoning {
+        body["include"] = json!(["reasoning.encrypted_content"]);
     }
     if !opts.strict {
         body["temperature"] = short_float(opts.temperature);
@@ -115,7 +128,11 @@ pub fn build_body(opts: &RequestOptions, messages: &[Message], tools: &[ToolDef]
 /// Later system messages (notes Cowboy inserts mid-conversation) become
 /// `developer` messages in place: a `system` item is refused by the ChatGPT-plan
 /// route, and folding them into `instructions` would move them out of order.
-fn to_input(messages: &[Message]) -> Result<(Option<String>, Vec<Value>)> {
+///
+/// With `replay` set to this request's origin, an assistant turn's reasoning items
+/// from that same origin are replayed before its output — the order the model
+/// produced them in.
+fn to_input(messages: &[Message], replay: Option<&str>) -> Result<(Option<String>, Vec<Value>)> {
     let mut instructions: Option<String> = None;
     let mut input = Vec::with_capacity(messages.len());
     for m in messages {
@@ -126,6 +143,11 @@ fn to_input(messages: &[Message]) -> Result<(Option<String>, Vec<Value>)> {
             Role::System => input.push(message("developer", &m.content)),
             Role::User => input.push(message("user", &m.content)),
             Role::Assistant => {
+                if let (Some(origin), Some(r)) = (replay, &m.reasoning_items) {
+                    if r.origin == origin {
+                        input.extend(r.items.iter().cloned());
+                    }
+                }
                 if !m.content.is_empty() {
                     input.push(message("assistant", &m.content));
                 }
@@ -243,6 +265,8 @@ impl ResponsesClient {
                 extra: model.extra.clone(),
                 strict,
                 tool_layout: ToolLayout::TopLevel,
+                include_reasoning: strict || model.reasoning_effort.is_some(),
+                origin: format!("{}#{}", model.base_url.trim_end_matches('/'), model.model),
             },
             stream_idle: model
                 .stream_idle_timeout_seconds
@@ -410,7 +434,7 @@ impl ModelClient for ResponsesClient {
         .await?;
         let rid = transport::request_id(&resp);
         let mut sse = SseStream::new(resp, self.stream_idle);
-        read_stream(&mut sse, deltas.as_ref())
+        read_stream(&mut sse, deltas.as_ref(), &self.opts.origin)
             .await
             .map_err(|e| with_request_id(e, rid.as_deref()))
     }
@@ -431,7 +455,9 @@ fn with_request_id(e: Error, rid: Option<&str>) -> Error {
 async fn read_stream(
     sse: &mut SseStream,
     deltas: Option<&UnboundedSender<Delta>>,
+    origin: &str,
 ) -> Result<ChatResponse> {
+    let mut reasoning_items: Vec<Value> = Vec::new();
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut calls = Calls::default();
@@ -444,8 +470,16 @@ async fn read_stream(
         if data == "[DONE]" {
             break;
         }
-        let Ok(ev) = serde_json::from_str::<Event>(&data) else {
+        let Ok(raw) = serde_json::from_str::<Value>(&data) else {
             continue; // keep-alives / unparseable frames
+        };
+        // A finished reasoning item is kept verbatim to replay next turn.
+        if raw["type"] == "response.output_item.done" && raw["item"]["type"] == "reasoning" {
+            reasoning_items.push(raw["item"].clone());
+            continue;
+        }
+        let Ok(ev) = serde_json::from_value::<Event>(raw) else {
+            continue;
         };
         match ev.kind.as_str() {
             "response.output_text.delta" => {
@@ -506,6 +540,10 @@ async fn read_stream(
                     tool_calls: calls.finish(),
                     reasoning: (!reasoning.is_empty()).then_some(reasoning),
                     truncated,
+                    reasoning_items: (!reasoning_items.is_empty()).then(|| ReasoningItems {
+                        origin: origin.to_string(),
+                        items: reasoning_items,
+                    }),
                     usage: r.usage.map(|u| Usage {
                         prompt_tokens: u.input_tokens,
                         completion_tokens: u.output_tokens,
@@ -555,6 +593,8 @@ mod tests {
             extra: BTreeMap::new(),
             strict,
             tool_layout: ToolLayout::TopLevel,
+            include_reasoning: false,
+            origin: "o".into(),
         }
     }
 
@@ -647,6 +687,48 @@ mod tests {
         let body = build_body(&o, &[Message::user("x")], &[]).unwrap();
         assert_eq!(body["temperature"], json!(1.0));
         assert_eq!(body["truncation"], json!("auto"));
+    }
+
+    #[test]
+    fn reasoning_items_are_replayed_only_to_the_model_that_wrote_them() {
+        let item = json!({"type": "reasoning", "id": "rs_1", "summary": [],
+                          "encrypted_content": "gAAA"});
+        let mut assistant = Message::new(Role::Assistant, "");
+        assistant.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        assistant.reasoning_items = Some(ReasoningItems {
+            origin: "o".into(),
+            items: vec![item.clone()],
+        });
+        let msgs = [
+            Message::user("go"),
+            assistant,
+            Message::tool_result("c1", "ok"),
+        ];
+        let mut o = opts(true);
+        o.include_reasoning = true;
+        let body = build_body(&o, &msgs, &[]).unwrap();
+        assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        let input = body["input"].as_array().unwrap();
+        // Replayed before the call it led to.
+        assert_eq!(input[1], item);
+        assert_eq!(input[2]["type"], "function_call");
+        insta::assert_snapshot!(pretty(&body));
+
+        // Another model's items are dropped, not sent where they would fail.
+        o.origin = "elsewhere".into();
+        let body = build_body(&o, &msgs, &[]).unwrap();
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "reasoning"));
+        // And nothing is replayed or requested when reasoning is off.
+        let body = build_body(&opts(false), &msgs, &[]).unwrap();
+        assert!(body.get("include").is_none());
     }
 
     #[test]
