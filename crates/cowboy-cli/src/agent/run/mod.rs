@@ -531,6 +531,9 @@ struct SubagentPlan {
     label: String,
     /// The crew-resolved model (routed via `COWBOY_MODEL`); None when no roster.
     model: Option<String>,
+    /// The crew this job was routed by, passed down (`COWBOY_CREW`) so the child —
+    /// should it delegate in turn — routes with the same crew as its parent.
+    crew: Option<String>,
     /// Per-task-type temperature override (routed via `COWBOY_TEMPERATURE`).
     temperature: Option<f32>,
     /// Initial iteration grant for the child (effort-scaled), and the host-enforced
@@ -604,6 +607,9 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
         cmd.env(crate::agent::harness::ENV_HARNESS, harness);
     } else if let Some(model) = &plan.model {
         cmd.env("COWBOY_MODEL", model);
+    }
+    if let Some(c) = &plan.crew {
+        cmd.env(crate::cmd::crew::ENV_CREW, c);
     }
     if let Some(t) = plan.temperature {
         cmd.env("COWBOY_TEMPERATURE", t.to_string());
@@ -1099,7 +1105,7 @@ impl<'a> AgentLoop<'a> {
         // is offered neither, rather than being told to delegate and refused when
         // it tries. Loaded once here; `dispatch_subagents` re-reads the roster per
         // turn so a mid-session `cowboy crew` edit still takes effect on routing.
-        let crew_cfg = cowboy_core::crew::load().ok().flatten();
+        let crew_cfg = crate::cmd::crew::session_crew().ok().flatten();
         let crew_on = crew_cfg.as_ref().is_some_and(|c| c.enabled());
         let subagent_depth = std::env::var("COWBOY_SUBAGENT_DEPTH")
             .ok()
@@ -4875,7 +4881,7 @@ impl<'a> AgentLoop<'a> {
         // edit takes effect on routing.
         let crew_cfg = match &self.pinned_crew {
             Some(pinned) => pinned.clone(),
-            None => cowboy_core::crew::load().ok().flatten(),
+            None => crate::cmd::crew::session_crew().ok().flatten(),
         };
 
         // Plan + announce sequentially (needs `&mut self`); collect runnable plans.
@@ -4926,6 +4932,7 @@ impl<'a> AgentLoop<'a> {
         // Harness jobs forward the network requests their own sandbox cannot ask about.
         let foreman_approver = self.runtime.approver();
         for (call_id, plan) in plans {
+            let crew_name = plan.crew.clone().unwrap_or_default();
             let label = plan
                 .label
                 .split(" → ")
@@ -5012,6 +5019,7 @@ impl<'a> AgentLoop<'a> {
                     // getting around to reading the result.
                     if let Some((category, effort, model, fell_back)) = routed {
                         cowboy_core::crew::record_outcome(&cowboy_core::crew::CrewOutcome {
+                            crew: crew_name,
                             ts_ms: now_ms(),
                             category,
                             effort,
@@ -5407,6 +5415,10 @@ impl<'a> AgentLoop<'a> {
                 })
             });
         Ok(SubagentPlan {
+            crew: crew_cfg
+                .as_ref()
+                .map(|c| c.name.clone())
+                .filter(|n| !n.is_empty()),
             exe,
             root: self.runtime.root().to_path_buf(),
             id,

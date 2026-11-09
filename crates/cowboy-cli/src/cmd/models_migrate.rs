@@ -10,9 +10,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{ConfigPaths, ModelsConfig, ProvidersConfig};
-use cowboy_core::crew::{self, CrewConfig};
+use cowboy_core::crew;
 use cowboy_core::models_migrate::{
-    legacy_renames, migrate_crew, migrate_models_text, rename_crew_text, Renames,
+    legacy_renames, migrate_crew_file, migrate_models_text, Renames,
 };
 
 /// One file the migration would rewrite.
@@ -121,19 +121,11 @@ fn plan(
     }
 
     if let Some(before) = read(crew_path)? {
-        let mut cfg: CrewConfig = serde_yaml_ng::from_str(&before)
-            .with_context(|| format!("parsing {}", crew_path.display()))?;
-        if migrate_crew(&mut cfg, &renames, is_harness)
+        // Qualifies bare model slots and turns a single roster into the crew
+        // `default`, editing in place so the roster's comments survive.
+        if let Some((after, _)) = migrate_crew_file(&before, &renames, is_harness)
             .with_context(|| format!("migrating {}", crew_path.display()))?
         {
-            // Rename in place so a hand-written roster keeps its comments; fall back
-            // to re-serializing only if the in-place edit doesn't parse to the same
-            // roster (the `.bak` keeps the original either way).
-            let in_place = rename_crew_text(&before, &renames);
-            let after = match serde_yaml_ng::from_str::<CrewConfig>(&in_place) {
-                Ok(parsed) if parsed == cfg => in_place,
-                _ => serde_yaml_ng::to_string(&cfg)?,
-            };
             out.push(Rewrite {
                 path: crew_path.to_path_buf(),
                 before,
@@ -209,6 +201,10 @@ mod tests {
         assert!(crew.contains("general: bifrost/glm"), "{crew}");
         assert!(crew.contains("deep: chatgpt/gpt"), "{crew}");
         assert!(crew.contains("review: codex"), "{crew}");
+        // The single roster became the active crew `default`.
+        let f = cowboy_core::crew::parse_file(&crew).unwrap();
+        assert_eq!(f.active.as_deref(), Some("default"));
+        assert!(f.crews.contains_key("default"));
         assert_eq!(std::fs::read_to_string(backup_path(&user)).unwrap(), USER);
         assert_eq!(
             std::fs::read_to_string(backup_path(&crew_path)).unwrap(),

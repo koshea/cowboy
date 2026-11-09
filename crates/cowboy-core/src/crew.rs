@@ -337,6 +337,13 @@ pub struct CrewConfig {
     /// failing on a typo is too, and only an explicit field gives both.
     #[serde(default, skip_serializing, rename = "planner")]
     pub legacy_planner: Option<serde_yaml_ng::Value>,
+    /// Which crew this is (set when resolved from a [`CrewFile`]; empty for a
+    /// bare roster).
+    #[serde(skip)]
+    pub name: String,
+    /// The crew's foreman, when it names one (see [`CrewDef::foreman`]).
+    #[serde(skip)]
+    pub foreman: Option<crate::config::ModelRef>,
 }
 
 /// Which roster layer produced the resolved model (for logging / display).
@@ -493,28 +500,284 @@ pub fn path() -> Option<PathBuf> {
     crate::config::global_config_dir().map(|d| d.join("crew.yaml"))
 }
 
-/// Load the roster, or `None` if it doesn't exist yet.
-pub fn load() -> Result<Option<CrewConfig>> {
-    let Some(p) = path() else { return Ok(None) };
-    if !p.exists() {
-        return Ok(None);
-    }
-    let text = std::fs::read_to_string(&p).map_err(|e| Error::Invalid(e.to_string()))?;
-    serde_yaml_ng::from_str(&text)
-        .map(Some)
-        .map_err(|e| Error::Invalid(format!("parsing crew.yaml: {e}")))
+/// Why a single-roster `crew.yaml` is refused.
+pub const MIGRATE_HINT: &str = "crew.yaml now holds named crews (`crews:` with `active:`); \
+     run `cowboy models migrate` to convert it";
+
+/// One named crew: its routing, and optionally the foreman it runs under.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CrewDef {
+    /// The model this crew's foreman runs on. Switching to the crew switches the
+    /// session's model to it (`/model` can still override afterwards), and its
+    /// `<default>` slots resolve to it. Unset: the foreman is whatever `/model`
+    /// selects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreman: Option<crate::config::ModelRef>,
+    #[serde(default)]
+    pub crew: BTreeMap<String, Ramp>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub temperature: BTreeMap<String, f32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub descriptions: BTreeMap<String, String>,
+    /// Overrides of the shared delegation limits for this crew only.
+    #[serde(default, skip_serializing_if = "DelegationOverride::is_empty")]
+    pub delegation: DelegationOverride,
 }
 
-/// Write the roster (creates `~/.config/cowboy/`; atomic temp+rename).
-pub fn save(cfg: &CrewConfig) -> Result<()> {
+impl CrewDef {
+    /// The routing half of a roster (its delegation settings are the file's).
+    pub fn from_roster(cfg: &CrewConfig) -> Self {
+        Self {
+            foreman: cfg.foreman.clone(),
+            crew: cfg.crew.clone(),
+            temperature: cfg.temperature.clone(),
+            descriptions: cfg.descriptions.clone(),
+            delegation: DelegationOverride::default(),
+        }
+    }
+}
+
+/// Per-crew overrides of [`Delegation`]. Every field optional; `enabled` is not
+/// here on purpose — solo vs crew is one switch for all crews.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DelegationOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_per_provider: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_depth: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_recursive_delegation: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iterations: Option<Grants>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stall_window: Option<u32>,
+}
+
+impl DelegationOverride {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn apply(&self, base: &Delegation) -> Delegation {
+        let mut d = base.clone();
+        macro_rules! take {
+            ($($f:ident),*) => { $( if let Some(v) = &self.$f { d.$f = v.clone(); } )* };
+        }
+        take!(
+            max_parallel,
+            max_parallel_per_provider,
+            max_depth,
+            allow_recursive_delegation,
+            iterations,
+            max_total_iterations,
+            request_timeout_seconds,
+            stall_window
+        );
+        d
+    }
+}
+
+/// `~/.config/cowboy/crew.yaml`: named crews, which one new sessions use, and the
+/// delegation settings they share.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "serde_yaml_ng::Value")]
+pub struct CrewFile {
+    pub version: u32,
+    /// The crew new sessions start with. Optional when there is exactly one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active: Option<String>,
+    /// Shared by every crew; `enabled` is crew mode on/off (solo when off).
+    pub delegation: Delegation,
+    pub crews: BTreeMap<String, CrewDef>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CrewFileRepr {
+    #[serde(default = "default_version")]
+    version: u32,
+    #[serde(default)]
+    active: Option<String>,
+    #[serde(default)]
+    delegation: Delegation,
+    #[serde(default)]
+    crews: BTreeMap<String, CrewDef>,
+    /// The retired `planner:` block, dropped (see [`CrewConfig::legacy_planner`]).
+    #[serde(default, rename = "planner")]
+    _planner: Option<serde_yaml_ng::Value>,
+}
+
+/// A usable crew name: non-empty, no `/`, no whitespace.
+pub fn valid_crew_name(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && !s.chars().any(char::is_whitespace)
+}
+
+impl TryFrom<serde_yaml_ng::Value> for CrewFile {
+    type Error = String;
+    fn try_from(v: serde_yaml_ng::Value) -> std::result::Result<Self, String> {
+        if is_single_roster(&v) {
+            return Err(format!(
+                "this crew.yaml holds a single roster — {MIGRATE_HINT}"
+            ));
+        }
+        let r: CrewFileRepr = serde_yaml_ng::from_value(v).map_err(|e| e.to_string())?;
+        if let Some(bad) = r.crews.keys().find(|n| !valid_crew_name(n)) {
+            return Err(format!("invalid crew name {bad:?} (no `/` or spaces)"));
+        }
+        if let Some(a) = &r.active {
+            if !r.crews.contains_key(a) {
+                return Err(format!(
+                    "`active: {a}` names no crew under `crews:` ({})",
+                    r.crews.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        Ok(Self {
+            version: r.version,
+            active: r.active,
+            delegation: r.delegation,
+            crews: r.crews,
+        })
+    }
+}
+
+/// True for a `crew.yaml` from before named crews: a top-level `crew:` roster and
+/// no `crews:`.
+pub fn is_single_roster(v: &serde_yaml_ng::Value) -> bool {
+    v.get("crew").is_some() && v.get("crews").is_none()
+}
+
+impl Default for CrewFile {
+    fn default() -> Self {
+        Self {
+            version: default_version(),
+            active: None,
+            delegation: Delegation::default(),
+            crews: BTreeMap::new(),
+        }
+    }
+}
+
+impl CrewFile {
+    /// The crew new sessions use: `active`, else the only crew.
+    pub fn active_name(&self) -> Option<&str> {
+        self.active.as_deref().or_else(|| {
+            (self.crews.len() == 1)
+                .then(|| self.crews.keys().next().map(String::as_str))
+                .flatten()
+        })
+    }
+
+    /// One crew as an effective roster: its routing plus the shared delegation
+    /// settings with its overrides applied. `None` when it does not exist.
+    pub fn resolve(&self, name: &str) -> Option<CrewConfig> {
+        let def = self.crews.get(name)?;
+        Some(CrewConfig {
+            version: self.version,
+            crew: def.crew.clone(),
+            temperature: def.temperature.clone(),
+            descriptions: def.descriptions.clone(),
+            delegation: def.delegation.apply(&self.delegation),
+            legacy_planner: None,
+            name: name.to_string(),
+            foreman: def.foreman.clone(),
+        })
+    }
+
+    /// `name`, or the active crew when `None`.
+    pub fn select(&self, name: Option<&str>) -> Option<CrewConfig> {
+        self.resolve(name.or_else(|| self.active_name())?)
+    }
+
+    /// Every crew, resolved.
+    pub fn all(&self) -> impl Iterator<Item = CrewConfig> + '_ {
+        self.crews.keys().filter_map(|n| self.resolve(n))
+    }
+}
+
+/// Load `crew.yaml`, or `None` if it doesn't exist yet.
+pub fn load_file() -> Result<Option<CrewFile>> {
+    let Some(p) = path() else { return Ok(None) };
+    load_file_at(&p)
+}
+
+/// Load a crews file from `p`, or `None` if absent.
+pub fn load_file_at(p: &std::path::Path) -> Result<Option<CrewFile>> {
+    match std::fs::read_to_string(p) {
+        Ok(text) => parse_file(&text).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::Invalid(format!("reading crew.yaml: {e}"))),
+    }
+}
+
+/// Parse crew.yaml text.
+pub fn parse_file(text: &str) -> Result<CrewFile> {
+    serde_yaml_ng::from_str(text).map_err(|e| Error::Invalid(format!("parsing crew.yaml: {e}")))
+}
+
+/// The active crew as an effective roster, or `None` without a crews file (or
+/// crews). Sessions select their own crew with [`load_named`].
+pub fn load() -> Result<Option<CrewConfig>> {
+    load_named(None)
+}
+
+/// The crew `name` (else the active one) as an effective roster. Naming a crew
+/// that does not exist is an error, not a silent fallback to another one.
+pub fn load_named(name: Option<&str>) -> Result<Option<CrewConfig>> {
+    let Some(file) = load_file()? else {
+        return Ok(None);
+    };
+    match name {
+        Some(n) => file.resolve(n).map(Some).ok_or_else(|| {
+            Error::Invalid(format!(
+                "no crew `{n}` in crew.yaml ({})",
+                file.crews.keys().cloned().collect::<Vec<_>>().join(", ")
+            ))
+        }),
+        None => Ok(file.select(None)),
+    }
+}
+
+/// Write `file` to crew.yaml (creates `~/.config/cowboy/`; atomic temp+rename).
+///
+/// Rosters are hand-written and commented, so a rewrite tries `edit` first — a
+/// targeted text change to the file as it is on disk — and keeps its result only
+/// if it parses to exactly `file`. Anything else falls back to a plain
+/// re-serialization, which is correct but drops comments.
+pub fn save_file(file: &CrewFile, edit: impl FnOnce(&str) -> Option<String>) -> Result<()> {
     let p = path().ok_or_else(|| Error::Invalid("cannot resolve home config dir".into()))?;
+    save_file_at(&p, file, edit)
+}
+
+/// [`save_file`] to an explicit path.
+pub fn save_file_at(
+    p: &std::path::Path,
+    file: &CrewFile,
+    edit: impl FnOnce(&str) -> Option<String>,
+) -> Result<()> {
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| Error::Invalid(e.to_string()))?;
     }
-    let yaml = serde_yaml_ng::to_string(cfg).map_err(|e| Error::Invalid(e.to_string()))?;
+    let before = std::fs::read_to_string(p).ok();
+    let edited = before
+        .as_deref()
+        .and_then(edit)
+        .filter(|t| parse_file(t).ok().as_ref() == Some(file));
+    let yaml = match edited {
+        Some(t) => t,
+        None => serde_yaml_ng::to_string(file).map_err(|e| Error::Invalid(e.to_string()))?,
+    };
     let tmp = p.with_extension("yaml.tmp");
     std::fs::write(&tmp, yaml).map_err(|e| Error::Invalid(e.to_string()))?;
-    std::fs::rename(&tmp, &p).map_err(|e| Error::Invalid(e.to_string()))?;
+    std::fs::rename(&tmp, p).map_err(|e| Error::Invalid(e.to_string()))?;
     Ok(())
 }
 
@@ -572,6 +835,8 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
         descriptions: BTreeMap::new(),
         delegation: Delegation::default(),
         legacy_planner: None,
+        name: String::new(),
+        foreman: None,
     }
 }
 
@@ -585,6 +850,10 @@ pub fn default_with_tiers(cheap: &str, standard: &str, premium: &str) -> CrewCon
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrewOutcome {
     pub ts_ms: u64,
+    /// The crew the delegation ran under (empty for history from before named
+    /// crews).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub crew: String,
     pub category: String,
     pub effort: String,
     pub model: String,
@@ -828,6 +1097,8 @@ mod tests {
             descriptions: BTreeMap::new(),
             delegation: Delegation::default(),
             legacy_planner: None,
+            name: String::new(),
+            foreman: None,
         }
     }
 
@@ -1093,6 +1364,7 @@ delegatoin:
     #[test]
     fn usage_aggregates_by_model() {
         let o = |model: &str, status: &str, dur: u64| CrewOutcome {
+            crew: String::new(),
             ts_ms: 1,
             category: "tests".into(),
             effort: "small".into(),
@@ -1120,6 +1392,7 @@ delegatoin:
     #[test]
     fn recommend_flags_low_success_and_frequent_fallback() {
         let o = |cat: &str, model: &str, status: &str, fb: bool| CrewOutcome {
+            crew: String::new(),
             ts_ms: 1,
             category: cat.into(),
             effort: "small".into(),

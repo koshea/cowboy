@@ -973,22 +973,56 @@ pub struct CrewArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum CrewCommand {
-    /// Write a default crew roster (tiers derived from your models' prices).
+    /// Write crew.yaml with one crew, `default` (tiers derived from your models'
+    /// prices). To add another crew to an existing file, use `cowboy crew new`.
     Init {
         /// Overwrite an existing crew.yaml (asks first).
         #[arg(long)]
         force: bool,
     },
-    /// Show the routing matrix (category × effort → model).
-    List,
-    /// Print the full crew.yaml (roster + delegation rules).
+    /// List the crews, then show a crew's routing matrix (category × effort →
+    /// model). Defaults to the active crew.
+    List {
+        /// The crew to show.
+        #[arg(long)]
+        crew: Option<String>,
+    },
+    /// Print the full crew.yaml (every crew + the shared delegation rules).
     Show,
-    /// Check the roster (models exist, `general` defined, etc.).
+    /// Check every crew (models exist, providers configured and signed in,
+    /// `general` defined, …).
     Validate,
+    /// Make a crew the one new sessions start with, and turn crew mode on.
+    /// Running sessions keep theirs; switch one with `/crew <name>`.
+    Use { name: String },
+    /// Turn crew mode off: the foreman does everything itself. `cowboy crew use`
+    /// turns it back on.
+    Solo,
+    /// Add a crew: a copy of `--from`, or tiers derived from your models' prices.
+    New {
+        name: String,
+        /// Start from this crew's roster.
+        #[arg(long)]
+        from: Option<String>,
+    },
+    /// Copy a crew under a new name.
+    Copy { from: String, to: String },
+    /// Rename a crew (the active pointer follows).
+    Rename { from: String, to: String },
+    /// Remove a crew. The active crew cannot be removed; `use` another first.
+    Remove { name: String },
     /// Show recorded delegation usage per model (tasks, success %, avg duration).
-    Usage,
+    Usage {
+        /// Only delegations that ran under this crew.
+        #[arg(long)]
+        crew: Option<String>,
+    },
     /// Suggest roster changes from recorded outcomes (recommend-only; never edits).
-    Recommend,
+    Recommend {
+        /// Only outcomes recorded under this crew.
+        #[arg(long)]
+        crew: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]

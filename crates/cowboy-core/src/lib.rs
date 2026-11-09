@@ -5,6 +5,7 @@ pub mod agents;
 pub mod artifact;
 pub mod config;
 pub mod crew;
+pub mod crew_text;
 pub mod decision;
 pub mod error;
 pub mod fs;

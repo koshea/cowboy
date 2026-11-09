@@ -428,7 +428,7 @@ fn event_name(e: &UiEventMsg) -> String {
 /// model", which is the only name guaranteed to resolve on any developer's machine.
 fn crew_yaml(grant: u32, ceiling: u32) -> String {
     format!(
-        "version: 1\ncrew:\n  general: \"<default>\"\ndelegation:\n  enabled: true\n  \
+        "version: 1\ncrews:\n  e2e:\n    crew:\n      general: \"<default>\"\ndelegation:\n  enabled: true\n  \
          max_parallel: 4\n  max_parallel_per_provider: 2\n  max_depth: 1\n  \
          iterations:\n    tiny: {grant}\n  max_total_iterations: {ceiling}\n  \
          request_timeout_seconds: 60\n"
@@ -1528,7 +1528,7 @@ fn e2e_crew_routes_delegated_subagents() {
     std::fs::write(
         cfg_cowboy.join("crew.yaml"),
         format!(
-            "version: 1\nplanner:\n  model: {default_model}\ncrew:\n  general: {default_model}\n  \
+            "version: 1\ncrews:\n  e2e:\n    crew:\n      general: {default_model}\n      \
              tests: {default_model}\ndelegation:\n  max_parallel: 4\n  max_depth: 1\n"
         ),
     )

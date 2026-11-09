@@ -1276,6 +1276,8 @@ mod tests {
             descriptions,
             delegation: Default::default(),
             legacy_planner: None,
+            name: String::new(),
+            foreman: None,
         };
 
         let p = foreman_prompt(Some(&cfg));

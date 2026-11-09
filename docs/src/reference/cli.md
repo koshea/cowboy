@@ -123,9 +123,19 @@ Examples:
 Manage the Crew Roster (route delegated work to models by category/effort)
 
 
+### `cowboy crew copy`
+
+Copy a crew under a new name
+
+| Arg | Description |
+|-----|-------------|
+| `<FROM>` |  |
+| `<TO>` |  |
+
+
 ### `cowboy crew init`
 
-Write a default crew roster (tiers derived from your models' prices)
+Write crew.yaml with one crew, `default` (tiers derived from your models' prices). To add another crew to an existing file, use `cowboy crew new`
 
 | Arg | Description |
 |-----|-------------|
@@ -134,27 +144,82 @@ Write a default crew roster (tiers derived from your models' prices)
 
 ### `cowboy crew list`
 
-Show the routing matrix (category × effort → model)
+List the crews, then show a crew's routing matrix (category × effort → model). Defaults to the active crew
+
+| Arg | Description |
+|-----|-------------|
+| `--crew` | The crew to show |
+
+
+### `cowboy crew new`
+
+Add a crew: a copy of `--from`, or tiers derived from your models' prices
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+| `--from` | Start from this crew's roster |
 
 
 ### `cowboy crew recommend`
 
 Suggest roster changes from recorded outcomes (recommend-only; never edits)
 
+| Arg | Description |
+|-----|-------------|
+| `--crew` | Only outcomes recorded under this crew |
+
+
+### `cowboy crew remove`
+
+Remove a crew. The active crew cannot be removed; `use` another first
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
+### `cowboy crew rename`
+
+Rename a crew (the active pointer follows)
+
+| Arg | Description |
+|-----|-------------|
+| `<FROM>` |  |
+| `<TO>` |  |
+
 
 ### `cowboy crew show`
 
-Print the full crew.yaml (roster + delegation rules)
+Print the full crew.yaml (every crew + the shared delegation rules)
+
+
+### `cowboy crew solo`
+
+Turn crew mode off: the foreman does everything itself. `cowboy crew use` turns it back on
 
 
 ### `cowboy crew usage`
 
 Show recorded delegation usage per model (tasks, success %, avg duration)
 
+| Arg | Description |
+|-----|-------------|
+| `--crew` | Only delegations that ran under this crew |
+
+
+### `cowboy crew use`
+
+Make a crew the one new sessions start with, and turn crew mode on. Running sessions keep theirs; switch one with `/crew <name>`
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
 
 ### `cowboy crew validate`
 
-Check the roster (models exist, `general` defined, etc.)
+Check every crew (models exist, providers configured and signed in, `general` defined, …)
 
 
 ## `cowboy decisions`

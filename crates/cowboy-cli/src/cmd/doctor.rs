@@ -347,30 +347,44 @@ fn check_models(
     }
 }
 
-/// The crew roster is optional. When present, every slot must name a harness or a
-/// `provider/name` model (a bare name means the roster predates qualified names),
-/// and every provider it routes to must be usable.
+/// The crews are optional. When present, every crew's slots must name a harness
+/// or a `provider/name` model, its foreman must exist, and every provider it
+/// routes to must be usable — checked for all crews, not just the active one, so a
+/// crew is not found broken only when someone switches to it.
 fn check_crew(providers: &cowboy_core::Result<ProvidersConfig>) -> Status {
-    let cfg = match cowboy_core::crew::load() {
-        Ok(Some(c)) => c,
-        Ok(None) => return Status::Ok("none (the foreman works solo)".into()),
+    let file = match cowboy_core::crew::load_file() {
+        Ok(Some(f)) if !f.crews.is_empty() => f,
+        Ok(_) => return Status::Ok("none (the foreman works solo)".into()),
         Err(e) => return Status::Fail(e.to_string()),
     };
     let harnesses = cowboy_core::harness::HarnessesConfig::load_user().unwrap_or_default();
-    if cowboy_core::models_migrate::crew_needs_migration(&cfg, |n| harnesses.get(n).is_some()) {
+    let is_harness = |n: &str| harnesses.get(n).is_some();
+    if let Some(c) = file
+        .all()
+        .find(|c| cowboy_core::models_migrate::crew_needs_migration(c, is_harness))
+    {
         return Status::Fail(format!(
-            "crew.yaml names models without their provider — {}",
+            "crew `{}` names models without their provider — {}",
+            c.name,
             cowboy_core::config::MIGRATE_HINT
         ));
     }
-    let Ok(providers) = providers else {
+    if providers.is_err() {
         return Status::Skipped("providers.yaml did not load (see above)".into());
-    };
-    let problems = crate::cmd::crew::provider_problems(&cfg, providers);
-    if problems.is_empty() {
-        Status::Ok(format!("{} categories", cfg.crew.len()))
-    } else {
-        Status::Fail(problems.join("; "))
+    }
+    match crate::cmd::crew::crew_problems(&file) {
+        Ok(p) if p.is_empty() => Status::Ok(format!(
+            "{} crew(s), active: {}{}",
+            file.crews.len(),
+            file.active_name().unwrap_or("none"),
+            if file.delegation.enabled {
+                ""
+            } else {
+                " (crew mode off)"
+            }
+        )),
+        Ok(p) => Status::Fail(p.join("; ")),
+        Err(e) => Status::Fail(e.to_string()),
     }
 }
 

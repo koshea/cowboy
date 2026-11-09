@@ -34,6 +34,10 @@ pub struct CommandCtx<'a> {
     pub current_model: Option<&'a str>,
     /// The iteration budget as `(enforced, turns per message)`; `None` if unknown.
     pub budget: Option<(bool, u32)>,
+    /// The crews in crew.yaml, for `/crew <name>`.
+    pub crews: &'a [String],
+    /// The crew this session routes with.
+    pub current_crew: Option<&'a str>,
 }
 
 /// Expand `/input` (without the leading slash). `None` means it isn't a session
@@ -126,7 +130,24 @@ pub fn expand(input: &str, ctx: &CommandCtx) -> Option<Expansion> {
         }),
         "mcp" => notice(mcp_report(ctx.root).text()),
         "boundary" => notice(boundary_report(ctx.root).text()),
-        "crew" => notice(crew_report((!rest.is_empty()).then_some(rest)).text()),
+        "crew" if rest.is_empty() || rest == "usage" => notice(
+            crew_report(
+                (!rest.is_empty()).then_some(rest),
+                ctx.current_crew,
+                ctx.crews,
+            )
+            .text(),
+        ),
+        "crew" if ctx.crews.iter().any(|c| c == rest) => {
+            send(vec![ClientMsg::SwitchCrew(rest.to_string())])
+        }
+        "crew" if ctx.crews.is_empty() => {
+            notice("no crews yet — create one with `cowboy crew init`".into())
+        }
+        "crew" => notice(format!(
+            "no crew {rest:?}; crews: {} (or /crew usage)",
+            ctx.crews.join(", ")
+        )),
         other => cowboy_core::skills::load(ctx.root, other)
             .map(|skill| Expansion::Send(vec![ClientMsg::Message(skill_prompt(&skill, rest))])),
     }
@@ -304,9 +325,10 @@ pub fn mcp_report(root: &std::path::Path) -> Report {
     r
 }
 
-/// `/crew` (and `/crew usage`): show the crew roster matrix or usage summary as
-/// notices. Read-only — manage the roster with the `cowboy crew` CLI.
-pub fn crew_report(arg: Option<&str>) -> Report {
+/// `/crew` (and `/crew usage`): this session's crew — the crews there are, which
+/// one this session routes with, and its roster matrix — or the usage summary, as
+/// notices. Switching is `/crew <name>`; editing is the `cowboy crew` CLI.
+pub fn crew_report(arg: Option<&str>, current: Option<&str>, crews: &[String]) -> Report {
     let mut r = Report::default();
     use cowboy_core::crew;
     if arg == Some("usage") {
@@ -327,8 +349,24 @@ pub fn crew_report(arg: Option<&str>) -> Report {
         }
         return r;
     }
-    match crew::load() {
+    match crew::load_named(current) {
         Ok(Some(cfg)) => {
+            if crews.len() > 1 {
+                let list: Vec<String> = crews
+                    .iter()
+                    .map(|c| {
+                        if *c == cfg.name {
+                            format!("[{c}]")
+                        } else {
+                            c.clone()
+                        }
+                    })
+                    .collect();
+                r.notice(format!(
+                    "crews: {}   (/crew <name> switches this session)",
+                    list.join(" ")
+                ));
+            }
             // Shorten ids to their last path segment so the grid stays readable.
             let short = |m: &str| m.rsplit('/').next().unwrap_or(m).to_string();
             let foreman =
@@ -345,7 +383,8 @@ pub fn crew_report(arg: Option<&str>) -> Report {
             }
             col_w += 2;
             r.notice(format!(
-                "crew foreman: {}   delegation: {}",
+                "crew {}: foreman {}   delegation: {}",
+                cfg.name,
                 foreman,
                 if cfg.enabled() { "on" } else { "off (solo)" }
             ));
@@ -380,6 +419,8 @@ mod tests {
             models: &[],
             current_model: None,
             budget: Some((true, 500)),
+            crews: &[],
+            current_crew: None,
         }
     }
 
@@ -444,6 +485,8 @@ mod tests {
             models: &models,
             current_model: Some("bifrost/fast"),
             budget: None,
+            crews: &[],
+            current_crew: None,
         };
         assert!(
             matches!(expand("model a/nope", &c), Some(Expansion::Notice(n)) if n.contains("unknown"))
@@ -459,6 +502,26 @@ mod tests {
                 "chatgpt/smart".into()
             )]))
         );
+    }
+
+    #[test]
+    fn crew_switches_to_a_known_crew_and_explains_anything_else() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let crews = ["oss".to_string(), "premium".to_string()];
+        let mut c = ctx(tmp.path());
+        c.crews = &crews;
+        c.current_crew = Some("oss");
+        assert_eq!(
+            expand("crew premium", &c),
+            Some(Expansion::Send(vec![ClientMsg::SwitchCrew(
+                "premium".into()
+            )]))
+        );
+        assert!(matches!(expand("crew nope", &c),
+            Some(Expansion::Notice(n)) if n.contains("no crew") && n.contains("oss, premium")));
+        c.crews = &[];
+        assert!(matches!(expand("crew oss", &c),
+            Some(Expansion::Notice(n)) if n.contains("cowboy crew init")));
     }
 
     #[test]

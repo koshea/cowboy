@@ -464,10 +464,9 @@ pub(super) fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
     f.render_widget(Paragraph::new(lines), rows[1]);
 
     // Footer: navigation hints + the Solo/Crew mode toggle (Tab).
-    let (mode_label, mode_color) = if p.crew_mode {
-        ("crew (delegates)", Color::Magenta)
-    } else {
-        ("solo", Color::Cyan)
+    let (mode_label, mode_color) = match p.crew() {
+        Some(c) => (format!("crew {c}"), Color::Magenta),
+        None => ("solo".to_string(), Color::Cyan),
     };
     let footer = Line::from(vec![
         Span::styled(

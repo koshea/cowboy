@@ -204,8 +204,8 @@ pub const SLASH: &[Slash] = &[
     },
     Slash {
         name: "crew",
-        args: "[usage]",
-        help: "the crew roster (which model each role gets), or its usage",
+        args: "[name|usage]",
+        help: "this session's crew and its roster; switch crews, or show usage",
         group: Group::Setup,
         aliases: &[],
         workstream_only: false,

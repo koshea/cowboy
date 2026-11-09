@@ -711,6 +711,9 @@ pub enum ClientMsg {
         scope: ApprovalScope,
     },
     SwitchModel(String),
+    /// Switch this session's crew (`/crew <name>`): routing for its next
+    /// delegations, and its foreman model when that crew names one.
+    SwitchCrew(String),
     /// Turn the per-message iteration budget on/off for this session (`/budget`).
     /// Off means a long task runs without stopping to ask "keep going?" — the user
     /// accepting the risk of a long-running turn. Takes effect mid-turn.

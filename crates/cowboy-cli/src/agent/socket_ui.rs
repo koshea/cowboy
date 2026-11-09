@@ -429,12 +429,18 @@ impl SocketUi {
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read per command: crews are edited from the CLI while sessions run.
+        let crews = crate::cmd::crew::crew_names();
+        let current_crew =
+            crate::cmd::crew::session_crew_name().or_else(crate::cmd::crew::active_crew);
         let ctx = CommandCtx {
             root: &root,
             workstream,
             models: &models,
             current_model: current.as_deref(),
             budget,
+            crews: &crews,
+            current_crew: current_crew.as_deref(),
         };
         match expand(text, &ctx) {
             Some(Expansion::Send(msgs)) => {

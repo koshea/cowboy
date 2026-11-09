@@ -12,14 +12,42 @@ from your **crew roster**.
 
 ## Solo or crew
 
-Crew is opt-in. The `/model` picker has a **Solo / Crew** toggle (Tab):
+Crew is opt-in. In the `/model` picker, **Tab** cycles the mode for the model you
+pick: **solo**, then each of your crews.
 
 - **Solo** — the selected model does everything itself; no delegation.
-- **Crew** — the selected model is the foreman and delegates per your roster.
+- **A crew** — the selected model is the foreman and delegates per that crew's
+  roster.
 
-There's no separate "planner" setting: the foreman is always whatever `/model`
-points at, so the picker can never disagree with what's actually running.
-Switching the foreman is just selecting a different model.
+There's no separate "planner" setting: the foreman is whatever `/model` points at,
+unless the crew names its own (`foreman:`, below).
+
+## Several crews
+
+You can keep several crews and switch between them: an open-source-heavy crew on
+your local gateway, a high-cost crew for hard problems, an all-OpenAI crew on your
+[ChatGPT subscription](chatgpt.md). They live side by side in `crew.yaml`, and
+**`active`** names the one new sessions start with:
+
+```sh
+cowboy crew use premium   # new sessions start with `premium` (and crew mode is on)
+cowboy crew solo          # crew mode off: the foreman works alone
+```
+
+```text
+/crew                     # this session's crew, the others, and its roster
+/crew premium             # switch this session (only) to `premium`
+```
+
+A switch takes effect at the next delegation. A session keeps the crew it started
+with even if `active` changes later, and its subagents use their parent's crew.
+Delegations already running finish on the crew that dispatched them.
+
+A crew can name its **`foreman`**. Switching to that crew also switches the session's
+model to the foreman, and the crew's `<default>` slots resolve to it. `/model` still
+overrides it for the rest of the session. A crew without `foreman:` keeps whatever
+`/model` selects. A switch made mid-turn changes the model when that turn finishes;
+it does not cancel the turn.
 
 ## The roster — `~/.config/cowboy/crew.yaml`
 
@@ -42,25 +70,42 @@ pointer at `cowboy models migrate`.
 
 ```yaml
 version: 1
-crew:
-  docs: bifrost/cheap            # one model for every effort
-  tests:
-    tiny: bifrost/cheap          # tiny..medium → bifrost/cheap
-    large: openai/opus           # large, deep  → a different provider
-  e2e:
-    small: bifrost/cheap         # ≤ medium → bifrost/cheap
-    large: <default>             # large, deep → the foreman (whatever /model selects)
-  general: bifrost/sonnet        # required: the cross-category fallback
-temperature:             # optional: override temperature per task type
-  tests: 0.0             #   cooler for precise work…
-  exploration: 0.6       #   …warmer for ideation (falls back to general's, else
-                         #   the model's own default)
-delegation:
-  enabled: true          # crew mode on (toggle Solo/Crew from the /model picker)
-  max_parallel: 4        # local fan-out hint (not a quota)
-  max_depth: 1           # foreman delegates; workers don't, by default
+active: oss                      # the crew new sessions start with
+delegation:                      # shared by every crew
+  enabled: true                  # crew mode on (solo when off; Tab in the /model picker)
+  max_parallel: 4                # local fan-out hint (not a quota)
+  max_depth: 1                   # foreman delegates; workers don't, by default
   allow_recursive_delegation: false
+crews:
+  oss:
+    crew:
+      docs: bifrost/cheap        # one model for every effort
+      tests:
+        tiny: bifrost/cheap      # tiny..medium → bifrost/cheap
+        large: bifrost/glm       # large, deep  → bifrost/glm
+      e2e:
+        small: bifrost/cheap
+        large: <default>         # large, deep → the foreman
+      general: bifrost/glm       # required: the cross-category fallback
+    temperature:                 # optional: override temperature per task type
+      tests: 0.0                 #   cooler for precise work…
+      exploration: 0.6           #   …warmer for ideation
+  openai:
+    foreman: chatgpt/gpt-6.1-sol # optional: switching here switches the model too
+    crew:
+      exploration: chatgpt/gpt-6-luna
+      general: <default>
+    delegation:                  # optional: per-crew overrides of the shared limits
+      max_parallel_per_provider: 1
 ```
+
+Each crew has its own `crew`, `temperature` and `descriptions`. The `delegation`
+block is shared; a crew may override any of its limits except `enabled`, which is
+one switch for all crews.
+
+**Upgrading.** A `crew.yaml` from before named crews (a top-level `crew:` roster)
+is refused with a pointer at `cowboy models migrate`. The migration turns the
+roster into the crew `default`, makes it active, and keeps its comments.
 
 The optional `temperature` map overrides the sampling temperature **per category**
 (task type): a delegated `tests` task runs cooler, an `exploration` task warmer,
@@ -87,21 +132,30 @@ every request gets a model, worst case the foreman.
 ## Managing it
 
 ```sh
-cowboy crew init        # write a default roster (tiers derived from model prices)
-cowboy crew list        # the routing matrix (category × effort → model)
-cowboy crew show        # the full crew.yaml
-cowboy crew validate    # models exist, every provider used is configured, `general` defined
-cowboy crew usage       # recorded activity per model (tasks, success %, avg time)
+cowboy crew init                  # write crew.yaml with a `default` crew (tiers from model prices)
+cowboy crew new <name> [--from c] # add a crew: a copy of c, or price tiers
+cowboy crew copy <from> <to>      # duplicate a crew to tweak it
+cowboy crew rename <from> <to>    # (the active pointer follows)
+cowboy crew remove <name>         # not the active one
+cowboy crew use <name> | solo     # what new sessions start with
+cowboy crew list [--crew c]       # the crews, and a routing matrix (category × effort → model)
+cowboy crew show                  # the full crew.yaml
+cowboy crew validate              # every crew: models and foremen exist, providers configured
+                                  #   and signed in, `general` defined
+cowboy crew usage [--crew c]      # recorded activity per model (tasks, success %, avg time)
 ```
 
-`crew init` ranks your models by price into three tiers (cheap / standard /
-premium) and emits sensible ramps — edit from there. Inside an interactive
-session, `/crew` shows the roster and `/crew usage` its activity.
+`crew init` and `crew new` rank your models by price into three tiers (cheap /
+standard / premium) and emit sensible ramps — edit from there. These commands edit
+`crew.yaml` in place where they can, so your comments survive. Inside an interactive
+session, `/crew` shows the session's crew and `/crew usage` its activity.
 
 ## Usage tracking
 
-Each routed delegation appends a small outcome record (category, effort, model,
-status, duration — never the task text) to `~/.config/cowboy/crew-history.jsonl`.
+Each routed delegation appends a small outcome record (crew, category, effort,
+model, status, duration — never the task text) to `~/.config/cowboy/crew-history.jsonl`.
+`--crew` on `usage` and `recommend` narrows to one crew. Records from before named
+crews carry no crew and appear only in the unfiltered view.
 `cowboy crew usage` aggregates it per model so you can see what your crew is
 actually doing and how each model performs. There is no spend tracking here — the
 [gateway](../security/network.md) owns cost and quotas.

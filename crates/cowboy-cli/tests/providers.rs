@@ -184,7 +184,7 @@ fn seed_chatgpt(home: &assert_fs::TempDir) {
         )
         .unwrap();
     home.child("cowboy/crew.yaml")
-        .write_str("version: 1\ncrew:\n  general: chatgpt/gpt\n")
+        .write_str("version: 1\ncrews:\n  openai:\n    crew:\n      general: chatgpt/gpt\n")
         .unwrap();
     home.child("cowboy/models.yaml")
         .write_str("default: chatgpt/gpt\nmodels:\n  chatgpt:\n    gpt:\n      model: gpt-6\n")

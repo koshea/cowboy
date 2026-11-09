@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use serde_yaml_ng::Value;
 
 use crate::config::{is_legacy_models_layout, ModelDef, ModelRef, ModelsConfig};
-use crate::crew::{CrewConfig, DEFAULT_MODEL};
+use crate::crew::{CrewConfig, CrewDef, CrewFile, Ramp, DEFAULT_MODEL};
 use crate::error::{Error, Result};
 
 /// Old bare name → its qualified reference.
@@ -142,8 +142,16 @@ pub fn migrate_crew(
     renames: &Renames,
     is_harness: impl Fn(&str) -> bool,
 ) -> Result<bool> {
+    migrate_ramps(&mut cfg.crew, renames, &is_harness)
+}
+
+fn migrate_ramps(
+    ramps: &mut BTreeMap<String, Ramp>,
+    renames: &Renames,
+    is_harness: &dyn Fn(&str) -> bool,
+) -> Result<bool> {
     let mut changed = false;
-    for (cat, ramp) in cfg.crew.iter_mut() {
+    for (cat, ramp) in ramps.iter_mut() {
         for slot in ramp.models_mut() {
             // An old model name first: it may itself contain `/`.
             if let Some(r) = renames.get(slot.as_str()) {
@@ -195,6 +203,107 @@ pub fn rename_crew_text(before: &str, renames: &Renames) -> String {
         }
     }
     out
+}
+
+/// Bring a `crew.yaml` up to date: qualify bare model slots (`renames`), and turn
+/// a single roster into named crews — it becomes the crew `default`, made active,
+/// and its delegation settings become the shared ones. `None` when there is
+/// nothing to do. Edits are made in the text so comments survive; if the edited
+/// text does not parse to exactly the migrated file, the file is re-serialized.
+pub fn migrate_crew_file(
+    text: &str,
+    renames: &Renames,
+    is_harness: impl Fn(&str) -> bool,
+) -> Result<Option<(String, CrewFile)>> {
+    let v = parse(text)?;
+    let (edited, expected) = if crate::crew::is_single_roster(&v) {
+        let mut cfg: CrewConfig =
+            serde_yaml_ng::from_str(text).map_err(|e| Error::Invalid(format!("crew.yaml: {e}")))?;
+        migrate_crew(&mut cfg, renames, &is_harness)?;
+        let expected = CrewFile {
+            version: cfg.version,
+            active: Some("default".into()),
+            delegation: cfg.delegation.clone(),
+            crews: BTreeMap::from([("default".to_string(), CrewDef::from_roster(&cfg))]),
+        };
+        (
+            wrap_single_roster(&rename_crew_text(text, renames)),
+            expected,
+        )
+    } else {
+        let mut file = crate::crew::parse_file(text)?;
+        let mut changed = false;
+        for def in file.crews.values_mut() {
+            changed |= migrate_ramps(&mut def.crew, renames, &is_harness)?;
+        }
+        if !changed {
+            return Ok(None);
+        }
+        (rename_crew_text(text, renames), file)
+    };
+    let out = match crate::crew::parse_file(&edited) {
+        Ok(f) if f == expected => edited,
+        _ => serde_yaml_ng::to_string(&expected).map_err(|e| Error::Invalid(e.to_string()))?,
+    };
+    Ok(Some((out, expected)))
+}
+
+/// Move a single roster's `crew`/`temperature`/`descriptions` blocks (with their
+/// comments) under `crews: default:`, add `active: default`, and drop the retired
+/// `planner:` block. Top-level comments travel with the key that follows them.
+fn wrap_single_roster(text: &str) -> String {
+    let mut groups: Vec<(Option<String>, Vec<String>)> = vec![(None, Vec::new())];
+    let mut pending: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let top = !line.starts_with(' ') && !line.starts_with('\t');
+        let filler = line.trim().is_empty() || line.trim_start().starts_with('#');
+        if top && filler {
+            pending.push(line.to_string());
+        } else if top {
+            let key = line.split(':').next().unwrap_or("").trim().to_string();
+            let mut lines = std::mem::take(&mut pending);
+            lines.push(line.to_string());
+            groups.push((Some(key), lines));
+        } else {
+            let g = groups.last_mut().expect("a group");
+            g.1.append(&mut pending);
+            g.1.push(line.to_string());
+        }
+    }
+    let take = |groups: &mut Vec<(Option<String>, Vec<String>)>, k: &str| {
+        groups
+            .iter()
+            .position(|(key, _)| key.as_deref() == Some(k))
+            .map(|i| groups.remove(i).1)
+    };
+    let mut out: Vec<String> = groups.remove(0).1;
+    if let Some(v) = take(&mut groups, "version") {
+        out.extend(v);
+    }
+    out.push("active: default".into());
+    let moved: Vec<Vec<String>> = ["crew", "temperature", "descriptions"]
+        .iter()
+        .filter_map(|k| take(&mut groups, k))
+        .collect();
+    let _ = take(&mut groups, "planner");
+    for (_, g) in groups {
+        out.extend(g);
+    }
+    out.push("crews:".into());
+    out.push("  default:".into());
+    for g in moved {
+        for l in g {
+            out.push(if l.trim().is_empty() {
+                String::new()
+            } else {
+                format!("    {l}")
+            });
+        }
+    }
+    out.extend(pending);
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
 }
 
 /// True when a roster still has bare slots that are not harnesses — what the
@@ -320,6 +429,37 @@ mod tests {
         assert!(out.contains("  general: d/glm # cheap\n"), "{out}");
         assert!(out.contains("    tiny: d/g2\n"), "{out}");
         assert!(out.contains("deep: <default>"), "{out}");
+    }
+
+    #[test]
+    fn a_single_roster_becomes_the_default_crew_keeping_its_comments() {
+        let text = "version: 1\n# The bench\n#   glm: cheap\ncrew:\n  general: glm # cheap\n  \
+                    deep:\n    # strong at the top\n    tiny: glm\n    deep: <default>\n\
+                    temperature:\n  general: 0.3\nplanner:\n  model: glm\ndelegation:\n  \
+                    enabled: true\n  max_parallel: 3\n";
+        let (out, file) = migrate_crew_file(text, &renames(), |_| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.active.as_deref(), Some("default"));
+        assert_eq!(file.delegation.max_parallel, 3);
+        let def = &file.crews["default"];
+        assert_eq!(def.crew["general"], Ramp::Single("bifrost/glm".into()));
+        assert_eq!(def.temperature["general"], 0.3);
+        for kept in ["# The bench", "# cheap", "# strong at the top"] {
+            assert!(out.contains(kept), "{kept} lost:\n{out}");
+        }
+        assert!(!out.contains("planner"), "{out}");
+        assert_eq!(crate::crew::parse_file(&out).unwrap(), file);
+        // Already migrated: nothing to do.
+        assert!(migrate_crew_file(&out, &renames(), |_| false)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn a_single_roster_is_refused_until_migrated() {
+        let err = crate::crew::parse_file("crew:\n  general: a/b\n").unwrap_err();
+        assert!(err.to_string().contains("cowboy models migrate"), "{err}");
     }
 
     #[test]

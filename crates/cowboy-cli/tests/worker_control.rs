@@ -45,7 +45,7 @@ impl Drop for Daemon {
 struct Fixture {
     _runtime: assert_fs::TempDir,
     _state: assert_fs::TempDir,
-    _cfg: assert_fs::TempDir,
+    cfg: assert_fs::TempDir,
     proj: assert_fs::TempDir,
     sock: std::path::PathBuf,
     _daemon: Daemon,
@@ -122,7 +122,7 @@ fn setup_inner(eager: bool, web_bind: Option<&str>) -> Fixture {
     let fx = Fixture {
         _runtime: runtime,
         _state: state,
-        _cfg: cfg,
+        cfg,
         proj,
         sock,
         _daemon: Daemon(daemon),
@@ -542,6 +542,46 @@ fn switch_model_reports_success_and_failure() {
         wait_for_notice(&mut c, "switched to model p/m"),
         "known model should switch"
     );
+
+    c.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// `/crew <name>` (as a command, the way both clients send it) switches the
+/// session's crew, and — because that crew names a foreman — its model too. A name
+/// that is not a crew is answered, not sent anywhere.
+#[test]
+fn crew_switch_changes_routing_and_the_foreman() {
+    let fx = setup();
+    fx.cfg
+        .child("cowboy/models.yaml")
+        .write_str(
+            "version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n    \
+             big:\n      model: y\n",
+        )
+        .unwrap();
+    fx.cfg
+        .child("cowboy/crew.yaml")
+        .write_str(
+            "version: 1\nactive: cheap\ncrews:\n  cheap:\n    crew:\n      general: p/m\n  \
+             premium:\n    foreman: p/big\n    crew:\n      general: p/big\n",
+        )
+        .unwrap();
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+
+    c.send(&ClientMsg::Command("crew premium".into()));
+    assert!(
+        wait_for_notice(&mut c, "switched to crew premium (foreman p/big)"),
+        "the crew switch should be announced with its foreman"
+    );
+    assert!(
+        wait_for_notice(&mut c, "switched to model p/big"),
+        "the crew's foreman should become the session's model"
+    );
+
+    c.send(&ClientMsg::SwitchCrew("nope".into()));
+    assert!(wait_for_notice(&mut c, "crew switch failed"));
 
     c.send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(300));

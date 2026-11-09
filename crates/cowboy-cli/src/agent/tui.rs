@@ -1101,11 +1101,18 @@ fn event_loop(
                         app.push(LineKind::Notice, "no chat models offered by the provider");
                     } else {
                         mode_before_overlay = app.mode.clone();
+                        // Opens on the active crew (or solo); Tab cycles solo → crews.
+                        let current = crate::cmd::crew::crew_enabled()
+                            .then(crate::cmd::crew::active_crew)
+                            .flatten();
+                        let (crews, mode) =
+                            ModelPicker::modes(crate::cmd::crew::crew_names(), current.as_deref());
                         app.model_picker = Some(ModelPicker {
                             entries,
                             filter: String::new(),
                             selected: 0,
-                            crew_mode: crate::cmd::crew::crew_enabled(),
+                            crews,
+                            mode,
                         });
                         app.mode = Mode::ModelPicker;
                     }
@@ -1949,10 +1956,6 @@ fn mcp_command(app: &mut App, root: &std::path::Path) {
     push_report(app, super::commands::mcp_report(root));
 }
 
-fn crew_command(arg: Option<&str>, app: &mut App) {
-    push_report(app, super::commands::crew_report(arg));
-}
-
 /// Handle a `/command`. Returns `true` if the client should exit the event loop
 /// now (e.g. `/detach`).
 fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
@@ -2092,7 +2095,13 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                 app.status = "drafting a ranch…".into();
             }
         }
-        "crew" => crew_command(arg, app),
+        // Expanded by the worker, which knows this session's crew (and switches it
+        // for `/crew <name>`); shared with the web client.
+        "crew" => {
+            if let Some(tx) = ctx.task_tx.as_ref() {
+                let _ = tx.send(AgentCmd::Command(input.to_string()));
+            }
+        }
         // Read from the state the worker already publishes, so both work while a turn is
         // running and need no round trip.
         "jobs" => app.push(LineKind::Notice, app.jobs_summary()),
@@ -2372,8 +2381,8 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
         }
         KeyCode::Up => p.move_sel(-1),
         KeyCode::Down => p.move_sel(1),
-        // Tab toggles Solo ⇄ Crew for the selection.
-        KeyCode::Tab => p.crew_mode = !p.crew_mode,
+        // Tab cycles solo → each crew for the selection.
+        KeyCode::Tab => p.next_mode(),
         KeyCode::Backspace => {
             p.filter.pop();
             p.clamp();
@@ -2382,12 +2391,33 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
             let Some(choice) = p.selected_choice() else {
                 return;
             };
-            // Apply the Solo/Crew choice now (independent of which model).
-            let crew_mode = p.crew_mode;
-            if let Err(e) = crate::cmd::crew::set_crew_enabled(crew_mode) {
-                app.push(LineKind::Error, format!("crew mode: {e}"));
-            }
-            let mode_word = if crew_mode { "crew" } else { "solo" };
+            // Apply the solo/crew choice now (independent of which model): persist
+            // it for new sessions, and switch this session's crew *before* the model
+            // so an explicitly picked model wins over the crew's own foreman.
+            let picked_crew = p.crew().map(str::to_string);
+            let mode_word = match &picked_crew {
+                Some(c) => {
+                    let switched = match crate::cmd::crew::set_active_crew(c) {
+                        Ok(()) => true,
+                        Err(e) => {
+                            app.push(LineKind::Error, format!("crew: {e}"));
+                            false
+                        }
+                    };
+                    if switched {
+                        if let Some(tx) = ctx.task_tx.as_ref() {
+                            let _ = tx.send(AgentCmd::Command(format!("crew {c}")));
+                        }
+                    }
+                    format!("crew {c}")
+                }
+                None => {
+                    if let Err(e) = crate::cmd::crew::set_crew_enabled(false) {
+                        app.push(LineKind::Error, format!("crew mode: {e}"));
+                    }
+                    "solo".to_string()
+                }
+            };
             if let Some(name) = choice.configured_name.clone() {
                 // Already configured: persist it as the foreman + switch live.
                 if let Err(e) = crate::cmd::models::set_user_default(&name) {

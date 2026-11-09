@@ -187,9 +187,39 @@ pub struct ModelPicker {
     pub entries: Vec<ModelChoice>,
     pub filter: String,
     pub selected: usize,
-    /// Whether the chosen model runs as a crew foreman (delegates) or solo.
-    /// Toggled with Tab; applied on selection.
-    pub crew_mode: bool,
+    /// How the chosen model runs: `crews[0]` is solo, the rest are crews it can
+    /// lead as foreman. Cycled with Tab; applied on selection.
+    pub crews: Vec<String>,
+    /// Index into `crews`.
+    pub mode: usize,
+}
+
+impl ModelPicker {
+    /// The label of the solo entry in [`ModelPicker::crews`].
+    pub const SOLO: &'static str = "solo";
+
+    /// Solo, then each crew; starting on `current` (a crew name), else solo.
+    pub fn modes(crews: Vec<String>, current: Option<&str>) -> (Vec<String>, usize) {
+        let mut all = vec![Self::SOLO.to_string()];
+        all.extend(crews);
+        let mode = current
+            .and_then(|c| all.iter().skip(1).position(|n| n == c).map(|i| i + 1))
+            .unwrap_or(0);
+        (all, mode)
+    }
+
+    /// The selected crew, or `None` for solo.
+    pub fn crew(&self) -> Option<&str> {
+        (self.mode > 0)
+            .then(|| self.crews.get(self.mode).map(String::as_str))
+            .flatten()
+    }
+
+    pub fn next_mode(&mut self) {
+        if !self.crews.is_empty() {
+            self.mode = (self.mode + 1) % self.crews.len();
+        }
+    }
 }
 
 impl ModelPicker {
@@ -2401,6 +2431,24 @@ mod tests {
     }
 
     #[test]
+    fn the_picker_mode_cycles_solo_then_each_crew() {
+        let (crews, mode) =
+            ModelPicker::modes(vec!["oss".into(), "premium".into()], Some("premium"));
+        let mut p = ModelPicker {
+            crews,
+            mode,
+            ..Default::default()
+        };
+        assert_eq!(p.crew(), Some("premium"));
+        p.next_mode();
+        assert_eq!(p.crew(), None, "wraps to solo");
+        p.next_mode();
+        assert_eq!(p.crew(), Some("oss"));
+        let (_, m) = ModelPicker::modes(vec!["oss".into()], None);
+        assert_eq!(m, 0, "crew mode off opens on solo");
+    }
+
+    #[test]
     fn snapshot_model_picker() {
         let mut app = App::new("cowboy");
         app.push(LineKind::User, "switch models");
@@ -2422,7 +2470,8 @@ mod tests {
             ],
             filter: String::new(),
             selected: 1,
-            crew_mode: true,
+            crews: vec!["solo".into(), "oss".into(), "premium".into()],
+            mode: 1,
         });
         app.mode = Mode::ModelPicker;
         insta::assert_snapshot!(render(&app));

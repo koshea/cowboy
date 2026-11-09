@@ -99,7 +99,8 @@ about to affect, and defaults to **no**:
 | `cowboy patch revert` | how many tracked files have uncommitted changes |
 | `cowboy memory delete <name>` | the memory's body |
 | `cowboy init --force` | which config files would be overwritten |
-| `cowboy crew init --force` | that your hand-edited roster is about to be replaced |
+| `cowboy crew init --force` | that every hand-edited crew is about to be replaced |
+| `cowboy crew remove <name>` | that the crew is about to be deleted |
 | `cowboy mcp trust` | each server's full command line, env var *names*, and tools |
 
 Two rules hold everywhere:
@@ -122,12 +123,13 @@ Reading an inbox is the one destructive default, because an inbox is a queue.
 - `/model` — show the current model and the available list.
 - `/model <provider/name>` — switch for the next turn (this session only).
 - `/models` — open the picker: type to filter, **Enter** to select, **Tab** to
-  toggle **Solo ⇄ Crew** for the highlighted model, **Esc** to cancel.
+  cycle **solo → each crew** for the highlighted model, **Esc** to cancel.
 - `cowboy models use <provider/name> [--global]` — make a model the persistent default
   (a `/model` switch only lasts the session).
 
-**Solo** = one model does everything. **Crew** = your model is the *foreman* and
-delegates sub-tasks to specialists; see `/crew` for the routing table.
+**Solo** = one model does everything. **A crew** = your model is the *foreman* and
+delegates sub-tasks to specialists; see `/crew` for the routing table, and
+`/crew <name>` to switch this session to another [crew](using/crew.md#several-crews).
 
 ## Approve (or deny) a network request
 

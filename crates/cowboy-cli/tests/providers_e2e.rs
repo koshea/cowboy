@@ -294,7 +294,7 @@ fn e2e_a_crew_routes_to_two_providers() {
     let home = copy_config(&dir);
     home.child("cowboy/crew.yaml")
         .write_str(&format!(
-            "version: 1\ncrew:\n  general: {a}\n  exploration: {a}\n  docs: {b}\n\
+            "version: 1\ncrews:\n  mixed:\n    crew:\n      general: {a}\n      exploration: {a}\n      docs: {b}\n\
              delegation:\n  enabled: true\n  max_parallel: 4\n  max_parallel_per_provider: 2\n  \
              max_depth: 1\n"
         ))

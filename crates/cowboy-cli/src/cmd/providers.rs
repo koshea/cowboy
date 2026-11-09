@@ -200,7 +200,7 @@ fn users_of(
     provider: &str,
     home: &ModelsConfig,
     project: Option<&ModelsConfig>,
-    crew: Option<&cowboy_core::crew::CrewConfig>,
+    crews: Option<&cowboy_core::crew::CrewFile>,
 ) -> Users {
     let names = |cfg: &ModelsConfig| -> Vec<String> {
         cfg.iter()
@@ -209,13 +209,17 @@ fn users_of(
             .collect()
     };
     let mut crew_categories = BTreeSet::new();
-    if let Some(c) = crew {
+    for c in crews.into_iter().flat_map(|f| f.all()) {
+        let foreman = c.foreman.as_ref().is_some_and(|r| r.provider == provider);
+        if foreman {
+            crew_categories.insert(format!("{}/foreman", c.name));
+        }
         for (cat, ramp) in &c.crew {
             let uses = ramp.models().into_iter().any(|m| {
                 cowboy_core::config::ModelRef::parse(m).is_ok_and(|r| r.provider == provider)
             });
             if uses {
-                crew_categories.insert(cat.clone());
+                crew_categories.insert(format!("{}/{cat}", c.name));
             }
         }
     }
@@ -233,7 +237,7 @@ fn remove(name: &str, force: bool) -> Result<()> {
         bail!("no provider `{name}`; see `cowboy providers list`");
     }
     let project = project_models();
-    let crew = cowboy_core::crew::load().ok().flatten();
+    let crew = cowboy_core::crew::load_file().ok().flatten();
     let users = users_of(name, &state.models, project.as_ref(), crew.as_ref());
     if !users.is_empty() {
         let mut why = Vec::new();
@@ -317,13 +321,15 @@ mod tests {
         home.insert(ModelRef::parse("b/m").unwrap(), def());
         let mut project = ModelsConfig::default();
         project.insert(ModelRef::parse("a/p").unwrap(), def());
-        let crew: cowboy_core::crew::CrewConfig =
-            serde_yaml_ng::from_str("crew:\n  general: a/m\n  deep: b/m\n  x: codex\n").unwrap();
+        let crew = cowboy_core::crew::parse_file(
+            "crews:\n  oss:\n    crew:\n      general: a/m\n      deep: b/m\n      x: codex\n",
+        )
+        .unwrap();
 
         let u = users_of("a", &home, Some(&project), Some(&crew));
         assert_eq!(u.home_models, ["a/m"]);
         assert_eq!(u.project_models, ["a/p"]);
-        assert_eq!(u.crew_categories, ["general"]);
+        assert_eq!(u.crew_categories, ["oss/general"]);
         assert!(users_of("c", &home, Some(&project), Some(&crew)).is_empty());
     }
 

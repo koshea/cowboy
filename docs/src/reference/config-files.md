@@ -11,8 +11,8 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 | `~/.config/cowboy/auth/<provider>.yaml` | [ChatGPT sign-in](../using/chatgpt.md) record for an `auth: chatgpt` provider: issued client id, account, OAuth tokens (`0600`). Refreshed host-side under `auth/<provider>.lock`. |
 | `~/.config/cowboy/auth/host_id` | This machine's opaque agent-host id (`urn:uuid:…`) sent at sign-in. Not a credential. |
 | `~/.config/cowboy/models.yaml` | User-level model definitions + default, grouped by provider (`provider/name`). |
-| `~/.config/cowboy/crew.yaml` | [Crew](../using/crew.md) roster — delegated-work routing by category/effort. |
-| `~/.config/cowboy/crew-history.jsonl` | Recorded delegation outcomes (append-only; powers `cowboy crew usage`). |
+| `~/.config/cowboy/crew.yaml` | [Crews](../using/crew.md) — named rosters routing delegated work by category/effort, the `active` one, and shared delegation limits. |
+| `~/.config/cowboy/crew-history.jsonl` | Recorded delegation outcomes, tagged with their crew (append-only; powers `cowboy crew usage`). |
 | `~/.config/cowboy/mcp.yaml` | [MCP](../how-to.md) server definitions (host-owned; the agent can call but not edit). |
 | `~/.config/cowboy/web.yaml` | [Web UI](../using/web.md) setting + bearer token (`0600`). |
 | `~/.config/cowboy/skills/` | User-level [skills](../using/skills-and-subagents.md). |
@@ -76,3 +76,6 @@ handled deliberately:
   Dropping it would take every mount under it with it.
 - `planner:` in `crew.yaml` → **accepted and ignored**, since the foreman is now the
   selected model. Dropping it costs nothing, and it is not written back out.
+- A single-roster `crew.yaml` (a top-level `crew:`) → **refused**, pointing at
+  `cowboy models migrate`, which makes it the crew `default`. Guessing would route
+  every delegation with a roster you may no longer mean.

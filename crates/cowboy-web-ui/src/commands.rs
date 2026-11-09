@@ -54,7 +54,11 @@ pub const HELP: &[(&str, &str, &str)] = &[
     ("skills", "", "list skills; run one as /<name> [args]"),
     ("mcp", "", "the MCP servers this session can use"),
     ("boundary", "", "what the sandbox exposes"),
-    ("crew", "[usage]", "the crew roster, or its usage"),
+    (
+        "crew",
+        "[name|usage]",
+        "this session's crew and the others; switch with /crew <name>",
+    ),
     (
         "ranch",
         "[note]",

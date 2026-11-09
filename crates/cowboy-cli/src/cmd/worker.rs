@@ -88,29 +88,47 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         .transpose()?
         .flatten();
     let project_models = ModelsConfig::load_opt(&paths.models)?;
-    // The crew planner model (or a COWBOY_MODEL override) is the session default;
-    // a stale/unknown override falls back to the models.yaml default.
+    // Pin this session's crew now — the one handed down (`COWBOY_CREW`), else the
+    // active one — so a later `cowboy crew use` changes new sessions, not this one.
+    let crew_notice =
+        match crate::cmd::crew::session_crew_name().or_else(crate::cmd::crew::active_crew) {
+            Some(name) => match cowboy_core::crew::load_named(Some(&name)) {
+                Ok(_) => {
+                    crate::cmd::crew::set_session_crew(&name);
+                    None
+                }
+                Err(e) => Some(format!(
+                    "crew `{name}` unavailable ({e}); delegation is off"
+                )),
+            },
+            None => cowboy_core::crew::load_file()
+                .err()
+                .map(|e| format!("crew.yaml did not load ({e}); delegation is off")),
+        };
+    // A routed COWBOY_MODEL, else the crew's foreman, is the session's model; a
+    // stale/unknown one falls back to the models.yaml default.
     let model_override = crate::cmd::crew::session_model_override();
-    let mut resolved = resolve_model(
-        &providers,
-        user_models.as_ref(),
-        project_models.as_ref(),
-        model_override.as_ref(),
-    )
-    .or_else(|_| {
-        resolve_model(
-            &providers,
-            user_models.as_ref(),
-            project_models.as_ref(),
-            None,
-        )
-    })?;
+    let resolve_named = |r: Option<&ModelRef>| {
+        resolve_model(&providers, user_models.as_ref(), project_models.as_ref(), r)
+    };
+    // The name it runs under too: that is what `<default>` crew slots resolve to.
+    let (mut resolved, running_model) =
+        match model_override.as_ref().map(|o| (o, resolve_named(Some(o)))) {
+            Some((o, Ok(r))) => (r, Some(o.clone())),
+            _ => (
+                resolve_named(None)?,
+                default_model_ref(user_models.as_ref(), project_models.as_ref()),
+            ),
+        };
     // A crew-routed subagent may override the temperature per task type.
     if let Some(t) = crate::cmd::crew::temperature_override() {
         resolved.temperature = t;
     }
     let context_window = resolved.context_window as usize;
     let model = build_client(&resolved).context("building model client")?;
+    if let Some(r) = &running_model {
+        crate::cmd::crew::set_session_foreman(&r.to_string());
+    }
 
     let logger = match &args.id {
         Some(id) => crate::session::SessionLogger::create_with_id(&root, id).ok(),
@@ -157,6 +175,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     let reg_info = info.clone();
     let (mut ui, mut cmd_rx) = SocketUi::bind(&sock, &journal, info).await?;
     let emitter = ui.clone(); // post-turn events without borrowing `ui`
+    if let Some(n) = &crew_notice {
+        emitter.emit(UiEventMsg::Notice(n.clone()));
+    }
     println!("{}", sock.display()); // so the daemon/manual client can locate it
 
     // Cancelled by the heartbeat watchdog if the daemon vanishes for good and no
@@ -320,7 +341,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         crate::cmd::session::models_and_default(&user_models, &project_models);
     emitter.set_models(
         model_names,
-        model_override
+        running_model
             .as_ref()
             .map(ToString::to_string)
             .or_else(|| (!default_name.is_empty()).then_some(default_name)),
@@ -561,7 +582,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             // answer, which is indistinguishable from the session being
                             // wedged. (Caught by `switch_model_reports_success_and_failure`,
                             // which raced setup roughly one run in six.)
-                            Some(m @ (ClientMsg::SwitchModel(_) | ClientMsg::PlanMode(_))) => {
+                            Some(
+                                m @ (ClientMsg::SwitchModel(_)
+                                | ClientMsg::SwitchCrew(_)
+                                | ClientMsg::PlanMode(_)),
+                            ) => {
                                 deferred.push(m);
                             }
                             // A shared switch, so unlike the settings above it needs no
@@ -578,6 +603,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                 match m {
                     ClientMsg::SwitchModel(name) => {
                         apply_switch(&mut agent, &resolve, &emitter, &name)
+                    }
+                    ClientMsg::SwitchCrew(name) => {
+                        if let Some(f) = switch_crew(&emitter, &name) {
+                            apply_switch(&mut agent, &resolve, &emitter, &f);
+                        }
                     }
                     ClientMsg::PlanMode(on) => agent.set_planning(on),
                     _ => {}
@@ -646,6 +676,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     Some(ClientMsg::End) => break,
                     Some(ClientMsg::SwitchModel(name)) => {
                         apply_switch(&mut agent, &resolve, &emitter, &name);
+                        continue;
+                    }
+                    Some(ClientMsg::SwitchCrew(name)) => {
+                        if let Some(f) = switch_crew(&emitter, &name) {
+                            apply_switch(&mut agent, &resolve, &emitter, &f);
+                        }
                         continue;
                     }
                     Some(ClientMsg::PlanMode(on)) => {
@@ -845,6 +881,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                                 "stopping background subagents; the current turn continues"
                                     .into(),
                             ));
+                        }
+                        // Routing switches now (the next delegation uses the new
+                        // crew); its foreman takes over when this turn finishes,
+                        // rather than cancelling the turn the way `/model` does.
+                        Some(ClientMsg::SwitchCrew(n)) => {
+                            if let Some(f) = switch_crew(&emitter, &n) {
+                                switch_to = Some(f);
+                            }
                         }
                         // Swapping the model needs &mut agent, so finish the
                         // current turn first, then apply below.
@@ -1366,11 +1410,44 @@ fn set_iteration_budget(
     }));
 }
 
+/// Switch this session's crew: its routing applies to the next delegation. Returns
+/// the crew's foreman, when it names one, for the caller to switch the model to
+/// once it holds the agent.
+fn switch_crew(ui: &SocketUi, name: &str) -> Option<String> {
+    match cowboy_core::crew::load_named(Some(name)) {
+        Ok(Some(c)) => {
+            crate::cmd::crew::set_session_crew(name);
+            let mode = if c.enabled() {
+                ""
+            } else {
+                " — crew mode is off, so nothing is delegated until it is on                  (`cowboy crew use` or the /model picker)"
+            };
+            let foreman = c.foreman.as_ref().map(ToString::to_string);
+            ui.emit(UiEventMsg::Notice(match &foreman {
+                Some(f) => format!("switched to crew {name} (foreman {f}){mode}"),
+                None => format!("switched to crew {name}{mode}"),
+            }));
+            foreman
+        }
+        Ok(None) => {
+            ui.emit(UiEventMsg::Notice(
+                "no crews — create one with `cowboy crew init`".into(),
+            ));
+            None
+        }
+        Err(e) => {
+            ui.emit(UiEventMsg::Notice(format!("crew switch failed: {e}")));
+            None
+        }
+    }
+}
+
 fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
     match resolve(name) {
         Ok((client, cw, pricing)) => {
             agent.set_model(client, cw, pricing);
             ui.set_current_model(name);
+            crate::cmd::crew::set_session_foreman(name);
             ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
         }
         Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),
