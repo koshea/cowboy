@@ -1,5 +1,6 @@
 [package]
 name = "cowboy-sandbox"
+description = "Host-native sandbox plan builder (Linux bwrap/Landlock/seccomp and macOS Seatbelt) for Cowboy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

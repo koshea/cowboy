@@ -18,7 +18,7 @@ class Cowboy < Formula
   depends_on macos: :tahoe
 
   url "https://github.com/koshea/cowboy/releases/download/v#{version}/cowboy-#{version}-aarch64-apple-darwin.tar.gz"
-  sha256 "REPLACE_WITH_THE_RELEASE_SHA256"
+  sha256 "456cf0ae1e7e10a536d8eb56413c21902a95ada0118e599dab7569e56443308d"
 
   def install
     # `cowboy` and `cowboyd` are version-locked to each other; install both.

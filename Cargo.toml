@@ -23,11 +23,11 @@ repository = "https://github.com/koshea/cowboy"
 
 [workspace.dependencies]
 # internal
-cowboy-core = { path = "crates/cowboy-core" }
-cowboy-proto = { path = "crates/cowboy-proto" }
-cowboy-sandbox = { path = "crates/cowboy-sandbox" }
-cowboy-gateway = { path = "crates/cowboy-gateway" }
-cowboy-tui = { path = "crates/cowboy-tui" }
+cowboy-core = { version = "0.1.0", path = "crates/cowboy-core" }
+cowboy-proto = { version = "0.1.0", path = "crates/cowboy-proto" }
+cowboy-sandbox = { version = "0.1.0", path = "crates/cowboy-sandbox" }
+cowboy-gateway = { version = "0.1.0", path = "crates/cowboy-gateway" }
+cowboy-tui = { version = "0.1.0", path = "crates/cowboy-tui" }
 
 # cli / runtime
 clap = { version = "4", features = ["derive"] }

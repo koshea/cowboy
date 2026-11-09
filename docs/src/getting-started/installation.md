@@ -104,7 +104,8 @@ GitHub's `ubuntu-24.04` runners, so build from source below if yours is older.
 Or build it yourself (needs a Rust toolchain — [rustup](https://rustup.rs)):
 
 ```sh
-cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli
+cargo install --locked cowboy-cli                                         # from crates.io
+cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli  # or straight from main
 ```
 
 This builds and installs `cowboy` (and the `cowboyd` daemon) to `~/.cargo/bin`.

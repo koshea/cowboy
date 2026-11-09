@@ -1,9 +1,12 @@
 [package]
 name = "cowboy-gateway"
+description = "Egress policy engine and DNS/SNI attribution for the Cowboy sandbox"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 cowboy-core.workspace = true

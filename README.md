@@ -37,7 +37,8 @@ Or build from source (needs Rust 1.99.1 or newer; a checkout pins it via
 `rust-toolchain.toml`):
 
 ```sh
-cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli   # installs `cowboy` + `cowboyd`
+cargo install --locked cowboy-cli                                         # from crates.io (`cowboy` + `cowboyd`)
+cargo install --locked --git https://github.com/koshea/cowboy cowboy-cli  # or straight from main
 ```
 
 Then, either way:

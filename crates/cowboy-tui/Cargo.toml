@@ -1,9 +1,12 @@
 [package]
 name = "cowboy-tui"
+description = "Ratatui terminal UI widgets and rendering for Cowboy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 ratatui.workspace = true

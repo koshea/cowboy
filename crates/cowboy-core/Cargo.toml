@@ -1,9 +1,12 @@
 [package]
 name = "cowboy-core"
+description = "Core configuration, policy, ranch, and model transport types for Cowboy"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 cowboy-proto.workspace = true

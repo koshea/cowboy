@@ -1,9 +1,12 @@
 [package]
 name = "cowboy-proto"
+description = "Wire protocol types shared by the Cowboy daemon, CLI, TUI, and web UI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [lib]
 name = "cowboy_proto"
