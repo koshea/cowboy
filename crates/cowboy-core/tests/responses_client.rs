@@ -217,6 +217,37 @@ async fn an_error_event_names_its_param() {
     assert!(s.contains("tools[0]"), "{s}");
 }
 
+/// The shape OpenAI actually sends: the reason nested under `error`, not at the
+/// event's top level. Reading only the top level reported "unknown_error: no
+/// message" for a usage limit.
+#[tokio::test]
+async fn an_error_event_with_a_nested_error_keeps_its_code_and_message() {
+    let (_s, client) = serve(&[json!({"type": "error", "sequence_number": 3, "error": {
+        "code": "rate_limit_exceeded", "message": "slow down", "param": null,
+        "type": "invalid_request_error"}})])
+    .await;
+    let s = client
+        .chat(&[Message::user("x")], &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        s.contains("rate_limit_exceeded") && s.contains("slow down"),
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn a_failure_with_no_reason_quotes_the_event() {
+    let (_s, client) = serve(&[json!({"type": "response.failed", "response": {"id": "r1"}})]).await;
+    let s = client
+        .chat(&[Message::user("x")], &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(s.contains("the provider sent") && s.contains("r1"), "{s}");
+}
+
 #[tokio::test]
 async fn a_stream_that_just_ends_is_an_error_not_an_empty_answer() {
     let (_s, client) =

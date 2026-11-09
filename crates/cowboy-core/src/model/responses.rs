@@ -316,13 +316,6 @@ struct Event {
     arguments: Option<String>,
     #[serde(default)]
     response: Option<ResponseObj>,
-    // `error` events carry these at the top level.
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    param: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -342,8 +335,6 @@ struct ResponseObj {
     #[serde(default)]
     usage: Option<UsageWire>,
     #[serde(default)]
-    error: Option<ErrorWire>,
-    #[serde(default)]
     incomplete_details: Option<IncompleteWire>,
 }
 
@@ -361,16 +352,6 @@ struct UsageWire {
 struct InputDetails {
     #[serde(default)]
     cached_tokens: u64,
-}
-
-#[derive(Deserialize, Default)]
-struct ErrorWire {
-    #[serde(default)]
-    code: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    param: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -508,6 +489,12 @@ async fn read_stream(
             reasoning_items.push(raw["item"].clone());
             continue;
         }
+        // A failure keeps the event itself: providers differ in where they put the
+        // code (top level, or nested under `error`), and a failure whose reason
+        // cannot be found must still show what was sent rather than "no message".
+        if raw["type"] == "response.failed" || raw["type"] == "error" {
+            return Err(failed_event(&raw, failures));
+        }
         let Ok(ev) = serde_json::from_value::<Event>(raw) else {
             continue;
         };
@@ -584,21 +571,6 @@ async fn read_stream(
                     }),
                 });
             }
-            "response.failed" => {
-                let err = ev.response.and_then(|r| r.error).unwrap_or_default();
-                return Err(failures.stream_error(
-                    err.code.as_deref(),
-                    err.message.as_deref(),
-                    err.param.as_deref(),
-                ));
-            }
-            "error" => {
-                return Err(failures.stream_error(
-                    ev.code.as_deref(),
-                    ev.message.as_deref(),
-                    ev.param.as_deref(),
-                ));
-            }
             _ => {}
         }
     }
@@ -607,6 +579,57 @@ async fn read_stream(
          the answer may be cut off — retry the turn"
             .into(),
     ))
+}
+
+/// The error for a `response.failed` or `error` event. The reason is looked for
+/// where the Responses API documents it (`response.error`, or the event's own
+/// `code`/`message`) and where providers also put it (`error: {…}`,
+/// `response.status_details.error`); if none is there, the event is quoted.
+fn failed_event(raw: &Value, failures: &dyn FailurePolicy) -> Error {
+    tracing::debug!(event = %quote(raw), "model response failed");
+    let candidates = [
+        &raw["response"]["error"],
+        &raw["error"],
+        raw,
+        &raw["response"]["status_details"]["error"],
+    ];
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    for c in candidates {
+        let (code, message) = (
+            str_of(c, "code").or_else(|| {
+                str_of(c, "type").filter(|t| t != "error" && !t.starts_with("response."))
+            }),
+            str_of(c, "message"),
+        );
+        if message.is_some() {
+            return failures.stream_error(
+                code.as_deref(),
+                message.as_deref(),
+                str_of(c, "param").as_deref(),
+            );
+        }
+        if let Some(code) = code {
+            // A code alone says little when it is generic; keep what came with it.
+            let e = failures.stream_error(Some(&code), None, str_of(c, "param").as_deref());
+            return match e {
+                Error::Model(m) => Error::Model(format!("{m}; the provider sent: {}", quote(raw))),
+                other => other,
+            };
+        }
+    }
+    Error::Model(format!(
+        "model response failed without a reason; the provider sent: {}",
+        quote(raw)
+    ))
+}
+
+/// An event for an error message, bounded.
+fn quote(raw: &Value) -> String {
+    let q = raw.to_string();
+    match q.char_indices().nth(800) {
+        Some((i, _)) => format!("{}…", &q[..i]),
+        None => q,
+    }
 }
 
 #[cfg(test)]

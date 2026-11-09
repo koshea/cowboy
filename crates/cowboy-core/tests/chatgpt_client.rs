@@ -194,6 +194,35 @@ async fn a_usage_limit_mid_stream_is_reported() {
     assert!(e.contains("usage limit reached"), "{e}");
 }
 
+/// Recorded from the live ChatGPT route: a usage limit arrives as an `error`
+/// event with the reason nested under `error`, after the stream opened.
+#[tokio::test]
+async fn a_usage_limit_error_event_as_chatgpt_sends_it() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    signed_in(dir.path());
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(&[json!({"type": "error", "sequence_number": 3, "error": {
+                "code": "subscription_sharing_usage_limit_exceeded",
+                "message": "The ChatGPT user has reached their Subscription Sharing usage limit.",
+                "param": null, "type": "invalid_request_error"}})]),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+    let e = client(dir.path(), &server)
+        .chat(&[Message::user("x")], &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("usage limit reached") && e.contains("Settings → Usage"),
+        "{e}"
+    );
+}
+
 #[tokio::test]
 async fn an_admission_detail_is_shown_as_a_diagnostic() {
     let dir = assert_fs::TempDir::new().unwrap();
