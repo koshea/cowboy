@@ -316,9 +316,12 @@ fn provider(base_url: &str) -> Provider {
     Provider::api_key(base_url, "sk-test")
 }
 
-fn model_def(provider: &str, model: &str) -> ModelDef {
+fn mref(s: &str) -> ModelRef {
+    ModelRef::parse(s).unwrap()
+}
+
+fn model_def(model: &str) -> ModelDef {
     ModelDef {
-        provider: provider.into(),
         model: model.into(),
         temperature: 0.2,
         max_tokens: 8192,
@@ -344,18 +347,14 @@ fn resolve_model_merges_and_picks_default() {
         .insert("p".into(), provider("https://api/v1"));
 
     let mut user = ModelsConfig::default();
-    user.default = Some("sonnet".into());
-    user.models
-        .insert("sonnet".into(), model_def("p", "anthropic/sonnet"));
-    user.models
-        .insert("cheap".into(), model_def("p", "openai/mini"));
+    user.default = Some(mref("p/sonnet"));
+    user.insert(mref("p/sonnet"), model_def("anthropic/sonnet"));
+    user.insert(mref("p/cheap"), model_def("openai/mini"));
 
     let mut project = ModelsConfig::default();
     // Project overrides "cheap" by name and adds a new model + a new default.
-    project.default = Some("cheap".into());
-    project
-        .models
-        .insert("cheap".into(), model_def("p", "project/override"));
+    project.default = Some(mref("p/cheap"));
+    project.insert(mref("p/cheap"), model_def("project/override"));
 
     // Default precedence: project default ("cheap") wins over user default.
     let r = resolve_model(&providers, Some(&user), Some(&project), None).unwrap();
@@ -366,7 +365,13 @@ fn resolve_model_merges_and_picks_default() {
     assert_eq!(r.api, WireApi::ChatCompletions);
 
     // Explicit name beats both defaults; user model still reachable.
-    let r = resolve_model(&providers, Some(&user), Some(&project), Some("sonnet")).unwrap();
+    let r = resolve_model(
+        &providers,
+        Some(&user),
+        Some(&project),
+        Some(&mref("p/sonnet")),
+    )
+    .unwrap();
     assert_eq!(r.model, "anthropic/sonnet");
 }
 
@@ -378,8 +383,8 @@ fn resolve_model_errors_clearly() {
 
     // Model references an unknown provider.
     let mut user = ModelsConfig::default();
-    user.default = Some("m".into());
-    user.models.insert("m".into(), model_def("ghost", "x"));
+    user.default = Some(mref("ghost/m"));
+    user.insert(mref("ghost/m"), model_def("x"));
     let err = resolve_model(&providers, Some(&user), None, None).unwrap_err();
     assert!(matches!(err, Error::Invalid(_)));
 
@@ -389,7 +394,7 @@ fn resolve_model_errors_clearly() {
         .providers
         .insert("p".into(), provider("https://api/v1"));
     let mut nodefault = ModelsConfig::default();
-    nodefault.models.insert("m".into(), model_def("p", "x"));
+    nodefault.insert(mref("p/m"), model_def("x"));
     assert!(resolve_model(&providers, Some(&nodefault), None, None).is_err());
 }
 
@@ -401,7 +406,7 @@ fn project_models_reject_credentials() {
     let p = write(
         tmp.path(),
         MODELS_FILE,
-        "version: 1\nmodels:\n  m:\n    provider: p\n    model: x\n    api_key: sk-leak\n",
+        "version: 1\nmodels:\n  p:\n    m:\n      model: x\n      api_key: sk-leak\n",
     );
     assert!(ModelsConfig::load(&p).is_err());
 }
@@ -526,8 +531,8 @@ fn provider_base_url_resolves_from_env() {
         Provider::api_key("${COWBOY_TEST_PROVIDER_URL}", "sk-test"),
     );
     let mut user = ModelsConfig::default();
-    user.default = Some("m".into());
-    user.models.insert("m".into(), model_def("p", "x"));
+    user.default = Some(mref("p/m"));
+    user.insert(mref("p/m"), model_def("x"));
 
     let r = resolve_model(&providers, Some(&user), None, None).unwrap();
     assert_eq!(r.base_url, "https://gw.local/v1");
@@ -575,17 +580,14 @@ fn an_omitted_cached_price_is_backfilled_from_the_shipped_defaults() {
 
     // As `cowboy models add` wrote it before the rate was known: prices set, cache
     // rate absent.
-    let mut def = model_def(
-        "p",
-        "fireworks/accounts/fireworks/models/deepseek-v4p1-flash",
-    );
+    let mut def = model_def("fireworks/accounts/fireworks/models/deepseek-v4p1-flash");
     def.input_cost_per_mtok = Some(0.22);
     def.output_cost_per_mtok = Some(0.66);
     def.cached_input_cost_per_mtok = None;
 
     let mut user = ModelsConfig::default();
-    user.default = Some("ds".into());
-    user.models.insert("ds".into(), def);
+    user.default = Some(mref("p/ds"));
+    user.insert(mref("p/ds"), def);
 
     let r = resolve_model(&providers, Some(&user), None, None).unwrap();
     let cached = r
@@ -609,17 +611,14 @@ fn an_explicit_cached_price_is_never_overridden() {
         .providers
         .insert("p".into(), provider("https://api/v1"));
 
-    let mut def = model_def(
-        "p",
-        "fireworks/accounts/fireworks/models/deepseek-v4p1-flash",
-    );
+    let mut def = model_def("fireworks/accounts/fireworks/models/deepseek-v4p1-flash");
     def.input_cost_per_mtok = Some(0.22);
     def.output_cost_per_mtok = Some(0.66);
     def.cached_input_cost_per_mtok = Some(0.123);
 
     let mut user = ModelsConfig::default();
-    user.default = Some("ds".into());
-    user.models.insert("ds".into(), def);
+    user.default = Some(mref("p/ds"));
+    user.insert(mref("p/ds"), def);
 
     let r = resolve_model(&providers, Some(&user), None, None).unwrap();
     assert_eq!(r.cached_input_cost_per_mtok, Some(0.123));
@@ -637,8 +636,8 @@ fn model_setup_pair_preserves_both_files_and_provider_permissions() {
         .providers
         .insert("p".into(), provider("https://api.example/v1"));
     let mut models = state.models.clone();
-    models.default = Some("m".into());
-    models.models.insert("m".into(), model_def("p", "model/id"));
+    models.default = Some(mref("p/m"));
+    models.insert(mref("p/m"), model_def("model/id"));
     commit_model_setup_pair(
         &providers_path,
         &models_path,
@@ -709,10 +708,8 @@ fn model_setup_recovers_an_interrupted_prepared_pair() {
         .insert("old".into(), provider("https://old.example/v1"));
     old_providers.save(&providers_path).unwrap();
     let mut old_models = ModelsConfig::default();
-    old_models.default = Some("old".into());
-    old_models
-        .models
-        .insert("old".into(), model_def("old", "old/model"));
+    old_models.default = Some(mref("old/old"));
+    old_models.insert(mref("old/old"), model_def("old/model"));
     old_models.save(&models_path).unwrap();
 
     std::fs::copy(
@@ -769,9 +766,8 @@ fn provider_api_and_auth_parse_and_resolve() {
     assert_eq!(providers.providers["chatgpt"].auth, ProviderAuth::Chatgpt);
 
     let mut user = ModelsConfig::default();
-    user.default = Some("g".into());
-    user.models
-        .insert("g".into(), model_def("chatgpt", "gpt-x"));
+    user.default = Some(mref("chatgpt/g"));
+    user.insert(mref("chatgpt/g"), model_def("gpt-x"));
     let r = resolve_model(&providers, Some(&user), None, None).unwrap();
     assert_eq!(r.provider_name, "chatgpt");
     assert_eq!(r.api, WireApi::Responses);
@@ -817,4 +813,102 @@ fn impossible_provider_combinations_are_refused_at_load() {
 fn a_resolved_key_never_appears_in_debug_output() {
     let dbg = format!("{:?}", ResolvedAuth::ApiKey("sk-very-secret".into()));
     assert!(!dbg.contains("sk-very-secret"), "{dbg}");
+}
+
+// --- `provider/name` model references ---
+
+#[test]
+fn model_refs_are_provider_slash_name() {
+    let r = ModelRef::parse("bifrost/glm-4.7").unwrap();
+    assert_eq!(
+        (r.provider.as_str(), r.name.as_str()),
+        ("bifrost", "glm-4.7")
+    );
+    assert_eq!(r.to_string(), "bifrost/glm-4.7");
+    // Interior spaces have always been legal in display-style names.
+    assert_eq!(
+        ModelRef::parse("p/Cerebras: GLM 4.7").unwrap().name,
+        "Cerebras: GLM 4.7"
+    );
+    // Bare names point at the migration.
+    let err = ModelRef::parse("glm").unwrap_err().to_string();
+    assert!(err.contains("cowboy models migrate"), "{err}");
+    // Empty parts, a second `/`, surrounding space inside a part.
+    for bad in ["/glm", "bifrost/", "a/b/c", "a /c", "/"] {
+        assert!(ModelRef::parse(bad).is_err(), "{bad:?} should be refused");
+    }
+}
+
+#[test]
+fn the_grouped_layout_parses_and_round_trips() {
+    let tmp = tempdir();
+    let p = write(
+        tmp.path(),
+        MODELS_FILE,
+        "default: chatgpt/gpt\nsummarizer: bifrost/glm\nmodels:\n  bifrost:\n    glm:\n      \
+         model: zai/glm-4.7\n  chatgpt:\n    gpt:\n      model: gpt-6.1-sol\n",
+    );
+    let cfg = ModelsConfig::load(&p).unwrap();
+    assert_eq!(cfg.default, Some(mref("chatgpt/gpt")));
+    assert_eq!(cfg.get(&mref("bifrost/glm")).unwrap().model, "zai/glm-4.7");
+    let names: Vec<String> = cfg.iter().map(|(r, _)| r.to_string()).collect();
+    assert_eq!(names, ["bifrost/glm", "chatgpt/gpt"]);
+    let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert_eq!(serde_yaml_ng::from_str::<ModelsConfig>(&yaml).unwrap(), cfg);
+}
+
+#[test]
+fn the_old_flat_layout_is_refused_with_the_migrate_hint() {
+    let tmp = tempdir();
+    for old in [
+        "default: m\nmodels:\n  m:\n    provider: p\n    model: x\n",
+        "models:\n  m:\n    provider: p\n    model: x\n",
+        "default: m\nmodels: {}\n",
+    ] {
+        let p = write(tmp.path(), MODELS_FILE, old);
+        let err = ModelsConfig::load(&p).unwrap_err().to_string();
+        assert!(err.contains("cowboy models migrate"), "{old:?}: {err}");
+    }
+}
+
+#[test]
+fn project_models_override_user_models_by_qualified_name() {
+    let mut providers = ProvidersConfig::default();
+    providers
+        .providers
+        .insert("a".into(), provider("https://a/v1"));
+    providers
+        .providers
+        .insert("b".into(), provider("https://b/v1"));
+
+    let mut user = ModelsConfig::default();
+    user.default = Some(mref("a/m"));
+    user.insert(mref("a/m"), model_def("user-a"));
+    user.insert(mref("b/m"), model_def("user-b"));
+    let mut project = ModelsConfig::default();
+    project.insert(mref("b/m"), model_def("project-b"));
+
+    // Same name on two providers stays two models; the project overrides only `b/m`.
+    let r = resolve_model(&providers, Some(&user), Some(&project), None).unwrap();
+    assert_eq!(
+        (r.model.as_str(), r.base_url.as_str()),
+        ("user-a", "https://a/v1")
+    );
+    let r = resolve_model(&providers, Some(&user), Some(&project), Some(&mref("b/m"))).unwrap();
+    assert_eq!(
+        (r.model.as_str(), r.provider_name.as_str()),
+        ("project-b", "b")
+    );
+
+    // A model under a provider the home file does not define is refused, naming both.
+    project.insert(mref("rogue/m"), model_def("x"));
+    let err = resolve_model(
+        &providers,
+        Some(&user),
+        Some(&project),
+        Some(&mref("rogue/m")),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("rogue") && err.contains("a, b"), "{err}");
 }

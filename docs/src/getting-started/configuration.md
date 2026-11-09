@@ -227,27 +227,49 @@ providers:
 
 ### `models.yaml` — user (`~/.config/cowboy/`) and/or project (`.cowboy/`)
 
-A model names a provider plus the model id and sampling params. **Never contains
-credentials** (a stray `api_key`/`base_url` is a hard parse error). User and
-project lists merge by name (project wins); the default is `project.default`, falling back to
-`user.default`.
+Models are grouped under the provider that serves them, and everything that names a
+model — `default`, `summarizer`, the [crew roster](../using/crew.md), `/model`,
+`cowboy models use` — names it as **`provider/name`**. The same name under two
+providers is two different models. The file **never contains credentials** (a stray
+`api_key`/`base_url` is a hard parse error), and a project file can only name
+providers defined in your home `providers.yaml`; it can never define one.
+
+User and project files merge by `provider/name` (project wins); the default is
+`project.default`, falling back to `user.default`.
 
 ```yaml
 version: 1
-default: sonnet
-summarizer: haiku        # optional: model for summaries (compaction + recovery)
+default: litellm/sonnet
+summarizer: litellm/haiku   # optional: model for summaries (compaction + recovery)
 models:
-  sonnet:
-    provider: litellm
-    model: anthropic/claude-sonnet-4-6
-    temperature: 0.2
-    max_tokens: 32768          # max OUTPUT tokens per response (see note)
-    context_window: 1000000    # total input+output window the model supports
-    input_cost_per_mtok: 3.0   # optional, for usage/cost display
-    output_cost_per_mtok: 15.0
-    cached_input_cost_per_mtok: 0.30  # optional: prompt-cache hit price (see below)
-    anthropic_cache: true      # optional: see below
+  litellm:                   # a provider from providers.yaml
+    sonnet:                  # → litellm/sonnet
+      model: anthropic/claude-sonnet-4-6   # the provider-side id (may contain `/`)
+      temperature: 0.2
+      max_tokens: 32768          # max OUTPUT tokens per response (see note)
+      context_window: 1000000    # total input+output window the model supports
+      input_cost_per_mtok: 3.0   # optional, for usage/cost display
+      output_cost_per_mtok: 15.0
+      cached_input_cost_per_mtok: 0.30  # optional: prompt-cache hit price (see below)
+      anthropic_cache: true      # optional: see below
 ```
+
+Provider and model names may not contain `/`; the provider-side `model:` id can.
+
+**Upgrading from bare model names.** Before models were grouped by provider, each
+entry carried a `provider:` field and was referred to by its bare name. Cowboy now
+refuses that layout (and bare names in `crew.yaml`) rather than guessing which
+provider you meant. Convert once:
+
+```sh
+cowboy models migrate    # shows a diff, asks, keeps a .bak of every file it rewrites
+```
+
+It rewrites your home `models.yaml`, the current project's `.cowboy/models.yaml`, and
+`crew.yaml` (in place, so roster comments survive). A name that was the provider-side
+id — `fireworks/accounts/fireworks/models/glm-5p3` — becomes its last segment,
+`default/glm-5p3`, unless that would collide. An older `cowboy` binary cannot read
+the migrated files.
 
 **`context_window` vs `max_tokens`.** `context_window` is the model's *total*
 window (prompt + completion); Cowboy prunes history to fit it. `max_tokens` is the

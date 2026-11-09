@@ -188,7 +188,7 @@ pub const SLASH: &[Slash] = &[
     },
     Slash {
         name: "model",
-        args: "[name]",
+        args: "[provider/name]",
         help: "show or switch the active model",
         group: Group::Setup,
         aliases: &[],

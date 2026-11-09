@@ -524,7 +524,7 @@ fn piped_run_is_denied_in_a_busy_worktree() {
         .write_str("version: 1\nproviders:\n  p:\n    base_url: https://x/v1\n    api_key: k\n")
         .unwrap();
     cfg.child("cowboy/models.yaml")
-        .write_str("version: 1\ndefault: m\nmodels:\n  m:\n    provider: p\n    model: x\n")
+        .write_str("version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n")
         .unwrap();
     proj.child(".cowboy/security.yaml")
         .write_str("version: 1\n")
@@ -597,7 +597,7 @@ fn start_session_spawns_and_registers_a_worker() {
         .write_str("version: 1\nproviders:\n  p:\n    base_url: https://x/v1\n    api_key: k\n")
         .unwrap();
     cfg.child("cowboy/models.yaml")
-        .write_str("version: 1\ndefault: m\nmodels:\n  m:\n    provider: p\n    model: x\n")
+        .write_str("version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n")
         .unwrap();
     // Minimal project config.
     proj.child(".cowboy/security.yaml")

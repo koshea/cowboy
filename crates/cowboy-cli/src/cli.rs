@@ -280,7 +280,8 @@ Examples:
   cowboy models                        # what is configured, and the effective default
   cowboy models setup                  # guided provider + model setup
   cowboy models available              # what your endpoint actually offers
-  cowboy models use claude-sonnet-4-6  # set the project default
+  cowboy models use litellm/sonnet     # set the project default (provider/name)
+  cowboy models migrate                # convert pre-`provider/name` config files
 
 Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are read
 host-side. They are never written into a project or bound into the sandbox.")]
@@ -652,9 +653,17 @@ are never overwritten; repair them first. Advanced tuning is optional.")]
     Setup,
     /// List configured providers and models, and the effective default.
     List,
+    /// Convert models.yaml (home and this project) and crew.yaml from bare model
+    /// names to `provider/name`, models grouped under their provider. Shows a
+    /// diff and keeps a `.bak` of every file it rewrites.
+    Migrate {
+        /// Rewrite without asking.
+        #[arg(long)]
+        yes: bool,
+    },
     /// Set the default model. Writes to the project unless `--global`.
     Use {
-        /// The model name to make default.
+        /// The model to make default, as `provider/name`.
         name: String,
         /// Set the user-level (home) default instead of the project default.
         #[arg(short, long)]
@@ -671,20 +680,19 @@ are never overwritten; repair them first. Advanced tuning is optional.")]
     #[command(after_help = "\
 Examples:
   cowboy models add anthropic/claude-sonnet-4-6
-  cowboy models add cerebras/zai-glm-4.7 --name fast --default
-  cowboy models add openai/gpt-5 --reasoning high --max-output 32000
+  cowboy models add cerebras/zai-glm-4.7 --name bifrost/fast --default
+  cowboy models add gpt-5 --name openai/gpt-5 --reasoning high --max-output 32000
 
-Shipped defaults fill in temperature, context window and pricing for known ids;
-`cowboy models available` lists what your endpoint actually offers.")]
+Models are named `provider/name`. Shipped defaults fill in temperature, context
+window and pricing for known ids; `cowboy models available` lists what each
+endpoint actually offers.")]
     Add {
         /// The provider-side model id, e.g. `cerebras/zai-glm-4.7`.
         id: String,
-        /// Friendly name (config key). Defaults to the recommended name.
-        #[arg(long)]
+        /// Where to save it, as `provider/name`. Defaults to the only configured
+        /// provider and the recommended name.
+        #[arg(long, value_name = "PROVIDER/NAME")]
         name: Option<String>,
-        /// Provider to use (defaults to the only configured one).
-        #[arg(long)]
-        provider: Option<String>,
         /// Sampling temperature (provider default if omitted).
         #[arg(long, value_name = "FLOAT")]
         temp: Option<f32>,

@@ -36,7 +36,7 @@ pub const HELP: &[(&str, &str, &str)] = &[
     ),
     (
         "model",
-        "[name]",
+        "[provider/name]",
         "show or switch the model (from the next turn)",
     ),
     ("models", "", "list the configured models"),

@@ -2,9 +2,10 @@
 //!
 //! **Providers** (endpoint + API key) are host-owned and live only in the home
 //! dir (`~/.config/cowboy/providers.yaml`, mode `0600`); the agent can never
-//! reach them. **Models** reference a provider by name and may be defined at the
-//! user level (`~/.config/cowboy/models.yaml`) or per project
-//! (`.cowboy/models.yaml`); project entries override user entries by name.
+//! reach them. **Models** are grouped under their provider and named
+//! `provider/name`; they may be defined at the user level
+//! (`~/.config/cowboy/models.yaml`) or per project (`.cowboy/models.yaml`), project
+//! entries overriding user entries by `provider/name`.
 
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
@@ -12,8 +13,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use cowboy_core::config::{
-    commit_model_setup_pair, expand_env, load_model_setup_state, resolve_model, ConfigPaths,
-    ModelDef, ModelsConfig, Provider, ProvidersConfig, ReasoningEffort,
+    commit_model_setup_pair, default_model_ref, expand_env, load_model_setup_state, merged_models,
+    resolve_model, valid_ref_part, ConfigPaths, ModelDef, ModelRef, ModelsConfig, Provider,
+    ProvidersConfig, ReasoningEffort,
 };
 use cowboy_core::model::list_models;
 use cowboy_core::model_defaults;
@@ -25,12 +27,12 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
     match args.command {
         None | Some(ModelsCommand::List) => list(),
         Some(ModelsCommand::Setup) => setup().await,
+        Some(ModelsCommand::Migrate { yes }) => crate::cmd::models_migrate::run(yes),
         Some(ModelsCommand::Use { name, global }) => use_default(&name, global),
         Some(ModelsCommand::Available { all }) => available(all).await,
         Some(ModelsCommand::Add {
             id,
             name,
-            provider,
             temp,
             context,
             max_output,
@@ -39,7 +41,6 @@ pub async fn run(args: ModelsArgs) -> Result<()> {
         }) => add(AddArgs {
             id,
             name,
-            provider,
             temp,
             context,
             max_output,
@@ -57,7 +58,7 @@ const CATALOGUE_LIMIT: usize = 50;
 struct SetupPlan {
     provider_name: String,
     provider: Provider,
-    model_name: String,
+    model_ref: ModelRef,
     model: ModelDef,
 }
 
@@ -68,7 +69,7 @@ async fn setup() -> Result<()> {
     let state = load_model_setup_state(&providers_path, &models_path)?;
 
     println!("Configure a model provider (saved to your home dir, never a project).\n");
-    let provider_name = prompt_required("Provider name", Some("default"), valid_name)?;
+    let provider_name = prompt_required("Provider name", Some("default"), valid_part)?;
     let base_url = prompt_required(
         "Endpoint base URL (e.g. https://host/v1)",
         None,
@@ -86,7 +87,12 @@ async fn setup() -> Result<()> {
     println!("\nChecking the endpoint model catalogue (up to 8 seconds)…");
     let model_id = choose_model_id(&provider).await?;
     let defaults = model_defaults::lookup(&model_id);
-    let model_name = prompt_required("Model name", Some(&defaults.name), valid_name)?;
+    let model_name = prompt_required(
+        &format!("Model name (saved as `{provider_name}/<name>`)"),
+        Some(&sanitize_part(&defaults.name)),
+        valid_part,
+    )?;
+    let model_ref = ModelRef::new(provider_name.clone(), model_name)?;
 
     let mut temperature = defaults.temperature;
     let mut max_tokens = defaults.max_tokens;
@@ -111,9 +117,8 @@ async fn setup() -> Result<()> {
     let plan = SetupPlan {
         provider_name: provider_name.clone(),
         provider,
-        model_name: model_name.clone(),
+        model_ref: model_ref.clone(),
         model: ModelDef {
-            provider: provider_name.clone(),
             model: model_id,
             temperature,
             max_tokens,
@@ -151,7 +156,7 @@ async fn setup() -> Result<()> {
     )?;
 
     crate::ui::ok(&format!(
-        "saved provider `{provider_name}` and model `{model_name}`"
+        "saved provider `{provider_name}` and model `{model_ref}`"
     ));
     println!("  credentials: {} (mode 0600)", providers_path.display());
     println!("  models: {}", models_path.display());
@@ -169,8 +174,8 @@ fn replacements(
     if providers.providers.contains_key(&plan.provider_name) {
         found.push(format!("provider `{}`", plan.provider_name));
     }
-    if models.models.contains_key(&plan.model_name) {
-        found.push(format!("model `{}`", plan.model_name));
+    if models.get(&plan.model_ref).is_some() {
+        found.push(format!("model `{}`", plan.model_ref));
     }
     found
 }
@@ -182,13 +187,13 @@ fn apply_setup(
 ) -> (ProvidersConfig, ModelsConfig) {
     let mut providers = existing_providers.clone();
     let mut models = existing_models.clone();
-    let first = models.models.is_empty();
+    let first = models.is_empty();
     providers
         .providers
         .insert(plan.provider_name, plan.provider);
-    models.models.insert(plan.model_name.clone(), plan.model);
+    models.insert(plan.model_ref.clone(), plan.model);
     if first || models.default.is_none() {
-        models.default = Some(plan.model_name);
+        models.default = Some(plan.model_ref);
     }
     (providers, models)
 }
@@ -249,6 +254,20 @@ fn valid_name(value: &str) -> std::result::Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+/// A provider or model name: one half of `provider/name`.
+fn valid_part(value: &str) -> std::result::Result<(), String> {
+    if valid_ref_part(value) {
+        Ok(())
+    } else {
+        Err("use a name with no `/` and no surrounding spaces".into())
+    }
+}
+
+/// A suggested name made usable as one half of `provider/name`.
+fn sanitize_part(name: &str) -> String {
+    name.trim().replace('/', "-")
 }
 
 fn validate_base_url(value: &str) -> std::result::Result<(), String> {
@@ -334,46 +353,47 @@ fn list() -> Result<()> {
             } else {
                 "set"
             };
-            println!("  {name:<14} {}  key: {key}", p.base_url);
+            println!(
+                "  {name:<14} {}  api: {}  auth: {}  key: {key}",
+                p.base_url,
+                p.api.as_str(),
+                p.auth.as_str()
+            );
         }
     }
 
     println!("\n{}", style::bold("models:"));
-    let mut names: Vec<&String> = Vec::new();
-    if let Some(u) = &user {
-        names.extend(u.models.keys());
-    }
-    if let Some(pr) = &project {
-        names.extend(pr.models.keys());
-    }
-    names.sort();
-    names.dedup();
-    if names.is_empty() {
+    let merged = merged_models(user.as_ref(), project.as_ref());
+    if merged.is_empty() {
         println!("  {}", style::dim("(none — run `cowboy models setup`)"));
     } else {
-        for name in names {
-            // Project overrides user; report the effective source + def.
-            let (def, src) = project
-                .as_ref()
-                .and_then(|pr| pr.models.get(name).map(|d| (d, "project")))
-                .or_else(|| {
-                    user.as_ref()
-                        .and_then(|u| u.models.get(name).map(|d| (d, "user")))
-                })
-                .expect("name came from one of the maps");
-            println!("  {name:<14} {} via {}  [{src}]", def.model, def.provider);
+        let mut current: Option<&str> = None;
+        for (r, def) in &merged {
+            if current != Some(r.provider.as_str()) {
+                current = Some(r.provider.as_str());
+                let missing = if providers.providers.contains_key(&r.provider) {
+                    ""
+                } else {
+                    "  (provider not configured)"
+                };
+                println!("  {}{missing}", style::bold(&format!("{}/", r.provider)));
+            }
+            // Project overrides user; report the effective source.
+            let src = if project.as_ref().is_some_and(|p| p.get(r).is_some()) {
+                "project"
+            } else {
+                "user"
+            };
+            println!("    {:<30} {}  [{src}]", r.to_string(), def.model);
         }
     }
 
-    let default = project
-        .as_ref()
-        .and_then(|p| p.default.clone())
-        .or_else(|| user.as_ref().and_then(|u| u.default.clone()));
+    let default = default_model_ref(user.as_ref(), project.as_ref());
     println!(
         "\ndefault: {}",
         default
-            .as_deref()
-            .unwrap_or("(none set — `cowboy models use <name>`)")
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "(none set — `cowboy models use <provider/name>`)".into())
     );
 
     // Confirm the default actually resolves to a provider.
@@ -392,7 +412,7 @@ fn list() -> Result<()> {
 pub fn set_user_default(name: &str) -> Result<()> {
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
-    cfg.default = Some(name.to_string());
+    cfg.default = Some(ModelRef::parse(name)?);
     cfg.save(&path)?;
     Ok(())
 }
@@ -405,22 +425,16 @@ fn use_default(name: &str, global: bool) -> Result<()> {
     let project = project_models()?;
 
     // The name must exist in the merged set.
-    let known = user
-        .as_ref()
-        .map(|u| u.models.contains_key(name))
-        .unwrap_or(false)
-        || project
-            .as_ref()
-            .map(|p| p.models.contains_key(name))
-            .unwrap_or(false);
-    if !known {
-        bail!("unknown model {name:?}; see `cowboy models list`");
+    let r = ModelRef::parse(name)?;
+    if !merged_models(user.as_ref(), project.as_ref()).contains_key(&r) {
+        bail!("unknown model `{r}`; see `cowboy models list`");
     }
+    let name = r.to_string();
 
     if global {
         let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
         let mut cfg = user.unwrap_or_default();
-        cfg.default = Some(name.to_string());
+        cfg.default = Some(r.clone());
         cfg.save(&path)?;
         crate::ui::ok(&format!(
             "user default is now `{name}` ({})",
@@ -429,7 +443,7 @@ fn use_default(name: &str, global: bool) -> Result<()> {
     } else {
         let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
         let mut cfg = project.unwrap_or_default();
-        cfg.default = Some(name.to_string());
+        cfg.default = Some(r);
         cfg.save(&paths.models)?;
         crate::ui::ok(&format!(
             "project default is now `{name}` ({})",
@@ -452,11 +466,12 @@ async fn available(all: bool) -> Result<()> {
         .transpose()?
         .flatten();
     let project = project_models()?;
-    let configured: std::collections::BTreeSet<String> = user
-        .iter()
-        .chain(project.iter())
-        .flat_map(|c| c.models.values().map(|d| d.model.clone()))
-        .collect();
+    // (provider, provider-side id) — the same id on two providers is two models.
+    let configured: std::collections::BTreeMap<(String, String), ModelRef> =
+        merged_models(user.as_ref(), project.as_ref())
+            .into_iter()
+            .map(|(r, d)| ((r.provider.clone(), d.model), r))
+            .collect();
 
     for (pname, p) in &providers.providers {
         let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
@@ -470,10 +485,9 @@ async fn available(all: bool) -> Result<()> {
                         continue;
                     }
                     let suggested = model_defaults::lookup(&e.id).name;
-                    let mark = if configured.contains(&e.id) {
-                        "  [configured]"
-                    } else {
-                        ""
+                    let mark = match configured.get(&(pname.clone(), e.id.clone())) {
+                        Some(r) => format!("  [configured as {r}]"),
+                        None => String::new(),
                     };
                     println!("  {:<50} {suggested}{mark}", e.id);
                     shown += 1;
@@ -485,7 +499,7 @@ async fn available(all: bool) -> Result<()> {
             Err(err) => println!("  {}", style::error(&format!("error: {err}"))),
         }
     }
-    println!("\nRegister one with: cowboy models add <id>");
+    println!("\nRegister one with: cowboy models add <id> --name <provider/name>");
     Ok(())
 }
 
@@ -494,7 +508,6 @@ async fn available(all: bool) -> Result<()> {
 struct AddArgs {
     id: String,
     name: Option<String>,
-    provider: Option<String>,
     temp: Option<f32>,
     context: Option<u32>,
     max_output: Option<u32>,
@@ -507,34 +520,24 @@ fn add(a: AddArgs) -> Result<()> {
     if providers.providers.is_empty() {
         bail!("no providers configured; run `cowboy models setup`");
     }
-    let provider = match a.provider {
-        Some(p) => p,
-        None if providers.providers.len() == 1 => {
-            providers.providers.keys().next().unwrap().clone()
-        }
-        None if providers.providers.contains_key("default") => "default".to_string(),
-        None => bail!(
-            "multiple providers configured; pass --provider <name> ({})",
-            providers
-                .providers
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    if !providers.providers.contains_key(&provider) {
-        bail!("unknown provider {provider:?}; see `cowboy models list`");
-    }
-
     let d = model_defaults::lookup(&a.id);
-    let name = a.name.unwrap_or(d.name);
+    // `--name provider/name`; without it, the only provider and the shipped name.
+    let r = match &a.name {
+        Some(n) => ModelRef::parse(n)?,
+        None => ModelRef::new(sole_provider(&providers)?, sanitize_part(&d.name))?,
+    };
+    if !providers.providers.contains_key(&r.provider) {
+        bail!(
+            "unknown provider `{}` in `{r}`; see `cowboy models list`",
+            r.provider
+        );
+    }
+    let name = r.to_string();
     let reasoning_effort = match a.reasoning {
         Some(r) => r.effort(),
         None => d.reasoning_effort,
     };
     let def = ModelDef {
-        provider,
         model: a.id.clone(),
         temperature: a.temp.unwrap_or(d.temperature),
         max_tokens: a.max_output.unwrap_or(d.max_tokens),
@@ -553,10 +556,10 @@ fn add(a: AddArgs) -> Result<()> {
 
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
-    let first = cfg.models.is_empty();
-    cfg.models.insert(name.clone(), def);
+    let first = cfg.is_empty();
+    cfg.insert(r.clone(), def);
     if a.default || first || cfg.default.is_none() {
-        cfg.default = Some(name.clone());
+        cfg.default = Some(r.clone());
     }
     cfg.save(&path)?;
     crate::ui::ok(&format!(
@@ -564,7 +567,7 @@ fn add(a: AddArgs) -> Result<()> {
         a.id,
         path.display()
     ));
-    if cfg.default.as_deref() == Some(name.as_str()) {
+    if cfg.default.as_ref() == Some(&r) {
         println!("  (default model)");
     }
     Ok(())
@@ -589,7 +592,7 @@ fn sole_provider(providers: &ProvidersConfig) -> Result<String> {
         Ok("default".to_string())
     } else {
         bail!(
-            "multiple providers configured; pass --provider <name> ({})",
+            "multiple providers configured; name the model `<provider>/<name>` with one of: {}",
             providers
                 .providers
                 .keys()
@@ -610,15 +613,14 @@ pub fn save_user_model(
     context_window: u32,
     max_output: u32,
     reasoning: &str,
-) -> Result<()> {
+) -> Result<ModelRef> {
     let providers = ProvidersConfig::load_global()?;
     if providers.providers.is_empty() {
         bail!("no providers configured; run `cowboy models setup`");
     }
-    let provider = sole_provider(&providers)?;
+    let r = ModelRef::new(sole_provider(&providers)?, name)?;
     let d = model_defaults::lookup(id);
     let def = ModelDef {
-        provider,
         model: id.to_string(),
         temperature,
         max_tokens: max_output,
@@ -636,13 +638,13 @@ pub fn save_user_model(
     };
     let path = ModelsConfig::user_path().context("cannot resolve home config directory")?;
     let mut cfg = ModelsConfig::load_opt(&path)?.unwrap_or_default();
-    let first = cfg.models.is_empty();
-    cfg.models.insert(name.to_string(), def);
+    let first = cfg.is_empty();
+    cfg.insert(r.clone(), def);
     if first || cfg.default.is_none() {
-        cfg.default = Some(name.to_string());
+        cfg.default = Some(r.clone());
     }
     cfg.save(&path)?;
-    Ok(())
+    Ok(r)
 }
 
 // --- helpers ---
@@ -677,9 +679,8 @@ mod tests {
         Provider::api_key(url, "secret")
     }
 
-    fn model(provider_name: &str, id: &str) -> ModelDef {
+    fn model(id: &str) -> ModelDef {
         ModelDef {
-            provider: provider_name.into(),
             model: id.into(),
             temperature: 0.2,
             max_tokens: 8_192,
@@ -701,8 +702,8 @@ mod tests {
         SetupPlan {
             provider_name: provider_name.into(),
             provider: provider("https://new.example/v1"),
-            model_name: model_name.into(),
-            model: model(provider_name, "new/model"),
+            model_ref: ModelRef::new(provider_name, model_name).unwrap(),
+            model: model("new/model"),
         }
     }
 
@@ -712,21 +713,22 @@ mod tests {
         providers
             .providers
             .insert("old".into(), provider("https://old.example/v1"));
+        let old = ModelRef::parse("old/old").unwrap();
         let mut models = ModelsConfig {
-            default: Some("old".into()),
+            default: Some(old.clone()),
             ..ModelsConfig::default()
         };
-        models
-            .models
-            .insert("old".into(), model("old", "old/model"));
+        models.insert(old.clone(), model("old/model"));
 
         let (updated_providers, updated_models) =
             apply_setup(&providers, &models, plan("new", "new"));
         assert!(updated_providers.providers.contains_key("old"));
         assert!(updated_providers.providers.contains_key("new"));
-        assert!(updated_models.models.contains_key("old"));
-        assert!(updated_models.models.contains_key("new"));
-        assert_eq!(updated_models.default.as_deref(), Some("old"));
+        assert!(updated_models.get(&old).is_some());
+        assert!(updated_models
+            .get(&ModelRef::parse("new/new").unwrap())
+            .is_some());
+        assert_eq!(updated_models.default, Some(old));
     }
 
     #[test]
@@ -736,11 +738,9 @@ mod tests {
             .providers
             .insert("same".into(), provider("https://old.example/v1"));
         let mut models = ModelsConfig::default();
-        models
-            .models
-            .insert("same".into(), model("same", "old/model"));
+        models.insert(ModelRef::parse("same/same").unwrap(), model("old/model"));
         let found = replacements(&providers, &models, &plan("same", "same"));
-        assert_eq!(found, ["provider `same`", "model `same`"]);
+        assert_eq!(found, ["provider `same`", "model `same/same`"]);
     }
 
     #[test]

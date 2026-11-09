@@ -141,6 +141,12 @@ pub async fn run() -> Result<()> {
         check_harnesses(&cowboy_core::harness::HarnessesConfig::load_user()),
     );
     report.check(
+        "crew roster",
+        Category::Config,
+        Remedy::Fix,
+        check_crew(&providers),
+    );
+    report.check(
         "config separation",
         Category::Config,
         Remedy::Fix,
@@ -332,6 +338,33 @@ fn check_models(
         Err(error) => Status::Fail(format!(
             "{error}; add one with `cowboy models add <model-id>`"
         )),
+    }
+}
+
+/// The crew roster is optional. When present, every slot must name a harness or a
+/// `provider/name` model (a bare name means the roster predates qualified names),
+/// and every provider it routes to must be usable.
+fn check_crew(providers: &cowboy_core::Result<ProvidersConfig>) -> Status {
+    let cfg = match cowboy_core::crew::load() {
+        Ok(Some(c)) => c,
+        Ok(None) => return Status::Ok("none (the foreman works solo)".into()),
+        Err(e) => return Status::Fail(e.to_string()),
+    };
+    let harnesses = cowboy_core::harness::HarnessesConfig::load_user().unwrap_or_default();
+    if cowboy_core::models_migrate::crew_needs_migration(&cfg, |n| harnesses.get(n).is_some()) {
+        return Status::Fail(format!(
+            "crew.yaml names models without their provider — {}",
+            cowboy_core::config::MIGRATE_HINT
+        ));
+    }
+    let Ok(providers) = providers else {
+        return Status::Skipped("providers.yaml did not load (see above)".into());
+    };
+    let problems = crate::cmd::crew::provider_problems(&cfg, providers);
+    if problems.is_empty() {
+        Status::Ok(format!("{} categories", cfg.crew.len()))
+    } else {
+        Status::Fail(problems.join("; "))
     }
 }
 

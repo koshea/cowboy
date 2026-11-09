@@ -19,7 +19,7 @@ fn seed_home(home: &assert_fs::TempDir) {
         .unwrap();
     home.child("cowboy/models.yaml")
         .write_str(
-            "version: 1\ndefault: sonnet\nmodels:\n  sonnet:\n    provider: litellm\n    model: anthropic/claude-sonnet-4-6\n  cheap:\n    provider: litellm\n    model: openai/gpt-5.4-mini\n",
+            "version: 1\ndefault: litellm/sonnet\nmodels:\n  litellm:\n    sonnet:\n      model: anthropic/claude-sonnet-4-6\n    cheap:\n      model: openai/gpt-5.4-mini\n",
         )
         .unwrap();
 }
@@ -39,8 +39,8 @@ fn list_shows_providers_and_models_without_leaking_the_key() {
         .stdout(predicate::str::contains("litellm"))
         .stdout(predicate::str::contains("https://gw.local/v1"))
         .stdout(predicate::str::contains("key: set"))
-        .stdout(predicate::str::contains("sonnet"))
-        .stdout(predicate::str::contains("default: sonnet"))
+        .stdout(predicate::str::contains("litellm/sonnet"))
+        .stdout(predicate::str::contains("default: litellm/sonnet"))
         // The actual key value must never be printed.
         .stdout(predicate::str::contains("sk-secret-xyz").not());
 }
@@ -54,13 +54,15 @@ fn use_global_sets_user_default() {
     cowboy()
         .current_dir(proj.path())
         .env("XDG_CONFIG_HOME", home.path())
-        .args(["models", "use", "--global", "cheap"])
+        .args(["models", "use", "--global", "litellm/cheap"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("user default is now `cheap`"));
+        .stdout(predicate::str::contains(
+            "user default is now `litellm/cheap`",
+        ));
 
     home.child("cowboy/models.yaml")
-        .assert(predicate::str::contains("default: cheap"));
+        .assert(predicate::str::contains("default: litellm/cheap"));
 }
 
 #[test]
@@ -72,14 +74,16 @@ fn use_writes_project_default() {
     cowboy()
         .current_dir(proj.path())
         .env("XDG_CONFIG_HOME", home.path())
-        .args(["models", "use", "cheap"])
+        .args(["models", "use", "litellm/cheap"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("project default is now `cheap`"));
+        .stdout(predicate::str::contains(
+            "project default is now `litellm/cheap`",
+        ));
 
     // Project file is created with the override; no credentials in it.
     proj.child(".cowboy/models.yaml")
-        .assert(predicate::str::contains("default: cheap"));
+        .assert(predicate::str::contains("default: litellm/cheap"));
     proj.child(".cowboy/models.yaml")
         .assert(predicate::str::contains("api_key").not());
 }
@@ -120,7 +124,7 @@ fn add_honors_overrides() {
             "add",
             "cerebras/zai-glm-4.7",
             "--name",
-            "glm",
+            "litellm/glm",
             "--temp",
             "0.3",
             "--reasoning",
@@ -131,9 +135,9 @@ fn add_honors_overrides() {
         .success();
 
     home.child("cowboy/models.yaml")
-        .assert(predicate::str::contains("  glm:"))
+        .assert(predicate::str::contains("    glm:"))
         .assert(predicate::str::contains("temperature: 0.3"))
-        .assert(predicate::str::contains("default: glm"))
+        .assert(predicate::str::contains("default: litellm/glm"))
         // reasoning explicitly disabled -> field omitted
         .assert(predicate::str::contains("reasoning_effort").not());
 }
@@ -147,8 +151,48 @@ fn use_unknown_model_errors() {
     cowboy()
         .current_dir(proj.path())
         .env("XDG_CONFIG_HOME", home.path())
-        .args(["models", "use", "ghost"])
+        .args(["models", "use", "litellm/ghost"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("unknown model"));
+}
+
+#[test]
+fn a_bare_model_name_is_refused_with_the_migrate_hint() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    seed_home(&home);
+
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["models", "use", "cheap"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cowboy models migrate"));
+}
+
+#[test]
+fn add_names_the_model_under_its_provider() {
+    let home = assert_fs::TempDir::new().unwrap();
+    let proj = assert_fs::TempDir::new().unwrap();
+    seed_home(&home);
+
+    // An unknown provider in `--name` is refused rather than silently created.
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["models", "add", "x/y", "--name", "ghost/y"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown provider `ghost`"));
+
+    cowboy()
+        .current_dir(proj.path())
+        .env("XDG_CONFIG_HOME", home.path())
+        .args(["models", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("litellm/"))
+        .stdout(predicate::str::contains("litellm/cheap"));
 }

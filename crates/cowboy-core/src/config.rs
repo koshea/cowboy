@@ -629,21 +629,140 @@ fn is_default<T: Default + PartialEq>(v: &T) -> bool {
 /// project may override the default. **Never contains provider credentials** —
 /// `deny_unknown_fields` makes a stray `api_key`/`base_url`/`providers` a hard
 /// parse error.
+///
+/// Models are grouped by provider (`models: {provider: {name: def}}`) and every
+/// reference to one is a [`ModelRef`] (`provider/name`), so a name can never be
+/// ambiguous between two endpoints. The older flat layout (a `provider:` field on
+/// each model, bare names in `default`) is refused with a pointer at
+/// `cowboy models migrate` rather than half-read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "serde_yaml_ng::Value")]
 pub struct ModelsConfig {
-    #[serde(default = "default_version")]
     pub version: u32,
-    /// Name of the default model (optional at the project level).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub default: Option<String>,
-    /// Name of the model used for auxiliary summarization — context compaction and
+    /// The default model (optional at the project level).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<ModelRef>,
+    /// The model used for auxiliary summarization — context compaction and
     /// truncation recovery — resolved like `default`. When unset, those calls fall
     /// back to the session's main model.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub summarizer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarizer: Option<ModelRef>,
+    /// `provider → name → definition`.
+    pub models: BTreeMap<String, BTreeMap<String, ModelDef>>,
+}
+
+/// The on-disk shape, strictly parsed once the legacy layout has been ruled out.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelsConfigRepr {
+    #[serde(default = "default_version")]
+    version: u32,
     #[serde(default)]
-    pub models: BTreeMap<String, ModelDef>,
+    default: Option<ModelRef>,
+    #[serde(default)]
+    summarizer: Option<ModelRef>,
+    #[serde(default)]
+    models: BTreeMap<String, BTreeMap<String, ModelDef>>,
+}
+
+/// The message every refusal of the old layout carries.
+pub const MIGRATE_HINT: &str = "models are now named `provider/name` and grouped by provider \
+     in models.yaml; run `cowboy models migrate` to convert your files";
+
+impl TryFrom<serde_yaml_ng::Value> for ModelsConfig {
+    type Error = String;
+
+    fn try_from(v: serde_yaml_ng::Value) -> std::result::Result<Self, String> {
+        if is_legacy_models_layout(&v) {
+            return Err(format!(
+                "this file uses the old flat layout — {MIGRATE_HINT}"
+            ));
+        }
+        let r: ModelsConfigRepr = serde_yaml_ng::from_value(v).map_err(|e| e.to_string())?;
+        for (provider, models) in &r.models {
+            if !valid_ref_part(provider) {
+                return Err(format!(
+                    "invalid provider name {provider:?} under `models:` (no `/`)"
+                ));
+            }
+            if let Some(name) = models.keys().find(|n| !valid_ref_part(n)) {
+                return Err(format!(
+                    "invalid model name {name:?} under `models.{provider}` (no `/`)"
+                ));
+            }
+        }
+        Ok(Self {
+            version: r.version,
+            default: r.default,
+            summarizer: r.summarizer,
+            models: r.models,
+        })
+    }
+}
+
+/// True for a models.yaml written before models were grouped by provider: some
+/// `models.<k>` entry is itself a definition (has a scalar `model:`), or `default`
+/// / `summarizer` is a bare name. In the grouped layout `models.<k>` is a map of
+/// definitions, so a scalar `model` key can only come from the old one.
+pub fn is_legacy_models_layout(v: &serde_yaml_ng::Value) -> bool {
+    use serde_yaml_ng::Value;
+    let bare = |k: &str| matches!(v.get(k), Some(Value::String(s)) if !s.contains('/'));
+    let flat_entry = v
+        .get("models")
+        .and_then(Value::as_mapping)
+        .is_some_and(|m| {
+            m.values().any(|entry| {
+                entry
+                    .get("model")
+                    .is_some_and(|x| matches!(x, Value::String(_)))
+            })
+        });
+    flat_entry || bare("default") || bare("summarizer")
+}
+
+impl ModelsConfig {
+    /// The definition for `r`, if this file has one.
+    pub fn get(&self, r: &ModelRef) -> Option<&ModelDef> {
+        self.models.get(&r.provider)?.get(&r.name)
+    }
+
+    /// Add or replace the definition for `r`.
+    pub fn insert(&mut self, r: ModelRef, def: ModelDef) {
+        self.models
+            .entry(r.provider)
+            .or_default()
+            .insert(r.name, def);
+    }
+
+    /// Remove `r`, dropping its provider group if that leaves it empty.
+    pub fn remove(&mut self, r: &ModelRef) -> Option<ModelDef> {
+        let group = self.models.get_mut(&r.provider)?;
+        let def = group.remove(&r.name);
+        if group.is_empty() {
+            self.models.remove(&r.provider);
+        }
+        def
+    }
+
+    /// Every model in this file, by qualified name.
+    pub fn iter(&self) -> impl Iterator<Item = (ModelRef, &ModelDef)> {
+        self.models.iter().flat_map(|(p, group)| {
+            group.iter().map(move |(n, d)| {
+                (
+                    ModelRef {
+                        provider: p.clone(),
+                        name: n.clone(),
+                    },
+                    d,
+                )
+            })
+        })
+    }
+
+    /// No models at all (an empty provider group counts as none).
+    pub fn is_empty(&self) -> bool {
+        self.models.values().all(BTreeMap::is_empty)
+    }
 }
 
 impl Default for ModelsConfig {
@@ -655,6 +774,107 @@ impl Default for ModelsConfig {
             models: BTreeMap::new(),
         }
     }
+}
+
+/// A model reference: `provider/name`. The provider is a key in `providers.yaml`,
+/// the name a key under it in `models.yaml`. Neither part may contain `/`, so the
+/// first `/` always splits them (the provider-side `model:` id is separate and may
+/// contain slashes freely).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelRef {
+    pub provider: String,
+    pub name: String,
+}
+
+impl ModelRef {
+    pub fn new(provider: impl Into<String>, name: impl Into<String>) -> Result<Self> {
+        let (provider, name) = (provider.into(), name.into());
+        if !valid_ref_part(&provider) || !valid_ref_part(&name) {
+            return Err(Error::Invalid(format!(
+                "invalid model reference `{provider}/{name}`: provider and name must be \
+                 non-empty, with no `/` and no surrounding spaces"
+            )));
+        }
+        Ok(Self { provider, name })
+    }
+
+    /// Parse `provider/name`. A bare name is refused with the migration hint: it is
+    /// what every pre-grouping config said, and guessing its provider would be
+    /// exactly the ambiguity qualified names exist to remove.
+    pub fn parse(s: &str) -> Result<Self> {
+        let s = s.trim();
+        match s.split_once('/') {
+            Some((p, n)) => Self::new(p, n),
+            None => Err(Error::Invalid(format!(
+                "model `{s}` is not `provider/name` — {MIGRATE_HINT}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.provider, self.name)
+    }
+}
+
+impl std::str::FromStr for ModelRef {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Self::parse(s)
+    }
+}
+
+impl Serialize for ModelRef {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A provider or model name: non-empty, no `/` (the separator), and no leading
+/// or trailing whitespace. Interior spaces are allowed — shipped display names
+/// such as `Cerebras: GLM 4.7` have always been valid model names.
+pub fn valid_ref_part(s: &str) -> bool {
+    !s.is_empty() && !s.contains('/') && s.trim() == s
+}
+
+/// User and project model definitions merged by qualified name, project winning.
+pub fn merged_models(
+    user: Option<&ModelsConfig>,
+    project: Option<&ModelsConfig>,
+) -> BTreeMap<ModelRef, ModelDef> {
+    let mut out = BTreeMap::new();
+    for cfg in [user, project].into_iter().flatten() {
+        out.extend(cfg.iter().map(|(r, d)| (r, d.clone())));
+    }
+    out
+}
+
+/// The configured default: project's, else the user's.
+pub fn default_model_ref(
+    user: Option<&ModelsConfig>,
+    project: Option<&ModelsConfig>,
+) -> Option<ModelRef> {
+    project
+        .and_then(|p| p.default.clone())
+        .or_else(|| user.and_then(|u| u.default.clone()))
+}
+
+/// The configured summarizer: project's, else the user's.
+pub fn summarizer_model_ref(
+    user: Option<&ModelsConfig>,
+    project: Option<&ModelsConfig>,
+) -> Option<ModelRef> {
+    project
+        .and_then(|p| p.summarizer.clone())
+        .or_else(|| user.and_then(|u| u.summarizer.clone()))
 }
 
 /// How hard a reasoning model should think. Sent as `reasoning_effort` in the
@@ -680,12 +900,11 @@ impl ReasoningEffort {
     }
 }
 
-/// A named model: which provider to use plus model id and sampling params.
+/// A named model: the provider-side id and sampling params. Which provider it
+/// belongs to is where it sits in `models.yaml` (`models.<provider>.<name>`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
-    /// Name of the provider (looked up in `providers.yaml`).
-    pub provider: String,
     /// The provider-side model id, e.g. `anthropic/claude-sonnet-4-6`.
     pub model: String,
     #[serde(default = "default_temperature")]
@@ -1671,6 +1890,20 @@ fn recover_global_model_pair_if_needed(providers: &Path) -> Result<()> {
     recover_pair(providers, &models, &paths)
 }
 
+/// Run `f` holding the same advisory lock `models setup` commits under (after
+/// finishing any interrupted pair commit), so a one-off rewrite of the home model
+/// files — `cowboy models migrate` — cannot interleave with a concurrent setup.
+pub fn with_model_config_lock<T>(
+    providers: &Path,
+    models: &Path,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let paths = PairPaths::new(providers, models)?;
+    let _lock = acquire_model_config_lock(&paths)?;
+    recover_pair(providers, models, &paths)?;
+    f()
+}
+
 /// Load setup's two home-owned files under one lock, recovering any interrupted
 /// paired commit first. Missing files become empty configs; present malformed files
 /// remain errors and are never replaced by setup.
@@ -1792,51 +2025,54 @@ impl ModelsConfig {
     }
 }
 
-/// Resolve the active model into a [`ResolvedModel`] by merging user and project
-/// model lists (project overrides by name) and joining with the named provider's
-/// credentials.
+/// Resolve a model into a [`ResolvedModel`] by merging user and project model
+/// lists (project overrides by `provider/name`) and joining with the provider's
+/// endpoint and credentials from the home `providers.yaml` — the only place a
+/// provider can be defined, so a project can name a provider but never invent one.
 ///
-/// Default precedence: explicit `name` → project `default` → user `default`.
+/// Default precedence: explicit `model` → project `default` → user `default`.
 pub fn resolve_model(
     providers: &ProvidersConfig,
     user: Option<&ModelsConfig>,
     project: Option<&ModelsConfig>,
-    name: Option<&str>,
+    model: Option<&ModelRef>,
 ) -> Result<ResolvedModel> {
-    // Merge model definitions: user first, then project overrides by name.
-    let mut models: BTreeMap<String, ModelDef> = BTreeMap::new();
-    if let Some(u) = user {
-        models.extend(u.models.clone());
-    }
-    if let Some(p) = project {
-        models.extend(p.models.clone());
-    }
+    let models = merged_models(user, project);
     if models.is_empty() {
         return Err(Error::Invalid(
             "no models configured; run `cowboy models setup`".to_string(),
         ));
     }
 
-    // Default precedence: explicit name, then project default, then user default.
-    let chosen = name
-        .map(str::to_string)
-        .or_else(|| project.and_then(|p| p.default.clone()))
-        .or_else(|| user.and_then(|u| u.default.clone()))
+    let chosen = model
+        .cloned()
+        .or_else(|| default_model_ref(user, project))
         .ok_or_else(|| {
             Error::Invalid(
-                "no default model set; pick one with `cowboy models use <name>`".to_string(),
+                "no default model set; pick one with `cowboy models use <provider/name>`"
+                    .to_string(),
             )
         })?;
 
-    let def = models
-        .get(&chosen)
-        .ok_or_else(|| Error::Invalid(format!("unknown model: {chosen}")))?;
-
-    let provider = providers.providers.get(&def.provider).ok_or_else(|| {
+    let def = models.get(&chosen).ok_or_else(|| {
+        let known: Vec<String> = models.keys().map(ToString::to_string).collect();
         Error::Invalid(format!(
-            "model {chosen:?} references provider {:?}, which is not configured; \
-             run `cowboy models setup`",
-            def.provider
+            "unknown model `{chosen}` (configured: {})",
+            known.join(", ")
+        ))
+    })?;
+
+    let provider = providers.providers.get(&chosen.provider).ok_or_else(|| {
+        let known: Vec<&str> = providers.providers.keys().map(String::as_str).collect();
+        Error::Invalid(format!(
+            "model `{chosen}` names provider `{}`, which is not in providers.yaml \
+             (configured: {}); add it with `cowboy models setup`",
+            chosen.provider,
+            if known.is_empty() {
+                "none".to_string()
+            } else {
+                known.join(", ")
+            }
         ))
     })?;
 
@@ -1845,7 +2081,7 @@ pub fn resolve_model(
     headers.extend(def.headers.clone());
 
     Ok(ResolvedModel {
-        provider_name: def.provider.clone(),
+        provider_name: chosen.provider.clone(),
         base_url: expand_env(&provider.base_url)?,
         api: provider.api,
         auth: match provider.auth {

@@ -146,10 +146,18 @@ impl Ramp {
     }
 
     /// Every model named in this ramp (for validation).
-    fn models(&self) -> Vec<&str> {
+    pub fn models(&self) -> Vec<&str> {
         match self {
             Ramp::Single(m) => vec![m.as_str()],
             Ramp::Steps(s) => s.values().map(String::as_str).collect(),
+        }
+    }
+
+    /// Every model slot, mutably (for `cowboy models migrate`).
+    pub fn models_mut(&mut self) -> Vec<&mut String> {
+        match self {
+            Ramp::Single(m) => vec![m],
+            Ramp::Steps(s) => s.values_mut().collect(),
         }
     }
 
@@ -436,15 +444,22 @@ impl CrewConfig {
             .collect()
     }
 
-    /// Validate the roster against the set of known model names.
+    /// Validate the roster against the set of known slot names (qualified
+    /// `provider/name` models plus bare harness names).
     pub fn validate(&self, available: &BTreeSet<String>) -> Result<()> {
         let known = |m: &str| -> Result<()> {
             // `<default>` is the foreman sentinel, not a models.yaml entry.
             if m == DEFAULT_MODEL || available.contains(m) {
                 Ok(())
+            } else if !m.contains('/') {
+                // Pre-grouping rosters named models bare; that is now only a harness.
+                Err(Error::Invalid(format!(
+                    "crew references `{m}`, which is not a harness in harnesses.yaml — {}",
+                    crate::config::MIGRATE_HINT
+                )))
             } else {
                 Err(Error::Invalid(format!(
-                    "crew references unknown model `{m}` (not in models.yaml or harnesses.yaml)"
+                    "crew references unknown model `{m}` (not in models.yaml)"
                 )))
             }
         };
@@ -777,6 +792,29 @@ fn default_stall_window() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_roster_routes_to_several_providers() {
+        let c: CrewConfig = serde_yaml_ng::from_str(
+            "crew:\n  general: bifrost/glm\n  deep:\n    tiny: bifrost/glm\n    \
+             large: chatgpt/gpt\n  review: codex\n",
+        )
+        .unwrap();
+        assert_eq!(c.resolve("deep", Effort::Small, "x/f").model, "bifrost/glm");
+        assert_eq!(c.resolve("deep", Effort::Deep, "x/f").model, "chatgpt/gpt");
+        let known: BTreeSet<String> = ["bifrost/glm", "chatgpt/gpt", "codex"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        c.validate(&known).unwrap();
+    }
+
+    #[test]
+    fn a_bare_non_harness_slot_points_at_migration() {
+        let c: CrewConfig = serde_yaml_ng::from_str("crew:\n  general: glm\n").unwrap();
+        let err = c.validate(&BTreeSet::new()).unwrap_err().to_string();
+        assert!(err.contains("cowboy models migrate"), "{err}");
+    }
 
     fn steps(pairs: &[(Effort, &str)]) -> Ramp {
         Ramp::Steps(pairs.iter().map(|(e, m)| (*e, m.to_string())).collect())

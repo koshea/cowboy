@@ -83,7 +83,7 @@ fn setup_inner(eager: bool, web_bind: Option<&str>) -> Fixture {
         ))
         .unwrap();
     cfg.child("cowboy/models.yaml")
-        .write_str("version: 1\ndefault: m\nmodels:\n  m:\n    provider: p\n    model: x\n")
+        .write_str("version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n")
         .unwrap();
     proj.child(".cowboy/security.yaml")
         .write_str("version: 1\n")
@@ -530,16 +530,16 @@ fn switch_model_reports_success_and_failure() {
     let mut c = Client::connect(&ws, Duration::from_secs(8));
 
     // Unknown model -> a failure notice, session stays alive.
-    c.send(&ClientMsg::SwitchModel("does-not-exist".into()));
+    c.send(&ClientMsg::SwitchModel("p/does-not-exist".into()));
     assert!(
         wait_for_notice(&mut c, "switch failed"),
         "unknown model should report a switch failure"
     );
 
     // Known model -> a success notice.
-    c.send(&ClientMsg::SwitchModel("m".into()));
+    c.send(&ClientMsg::SwitchModel("p/m".into()));
     assert!(
-        wait_for_notice(&mut c, "switched to model m"),
+        wait_for_notice(&mut c, "switched to model p/m"),
         "known model should switch"
     );
 

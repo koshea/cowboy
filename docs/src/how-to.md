@@ -120,10 +120,10 @@ Reading an inbox is the one destructive default, because an inbox is a queue.
 ## Switch model · solo vs. crew
 
 - `/model` — show the current model and the available list.
-- `/model <name>` — switch for the next turn (this session only).
+- `/model <provider/name>` — switch for the next turn (this session only).
 - `/models` — open the picker: type to filter, **Enter** to select, **Tab** to
   toggle **Solo ⇄ Crew** for the highlighted model, **Esc** to cancel.
-- `cowboy models use <name> [--global]` — make a model the persistent default
+- `cowboy models use <provider/name> [--global]` — make a model the persistent default
   (a `/model` switch only lasts the session).
 
 **Solo** = one model does everything. **Crew** = your model is the *foreman* and

@@ -2005,10 +2005,15 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                 if !ctx.session.models.is_empty()
                     && !ctx.session.models.iter().any(|m| m == name) =>
             {
+                let hint = if name.contains('/') {
+                    ""
+                } else {
+                    " — models are named `provider/name`"
+                };
                 app.push(
                     LineKind::Error,
                     format!(
-                        "unknown model {name:?}; available: {}",
+                        "unknown model {name:?}{hint}; available: {}",
                         ctx.session.models.join(", ")
                     ),
                 );
@@ -2255,11 +2260,11 @@ fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
     let mut id_to_name: std::collections::BTreeMap<String, String> = Default::default();
     let mut name_to_id: std::collections::BTreeMap<String, String> = Default::default();
     for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
-        for (k, d) in &cfg.models {
+        for (k, d) in cfg.iter() {
             id_to_name
                 .entry(d.model.clone())
-                .or_insert_with(|| k.clone());
-            name_to_id.insert(k.clone(), d.model.clone());
+                .or_insert_with(|| k.to_string());
+            name_to_id.insert(k.to_string(), d.model.clone());
         }
     }
     let current_id = name_to_id.get(current_name).cloned();
@@ -2297,7 +2302,8 @@ fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
     // `/v1/models` that omits a model you've set up — common with some gateways/
     // providers). Include them so they're always selectable.
     for cfg in [user.as_ref(), project.as_ref()].into_iter().flatten() {
-        for (name, def) in &cfg.models {
+        for (name, def) in cfg.iter() {
+            let name = name.to_string();
             if !seen.insert(def.model.clone()) {
                 continue; // already listed from a provider catalogue
             }
@@ -2454,7 +2460,8 @@ fn save_model_form(app: &mut App, ctx: &mut KeyCtx) {
     let id = form.id.clone();
 
     match crate::cmd::models::save_user_model(&name, &id, temp, context, max_output, &reasoning) {
-        Ok(()) => {
+        Ok(saved) => {
+            let name = saved.to_string();
             if let Some(tx) = ctx.task_tx.as_ref() {
                 let _ = tx.send(AgentCmd::SwitchModel(name.clone()));
             }

@@ -33,17 +33,24 @@ slot can name the special value `<default>` to mean "use the foreman," so you ca
 pin some efforts to specific models and inherit the foreman for the rest.
 Swapping `/model` then re-points every `<default>` slot automatically.
 
+Slots name models as `provider/name` (see
+[models.yaml](../getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy)),
+so one roster can route to several providers — a local gateway for the cheap,
+high-volume work and a hosted model for the hard parts. A bare name in a slot is a
+[harness](#harnesses) or `<default>`; anything else is refused with a
+pointer at `cowboy models migrate`.
+
 ```yaml
 version: 1
 crew:
-  docs: cheap            # one model for every effort
+  docs: bifrost/cheap            # one model for every effort
   tests:
-    tiny: cheap          # tiny..medium → cheap
-    large: opus          # large, deep  → opus
+    tiny: bifrost/cheap          # tiny..medium → bifrost/cheap
+    large: openai/opus           # large, deep  → a different provider
   e2e:
-    small: cheap         # ≤ medium → cheap
-    large: <default>     # large, deep → the foreman (whatever /model selects)
-  general: sonnet        # required: the cross-category fallback
+    small: bifrost/cheap         # ≤ medium → bifrost/cheap
+    large: <default>             # large, deep → the foreman (whatever /model selects)
+  general: bifrost/sonnet        # required: the cross-category fallback
 temperature:             # optional: override temperature per task type
   tests: 0.0             #   cooler for precise work…
   exploration: 0.6       #   …warmer for ideation (falls back to general's, else
@@ -83,7 +90,7 @@ every request gets a model, worst case the foreman.
 cowboy crew init        # write a default roster (tiers derived from model prices)
 cowboy crew list        # the routing matrix (category × effort → model)
 cowboy crew show        # the full crew.yaml
-cowboy crew validate    # check models exist, `general` defined, etc.
+cowboy crew validate    # models exist, every provider used is configured, `general` defined
 cowboy crew usage       # recorded activity per model (tasks, success %, avg time)
 ```
 

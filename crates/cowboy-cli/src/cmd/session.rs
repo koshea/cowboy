@@ -77,7 +77,7 @@ pub async fn run(
         &providers,
         user_models.as_ref(),
         project_models.as_ref(),
-        model_override.as_deref(),
+        model_override.as_ref(),
     )
     .or_else(|_| {
         resolve_model(
@@ -552,19 +552,12 @@ pub(crate) fn models_and_default(
     user: &Option<ModelsConfig>,
     project: &Option<ModelsConfig>,
 ) -> (Vec<String>, String) {
-    let mut names: Vec<String> = Vec::new();
-    if let Some(u) = user {
-        names.extend(u.models.keys().cloned());
-    }
-    if let Some(p) = project {
-        names.extend(p.models.keys().cloned());
-    }
-    names.sort();
-    names.dedup();
-    let default = project
-        .as_ref()
-        .and_then(|p| p.default.clone())
-        .or_else(|| user.as_ref().and_then(|u| u.default.clone()))
+    let names = cowboy_core::config::merged_models(user.as_ref(), project.as_ref())
+        .into_keys()
+        .map(|r| r.to_string())
+        .collect();
+    let default = cowboy_core::config::default_model_ref(user.as_ref(), project.as_ref())
+        .map(|r| r.to_string())
         .unwrap_or_default();
     (names, default)
 }

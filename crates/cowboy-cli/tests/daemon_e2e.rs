@@ -125,7 +125,7 @@ impl Env {
             .unwrap();
         config
             .child("cowboy/models.yaml")
-            .write_str("version: 1\ndefault: m\nmodels:\n  m:\n    provider: p\n    model: x\n")
+            .write_str("version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n")
             .unwrap();
         Self {
             runtime: assert_fs::TempDir::new().unwrap(),
@@ -1513,7 +1513,7 @@ fn e2e_crew_routes_delegated_subagents() {
     std::fs::copy(&real_providers, cfg_cowboy.join("providers.yaml")).unwrap();
     std::fs::copy(real_dir.join("models.yaml"), cfg_cowboy.join("models.yaml")).unwrap();
     let models = cowboy_core::config::ModelsConfig::load(&cfg_cowboy.join("models.yaml")).unwrap();
-    let default_model = models.default.clone().expect("a default model");
+    let default_model = models.default.clone().expect("a default model").to_string();
     // Route everything at the one real model so the subagents actually run.
     std::fs::write(
         cfg_cowboy.join("crew.yaml"),

@@ -415,7 +415,8 @@ Examples:
   cowboy models                        # what is configured, and the effective default
   cowboy models setup                  # guided provider + model setup
   cowboy models available              # what your endpoint actually offers
-  cowboy models use claude-sonnet-4-6  # set the project default
+  cowboy models use litellm/sonnet     # set the project default (provider/name)
+  cowboy models migrate                # convert pre-`provider/name` config files
 
 Credentials live only in ~/.config/cowboy/providers.yaml (mode 0600) and are read
 host-side. They are never written into a project or bound into the sandbox.
@@ -429,8 +430,7 @@ Register a model by its provider id, prefilled from shipped defaults
 | Arg | Description |
 |-----|-------------|
 | `<ID>` | The provider-side model id, e.g. `cerebras/zai-glm-4.7` |
-| `--name` | Friendly name (config key). Defaults to the recommended name |
-| `--provider` | Provider to use (defaults to the only configured one) |
+| `--name` | Where to save it, as `provider/name`. Defaults to the only configured provider and the recommended name |
 | `--temp` | Sampling temperature (provider default if omitted) |
 | `--context` | Context window in tokens, used to size the /context gauge and to decide when to compact |
 | `--max-output` | Cap on tokens generated per response |
@@ -440,11 +440,12 @@ Register a model by its provider id, prefilled from shipped defaults
 ```text
 Examples:
   cowboy models add anthropic/claude-sonnet-4-6
-  cowboy models add cerebras/zai-glm-4.7 --name fast --default
-  cowboy models add openai/gpt-5 --reasoning high --max-output 32000
+  cowboy models add cerebras/zai-glm-4.7 --name bifrost/fast --default
+  cowboy models add gpt-5 --name openai/gpt-5 --reasoning high --max-output 32000
 
-Shipped defaults fill in temperature, context window and pricing for known ids;
-`cowboy models available` lists what your endpoint actually offers.
+Models are named `provider/name`. Shipped defaults fill in temperature, context
+window and pricing for known ids; `cowboy models available` lists what each
+endpoint actually offers.
 ```
 
 
@@ -460,6 +461,15 @@ List models offered by the configured provider endpoints (chat models only unles
 ### `cowboy models list`
 
 List configured providers and models, and the effective default
+
+
+### `cowboy models migrate`
+
+Convert models.yaml (home and this project) and crew.yaml from bare model names to `provider/name`, models grouped under their provider. Shows a diff and keeps a `.bak` of every file it rewrites
+
+| Arg | Description |
+|-----|-------------|
+| `--yes` | Rewrite without asking |
 
 
 ### `cowboy models setup`
@@ -479,7 +489,7 @@ Set the default model. Writes to the project unless `--global`
 
 | Arg | Description |
 |-----|-------------|
-| `<NAME>` | The model name to make default |
+| `<NAME>` | The model to make default, as `provider/name` |
 | `-g, --global` | Set the user-level (home) default instead of the project default |
 
 

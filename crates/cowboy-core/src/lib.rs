@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod memory;
 pub mod model;
 pub mod model_defaults;
+pub mod models_migrate;
 pub mod policy;
 pub mod presets;
 

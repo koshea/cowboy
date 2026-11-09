@@ -19,6 +19,7 @@ pub mod logs;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+pub mod models_migrate;
 pub mod patch;
 pub mod proc;
 pub mod ranch;

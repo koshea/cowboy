@@ -98,7 +98,7 @@ fn doctor_runs_after_init() {
     .unwrap();
     std::fs::write(
         cfg.join("models.yaml"),
-        "version: 1\ndefault: test-model\nmodels:\n  test-model:\n    provider: default\n    \
+        "version: 1\ndefault: default/test-model\nmodels:\n  default:\n    test-model:\n      \
          model: vendor/test-model\n",
     )
     .unwrap();

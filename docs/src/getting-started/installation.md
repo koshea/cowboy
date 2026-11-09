@@ -182,7 +182,7 @@ endpoint at your gateway (if you set one up) or directly at a provider:
 ```sh
 cowboy models setup             # save an endpoint + key to ~/.config/cowboy/providers.yaml (0600)
 cowboy models list              # review providers + models
-cowboy models use [-g] <name>   # set the default model (-g = global/user level)
+cowboy models use [-g] <provider/name>   # set the default model (-g = global/user level)
 ```
 
 See [Configuration](configuration.md) for how providers and models are split so

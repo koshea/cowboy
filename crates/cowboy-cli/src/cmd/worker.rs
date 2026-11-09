@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cowboy_core::config::{
-    resolve_model, AgentConfig, ConfigPaths, ModelsConfig, ProvidersConfig, SecurityConfig,
+    default_model_ref, resolve_model, summarizer_model_ref, AgentConfig, ConfigPaths, ModelRef,
+    ModelsConfig, ProvidersConfig, SecurityConfig,
 };
 use cowboy_core::daemonproto::{
     ClientMsg, DaemonReq, InterruptKind, LeaseMode, SessionInfo, SessionStatus, UiEventMsg,
@@ -94,7 +95,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         &providers,
         user_models.as_ref(),
         project_models.as_ref(),
-        model_override.as_deref(),
+        model_override.as_ref(),
     )
     .or_else(|_| {
         resolve_model(
@@ -286,10 +287,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // Optional dedicated summarizer model (context compaction + truncation
     // recovery). Project setting overrides user; on any resolution/build error we
     // warn and fall back to the main model rather than failing the session.
-    let summarizer_name = project_models
-        .as_ref()
-        .and_then(|m| m.summarizer.clone())
-        .or_else(|| user_models.as_ref().and_then(|m| m.summarizer.clone()));
+    let summarizer_name = summarizer_model_ref(user_models.as_ref(), project_models.as_ref());
     let summarizer: Option<Box<dyn ModelClient>> = match summarizer_name {
         Some(name) => match resolve_model(
             &providers,
@@ -302,7 +300,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             Ok(c) => Some(c),
             Err(e) => {
                 emitter.emit(UiEventMsg::Notice(format!(
-                    "summarizer model {name:?} unavailable ({e}); using the main model for summaries"
+                    "summarizer model `{name}` unavailable ({e}); using the main model for summaries"
                 )));
                 None
             }
@@ -315,10 +313,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // *default* model, when that's a different name than the one we're running.
     // Without this a stale roster entry kills every subagent routed to it — crew
     // fallback is decided at routing time and never re-evaluated at runtime.
-    let default_model_name = project_models
-        .as_ref()
-        .and_then(|m| m.default.clone())
-        .or_else(|| user_models.as_ref().and_then(|m| m.default.clone()));
+    let default_model_name = default_model_ref(user_models.as_ref(), project_models.as_ref());
     let fallback_name = default_model_name.filter(|d| Some(d) != model_override.as_ref());
     // For `/model` from any client (see `agent::commands`).
     let (model_names, default_name) =
@@ -326,7 +321,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     emitter.set_models(
         model_names,
         model_override
-            .clone()
+            .as_ref()
+            .map(ToString::to_string)
             .or_else(|| (!default_name.is_empty()).then_some(default_name)),
     );
 
@@ -363,9 +359,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let user = user_models.clone();
         let project = project_models.clone();
         agent = agent.with_model_fallback(
-            name,
+            name.to_string(),
             Box::new(move |n: &str| {
-                let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(n))?;
+                let r = resolve_model(
+                    &providers,
+                    user.as_ref(),
+                    project.as_ref(),
+                    Some(&ModelRef::parse(n)?),
+                )?;
                 let cw = r.context_window as usize;
                 let pricing = pricing_of(&r);
                 let client: Box<dyn ModelClient> = build_client(&r)?;
@@ -428,7 +429,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let user = user_models.clone();
         let project = project_models.clone();
         Box::new(move |name: &str| {
-            let r = resolve_model(&providers, user.as_ref(), project.as_ref(), Some(name))?;
+            let r = resolve_model(
+                &providers,
+                user.as_ref(),
+                project.as_ref(),
+                Some(&ModelRef::parse(name)?),
+            )?;
             let cw = r.context_window as usize;
             let pricing = pricing_of(&r);
             let client: Box<dyn ModelClient> = build_client(&r)?;

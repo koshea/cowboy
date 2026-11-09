@@ -277,6 +277,10 @@ pub type ModelBuilder = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize,
 /// Drives a single agent session.
 pub struct AgentLoop<'a> {
     model: Box<dyn ModelClient>,
+    /// The roster `dispatch_subagents` routes by: `None` re-reads `crew.yaml` each
+    /// turn (production); `Some` pins one, so a test's routing never depends on
+    /// whatever roster the machine running it happens to have.
+    pinned_crew: Option<Option<cowboy_core::crew::CrewConfig>>,
     /// Optional dedicated model for auxiliary summarization (compaction +
     /// truncation recovery). `None` falls back to `model` — see [`Self::summarizer`].
     summarizer: Option<Box<dyn ModelClient>>,
@@ -548,14 +552,10 @@ struct SubagentPlan {
 impl SubagentPlan {
     /// The concurrency-throttle key: a harness is its own provider (each CLI has its
     /// own subscription limits), else the model's provider.
-    fn provider_key(
-        &self,
-        defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
-        foreman: Option<&str>,
-    ) -> String {
+    fn provider_key(&self, foreman: Option<&str>) -> String {
         match &self.harness {
             Some(h) => format!("harness:{h}"),
-            None => provider_key(self.model.as_deref(), defs, foreman),
+            None => provider_key(self.model.as_deref(), foreman),
         }
     }
 }
@@ -813,25 +813,6 @@ fn read_subagent_usage(root: &std::path::Path, id: &str) -> SubagentUsage {
     usage
 }
 
-/// Merged user+project model definitions (name → def), best-effort. Maps a
-/// routed model name to its provider for the per-provider throttle; a missing or
-/// unparseable file just yields fewer entries (callers then key on the model name).
-fn load_model_defs(
-    root: &std::path::Path,
-) -> std::collections::BTreeMap<String, cowboy_core::config::ModelDef> {
-    use cowboy_core::config::{ModelsConfig, COWBOY_DIR, MODELS_FILE};
-    let mut defs = std::collections::BTreeMap::new();
-    if let Some(p) = ModelsConfig::user_path() {
-        if let Ok(Some(u)) = ModelsConfig::load_opt(&p) {
-            defs.extend(u.models);
-        }
-    }
-    if let Ok(Some(p)) = ModelsConfig::load_opt(&root.join(COWBOY_DIR).join(MODELS_FILE)) {
-        defs.extend(p.models);
-    }
-    defs
-}
-
 /// A user-facing notice describing the *true* concurrency of a subagent batch:
 /// how many start running now vs. how many queue behind the per-provider cap.
 /// Grouping by provider matters because the cap is per provider — three subagents
@@ -841,12 +822,11 @@ fn concurrency_notice(
     plans: &[(String, SubagentPlan)],
     per_provider: usize,
     max_parallel: usize,
-    defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
     foreman: Option<&str>,
 ) -> String {
     let keys: Vec<String> = plans
         .iter()
-        .map(|(_, plan)| plan.provider_key(defs, foreman))
+        .map(|(_, plan)| plan.provider_key(foreman))
         .collect();
     concurrency_notice_from_keys(&keys, per_provider, max_parallel)
 }
@@ -889,20 +869,16 @@ fn concurrency_notice_from_keys(
 /// throttle. A routed model resolves to its `provider`; an unknown model keys on
 /// its own name (still groups identical models); a roster-less worker (`None`)
 /// runs on the foreman's model, so it keys on the foreman's provider.
-fn provider_key(
-    model: Option<&str>,
-    defs: &std::collections::BTreeMap<String, cowboy_core::config::ModelDef>,
-    foreman: Option<&str>,
-) -> String {
+fn provider_key(model: Option<&str>, foreman: Option<&str>) -> String {
+    // Models are `provider/name`, so the provider is in the name itself. A routed
+    // name that does not parse keys on itself (still grouping identical routes).
+    let of = |m: &str| match cowboy_core::config::ModelRef::parse(m) {
+        Ok(r) => r.provider,
+        Err(_) => m.to_string(),
+    };
     match model {
-        Some(name) => defs
-            .get(name)
-            .map(|d| d.provider.clone())
-            .unwrap_or_else(|| name.to_string()),
-        None => foreman
-            .and_then(|f| defs.get(f))
-            .map(|d| d.provider.clone())
-            .unwrap_or_else(|| "<foreman>".to_string()),
+        Some(name) => of(name),
+        None => foreman.map(of).unwrap_or_else(|| "<foreman>".to_string()),
     }
 }
 
@@ -1241,6 +1217,7 @@ impl<'a> AgentLoop<'a> {
             planning: false,
             mcp: None,
             fallback_model: None,
+            pinned_crew: None,
             fallback_used: false,
             messages: vec![Message::system(system)],
             ui,
@@ -2294,6 +2271,13 @@ impl<'a> AgentLoop<'a> {
     /// this, such a model kills the session/subagent outright: the crew's
     /// `fell_back` flag is decided at *routing* time and nothing reroutes on a
     /// runtime error. Used once per session (see `fallback_used`).
+    /// Route subagents by this roster (or none) instead of reading `crew.yaml`.
+    #[cfg(test)]
+    pub(crate) fn with_pinned_crew(mut self, crew: Option<cowboy_core::crew::CrewConfig>) -> Self {
+        self.pinned_crew = Some(crew);
+        self
+    }
+
     pub fn with_model_fallback(mut self, name: String, build: ModelBuilder) -> Self {
         self.fallback_model = Some((name, build));
         self
@@ -4867,7 +4851,10 @@ impl<'a> AgentLoop<'a> {
         }
         // Re-read per turn (not cached at construction) so a mid-session `cowboy crew`
         // edit takes effect on routing.
-        let crew_cfg = cowboy_core::crew::load().ok().flatten();
+        let crew_cfg = match &self.pinned_crew {
+            Some(pinned) => pinned.clone(),
+            None => cowboy_core::crew::load().ok().flatten(),
+        };
 
         // Plan + announce sequentially (needs `&mut self`); collect runnable plans.
         let mut plans: Vec<(String, SubagentPlan)> = Vec::new();
@@ -4893,7 +4880,6 @@ impl<'a> AgentLoop<'a> {
         if plans.is_empty() {
             return results;
         }
-        let model_defs = load_model_defs(self.root());
         let foreman = crate::cmd::crew::foreman_model();
         let per_provider = crew_cfg
             .as_ref()
@@ -4911,7 +4897,6 @@ impl<'a> AgentLoop<'a> {
                 &plans,
                 per_provider,
                 max_parallel,
-                &model_defs,
                 foreman.as_deref(),
             ));
         }
@@ -4935,7 +4920,7 @@ impl<'a> AgentLoop<'a> {
                     .clone()
                     .unwrap_or_else(|| "<default>".to_string()),
                 task: plan.display_task.clone(),
-                provider: plan.provider_key(&model_defs, foreman.as_deref()),
+                provider: plan.provider_key(foreman.as_deref()),
                 granted,
                 ceiling,
             };
@@ -5306,6 +5291,21 @@ impl<'a> AgentLoop<'a> {
                 .filter(|r| harnesses.get(&r.model).is_some())
                 .map(|r| r.model.clone()),
         };
+        // A model slot must be `provider/name`. A bare one is a pre-grouping roster;
+        // routing it would hand the child a name it cannot resolve, and the child's
+        // fallback to the default would hide that the roster is being ignored.
+        if harness.is_none() {
+            if let Some(r) = routed.as_ref().filter(|r| !r.model.is_empty()) {
+                if cowboy_core::config::ModelRef::parse(&r.model).is_err() {
+                    return Err(format!(
+                        "error: the crew roster routes `{category}` to `{}`, which is neither \
+                         a harness nor a `provider/name` model — {}",
+                        r.model,
+                        cowboy_core::config::MIGRATE_HINT
+                    ));
+                }
+            }
+        }
         // The child's iteration budget: an effort-scaled grant plus the ceiling it
         // can be granted up to. `max_total_iterations: 0` opts out of supervision,
         // and with no roster at all there is nothing to scale from — either way the
@@ -6526,30 +6526,22 @@ mod tests {
 
     #[test]
     fn provider_key_groups_same_provider_models_together() {
-        use cowboy_core::config::ModelsConfig;
-        let yaml = "default: a\nmodels:\n  \
-                    a: { provider: fireworks, model: minimax-m3 }\n  \
-                    b: { provider: fireworks, model: other }\n  \
-                    c: { provider: openai, model: gpt }\n";
-        let defs = serde_yaml_ng::from_str::<ModelsConfig>(yaml)
-            .unwrap()
-            .models;
         // Two different model NAMES on the same provider share a throttle key.
-        assert_eq!(provider_key(Some("a"), &defs, None), "fireworks");
+        assert_eq!(provider_key(Some("fireworks/a"), None), "fireworks");
         assert_eq!(
-            provider_key(Some("a"), &defs, None),
-            provider_key(Some("b"), &defs, None),
+            provider_key(Some("fireworks/a"), None),
+            provider_key(Some("fireworks/b"), None),
         );
         // Different provider → different key.
         assert_ne!(
-            provider_key(Some("a"), &defs, None),
-            provider_key(Some("c"), &defs, None),
+            provider_key(Some("fireworks/a"), None),
+            provider_key(Some("openai/a"), None),
         );
-        // Unknown model keys on its own name (still groups identical models).
-        assert_eq!(provider_key(Some("zzz"), &defs, None), "zzz");
+        // An unparseable route keys on its own name (still groups identical routes).
+        assert_eq!(provider_key(Some("zzz"), None), "zzz");
         // Roster-less worker keys on the foreman's provider, else a sentinel.
-        assert_eq!(provider_key(None, &defs, Some("c")), "openai");
-        assert_eq!(provider_key(None, &defs, None), "<foreman>");
+        assert_eq!(provider_key(None, Some("openai/c")), "openai");
+        assert_eq!(provider_key(None, None), "<foreman>");
     }
 
     #[tokio::test]
@@ -10069,7 +10061,7 @@ mod tests {
         let mut ui = RecordingUi::default();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let mut agent = AgentLoop::new(
+        let agent = AgentLoop::new(
             Box::new(ScriptedModel::new(vec![])),
             FakeSandbox::new(),
             cowboy_core::config::AgentBehavior::default(),
@@ -10089,6 +10081,7 @@ mod tests {
                 r#"{"task":"y","category":"docs","effort":"tiny"}"#,
             ),
         ];
+        let mut agent = agent.with_pinned_crew(None);
         let results = agent.dispatch_subagents(&calls);
         assert_eq!(results.len(), 2);
         for id in ["a", "b"] {

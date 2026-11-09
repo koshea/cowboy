@@ -83,10 +83,17 @@ pub fn expand(input: &str, ctx: &CommandCtx) -> Option<Expansion> {
             None => "usage: /model <name>".into(),
         }),
         "model" if !ctx.models.is_empty() && !ctx.models.iter().any(|m| m == rest) => {
-            notice(format!(
-                "unknown model {rest:?}; available: {}",
-                ctx.models.join(", ")
-            ))
+            notice(if rest.contains('/') {
+                format!(
+                    "unknown model {rest:?}; available: {}",
+                    ctx.models.join(", ")
+                )
+            } else {
+                format!(
+                    "unknown model {rest:?} — models are named `provider/name`; available: {}",
+                    ctx.models.join(", ")
+                )
+            })
         }
         "model" => send(vec![ClientMsg::SwitchModel(rest.to_string())]),
         "stop" => send(vec![ClientMsg::StopSubagents]),
@@ -418,7 +425,10 @@ mod tests {
         assert_eq!(one("queue clear"), ClientMsg::QueueClear);
         assert_eq!(one("stop"), ClientMsg::StopSubagents);
         assert_eq!(one("quit"), ClientMsg::End);
-        assert_eq!(one("model fast"), ClientMsg::SwitchModel("fast".into()));
+        assert_eq!(
+            one("model bifrost/fast"),
+            ClientMsg::SwitchModel("bifrost/fast".into())
+        );
         assert_eq!(one("budget off"), ClientMsg::IterationBudget(false));
         assert_eq!(one("budget on"), ClientMsg::IterationBudget(true));
         assert!(matches!(expand("budget", &c), Some(Expansion::Notice(n)) if n.contains("500")));
@@ -427,24 +437,26 @@ mod tests {
     #[test]
     fn model_is_validated_against_known_names_when_there_are_any() {
         let tmp = assert_fs::TempDir::new().unwrap();
-        let models = ["fast".to_string(), "smart".to_string()];
+        let models = ["bifrost/fast".to_string(), "chatgpt/smart".to_string()];
         let c = CommandCtx {
             root: tmp.path(),
             workstream: false,
             models: &models,
-            current_model: Some("fast"),
+            current_model: Some("bifrost/fast"),
             budget: None,
         };
         assert!(
-            matches!(expand("model nope", &c), Some(Expansion::Notice(n)) if n.contains("unknown"))
+            matches!(expand("model a/nope", &c), Some(Expansion::Notice(n)) if n.contains("unknown"))
         );
-        assert!(
-            matches!(expand("model", &c), Some(Expansion::Notice(n)) if n.contains("model: fast"))
-        );
+        // A bare name is explained, not guessed at.
+        assert!(matches!(expand("model smart", &c),
+            Some(Expansion::Notice(n)) if n.contains("`provider/name`")));
+        assert!(matches!(expand("model", &c),
+            Some(Expansion::Notice(n)) if n.contains("model: bifrost/fast")));
         assert_eq!(
-            expand("model smart", &c),
+            expand("model chatgpt/smart", &c),
             Some(Expansion::Send(vec![ClientMsg::SwitchModel(
-                "smart".into()
+                "chatgpt/smart".into()
             )]))
         );
     }
