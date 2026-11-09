@@ -8,11 +8,19 @@
 //! body minus every field that route refuses (sampling knobs, output caps).
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
+use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::mpsc::UnboundedSender;
 
-use super::{Message, Role, ToolDef};
-use crate::config::ReasoningEffort;
+use super::transport::{self, FailurePolicy, SseStream, TokenSource};
+use super::{
+    header_map, oa_err, ChatResponse, Delta, Message, ModelClient, Role, ToolCall, ToolDef, Usage,
+};
+use crate::config::{ReasoningEffort, ResolvedModel};
 use crate::error::{Error, Result};
 
 /// Everything about a request that comes from the model's configuration rather
@@ -195,10 +203,347 @@ fn to_tools(tools: &[ToolDef], layout: ToolLayout) -> Value {
     }
 }
 
+/// A streaming Responses API client. Speaks to any endpoint that implements
+/// `POST /responses` — OpenAI, or a gateway such as Bifrost — and, in strict
+/// mode with an OAuth token source, to ChatGPT plan usage.
+#[derive(Clone)]
+pub struct ResponsesClient {
+    http: reqwest::Client,
+    url: String,
+    auth: Arc<dyn TokenSource>,
+    failures: Arc<dyn FailurePolicy>,
+    opts: RequestOptions,
+    stream_idle: Duration,
+}
+
+impl ResponsesClient {
+    /// Build from a resolved model with the given token source and failure
+    /// policy. `strict` selects the ChatGPT-plan body (see [`STRICT_OMITTED`]).
+    pub fn new(
+        model: &ResolvedModel,
+        auth: Arc<dyn TokenSource>,
+        failures: Arc<dyn FailurePolicy>,
+        strict: bool,
+    ) -> Result<Self> {
+        let http = reqwest::Client::builder()
+            .default_headers(header_map(&model.headers))
+            .build()
+            .map_err(oa_err)?;
+        Ok(Self {
+            http,
+            url: format!("{}/responses", model.base_url.trim_end_matches('/')),
+            auth,
+            failures,
+            opts: RequestOptions {
+                model: model.model.clone(),
+                temperature: model.temperature,
+                max_tokens: model.max_tokens,
+                reasoning_effort: model.reasoning_effort,
+                top_p: model.top_p,
+                extra: model.extra.clone(),
+                strict,
+                tool_layout: ToolLayout::TopLevel,
+            },
+            stream_idle: model
+                .stream_idle_timeout_seconds
+                .map(Duration::from_secs)
+                .unwrap_or(super::DEFAULT_STREAM_IDLE),
+        })
+    }
+}
+
+/// One streamed event. Only the fields Cowboy reads; everything else is ignored
+/// so a provider adding event types or fields never breaks the stream.
+#[derive(Deserialize)]
+struct Event {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    delta: Option<String>,
+    #[serde(default)]
+    output_index: Option<u64>,
+    #[serde(default)]
+    item: Option<Item>,
+    #[serde(default)]
+    arguments: Option<String>,
+    #[serde(default)]
+    response: Option<ResponseObj>,
+    // `error` events carry these at the top level.
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    param: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Item {
+    #[serde(rename = "type", default)]
+    kind: String,
+    #[serde(default)]
+    call_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct ResponseObj {
+    #[serde(default)]
+    usage: Option<UsageWire>,
+    #[serde(default)]
+    error: Option<ErrorWire>,
+    #[serde(default)]
+    incomplete_details: Option<IncompleteWire>,
+}
+
+#[derive(Deserialize)]
+struct UsageWire {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: Option<InputDetails>,
+}
+
+#[derive(Deserialize)]
+struct InputDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+#[derive(Deserialize, Default)]
+struct ErrorWire {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    param: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IncompleteWire {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// A failure the provider reported inside the stream (`response.failed` or an
+/// `error` event), with its machine-readable code kept for the caller.
+pub fn stream_error(code: Option<&str>, message: Option<&str>, param: Option<&str>) -> Error {
+    let code_s = code.unwrap_or("unknown_error");
+    let mut msg = format!(
+        "model response failed ({code_s}): {}",
+        message.unwrap_or("no message")
+    );
+    if let Some(p) = param {
+        msg.push_str(&format!(" [param: {p}]"));
+    }
+    if matches!(code, Some("model_not_found")) {
+        Error::ModelUnavailable(msg)
+    } else {
+        Error::Model(msg)
+    }
+}
+
+/// Function calls assembled by output index (the stream's own ordering).
+#[derive(Default)]
+struct Calls(BTreeMap<u64, (String, String, String)>);
+
+impl Calls {
+    fn slot(&mut self, index: u64) -> &mut (String, String, String) {
+        self.0.entry(index).or_default()
+    }
+
+    /// The finished calls; one with no id gets `call_{index}` so its result can
+    /// still be addressed (see the Chat Completions accumulator for why).
+    fn finish(self) -> Vec<ToolCall> {
+        self.0
+            .into_iter()
+            .filter(|(_, (_, name, _))| !name.is_empty())
+            .map(|(i, (id, name, arguments))| ToolCall {
+                id: if id.is_empty() {
+                    format!("call_{i}")
+                } else {
+                    id
+                },
+                name,
+                arguments,
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl ModelClient for ResponsesClient {
+    fn max_output_tokens(&self) -> usize {
+        self.opts.max_tokens as usize
+    }
+
+    /// Same endpoint and budget, `reasoning.effort: minimal` — see the trait.
+    fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
+        if self.opts.reasoning_effort == Some(ReasoningEffort::Minimal) {
+            return None;
+        }
+        let mut c = self.clone();
+        c.opts.reasoning_effort = Some(ReasoningEffort::Minimal);
+        Some(Box::new(c))
+    }
+
+    async fn chat(
+        &self,
+        messages: &[Message],
+        tools: &[ToolDef],
+        deltas: Option<UnboundedSender<Delta>>,
+    ) -> Result<ChatResponse> {
+        let body = build_body(&self.opts, messages, tools)?;
+        let resp = transport::send_with_retry(
+            &self.http,
+            &self.url,
+            &body,
+            self.auth.as_ref(),
+            self.failures.as_ref(),
+        )
+        .await?;
+        let rid = transport::request_id(&resp);
+        let mut sse = SseStream::new(resp, self.stream_idle);
+        read_stream(&mut sse, deltas.as_ref())
+            .await
+            .map_err(|e| with_request_id(e, rid.as_deref()))
+    }
+}
+
+fn with_request_id(e: Error, rid: Option<&str>) -> Error {
+    let Some(rid) = rid else { return e };
+    match e {
+        Error::Model(m) => Error::Model(format!("{m} [request {rid}]")),
+        Error::ModelUnavailable(m) => Error::ModelUnavailable(format!("{m} [request {rid}]")),
+        other => other,
+    }
+}
+
+/// Fold a Responses event stream into one [`ChatResponse`]. Success is only a
+/// `response.completed` (or `response.incomplete`, which is a truncation); a
+/// stream that simply ends is an interrupted response, not an empty answer.
+async fn read_stream(
+    sse: &mut SseStream,
+    deltas: Option<&UnboundedSender<Delta>>,
+) -> Result<ChatResponse> {
+    let mut content = String::new();
+    let mut reasoning = String::new();
+    let mut calls = Calls::default();
+    let send = |d: Delta| {
+        if let Some(tx) = deltas {
+            let _ = tx.send(d);
+        }
+    };
+    while let Some(data) = sse.next_data().await? {
+        if data == "[DONE]" {
+            break;
+        }
+        let Ok(ev) = serde_json::from_str::<Event>(&data) else {
+            continue; // keep-alives / unparseable frames
+        };
+        match ev.kind.as_str() {
+            "response.output_text.delta" => {
+                if let Some(t) = ev.delta.filter(|t| !t.is_empty()) {
+                    send(Delta::Content(t.clone()));
+                    content.push_str(&t);
+                }
+            }
+            // A reasoning summary (OpenAI) or raw reasoning text (some gateways and
+            // open models): shown as thinking, never folded into the answer.
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                if let Some(t) = ev.delta.filter(|t| !t.is_empty()) {
+                    send(Delta::Reasoning(t.clone()));
+                    reasoning.push_str(&t);
+                }
+            }
+            "response.output_item.added" | "response.output_item.done" => {
+                let (Some(i), Some(item)) = (ev.output_index, ev.item) else {
+                    continue;
+                };
+                if item.kind != "function_call" {
+                    continue;
+                }
+                let done = ev.kind.ends_with(".done");
+                let slot = calls.slot(i);
+                if let Some(id) = item.call_id.filter(|s| !s.is_empty()) {
+                    slot.0 = id;
+                }
+                if let Some(n) = item.name.filter(|s| !s.is_empty()) {
+                    slot.1 = n;
+                }
+                // `.done` carries the authoritative full arguments.
+                match item.arguments {
+                    Some(a) if done && !a.is_empty() => slot.2 = a,
+                    Some(a) if !done && slot.2.is_empty() => slot.2 = a,
+                    _ => {}
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                if let (Some(i), Some(d)) = (ev.output_index, ev.delta) {
+                    calls.slot(i).2.push_str(&d);
+                }
+            }
+            "response.function_call_arguments.done" => {
+                if let (Some(i), Some(a)) = (ev.output_index, ev.arguments) {
+                    calls.slot(i).2 = a;
+                }
+            }
+            "response.completed" | "response.incomplete" => {
+                let r = ev.response.unwrap_or_default();
+                let truncated = ev.kind == "response.incomplete"
+                    && r.incomplete_details
+                        .as_ref()
+                        .and_then(|d| d.reason.as_deref())
+                        .is_none_or(|reason| reason == "max_output_tokens");
+                return Ok(ChatResponse {
+                    content: (!content.is_empty()).then_some(content),
+                    tool_calls: calls.finish(),
+                    reasoning: (!reasoning.is_empty()).then_some(reasoning),
+                    truncated,
+                    usage: r.usage.map(|u| Usage {
+                        prompt_tokens: u.input_tokens,
+                        completion_tokens: u.output_tokens,
+                        cached_prompt_tokens: u
+                            .input_tokens_details
+                            .map(|d| d.cached_tokens)
+                            .unwrap_or(0),
+                    }),
+                });
+            }
+            "response.failed" => {
+                let err = ev.response.and_then(|r| r.error).unwrap_or_default();
+                return Err(stream_error(
+                    err.code.as_deref(),
+                    err.message.as_deref(),
+                    err.param.as_deref(),
+                ));
+            }
+            "error" => {
+                return Err(stream_error(
+                    ev.code.as_deref(),
+                    ev.message.as_deref(),
+                    ev.param.as_deref(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    Err(Error::Model(
+        "model stream ended before the response completed (no `response.completed`); \
+         the answer may be cut off — retry the turn"
+            .into(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ToolCall;
 
     fn opts(strict: bool) -> RequestOptions {
         RequestOptions {

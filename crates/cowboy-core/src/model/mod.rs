@@ -13,7 +13,6 @@ use async_openai::types::chat::{
     CreateChatCompletionRequestArgs, FunctionCall, FunctionObjectArgs,
 };
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -21,6 +20,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 pub mod responses;
+pub mod transport;
+
+pub use transport::{StaticKey, TokenSource};
 
 use crate::config::{ReasoningEffort, ResolvedAuth, ResolvedModel, WireApi};
 use crate::error::{Error, Result};
@@ -33,8 +35,16 @@ pub fn build_client(model: &ResolvedModel) -> Result<Box<dyn ModelClient>> {
         (WireApi::ChatCompletions, ResolvedAuth::ApiKey(_)) => {
             Ok(Box::new(OpenAiClient::from_resolved(model)?))
         }
-        (WireApi::Responses, _) => Err(Error::Invalid(format!(
-            "provider {:?} uses `api: responses`, which this build does not support yet",
+        (WireApi::Responses, ResolvedAuth::ApiKey(key)) => {
+            Ok(Box::new(responses::ResponsesClient::new(
+                model,
+                std::sync::Arc::new(StaticKey(key.clone())),
+                std::sync::Arc::new(transport::DefaultFailures),
+                false,
+            )?))
+        }
+        (WireApi::Responses, ResolvedAuth::Chatgpt) => Err(Error::Invalid(format!(
+            "provider {:?} signs in with ChatGPT, which this build does not support yet",
             model.provider_name
         ))),
         (WireApi::ChatCompletions, ResolvedAuth::Chatgpt) => Err(Error::Invalid(format!(
@@ -351,7 +361,7 @@ pub trait ModelClient: Send + Sync {
 pub struct OpenAiClient {
     http: reqwest::Client,
     base_url: String,
-    api_key: String,
+    auth: std::sync::Arc<dyn TokenSource>,
     model: String,
     temperature: f32,
     max_tokens: u32,
@@ -370,7 +380,7 @@ pub struct OpenAiClient {
 /// Default idle-stream bound. Generous: a reasoning model that thinks without
 /// streaming (and a gateway that forwards no keep-alives) can legitimately be
 /// silent for a while — but nothing healthy is silent for five minutes.
-const DEFAULT_STREAM_IDLE: Duration = Duration::from_secs(300);
+pub(crate) const DEFAULT_STREAM_IDLE: Duration = Duration::from_secs(300);
 
 impl OpenAiClient {
     /// Build from a fully-resolved model (provider credentials joined with the
@@ -391,7 +401,7 @@ impl OpenAiClient {
         Ok(Self {
             http,
             base_url: model.base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.clone(),
+            auth: std::sync::Arc::new(StaticKey(api_key.clone())),
             model: model.model.clone(),
             temperature: model.temperature,
             max_tokens: model.max_tokens,
@@ -480,7 +490,7 @@ async fn list_openai_models(
 
 /// Custom headers as a reqwest map; names or values that are not valid HTTP are
 /// skipped (they could never have been sent).
-fn header_map(headers: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
+pub(crate) fn header_map(headers: &BTreeMap<String, String>) -> reqwest::header::HeaderMap {
     let mut hmap = reqwest::header::HeaderMap::new();
     for (k, v) in headers {
         if let (Ok(name), Ok(val)) = (
@@ -857,175 +867,64 @@ impl ModelClient for OpenAiClient {
             }
         }
 
-        // Send with backoff-retry on rate limits (429), overload (529), 5xx, and
-        // transient connection/timeout errors. Streaming hasn't started yet, so a
-        // retry is clean (no partial output to discard).
         let url = format!("{}/chat/completions", self.base_url);
-        let mut attempt = 0u32;
-        let resp = loop {
-            match self
-                .http
-                .post(&url)
-                .bearer_auth(&self.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
-                Ok(r) if r.status().is_success() => break r,
-                Ok(r) if is_retryable_status(r.status()) && attempt < MAX_RETRIES => {
-                    // A provider signal of 0 (`Retry-After: 0`, or a reset header that
-                    // already elapsed) is not a licence to retry instantly and re-hammer
-                    // the endpoint — treat a zero/absent signal as "use our jittered
-                    // backoff", which also de-synchronizes parallel retriers.
-                    let delay = retry_after(&r)
-                        .filter(|d| !d.is_zero())
-                        .unwrap_or_else(|| backoff(attempt));
-                    tracing::warn!(
-                        status = %r.status(),
-                        attempt = attempt + 1,
-                        delay_ms = delay.as_millis() as u64,
-                        "model request throttled/failed; backing off and retrying"
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                Ok(r) => {
-                    let code = r.status();
-                    let text = r.text().await.unwrap_or_default();
-                    let msg = format!("chat request failed ({code}): {text}");
-                    // A model the provider doesn't serve is a PERMANENT failure of
-                    // this model, not of the request — surface it as such so callers
-                    // can reroute to another model instead of failing the session
-                    // (a deprecated model id would otherwise kill every subagent
-                    // routed to it, with no fallback).
-                    return Err(if is_model_not_found(code, &text) {
-                        Error::ModelUnavailable(msg)
-                    } else {
-                        Error::Model(msg)
-                    });
-                }
-                Err(e) if is_transient(&e) && attempt < MAX_RETRIES => {
-                    let delay = backoff(attempt);
-                    tracing::warn!(
-                        error = %e,
-                        attempt = attempt + 1,
-                        delay_ms = delay.as_millis() as u64,
-                        "model request connection error; backing off and retrying"
-                    );
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => return Err(oa_err(e)),
-            }
-        };
+        let resp = transport::send_with_retry(
+            &self.http,
+            &url,
+            &body,
+            self.auth.as_ref(),
+            &transport::DefaultFailures,
+        )
+        .await?;
 
         let mut content = String::new();
         let mut reasoning = String::new();
         let mut acc = ToolCallAccumulator::default();
         let mut truncated = false;
         let mut usage: Option<Usage> = None;
-        let mut buf = String::new();
-        let mut stream = resp.bytes_stream();
-        // Set once the stream has ended, so the final (unterminated) frame still gets
-        // one pass through the line loop before we stop.
-        let mut ended = false;
-        while !ended {
-            // Bound the wait for the next frame: a provider whose stream stalls
-            // silently mid-response (observed with wafer/MiniMax-M3: reasoning
-            // deltas, then nothing, forever) must error out, not hang the turn.
-            // Any bytes on the wire — including SSE keep-alive comments — reset
-            // the clock, so slow-but-alive streams are unaffected.
-            let item = if self.stream_idle.is_zero() {
-                stream.next().await
-            } else {
-                match tokio::time::timeout(self.stream_idle, stream.next()).await {
-                    Ok(item) => item,
-                    Err(_) => {
-                        return Err(Error::Model(format!(
-                            "model stream stalled: no data from the provider for {}s \
-                             (tune with `stream_idle_timeout_seconds` on the model; 0 disables)",
-                            self.stream_idle.as_secs()
-                        )))
-                    }
-                }
+        let mut sse = transport::SseStream::new(resp, self.stream_idle);
+        while let Some(data) = sse.next_data().await? {
+            if data == "[DONE]" {
+                break;
+            }
+            let Ok(chunk) = serde_json::from_str::<StreamChunk>(&data) else {
+                continue; // skip keep-alives / unparseable frames
             };
-            match item {
-                Some(chunk) => buf.push_str(&String::from_utf8_lossy(&chunk.map_err(oa_err)?)),
-                None => {
-                    // End of stream. Anything left in the buffer is a frame with no
-                    // trailing newline, which the line loop below would never see — so
-                    // a provider that ends without a final `\n` (or without `[DONE]`)
-                    // silently lost its last delta. That delta is often the one
-                    // carrying `finish_reason` or the tail of a tool call's arguments,
-                    // which turns a complete response into a subtly wrong one rather
-                    // than a failed one. Terminate the partial line and make one final
-                    // pass.
-                    if buf.trim().is_empty() {
-                        break;
-                    }
-                    buf.push('\n');
-                    ended = true;
+            if let Some(u) = chunk.usage {
+                usage = Some(Usage {
+                    prompt_tokens: u.prompt_tokens,
+                    completion_tokens: u.completion_tokens,
+                    cached_prompt_tokens: u
+                        .prompt_tokens_details
+                        .map(|d| d.cached_tokens)
+                        .unwrap_or(0),
+                });
+            }
+            let Some(choice) = chunk.choices.into_iter().next() else {
+                continue;
+            };
+            if choice.finish_reason.as_deref() == Some("length") {
+                truncated = true;
+            }
+            if let Some(r) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
+                reasoning.push_str(&r);
+                if let Some(tx) = &deltas {
+                    let _ = tx.send(Delta::Reasoning(r));
                 }
             }
-            // SSE: process complete `\n`-terminated lines, leaving any partial
-            // line in the buffer for the next chunk.
-            while let Some(nl) = buf.find('\n') {
-                let line: String = buf.drain(..=nl).collect();
-                let Some(data) = line.trim().strip_prefix("data:") else {
-                    continue;
-                };
-                let data = data.trim();
-                if data.is_empty() {
-                    continue;
+            if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
+                if let Some(tx) = &deltas {
+                    let _ = tx.send(Delta::Content(text.clone()));
                 }
-                if data == "[DONE]" {
-                    return Ok(ChatResponse {
-                        content: (!content.is_empty()).then_some(content),
-                        tool_calls: acc.finish(),
-                        reasoning: (!reasoning.is_empty()).then_some(reasoning),
-                        truncated,
-                        usage,
-                    });
-                }
-                let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) else {
-                    continue; // skip keep-alives / unparseable frames
-                };
-                if let Some(u) = chunk.usage {
-                    usage = Some(Usage {
-                        prompt_tokens: u.prompt_tokens,
-                        completion_tokens: u.completion_tokens,
-                        cached_prompt_tokens: u
-                            .prompt_tokens_details
-                            .map(|d| d.cached_tokens)
-                            .unwrap_or(0),
-                    });
-                }
-                let Some(choice) = chunk.choices.into_iter().next() else {
-                    continue;
-                };
-                if choice.finish_reason.as_deref() == Some("length") {
-                    truncated = true;
-                }
-                if let Some(r) = choice.delta.reasoning_content.filter(|r| !r.is_empty()) {
-                    reasoning.push_str(&r);
-                    if let Some(tx) = &deltas {
-                        let _ = tx.send(Delta::Reasoning(r));
-                    }
-                }
-                if let Some(text) = choice.delta.content.filter(|t| !t.is_empty()) {
-                    if let Some(tx) = &deltas {
-                        let _ = tx.send(Delta::Content(text.clone()));
-                    }
-                    content.push_str(&text);
-                }
-                if let Some(calls) = choice.delta.tool_calls {
-                    for tc in calls {
-                        let (name, args) = match tc.function {
-                            Some(f) => (f.name, f.arguments),
-                            None => (None, None),
-                        };
-                        acc.apply(tc.index as usize, tc.id, name, args);
-                    }
+                content.push_str(&text);
+            }
+            if let Some(calls) = choice.delta.tool_calls {
+                for tc in calls {
+                    let (name, args) = match tc.function {
+                        Some(f) => (f.name, f.arguments),
+                        None => (None, None),
+                    };
+                    acc.apply(tc.index as usize, tc.id, name, args);
                 }
             }
         }
