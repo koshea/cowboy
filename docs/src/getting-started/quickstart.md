@@ -7,7 +7,7 @@ prints and what to do when the agent asks for the network — see
 ```sh
 cd your-project
 cowboy init                 # writes .cowboy/{security,agent}.yaml
-cowboy models setup         # model endpoint + key (stored host-side)
+cowboy models setup         # a provider + model (stored host-side); more: `cowboy providers add`
 cowboy doctor               # kernel prerequisites, model config, daemon
 cowboy "run the tests and fix one simple failure"
 ```

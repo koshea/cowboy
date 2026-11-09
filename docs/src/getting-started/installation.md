@@ -181,10 +181,15 @@ Provider credentials are **host-owned** and stored outside any project. Point th
 endpoint at your gateway (if you set one up) or directly at a provider:
 
 ```sh
-cowboy models setup             # save an endpoint + key to ~/.config/cowboy/providers.yaml (0600)
+cowboy models setup             # a provider (endpoint + key) and a model that uses it
+cowboy providers add <name> --base-url <url> [--api responses] [--no-key]   # another provider
+cowboy providers add chatgpt --chatgpt   # your ChatGPT subscription (browser sign-in)
 cowboy models list              # review providers + models
 cowboy models use [-g] <provider/name>   # set the default model (-g = global/user level)
 ```
+
+Coming from an earlier version, with bare model names? Run `cowboy models migrate`
+once; it converts `models.yaml` and `crew.yaml` and keeps a `.bak` of each.
 
 See [Configuration](configuration.md) for how providers and models are split so
 the agent can never reach your credentials.

@@ -131,6 +131,49 @@ Reading an inbox is the one destructive default, because an inbox is a queue.
 delegates sub-tasks to specialists; see `/crew` for the routing table, and
 `/crew <name>` to switch this session to another [crew](using/crew.md#several-crews).
 
+## Add a second provider
+
+Providers sit side by side; every model is `provider/name` under the one that
+serves it.
+
+```sh
+cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
+cowboy models available                          # every provider's catalogue
+cowboy models add zai/glm-4.7 --name bifrost/glm # or pick from /models in a session
+cowboy providers                                 # endpoint, API, auth, models per provider
+```
+
+`--api responses` is for endpoints that speak the OpenAI Responses API (OpenAI,
+Bifrost, …); leave it off for Chat Completions. `cowboy providers remove <name>`
+refuses while models or crew slots still use the provider. See
+[Configuration](getting-started/configuration.md#providers--models).
+
+## Use your ChatGPT subscription
+
+```sh
+cowboy providers add chatgpt --chatgpt           # opens the browser: "Continue with ChatGPT"
+cowboy models available                          # the models your account offers
+cowboy models add gpt-6.1-sol --name chatgpt/gpt-6.1-sol
+```
+
+Then `/model chatgpt/gpt-6.1-sol` in a session, or `cowboy models use -g
+chatgpt/gpt-6.1-sol`. On a remote machine, forward the callback port first
+(`ssh -L 1455:127.0.0.1:1455 <host>`). `cowboy providers login chatgpt` renews an
+expired sign-in; `cowboy providers logout chatgpt` signs out. Usage limits, tokens
+and what plan usage supports: [ChatGPT sign-in](using/chatgpt.md).
+
+## Switch between crews
+
+```sh
+cowboy crew copy default premium    # start a new crew from an existing one, then edit crew.yaml
+cowboy crew use premium             # new sessions start with it
+```
+
+In a session, `/crew` shows its crew and the others, and `/crew premium` switches
+that session only. A crew can name its own `foreman: provider/name`, so switching to
+an all-OpenAI crew also switches the session to a ChatGPT model. See
+[Several crews](using/crew.md#several-crews).
+
 ## Approve (or deny) a network request
 
 Cowboy denies network by default and asks when the agent reaches for something

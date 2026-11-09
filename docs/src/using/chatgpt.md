@@ -11,6 +11,14 @@ cowboy models available                    # your account's models
 cowboy models add gpt-6.1-sol --name chatgpt/gpt-6.1-sol
 ```
 
+Then use it like any model: `/model chatgpt/gpt-6.1-sol` in a session, `cowboy models
+use -g chatgpt/gpt-6.1-sol` as the default, a crew slot (`deep: chatgpt/gpt-6.1-sol`),
+or a crew's `foreman:` — so switching to, say, an all-OpenAI crew with `/crew openai`
+runs the session on your subscription. See [Several crews](crew.md#several-crews).
+
+If you are upgrading from an earlier Cowboy, run `cowboy models migrate` first: the
+current build refuses the old bare-name `models.yaml` and single-roster `crew.yaml`.
+
 `--chatgpt` creates a provider like this in `providers.yaml`:
 
 ```yaml

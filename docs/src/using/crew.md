@@ -1,7 +1,8 @@
 # The crew (model routing)
 
 Cowboy can route delegated work to **different models by the kind of work**. The
-**foreman** is simply the model you select with `/model` (or `cowboy models use`):
+**foreman** is the model the session runs — the one you select with `/model` (or
+`cowboy models use`), or the crew's own `foreman:`:
 it plans, delegates, reviews, and integrates. When it delegates a sub-task, it
 describes the work by *category* and *effort*; Cowboy resolves that to a model
 from your **crew roster**.
@@ -56,10 +57,11 @@ is an **effort ramp**: a model is assigned a *floor* effort and handles that lev
 and everything above it, until a higher floor takes over. So a category can be one
 model for all efforts, a couple of breakpoints, or all five spelled out.
 
-There is no `planner:` field — the foreman is the selected `/model`. A roster
-slot can name the special value `<default>` to mean "use the foreman," so you can
-pin some efforts to specific models and inherit the foreman for the rest.
-Swapping `/model` then re-points every `<default>` slot automatically.
+There is no `planner:` field — the foreman is the session's model: the crew's
+`foreman:` if it names one, else the selected `/model`. A roster slot can name the
+special value `<default>` to mean "use the foreman," so you can pin some efforts to
+specific models and inherit the foreman for the rest. Swapping `/model` then
+re-points every `<default>` slot automatically.
 
 Slots name models as `provider/name` (see
 [models.yaml](../getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy)),
@@ -190,13 +192,15 @@ own category, under `descriptions:` — your wording goes into the prompt verbat
 so the sentence that documents the slot *is* the sentence the model routes on.
 
 ```yaml
-crew:
-  perf:
-    medium: cheap
-    large: premium
-descriptions:
-  perf: "profiling and optimisation; must show a before/after measurement"
-  review: "read the diff and report problems — never edit, never 'just fix it'"
+crews:
+  oss:
+    crew:
+      perf:
+        medium: bifrost/cheap
+        large: bifrost/premium
+    descriptions:
+      perf: "profiling and optimisation; must show a before/after measurement"
+      review: "read the diff and report problems — never edit, never 'just fix it'"
 ```
 
 `cowboy crew list` prints the meaning in force for every category, so you can see

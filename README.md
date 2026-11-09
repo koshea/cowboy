@@ -78,13 +78,16 @@ checkout.
 Already installed at the same version? Add `--force` so cargo actually rebuilds
 (it skips a same-commit reinstall otherwise, and the flag would have no effect).
 
-**Providers vs. models.** Provider credentials (endpoint URL + API key) are
-host-owned: `cowboy models setup` saves them to `~/.config/cowboy/providers.yaml`
-(`0600`), never in a project, so the agent can't reach them. Models (which
-provider + model id + params) can be defined at the user level
-(`~/.config/cowboy/models.yaml`) or per project (`.cowboy/models.yaml`, no
-credentials); set the default with `cowboy models use [-g] <name>` and review with
-`cowboy models list`.
+**Providers vs. models.** Provider credentials (endpoint URL + API key, or a ChatGPT
+sign-in) are host-owned: `cowboy models setup` and `cowboy providers add` save them
+to `~/.config/cowboy/providers.yaml` (`0600`), never in a project, so the agent can't
+reach them. Configure as many providers as you use — a local gateway beside a hosted
+API, or your ChatGPT subscription via `cowboy providers add chatgpt --chatgpt`.
+Models are grouped under their provider and named `provider/name`; define them at
+the user level (`~/.config/cowboy/models.yaml`) or per project (`.cowboy/models.yaml`,
+no credentials), set the default with `cowboy models use [-g] <provider/name>` and
+review with `cowboy models list`. Upgrading from bare model names? Run
+`cowboy models migrate` once.
 
 ## Docs
 

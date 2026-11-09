@@ -44,9 +44,10 @@ harnesses:
 
 ## Use it
 
-- **Routing.** In `crew.yaml`, a category slot may name a harness instead of a model:
-  `exploration: grok`. A name defined in both `models.yaml` and `harnesses.yaml` is a
-  configuration error (`cowboy crew validate` reports it).
+- **Routing.** In a crew in `crew.yaml`, a category slot may name a harness instead
+  of a model: `exploration: grok`. Models are always `provider/name` and harnesses are
+  bare names, so the two cannot be confused; `cowboy crew validate` reports a bare
+  name that is not a configured harness.
 - **By name.** Ask the agent to "have grok …" and it passes `harness: grok` to the
   `subagent` tool. The foreman only picks a harness itself through the roster.
 
