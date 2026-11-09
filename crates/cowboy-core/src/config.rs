@@ -1615,7 +1615,7 @@ impl WebConfig {
 
 /// Serialize `value` to YAML at `path` with owner-only (`0600`) perms, created
 /// atomically (temp file at `0600` + rename) so secrets are never briefly exposed.
-fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
+pub(crate) fn write_yaml_private<T: Serialize>(value: &T, path: &Path) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|source| Error::ConfigRead {
             path: parent.to_path_buf(),

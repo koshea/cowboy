@@ -661,6 +661,7 @@ dependencies = [
 name = "cowboy-core"
 version = "0.1.0"
 dependencies = [
+ "assert_fs",
  "async-openai",
  "async-trait",
  "cowboy-proto",
@@ -681,6 +682,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tracing",
+ "uuid",
  "wiremock",
 ]
 

@@ -22,6 +22,7 @@ futures.workspace = true
 tiktoken-rs.workspace = true
 reqwest.workspace = true
 libc.workspace = true
+uuid.workspace = true      # the OAuth agent-host id (`urn:uuid:…`)
 
 [dev-dependencies]
 insta.workspace = true
@@ -29,4 +30,5 @@ proptest.workspace = true
 rstest.workspace = true
 pretty_assertions.workspace = true
 wiremock.workspace = true
+assert_fs.workspace = true
 tokio.workspace = true

@@ -44,6 +44,11 @@ pub enum Error {
     #[error("model unavailable: {0}")]
     ModelUnavailable(String),
 
+    /// A sign-in (OAuth) credential is missing, expired beyond refresh, or was
+    /// revoked: only the user signing in again fixes it, so the message says how.
+    #[error("{0}")]
+    SignInRequired(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
