@@ -1,0 +1,66 @@
+---
+source: crates/cowboy-core/src/model/responses.rs
+expression: "pretty(&build_body(&opts(false), &msgs, &[shell_tool()]).unwrap())"
+---
+{
+  "input": [
+    {
+      "content": "list files",
+      "role": "user",
+      "type": "message"
+    },
+    {
+      "content": "looking",
+      "role": "assistant",
+      "type": "message"
+    },
+    {
+      "arguments": "{\"cmd\":\"ls\"}",
+      "call_id": "call_1",
+      "name": "shell",
+      "type": "function_call"
+    },
+    {
+      "arguments": "{}",
+      "call_id": "call_2",
+      "name": "unknown",
+      "type": "function_call"
+    },
+    {
+      "call_id": "call_1",
+      "output": "a.rs\nb.rs",
+      "type": "function_call_output"
+    },
+    {
+      "call_id": "call_2",
+      "output": "error: unknown tool",
+      "type": "function_call_output"
+    },
+    {
+      "content": "note: budget is low",
+      "role": "developer",
+      "type": "message"
+    }
+  ],
+  "instructions": "sys",
+  "max_output_tokens": 4096,
+  "model": "gpt-x",
+  "store": false,
+  "stream": true,
+  "temperature": 0.2,
+  "tools": [
+    {
+      "description": "run a command",
+      "name": "shell",
+      "parameters": {
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}

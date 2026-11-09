@@ -1,0 +1,19 @@
+---
+source: crates/cowboy-core/src/model/responses.rs
+expression: "pretty(&build_body(&opts(false), &msgs, &[]).unwrap())"
+---
+{
+  "input": [
+    {
+      "content": "hi",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "be terse",
+  "max_output_tokens": 4096,
+  "model": "gpt-x",
+  "store": false,
+  "stream": true,
+  "temperature": 0.2
+}

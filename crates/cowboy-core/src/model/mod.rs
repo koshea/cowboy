@@ -20,6 +20,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+pub mod responses;
+
 use crate::config::{ReasoningEffort, ResolvedAuth, ResolvedModel, WireApi};
 use crate::error::{Error, Result};
 

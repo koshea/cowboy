@@ -1,0 +1,36 @@
+---
+source: crates/cowboy-core/src/model/responses.rs
+expression: pretty(&body)
+---
+{
+  "input": [
+    {
+      "content": "hi",
+      "role": "user",
+      "type": "message"
+    }
+  ],
+  "instructions": "sys",
+  "model": "gpt-x",
+  "parallel_tool_calls": true,
+  "reasoning": {
+    "effort": "low"
+  },
+  "store": false,
+  "stream": true,
+  "tools": [
+    {
+      "description": "run a command",
+      "name": "shell",
+      "parameters": {
+        "properties": {
+          "cmd": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "type": "function"
+    }
+  ]
+}
