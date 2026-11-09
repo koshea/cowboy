@@ -33,7 +33,7 @@ On macOS, `brew install koshea/cowboy/cowboy`, or unpack
 `cowboy-<version>-aarch64-apple-darwin.tar.gz` and copy both binaries onto your
 `PATH` (macOS `install` has no `-D`).
 
-Or build from source (needs Rust 1.98.1 or newer; a checkout pins it via
+Or build from source (needs Rust 1.99.1 or newer; a checkout pins it via
 `rust-toolchain.toml`):
 
 ```sh

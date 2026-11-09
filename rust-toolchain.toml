@@ -11,6 +11,6 @@
 # refs in `.github/workflows/{ci,release}.yml`. Change them together, and bump
 # `workspace.package.rust-version` in Cargo.toml to match.
 [toolchain]
-channel = "1.98.1"
+channel = "1.99.1"
 components = ["rustfmt", "clippy"]
 targets = ["wasm32-unknown-unknown"]
