@@ -32,9 +32,15 @@ model behaving, that's a bug in the docs (or the code).
   Tailscale, alongside or instead of the terminal. See [The web UI](using/web.md).
 - **Sessions & a daemon** (`cowboyd`) that supervise worker processes, track
   worktree leases, and let you attach/detach/replay — from the TUI or the browser.
-- **A configurable crew** — your selected model (the foreman) delegates work by *kind* (category
-  + effort) and Cowboy routes each sub-task to the right model from your roster,
-  running independent work in parallel. See [The crew](using/crew.md).
+- **Any mix of providers** — a local gateway for open models, hosted APIs, and your
+  ChatGPT subscription side by side, every model named `provider/name`. See
+  [Configuration](getting-started/configuration.md#providers--models) and
+  [ChatGPT sign-in](using/chatgpt.md).
+- **Configurable crews** — your selected model (the foreman) delegates work by *kind*
+  (category + effort) and Cowboy routes each sub-task to the right model from your
+  roster, running independent work in parallel. Keep several crews (open-source
+  heavy, premium, all-OpenAI) and switch per session with `/crew <name>`. See
+  [The crew](using/crew.md).
 - **Ranch Plans** — the headline feature: split a large task into coordinated,
   dependency-aware workstreams, each its own session in its own worktree, with a
   coordinator that advances the plan and pauses for your sign-off where it matters.
