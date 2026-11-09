@@ -231,7 +231,17 @@ fn make_project() -> assert_fs::TempDir {
 /// worker (rooted at the worktree) to resolve it — the home default may not be valid
 /// in every environment. Override the model with `COWBOY_E2E_MODEL`.
 fn commit_model(dir: &Path, env: &Env) {
-    let model = std::env::var("COWBOY_E2E_MODEL").unwrap_or_else(|_| "cerebras/zai-glm-4.7".into());
+    // `provider/name`; without the override, the home default (always resolvable,
+    // being user-level) is committed explicitly.
+    let model = std::env::var("COWBOY_E2E_MODEL").unwrap_or_else(|_| {
+        real_provider()
+            .and_then(|p| {
+                cowboy_core::config::ModelsConfig::load(&p.with_file_name("models.yaml")).ok()
+            })
+            .and_then(|m| m.default)
+            .map(|d| d.to_string())
+            .expect("COWBOY_E2E_MODEL or a home default model")
+    });
     let ok = Command::new(env!("CARGO_BIN_EXE_cowboy"))
         .current_dir(dir)
         .env("XDG_RUNTIME_DIR", env.runtime.path())

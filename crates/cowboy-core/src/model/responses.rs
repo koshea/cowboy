@@ -71,20 +71,27 @@ pub const STRICT_OMITTED: &[&str] = &[
     "user",
 ];
 
-/// How function tools are presented. Kept behind one switch because the
-/// ChatGPT-plan route documents namespaced / `additional_tools` tools while every
-/// other Responses endpoint takes them top-level.
+/// How function tools are presented. The ChatGPT-plan route documents function
+/// tools grouped in namespaces (or `additional_tools`), while plain Responses
+/// endpoints — and gateways translating to other providers, which may drop what
+/// is not `type: function` — take them top-level.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ToolLayout {
     /// `tools: [{type: "function", name, description, parameters}]`.
     #[default]
     TopLevel,
+    /// `tools: [{type: "namespace", name, description, tools: [functions]}]`. Calls
+    /// come back with a bare `name` plus `namespace`, and are replayed the same way.
+    Namespace(&'static str),
 }
+
+/// The namespace Cowboy's tools are grouped under on the ChatGPT-plan route.
+pub const TOOL_NAMESPACE: &str = "cowboy";
 
 /// The JSON body for one Responses request (`stream: true`).
 pub fn build_body(opts: &RequestOptions, messages: &[Message], tools: &[ToolDef]) -> Result<Value> {
     let replay = opts.include_reasoning.then_some(opts.origin.as_str());
-    let (instructions, input) = to_input(messages, replay)?;
+    let (instructions, input) = to_input(messages, replay, opts.tool_layout)?;
     let mut body = json!({
         "model": opts.model,
         "input": input,
@@ -132,7 +139,11 @@ pub fn build_body(opts: &RequestOptions, messages: &[Message], tools: &[ToolDef]
 /// With `replay` set to this request's origin, an assistant turn's reasoning items
 /// from that same origin are replayed before its output — the order the model
 /// produced them in.
-fn to_input(messages: &[Message], replay: Option<&str>) -> Result<(Option<String>, Vec<Value>)> {
+fn to_input(
+    messages: &[Message],
+    replay: Option<&str>,
+    layout: ToolLayout,
+) -> Result<(Option<String>, Vec<Value>)> {
     let mut instructions: Option<String> = None;
     let mut input = Vec::with_capacity(messages.len());
     for m in messages {
@@ -165,12 +176,16 @@ fn to_input(messages: &[Message], replay: Option<&str>) -> Result<(Option<String
                     } else {
                         tc.name.clone()
                     };
-                    input.push(json!({
+                    let mut call = json!({
                         "type": "function_call",
                         "call_id": tc.id,
                         "name": name,
                         "arguments": arguments,
-                    }));
+                    });
+                    if let ToolLayout::Namespace(ns) = layout {
+                        call["namespace"] = json!(ns);
+                    }
+                    input.push(call);
                 }
             }
             Role::Tool => {
@@ -208,20 +223,25 @@ fn message(role: &str, content: &str) -> Value {
 }
 
 fn to_tools(tools: &[ToolDef], layout: ToolLayout) -> Value {
+    let functions: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            })
+        })
+        .collect();
     match layout {
-        ToolLayout::TopLevel => Value::Array(
-            tools
-                .iter()
-                .map(|t| {
-                    json!({
-                        "type": "function",
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    })
-                })
-                .collect(),
-        ),
+        ToolLayout::TopLevel => Value::Array(functions),
+        ToolLayout::Namespace(ns) => json!([{
+            "type": "namespace",
+            "name": ns,
+            "description": "Cowboy's tools: the workspace, the shell, and session coordination.",
+            "tools": functions,
+        }]),
     }
 }
 
@@ -264,7 +284,11 @@ impl ResponsesClient {
                 top_p: model.top_p,
                 extra: model.extra.clone(),
                 strict,
-                tool_layout: ToolLayout::TopLevel,
+                tool_layout: if strict {
+                    ToolLayout::Namespace(TOOL_NAMESPACE)
+                } else {
+                    ToolLayout::TopLevel
+                },
                 include_reasoning: strict || model.reasoning_effort.is_some(),
                 origin: format!("{}#{}", model.base_url.trim_end_matches('/'), model.model),
             },
@@ -434,9 +458,14 @@ impl ModelClient for ResponsesClient {
         .await?;
         let rid = transport::request_id(&resp);
         let mut sse = SseStream::new(resp, self.stream_idle);
-        read_stream(&mut sse, deltas.as_ref(), &self.opts.origin)
-            .await
-            .map_err(|e| with_request_id(e, rid.as_deref()))
+        read_stream(
+            &mut sse,
+            deltas.as_ref(),
+            &self.opts.origin,
+            self.failures.as_ref(),
+        )
+        .await
+        .map_err(|e| with_request_id(e, rid.as_deref()))
     }
 }
 
@@ -456,6 +485,7 @@ async fn read_stream(
     sse: &mut SseStream,
     deltas: Option<&UnboundedSender<Delta>>,
     origin: &str,
+    failures: &dyn FailurePolicy,
 ) -> Result<ChatResponse> {
     let mut reasoning_items: Vec<Value> = Vec::new();
     let mut content = String::new();
@@ -556,14 +586,14 @@ async fn read_stream(
             }
             "response.failed" => {
                 let err = ev.response.and_then(|r| r.error).unwrap_or_default();
-                return Err(stream_error(
+                return Err(failures.stream_error(
                     err.code.as_deref(),
                     err.message.as_deref(),
                     err.param.as_deref(),
                 ));
             }
             "error" => {
-                return Err(stream_error(
+                return Err(failures.stream_error(
                     ev.code.as_deref(),
                     ev.message.as_deref(),
                     ev.param.as_deref(),
@@ -659,6 +689,7 @@ mod tests {
     #[test]
     fn strict_mode_omits_every_refused_field() {
         let mut o = opts(true);
+        o.tool_layout = ToolLayout::Namespace(TOOL_NAMESPACE);
         o.top_p = Some(0.9);
         o.reasoning_effort = Some(ReasoningEffort::Low);
         o.extra.insert("temperature".into(), json!(1.0));
@@ -729,6 +760,32 @@ mod tests {
         // And nothing is replayed or requested when reasoning is off.
         let body = build_body(&opts(false), &msgs, &[]).unwrap();
         assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn namespaced_tools_are_grouped_and_their_calls_replayed_with_the_namespace() {
+        let mut o = opts(true);
+        o.tool_layout = ToolLayout::Namespace(TOOL_NAMESPACE);
+        let mut assistant = Message::new(Role::Assistant, "");
+        assistant.tool_calls = vec![ToolCall {
+            id: "c1".into(),
+            name: "shell".into(),
+            arguments: "{}".into(),
+        }];
+        let msgs = [
+            Message::user("go"),
+            assistant,
+            Message::tool_result("c1", "ok"),
+        ];
+        let body = build_body(&o, &msgs, &[shell_tool()]).unwrap();
+        assert_eq!(body["tools"][0]["type"], "namespace");
+        assert_eq!(body["tools"][0]["name"], TOOL_NAMESPACE);
+        assert_eq!(body["tools"][0]["tools"][0]["name"], "shell");
+        assert_eq!(body["input"][1]["namespace"], TOOL_NAMESPACE);
+        // Top-level elsewhere: nothing namespaced leaks into a gateway request.
+        let body = build_body(&opts(false), &msgs, &[shell_tool()]).unwrap();
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert!(body["input"][1].get("namespace").is_none());
     }
 
     #[test]

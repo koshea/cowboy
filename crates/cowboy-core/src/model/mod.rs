@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+pub mod chatgpt;
 pub mod responses;
 pub mod transport;
 
@@ -43,10 +44,18 @@ pub fn build_client(model: &ResolvedModel) -> Result<Box<dyn ModelClient>> {
                 false,
             )?))
         }
-        (WireApi::Responses, ResolvedAuth::Chatgpt) => Err(Error::Invalid(format!(
-            "provider {:?} signs in with ChatGPT, which this build does not support yet",
-            model.provider_name
-        ))),
+        // ChatGPT plan usage: the strict Responses body, OAuth tokens refreshed
+        // host-side, and the plan-usage failure meanings.
+        (WireApi::Responses, ResolvedAuth::Chatgpt) => {
+            Ok(Box::new(responses::ResponsesClient::new(
+                model,
+                crate::oauth::chatgpt::ChatGptTokens::for_provider(&model.provider_name)?,
+                std::sync::Arc::new(chatgpt::ChatGptFailures {
+                    provider: model.provider_name.clone(),
+                }),
+                true,
+            )?))
+        }
         (WireApi::ChatCompletions, ResolvedAuth::Chatgpt) => Err(Error::Invalid(format!(
             "provider {:?}: `auth: chatgpt` requires `api: responses`",
             model.provider_name
@@ -444,6 +453,8 @@ impl OpenAiClient {
 pub struct ModelEntry {
     pub id: String,
     pub owned_by: String,
+    /// A display name, when the catalogue offers one (the ChatGPT catalogue does).
+    pub label: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -462,17 +473,76 @@ struct ModelEntryWire {
 /// `/models` picker, `cowboy models available` and setup. Takes the provider, not
 /// a URL and key, because how its catalogue is fetched (and authenticated)
 /// depends on the provider's `auth`.
-pub async fn list_models(provider: &crate::config::Provider) -> Result<Vec<ModelEntry>> {
+pub async fn list_models(
+    name: &str,
+    provider: &crate::config::Provider,
+) -> Result<Vec<ModelEntry>> {
     use crate::config::ProviderAuth;
     let base_url = crate::config::expand_env(&provider.base_url)?;
     match provider.auth {
         ProviderAuth::ApiKey => {
             list_openai_models(&base_url, &provider.api_key, &provider.headers).await
         }
-        ProviderAuth::Chatgpt => Err(Error::Invalid(
-            "listing a ChatGPT provider's models is not supported by this build yet".into(),
-        )),
+        ProviderAuth::Chatgpt => {
+            let tokens = crate::oauth::chatgpt::ChatGptTokens::for_provider(name)?;
+            let token = tokens.token().await?;
+            list_chatgpt_models(&base_url, &token, &provider.headers).await
+        }
     }
+}
+
+#[derive(Deserialize)]
+struct ChatGptModels {
+    #[serde(default)]
+    models: Vec<ChatGptModel>,
+}
+#[derive(Deserialize)]
+struct ChatGptModel {
+    slug: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    visibility: Option<String>,
+}
+
+/// The signed-in account's own catalogue: `GET {base_url}/models` with the OAuth
+/// token returns `{models: [{slug, display_name, visibility}]}`. Only entries
+/// meant for display (`visibility: list`) are kept, in the server's order, with
+/// `slug` as the model id.
+pub async fn list_chatgpt_models(
+    base_url: &str,
+    token: &str,
+    headers: &BTreeMap<String, String>,
+) -> Result<Vec<ModelEntry>> {
+    let http = reqwest::Client::builder()
+        .default_headers(header_map(headers))
+        .build()
+        .map_err(oa_err)?;
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(oa_err)?;
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(Error::Model(format!(
+            "listing the ChatGPT models failed ({code}): {text}"
+        )));
+    }
+    let list: ChatGptModels = resp.json().await.map_err(oa_err)?;
+    Ok(list
+        .models
+        .into_iter()
+        .filter(|m| m.visibility.as_deref() == Some("list"))
+        .map(|m| ModelEntry {
+            id: m.slug,
+            owned_by: "openai".into(),
+            label: m.display_name,
+        })
+        .collect())
 }
 
 /// `GET {base_url}/models` returning the OpenAI `{data: [{id, owned_by}]}` shape.
@@ -505,6 +575,7 @@ async fn list_openai_models(
         .map(|e| ModelEntry {
             id: e.id,
             owned_by: e.owned_by,
+            label: None,
         })
         .collect())
 }

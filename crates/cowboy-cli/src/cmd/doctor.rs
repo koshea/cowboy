@@ -135,6 +135,12 @@ pub async fn run() -> Result<()> {
         check_models(&providers, &user_models, &project_models),
     );
     report.check(
+        "ChatGPT sign-in",
+        Category::Config,
+        Remedy::Fix,
+        check_chatgpt(&providers),
+    );
+    report.check(
         "harnesses",
         Category::Config,
         Remedy::Fix,
@@ -365,6 +371,75 @@ fn check_crew(providers: &cowboy_core::Result<ProvidersConfig>) -> Status {
         Status::Ok(format!("{} categories", cfg.crew.len()))
     } else {
         Status::Fail(problems.join("; "))
+    }
+}
+
+/// Every `auth: chatgpt` provider: signed in, with plan usage granted, its record
+/// owner-only, and a warning while its refresh token is close to its 30 days
+/// (any use of the provider renews it).
+fn check_chatgpt(providers: &cowboy_core::Result<ProvidersConfig>) -> Status {
+    use cowboy_core::config::ProviderAuth;
+    use cowboy_core::oauth::chatgpt;
+    let Ok(providers) = providers else {
+        return Status::Skipped("providers.yaml did not load (see above)".into());
+    };
+    let names: Vec<&String> = providers
+        .providers
+        .iter()
+        .filter(|(_, p)| p.auth == ProviderAuth::Chatgpt)
+        .map(|(n, _)| n)
+        .collect();
+    if names.is_empty() {
+        return Status::Ok("no ChatGPT providers".into());
+    }
+    let dir = match cowboy_core::oauth::auth_dir() {
+        Ok(d) => d,
+        Err(e) => return Status::Fail(e.to_string()),
+    };
+    let now = cowboy_core::time::now_ms();
+    let mut fails = Vec::new();
+    let mut warns = Vec::new();
+    let mut oks = Vec::new();
+    for name in names {
+        let path = chatgpt::record_path(&dir, name);
+        match chatgpt::load(&dir, name) {
+            Err(e) => fails.push(format!("{name}: {e}")),
+            Ok(Some(r)) if r.signed_in() => {
+                if ProvidersConfig::perms_are_loose(&path) {
+                    fails.push(format!(
+                        "{name}: {} is readable by others (chmod 600 it)",
+                        path.display()
+                    ));
+                } else if !r.plan_usage_enabled() {
+                    fails.push(format!(
+                        "{name}: signed in without ChatGPT plan usage → `cowboy providers login {name}`"
+                    ));
+                } else if r
+                    .refresh_token_expires_at_ms()
+                    .is_some_and(|t| t < now + 3 * 24 * 60 * 60 * 1000)
+                {
+                    warns.push(format!(
+                        "{name}: sign-in expires within 3 days unless used; \
+                         `cowboy providers login {name}` renews it"
+                    ));
+                } else {
+                    oks.push(format!(
+                        "{name}: {}",
+                        r.email.as_deref().unwrap_or("signed in")
+                    ));
+                }
+            }
+            Ok(_) => fails.push(format!(
+                "{name}: not signed in → `cowboy providers login {name}`"
+            )),
+        }
+    }
+    if !fails.is_empty() {
+        Status::Fail(fails.join("; "))
+    } else if !warns.is_empty() {
+        Status::Warn(warns.join("; "))
+    } else {
+        Status::Ok(oks.join("; "))
     }
 }
 

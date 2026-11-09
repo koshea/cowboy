@@ -49,6 +49,17 @@ pub trait FailurePolicy: Send + Sync {
     fn error(&self, status: reqwest::StatusCode, body: &str, request_id: Option<&str>) -> Error {
         default_error(status, body, request_id)
     }
+
+    /// The error for a failure reported inside an already-open stream
+    /// (`response.failed`, an `error` event).
+    fn stream_error(
+        &self,
+        code: Option<&str>,
+        message: Option<&str>,
+        param: Option<&str>,
+    ) -> Error {
+        super::responses::stream_error(code, message, param)
+    }
 }
 
 /// The policy for ordinary API-key endpoints.

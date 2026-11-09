@@ -20,17 +20,24 @@ expression: pretty(&body)
   "stream": true,
   "tools": [
     {
-      "description": "run a command",
-      "name": "shell",
-      "parameters": {
-        "properties": {
-          "cmd": {
-            "type": "string"
-          }
-        },
-        "type": "object"
-      },
-      "type": "function"
+      "description": "Cowboy's tools: the workspace, the shell, and session coordination.",
+      "name": "cowboy",
+      "tools": [
+        {
+          "description": "run a command",
+          "name": "shell",
+          "parameters": {
+            "properties": {
+              "cmd": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "type": "function"
+        }
+      ],
+      "type": "namespace"
     }
   ]
 }

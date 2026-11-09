@@ -280,7 +280,7 @@ async fn list_models_parses_the_catalogue() {
 
     let provider =
         cowboy_core::config::Provider::api_key(format!("{}/v1", server.uri()), "test-key");
-    let entries = list_models(&provider).await.unwrap();
+    let entries = list_models("p", &provider).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].id, "anthropic/claude-opus-4-8");
     assert_eq!(entries[1].owned_by, "Cerebras");
@@ -631,12 +631,13 @@ fn build_client_refuses_unsupported_providers_clearly() {
     let mut p = profile("https://x/v1".into());
     assert!(build_client(&p).is_ok(), "chat completions + key works");
 
+    // A ChatGPT sign-in only works over the Responses API.
     p.provider_name = "chatgpt".into();
-    p.api = WireApi::Responses;
+    p.api = WireApi::ChatCompletions;
     p.auth = ResolvedAuth::Chatgpt;
     let err = build_client(&p).err().unwrap().to_string();
     assert!(
-        err.contains("chatgpt"),
-        "the error names the provider: {err}"
+        err.contains("chatgpt") && err.contains("responses"),
+        "{err}"
     );
 }

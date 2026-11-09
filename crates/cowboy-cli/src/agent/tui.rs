@@ -2263,7 +2263,7 @@ fn fetch_model_choices(current_name: &str) -> Result<Vec<ModelChoice>> {
     let catalogues = providers
         .providers
         .iter()
-        .map(|(name, p)| (name.clone(), rt.block_on(list_models(p))))
+        .map(|(name, p)| (name.clone(), rt.block_on(list_models(name, p))))
         .collect::<Vec<_>>();
     model_choices(catalogues, &merged, current_name)
 }
@@ -2298,23 +2298,25 @@ fn model_choices(
             .map(|d| (r.provider.clone(), d.model.clone()))
     });
 
-    let choice = |provider: &str, id: &str, configured_name: Option<String>| {
-        let d = model_defaults::lookup(id);
-        let key = (provider.to_string(), id.to_string());
-        ModelChoice {
-            provider: provider.to_string(),
-            label: configured_name.clone().unwrap_or_else(|| d.name.clone()),
-            configured: configured_name.is_some(),
-            current: current_key.as_ref() == Some(&key),
-            configured_name,
-            suggested_name: d.name.trim().replace('/', "-"),
-            context_window: d.context_window,
-            max_tokens: d.max_tokens,
-            temperature: d.temperature,
-            reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
-            id: id.to_string(),
-        }
-    };
+    let choice =
+        |provider: &str, id: &str, configured_name: Option<String>, label: Option<String>| {
+            let d = model_defaults::lookup(id);
+            let key = (provider.to_string(), id.to_string());
+            let suggested = label.clone().unwrap_or_else(|| d.name.clone());
+            ModelChoice {
+                provider: provider.to_string(),
+                label: configured_name.clone().unwrap_or_else(|| suggested.clone()),
+                configured: configured_name.is_some(),
+                current: current_key.as_ref() == Some(&key),
+                configured_name,
+                suggested_name: suggested.trim().replace('/', "-"),
+                context_window: d.context_window,
+                max_tokens: d.max_tokens,
+                temperature: d.temperature,
+                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
+                id: id.to_string(),
+            }
+        };
 
     let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<ModelChoice> = Vec::new();
@@ -2333,7 +2335,7 @@ fn model_choices(
                 continue;
             }
             let name = configured.get(&key).map(ToString::to_string);
-            out.push(choice(&pname, &e.id, name));
+            out.push(choice(&pname, &e.id, name, e.label.clone()));
         }
     }
     if out.is_empty() && !failures.is_empty() && merged.is_empty() {
@@ -2344,7 +2346,7 @@ fn model_choices(
     // that could not be reached). Include them so they're always selectable.
     for (r, def) in merged {
         if seen.insert((r.provider.clone(), def.model.clone())) {
-            out.push(choice(&r.provider, &def.model, Some(r.to_string())));
+            out.push(choice(&r.provider, &def.model, Some(r.to_string()), None));
         }
     }
     // Current first, then configured, then by provider and label.
@@ -2580,6 +2582,7 @@ mod tests {
         let entry = |id: &str| ModelEntry {
             id: id.into(),
             owned_by: String::new(),
+            label: None,
         };
         let mut merged = std::collections::BTreeMap::new();
         let def: ModelDef = serde_yaml_ng::from_str("model: glm-4.7\n").unwrap();

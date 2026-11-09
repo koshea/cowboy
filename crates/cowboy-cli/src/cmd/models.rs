@@ -98,7 +98,7 @@ async fn setup() -> Result<()> {
         None => prompt_new_provider(&provider_name)?,
     };
     println!("\nChecking the endpoint model catalogue (up to 8 seconds)…");
-    let model_id = choose_model_id(&provider).await?;
+    let model_id = choose_model_id(&provider_name, &provider).await?;
     let defaults = model_defaults::lookup(&model_id);
     let model_name = prompt_required(
         &format!("Model name (saved as `{provider_name}/<name>`)"),
@@ -211,8 +211,8 @@ fn apply_setup(
     (providers, models)
 }
 
-async fn choose_model_id(provider: &Provider) -> Result<String> {
-    let entries = tokio::time::timeout(CATALOGUE_TIMEOUT, list_models(provider)).await;
+async fn choose_model_id(name: &str, provider: &Provider) -> Result<String> {
+    let entries = tokio::time::timeout(CATALOGUE_TIMEOUT, list_models(name, provider)).await;
     let mut entries = match entries {
         Ok(Ok(entries)) => entries
             .into_iter()
@@ -511,7 +511,7 @@ async fn available(all: bool) -> Result<()> {
     for (pname, p) in &providers.providers {
         let base = expand_env(&p.base_url).unwrap_or_else(|_| p.base_url.clone());
         println!("{}", style::bold(&format!("provider {pname} ({base}):")));
-        match list_models(p).await {
+        match list_models(pname, p).await {
             Ok(mut entries) => {
                 entries.sort_by(|a, b| a.id.cmp(&b.id));
                 let mut shown = 0;
