@@ -25,6 +25,12 @@ work turn by turn.
   in the background pane.
 - **Scrolling** follows the tail by exact wrapped-line counts, so the latest
   output is never cut off under the input box.
+- **`/models`** opens the model picker: type to filter, **Enter** selects, **Tab**
+  cycles solo → each crew, **←/→** cycles the highlighted model's reasoning level
+  (*as is* → *the model's own* → each level it accepts), **Esc** cancels. `/model
+  <provider/name>` switches directly, `/reasoning [<level>|default]` shows or sets the
+  session's level, and `/crew [<name>]` shows or switches the crew. See
+  [Switch model · solo vs. crew](../how-to.md#switch-model--solo-vs-crew).
 - **`/help`** lists the slash commands; **`/context`** shows how much of the model's
   window the conversation is using and what is filling it (see
   [Context management](agent-and-tools.md#context-management)), and completion

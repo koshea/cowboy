@@ -54,12 +54,18 @@ Cowboy ships no keys. This asks for a provider — an endpoint and its key — t
 model that uses it, saved as `provider/name`. Both steps are required — a provider
 with no model leaves you with an error at the first turn instead of at setup.
 
-You can configure several providers side by side (a local gateway beside a hosted
-API) with `cowboy providers add`, and use a ChatGPT subscription for OpenAI models
-with `cowboy providers add chatgpt --chatgpt` — see
-[ChatGPT sign-in](../using/chatgpt.md).
+**With a ChatGPT subscription instead of a key**, run
+`cowboy providers add chatgpt --chatgpt`. It signs you in through the browser, then
+offers to import your account's models and to add an `openai` crew built from them.
+Say yes to both and this step is done. See the
+[ChatGPT quick start](quickstart.md#quick-start-with-a-chatgpt-subscription).
 
-Credentials go to `~/.config/cowboy/providers.yaml` (mode `0600`), read host-side.
+You can configure several providers side by side (a local gateway beside a hosted
+API, or beside your ChatGPT subscription) with `cowboy providers add`.
+
+Credentials go to `~/.config/cowboy/providers.yaml` (mode `0600`), and a ChatGPT
+sign-in's tokens to `~/.config/cowboy/auth/<provider>.yaml` (also `0600`), read
+host-side.
 They are never written into your project and never bound into the sandbox, so the
 agent cannot exfiltrate a key it has no way to read.
 

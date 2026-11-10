@@ -153,7 +153,10 @@ crews:
 The levels are `minimal`, `low`, `medium`, `high`, `xhigh` and `max` (`ultra` is read
 as `max`; see [reasoning levels](../getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy)).
 A subagent routed to a slot runs at its level; a slot without one runs at its model's
-own `reasoning_effort`, whatever level its parent runs at. A session on a crew whose
+own `reasoning_effort`, whatever level its parent runs at. The child process gets
+the slot's model in `COWBOY_MODEL`, the level in `COWBOY_REASONING`, and its parent's
+crew in `COWBOY_CREW`, so it delegates in turn with the same crew. These are set by
+Cowboy for its own children; you don't set them. A session on a crew whose
 foreman names a level starts at it, and switching to that crew sets it (`/reasoning`
 changes it afterwards). A level on a [harness](#harnesses) slot is ignored, because the
 harness runs its own model.

@@ -160,7 +160,7 @@ serves it.
 cowboy providers add bifrost --base-url http://localhost:8080/v1 --api responses --no-key
                                                  # …then offers to import its models
 cowboy models import bifrost --match 'glm*'      # or later: all, a pattern, or a pick list
-cowboy models add zai/glm-4.7 --name bifrost/glm # one model by hand
+cowboy models add zai/glm-4.7 --name bifrost/glm # one model by hand (--reasoning high, …)
 cowboy providers                                 # endpoint, API, auth, models per provider
 ```
 
@@ -175,6 +175,9 @@ refuses while models or crew slots still use the provider. See
 [Configuration](getting-started/configuration.md#providers--models).
 
 ## Use your ChatGPT subscription
+
+(Setting Cowboy up for the first time? Follow the
+[ChatGPT quick start](getting-started/quickstart.md#quick-start-with-a-chatgpt-subscription).)
 
 ```sh
 cowboy providers add chatgpt --chatgpt           # opens the browser: "Continue with ChatGPT"

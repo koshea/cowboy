@@ -25,7 +25,8 @@ shared with Claude Code.
 subagent **adopt** one, pass `agent: <name>` to the `subagent` tool: its
 instructions are prepended so the worker takes on that persona. The model is
 still chosen by the [crew](crew.md) (category + effort), not the agent's
-frontmatter — Cowboy's routing stays in charge.
+frontmatter — Cowboy's routing stays in charge. So is its reasoning level: a slot's
+[`@level`](crew.md#reasoning-levels-per-slot), else the model's own.
 
 ## Subagents
 

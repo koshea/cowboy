@@ -7,11 +7,11 @@ editable config files, see [Configuration](../getting-started/configuration.md).
 
 | Path | Purpose |
 |------|---------|
-| `~/.config/cowboy/providers.yaml` | Provider endpoints, wire API (`api`), auth (`auth`) + API keys (`0600`). The agent can't reach this. |
+| `~/.config/cowboy/providers.yaml` | [Providers](../getting-started/configuration.md#providers--models): `base_url`, `api_key`, `api` (`chat_completions` \| `responses`), `auth` (`api_key` \| `chatgpt`), `headers` (`0600`). The agent can't reach this. |
 | `~/.config/cowboy/auth/<provider>.yaml` | [ChatGPT sign-in](../using/chatgpt.md) record for an `auth: chatgpt` provider: issued client id, account, OAuth tokens (`0600`). Refreshed host-side under `auth/<provider>.lock`. |
 | `~/.config/cowboy/auth/host_id` | This machine's opaque agent-host id (`urn:uuid:…`) sent at sign-in. Not a credential. |
-| `~/.config/cowboy/models.yaml` | User-level model definitions + default, grouped by provider (`provider/name`). |
-| `~/.config/cowboy/crew.yaml` | [Crews](../using/crew.md) — named rosters routing delegated work by category/effort, the `active` one, and shared delegation limits. |
+| `~/.config/cowboy/models.yaml` | User-level [model definitions](../getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy) + `default`/`summarizer`, grouped by provider (`provider/name`): id, sampling, `max_tokens`, `context_window`, `reasoning_effort`, `reasoning_levels`, prices. |
+| `~/.config/cowboy/crew.yaml` | [Crews](../using/crew.md): `crews:` (each a roster routing delegated work by category/effort to `provider/name[@level]` slots, an optional `foreman:`, `temperature`, `descriptions`, `delegation` overrides), the `active` one, and the shared `delegation` limits. |
 | `~/.config/cowboy/crew-history.jsonl` | Recorded delegation outcomes, tagged with their crew (append-only; powers `cowboy crew usage`). |
 | `~/.config/cowboy/mcp.yaml` | [MCP](../how-to.md) server definitions (host-owned; the agent can call but not edit). |
 | `~/.config/cowboy/web.yaml` | [Web UI](../using/web.md) setting + bearer token (`0600`). |
@@ -69,8 +69,8 @@ typo *silently* leaves that section at its defaults. A misspelt `netwrok_policy:
 to mean the deny rules under it did not exist, and the only symptom was a sandbox
 behaving as though it had never been configured.
 
-Two keys are retired rather than unknown, and are declared so that they can be
-handled deliberately:
+Some old keys and layouts are retired rather than unknown, and are declared so that
+they can be handled deliberately:
 
 - `container:` in `security.yaml` → **refused by name**, pointing at `sandbox:`.
   Dropping it would take every mount under it with it.
@@ -79,3 +79,22 @@ handled deliberately:
 - A single-roster `crew.yaml` (a top-level `crew:`) → **refused**, pointing at
   `cowboy models migrate`, which makes it the crew `default`. Guessing would route
   every delegation with a roster you may no longer mean.
+- A flat `models.yaml` (bare model names, a provider per model) → **refused**,
+  pointing at `cowboy models migrate`, which groups the models under their providers
+  and rewrites every reference as `provider/name`. Guessing a bare name's provider is
+  the ambiguity qualified names exist to remove.
+
+## Environment variables Cowboy sets for subagents
+
+A delegated subagent is a child `cowboy` process. Its parent passes the routing
+decision down in its environment, set host-side when the child is spawned:
+
+| Variable | Meaning |
+|---|---|
+| `COWBOY_MODEL` | The `provider/name` the crew routed the job to. |
+| `COWBOY_REASONING` | The slot's [`@level`](../using/crew.md#reasoning-levels-per-slot); unset for a slot without one, so the model's own level applies. |
+| `COWBOY_TEMPERATURE` | The crew's per-category temperature override, when it has one. |
+| `COWBOY_CREW` | The parent's crew, so a child that delegates in turn routes the same way. |
+
+They are not configuration. Setting them by hand runs a session the way a routed
+subagent would run.

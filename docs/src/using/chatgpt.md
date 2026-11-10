@@ -3,7 +3,9 @@
 Cowboy can run OpenAI models on your **ChatGPT subscription** instead of an API key,
 using OpenAI's [Sign in with ChatGPT](https://developers.openai.com/siwc/token-sharing-open-source)
 flow for open-source apps. The provider sits beside any others — a local gateway for
-open models, say — so `/model` and the [crew](crew.md) can mix them.
+open models, say — so `/model` and the [crew](crew.md) can mix them. Starting from
+nothing? The [ChatGPT quick start](../getting-started/quickstart.md#quick-start-with-a-chatgpt-subscription)
+goes from install to a first session.
 
 ```sh
 cowboy providers add chatgpt --chatgpt     # writes the provider, signs in, then offers

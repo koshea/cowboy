@@ -45,6 +45,8 @@ Then, either way:
 
 ```sh
 cowboy models setup                      # save a provider (endpoint + key) to ~/.config/cowboy
+                                         # …or: cowboy providers add chatgpt --chatgpt
+                                         #      (your ChatGPT subscription, no key)
 cd your-project
 cowboy init                              # writes .cowboy/{security,agent}.yaml
 cowboy doctor                            # kernel prerequisites, model config, daemon
@@ -95,7 +97,8 @@ review with `cowboy models list`. Upgrading from bare model names? Run
 Full documentation lives at **[cowboycode.io](https://cowboycode.io)**.
 
 Highlights: [Your first five minutes](https://cowboycode.io/getting-started/first-five-minutes.html) ·
-[Quick start](https://cowboycode.io/getting-started/quickstart.html) ·
+[Quick start](https://cowboycode.io/getting-started/quickstart.html)
+([with a ChatGPT subscription](https://cowboycode.io/getting-started/quickstart.html#quick-start-with-a-chatgpt-subscription)) ·
 [The boundary](https://cowboycode.io/security/model.html) ·
 [Network egress](https://cowboycode.io/security/network.html) ·
 [Sandbox design decisions](https://cowboycode.io/security/sandbox-decisions.html) ·
