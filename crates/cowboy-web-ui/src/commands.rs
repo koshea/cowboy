@@ -39,6 +39,11 @@ pub const HELP: &[(&str, &str, &str)] = &[
         "[provider/name]",
         "show or switch the model (from the next turn)",
     ),
+    (
+        "reasoning",
+        "[level|default]",
+        "show or set this session's reasoning level (kept across /model)",
+    ),
     ("models", "", "list the configured models"),
     (
         "budget",

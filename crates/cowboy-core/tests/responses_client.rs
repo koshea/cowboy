@@ -21,6 +21,7 @@ fn profile(base_url: String) -> ResolvedModel {
         max_tokens: 256,
         context_window: 8192,
         reasoning_effort: None,
+        reasoning_levels: Vec::new(),
         top_p: None,
         stop: Vec::new(),
         extra: BTreeMap::new(),
@@ -367,5 +368,38 @@ fn minimal_reasoning_variant_exists_until_already_minimal() {
     let c = build_client(&p).unwrap();
     assert!(c.with_minimal_reasoning().is_some());
     p.reasoning_effort = Some(cowboy_core::config::ReasoningEffort::Minimal);
+    assert!(build_client(&p).unwrap().with_minimal_reasoning().is_none());
+}
+
+/// A client that answers only when the request carries `reasoning.effort: want`.
+async fn expect_effort(server: &MockServer, want: &str) {
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .and(body_partial_json(json!({"reasoning": {"effort": want}})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(sse(&[completed(1, 1, 0)]), "text/event-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_level_the_model_does_not_accept_is_stepped_down_and_the_retry_uses_its_floor() {
+    use cowboy_core::config::ReasoningEffort as R;
+    let server = MockServer::start().await;
+    expect_effort(&server, "high").await;
+    expect_effort(&server, "low").await;
+    let mut p = profile(format!("{}/v1", server.uri()));
+    p.reasoning_levels = vec![R::Low, R::High];
+    // `xhigh` is not listed: sent as `high`.
+    p.reasoning_effort = Some(R::Xhigh);
+    let c = build_client(&p).unwrap();
+    c.chat(&[Message::user("hi")], &[], None).await.unwrap();
+    // The out-of-tokens retry asks for the lowest accepted level, not `minimal`.
+    let retry = c.with_minimal_reasoning().unwrap();
+    retry.chat(&[Message::user("hi")], &[], None).await.unwrap();
+    // Already at the floor: no lower variant.
+    p.reasoning_effort = Some(R::Low);
     assert!(build_client(&p).unwrap().with_minimal_reasoning().is_none());
 }

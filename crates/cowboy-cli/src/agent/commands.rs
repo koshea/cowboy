@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use cowboy_core::config::ReasoningEffort;
 use cowboy_core::daemonproto::ClientMsg;
 
 /// What a session command turned into.
@@ -22,6 +23,18 @@ pub enum Expansion {
     Send(Vec<ClientMsg>),
     /// Nothing to do but tell the user something (usage, a listing, an error).
     Notice(String),
+}
+
+/// The session's reasoning level, for `/reasoning`. Set by the worker whenever
+/// the model client is (re)built.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReasoningView {
+    /// What the session asks for (`None`: each model's own).
+    pub session: Option<ReasoningEffort>,
+    /// What the current model is sent (after stepping to an accepted level).
+    pub effective: Option<ReasoningEffort>,
+    /// The levels the current model accepts (empty: unknown).
+    pub accepted: Vec<ReasoningEffort>,
 }
 
 /// What the expansion needs to know about the session.
@@ -38,6 +51,7 @@ pub struct CommandCtx<'a> {
     pub crews: &'a [String],
     /// The crew this session routes with.
     pub current_crew: Option<&'a str>,
+    pub reasoning: &'a ReasoningView,
 }
 
 /// Expand `/input` (without the leading slash). `None` means it isn't a session
@@ -100,6 +114,15 @@ pub fn expand(input: &str, ctx: &CommandCtx) -> Option<Expansion> {
             })
         }
         "model" => send(vec![ClientMsg::SwitchModel(rest.to_string())]),
+        "reasoning" if rest.is_empty() => notice(reasoning_report(ctx)),
+        "reasoning" if rest == "default" => send(vec![ClientMsg::SetReasoning(None)]),
+        "reasoning" => match ReasoningEffort::parse(rest) {
+            Some(l) => send(vec![ClientMsg::SetReasoning(Some(l.as_str().to_string()))]),
+            None => notice(format!(
+                "no reasoning level {rest:?} — usage: /reasoning [{}|default]",
+                level_list(&ReasoningEffort::ALL, "|")
+            )),
+        },
         "stop" => send(vec![ClientMsg::StopSubagents]),
         "budget" => match rest {
             "on" => send(vec![ClientMsg::IterationBudget(true)]),
@@ -151,6 +174,39 @@ pub fn expand(input: &str, ctx: &CommandCtx) -> Option<Expansion> {
         other => cowboy_core::skills::load(ctx.root, other)
             .map(|skill| Expansion::Send(vec![ClientMsg::Message(skill_prompt(&skill, rest))])),
     }
+}
+
+fn level_list(levels: &[ReasoningEffort], sep: &str) -> String {
+    levels
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+/// `/reasoning`: the level the current model runs at, where it comes from, and
+/// what else it accepts.
+fn reasoning_report(ctx: &CommandCtx) -> String {
+    let v = ctx.reasoning;
+    let model = ctx.current_model.unwrap_or("the model");
+    let now = match (v.session, v.effective) {
+        (Some(want), Some(e)) if want != e => format!(
+            "{} (this session asks for {}; {model} doesn't accept it)",
+            e.as_str(),
+            want.as_str()
+        ),
+        (Some(want), _) => format!("{} (set for this session)", want.as_str()),
+        (None, Some(e)) => format!("{} ({model}'s own)", e.as_str()),
+        (None, None) => format!("{model}'s own (no level sent)"),
+    };
+    let accepts = if v.accepted.is_empty() {
+        "accepted levels unknown — any is sent as asked".to_string()
+    } else {
+        format!("{model} accepts {}", level_list(&v.accepted, ", "))
+    };
+    format!(
+        "reasoning: {now}\n{accepts}\n/reasoning <level> to change, /reasoning default to reset"
+    )
 }
 
 /// The turn `/plan <task>` runs.
@@ -412,6 +468,43 @@ pub fn crew_report(arg: Option<&str>, current: Option<&str>, crews: &[String]) -
 mod tests {
     use super::*;
 
+    static NO_REASONING: ReasoningView = ReasoningView {
+        session: None,
+        effective: None,
+        accepted: Vec::new(),
+    };
+
+    #[test]
+    fn reasoning_sets_resets_and_reports_the_level() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let mut c = ctx(tmp.path());
+        assert_eq!(
+            expand("reasoning XHigh", &c),
+            Some(Expansion::Send(vec![ClientMsg::SetReasoning(Some(
+                "xhigh".into()
+            ))]))
+        );
+        assert_eq!(
+            expand("reasoning default", &c),
+            Some(Expansion::Send(vec![ClientMsg::SetReasoning(None)]))
+        );
+        assert!(matches!(expand("reasoning hard", &c),
+            Some(Expansion::Notice(n)) if n.contains("minimal|low|medium|high|xhigh|max")));
+        // Asked for one the model doesn't take: the report says what it runs at.
+        let v = ReasoningView {
+            session: Some(ReasoningEffort::Max),
+            effective: Some(ReasoningEffort::Xhigh),
+            accepted: vec![ReasoningEffort::Low, ReasoningEffort::Xhigh],
+        };
+        c.reasoning = &v;
+        c.current_model = Some("chatgpt/sol");
+        let Some(Expansion::Notice(n)) = expand("reasoning", &c) else {
+            panic!("a report")
+        };
+        assert!(n.contains("xhigh (this session asks for max"), "{n}");
+        assert!(n.contains("chatgpt/sol accepts low, xhigh"), "{n}");
+    }
+
     fn ctx(root: &Path) -> CommandCtx<'_> {
         CommandCtx {
             root,
@@ -421,6 +514,7 @@ mod tests {
             budget: Some((true, 500)),
             crews: &[],
             current_crew: None,
+            reasoning: &NO_REASONING,
         }
     }
 
@@ -487,6 +581,7 @@ mod tests {
             budget: None,
             crews: &[],
             current_crew: None,
+            reasoning: &NO_REASONING,
         };
         assert!(
             matches!(expand("model a/nope", &c), Some(Expansion::Notice(n)) if n.contains("unknown"))

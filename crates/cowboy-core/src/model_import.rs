@@ -8,45 +8,38 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{ModelDef, ModelRef, ModelsConfig, ReasoningEffort};
+use crate::config::{clamp_reasoning, ModelDef, ModelRef, ModelsConfig, ReasoningEffort};
 use crate::model::ModelEntry;
 use crate::model_defaults;
 
-/// A catalogue's reasoning level as one of Cowboy's. Levels above `high`
-/// (`xhigh`, `max`, `ultra`) become `high`; `none`/`off` mean no hint.
+/// A catalogue's reasoning level as one of Cowboy's (`ultra` is read as `max`;
+/// `none`/`off` mean no hint).
 pub fn map_reasoning(level: &str) -> Option<ReasoningEffort> {
-    match level.trim().to_ascii_lowercase().as_str() {
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" | "xhigh" | "max" | "ultra" => Some(ReasoningEffort::High),
-        _ => None,
-    }
+    ReasoningEffort::parse(level)
 }
 
-/// Whether `effort` is a level the entry accepts (always true when the catalogue
-/// doesn't list levels).
-fn accepts(e: &ModelEntry, effort: ReasoningEffort) -> bool {
-    e.supported_reasoning.is_empty()
-        || e.supported_reasoning
-            .iter()
-            .any(|l| l.eq_ignore_ascii_case(effort.as_str()))
+/// The levels the catalogue says the entry accepts, as Cowboy levels, lowest
+/// first (empty when it doesn't say).
+pub fn accepted_levels(e: &ModelEntry) -> Vec<ReasoningEffort> {
+    let mut v: Vec<_> = e
+        .supported_reasoning
+        .iter()
+        .filter_map(|l| map_reasoning(l))
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    v
 }
 
 /// The reasoning effort to save for an entry: the catalogue's default, else the
-/// shipped one — but never a level the catalogue says the model refuses.
+/// shipped one, stepped to a level the model accepts.
 fn reasoning_for(e: &ModelEntry, shipped: Option<ReasoningEffort>) -> Option<ReasoningEffort> {
     let pick = e
         .default_reasoning
         .as_deref()
         .and_then(map_reasoning)
-        .or(shipped);
-    match pick {
-        Some(r) if accepts(e, r) => Some(r),
-        // A shipped level the model refuses: its lowest accepted level instead.
-        Some(_) => e.supported_reasoning.iter().find_map(|l| map_reasoning(l)),
-        None => None,
-    }
+        .or(shipped)?;
+    Some(clamp_reasoning(pick, &accepted_levels(e)))
 }
 
 /// A model definition for a catalogue entry.
@@ -60,6 +53,7 @@ pub fn def_from_entry(e: &ModelEntry) -> ModelDef {
         max_tokens: d.max_tokens.min(context_window / 2).max(1),
         context_window,
         reasoning_effort: reasoning_for(e, d.reasoning_effort),
+        reasoning_levels: accepted_levels(e),
         top_p: None,
         stop: Vec::new(),
         extra: Default::default(),
@@ -173,8 +167,28 @@ pub fn refresh(
                 def.max_tokens = cap;
             }
         }
-        if let Some(cur) = def.reasoning_effort.filter(|c| !accepts(e, *c)) {
-            let to = reasoning_for(e, None);
+        let levels = accepted_levels(e);
+        if !levels.is_empty() && levels != def.reasoning_levels {
+            let show = |v: &[ReasoningEffort]| {
+                if v.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    v.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(",")
+                }
+            };
+            changes.push(Change {
+                model: r.clone(),
+                field: "reasoning_levels",
+                from: show(&def.reasoning_levels),
+                to: show(&levels),
+            });
+            def.reasoning_levels = levels.clone();
+        }
+        if let Some(cur) = def
+            .reasoning_effort
+            .filter(|c| !levels.is_empty() && !levels.contains(c))
+        {
+            let to = Some(clamp_reasoning(cur, &levels));
             changes.push(Change {
                 model: r.clone(),
                 field: "reasoning_effort",
@@ -225,14 +239,29 @@ mod tests {
 
     #[test]
     fn a_level_the_model_refuses_is_never_saved() {
-        // The catalogue's default is above Cowboy's range: mapped to high.
-        let e = chatgpt("x", 1000, "xhigh", &["low", "xhigh"]);
-        // `high` itself is not listed, so the lowest accepted level is used.
+        let e = chatgpt("x", 1000, "xhigh", &["low", "xhigh", "ultra"]);
+        let d = def_from_entry(&e);
+        assert_eq!(d.reasoning_effort, Some(ReasoningEffort::Xhigh));
+        // `ultra` is read as `max`.
+        assert_eq!(
+            d.reasoning_levels,
+            [
+                ReasoningEffort::Low,
+                ReasoningEffort::Xhigh,
+                ReasoningEffort::Max
+            ]
+        );
+        // A default the model doesn't list steps down to one it does.
+        let e = chatgpt("x", 1000, "high", &["low", "xhigh"]);
         assert_eq!(
             def_from_entry(&e).reasoning_effort,
             Some(ReasoningEffort::Low)
         );
-        assert_eq!(map_reasoning("ultra"), Some(ReasoningEffort::High));
+        let e = chatgpt("x", 1000, "minimal", &["medium", "high"]);
+        assert_eq!(
+            def_from_entry(&e).reasoning_effort,
+            Some(ReasoningEffort::Medium)
+        );
         assert_eq!(map_reasoning("none"), None);
     }
 
@@ -276,7 +305,11 @@ mod tests {
         let fields: Vec<_> = changes.iter().map(|c| (c.field, c.to.as_str())).collect();
         assert_eq!(
             fields,
-            [("context_window", "500000"), ("reasoning_effort", "low")]
+            [
+                ("context_window", "500000"),
+                ("reasoning_levels", "low,medium"),
+                ("reasoning_effort", "low")
+            ]
         );
         assert_eq!(missing, [ModelRef::parse("chatgpt/old").unwrap()]);
         let sol = cfg.get(&ModelRef::parse("chatgpt/sol").unwrap()).unwrap();

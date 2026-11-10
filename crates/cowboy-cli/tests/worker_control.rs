@@ -587,6 +587,97 @@ fn crew_switch_changes_routing_and_the_foreman() {
     std::thread::sleep(Duration::from_millis(300));
 }
 
+/// `/reasoning` sets the session's level, says when the model doesn't take it, and
+/// keeps it across `/model`; a crew's foreman `@level` replaces it on a crew switch.
+#[test]
+fn reasoning_is_set_per_session_and_follows_the_foreman() {
+    let fx = setup();
+    fx.cfg
+        .child("cowboy/models.yaml")
+        .write_str(
+            "version: 1\ndefault: p/m\nmodels:\n  p:\n    m:\n      model: x\n      \
+             reasoning_levels: [low, medium, high]\n    big:\n      model: y\n",
+        )
+        .unwrap();
+    fx.cfg
+        .child("cowboy/crew.yaml")
+        .write_str(
+            "version: 1\nactive: cheap\ncrews:\n  cheap:\n    crew:\n      general: p/m\n  \
+             premium:\n    foreman: p/big@xhigh\n    crew:\n      general: p/big\n",
+        )
+        .unwrap();
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+
+    c.send(&ClientMsg::Command("reasoning high".into()));
+    assert!(wait_for_notice(&mut c, "reasoning: high for p/m"));
+    // `max` is not one p/m lists: stepped down, and said so.
+    c.send(&ClientMsg::Command("reasoning max".into()));
+    assert!(wait_for_notice(
+        &mut c,
+        "reasoning: high — p/m accepts low, medium, high, so not max"
+    ));
+    c.send(&ClientMsg::Command("reasoning".into()));
+    assert!(
+        wait_for_reply(&mut c, "this session asks for max"),
+        "the report names the level asked for and the one sent"
+    );
+    // Kept across a model switch (p/big lists no levels, so `max` is sent as is).
+    c.send(&ClientMsg::SwitchModel("p/big".into()));
+    assert!(wait_for_notice(
+        &mut c,
+        "switched to model p/big (reasoning max)"
+    ));
+    c.send(&ClientMsg::Command("reasoning default".into()));
+    assert!(wait_for_notice(&mut c, "reasoning: p/big's own"));
+    // The crew's foreman brings its own level.
+    c.send(&ClientMsg::Command("crew premium".into()));
+    assert!(wait_for_notice(
+        &mut c,
+        "switched to model p/big (reasoning xhigh)"
+    ));
+
+    c.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// A session that starts on a crew whose foreman names a level runs at it.
+#[test]
+fn a_session_starts_at_its_crew_foremans_level() {
+    let fx = setup();
+    fx.cfg
+        .child("cowboy/crew.yaml")
+        .write_str(
+            "version: 1\nactive: o\ncrews:\n  o:\n    foreman: p/m@high\n    crew:\n      \
+             general: p/m@low\n",
+        )
+        .unwrap();
+    let ws = start(&fx, None);
+    let mut c = Client::connect(&ws, Duration::from_secs(8));
+    c.send(&ClientMsg::Command("reasoning".into()));
+    assert!(wait_for_reply(
+        &mut c,
+        "reasoning: high (set for this session)"
+    ));
+    c.send(&ClientMsg::End);
+    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// Read events until a `CommandReply` containing `needle`.
+fn wait_for_reply(c: &mut Client, needle: &str) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match c.recv_outcome() {
+            Recv::Msg(m) if matches!(&*m, ServerMsg::CommandReply { text } if text.contains(needle)) => {
+                return true
+            }
+            Recv::Msg(_) | Recv::Garbage | Recv::Timeout => continue,
+            Recv::Closed => return false,
+        }
+    }
+    false
+}
+
 /// Read events until a `Notice` containing `needle` (or we run out / time out).
 fn wait_for_notice(c: &mut Client, needle: &str) -> bool {
     // Bounded by time, not by a message count: a busy machine can interleave far more

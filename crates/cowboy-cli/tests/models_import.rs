@@ -178,8 +178,21 @@ async fn the_chatgpt_preset_imports_its_models_and_adds_a_valid_crew() {
     );
     assert_eq!(
         f.crews["openai"].foreman.as_ref().unwrap().to_string(),
-        "chatgpt/gpt-6.1-sol"
+        "chatgpt/gpt-6.1-sol@medium"
     );
+    assert_eq!(
+        sol.reasoning_levels.len(),
+        3,
+        "the accepted levels are recorded"
+    );
+    let debugging = &f.crews["openai"].crew["debugging"];
+    use cowboy_core::crew::Effort;
+    assert_eq!(
+        debugging.pick(Effort::Large),
+        Some("chatgpt/gpt-6.1-sol@high")
+    );
+    // This catalogue lists no `xhigh`, so the slot is left at astra's own level.
+    assert_eq!(debugging.pick(Effort::Deep), Some("chatgpt/gpt-6-astra"));
     cowboy(&home).args(["crew", "validate"]).assert().success();
     // A second preset crew reuses the configured models instead of importing again.
     cowboy(&home)

@@ -159,7 +159,8 @@ fn migrate_ramps(
                 changed = true;
                 continue;
             }
-            if slot == DEFAULT_MODEL || ModelRef::parse(slot).is_ok() || is_harness(slot) {
+            let base = crate::config::ModelSpec::split(slot).0;
+            if base == DEFAULT_MODEL || ModelRef::parse(base).is_ok() || is_harness(base) {
                 continue;
             }
             return Err(Error::Invalid(format!(
@@ -312,6 +313,7 @@ pub fn crew_needs_migration(cfg: &CrewConfig, is_harness: impl Fn(&str) -> bool)
     cfg.crew.values().any(|ramp| {
         ramp.models()
             .into_iter()
+            .map(|m| crate::config::ModelSpec::split(m).0)
             .any(|m| m != DEFAULT_MODEL && ModelRef::parse(m).is_err() && !is_harness(m))
     })
 }

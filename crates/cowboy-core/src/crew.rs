@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::ModelSpec;
 use crate::error::{Error, Result};
 
 /// Task complexity, lowest to highest. Declaration order IS the rank (derive Ord
@@ -343,7 +344,7 @@ pub struct CrewConfig {
     pub name: String,
     /// The crew's foreman, when it names one (see [`CrewDef::foreman`]).
     #[serde(skip)]
-    pub foreman: Option<crate::config::ModelRef>,
+    pub foreman: Option<ModelSpec>,
 }
 
 /// Which roster layer produced the resolved model (for logging / display).
@@ -390,19 +391,23 @@ impl CrewConfig {
     /// model (worst case the foreman). Unknown categories fall to `general`,
     /// then to the foreman. A `<default>` slot resolves to `foreman`.
     pub fn resolve(&self, category: &str, effort: Effort, foreman: &str) -> Resolved {
-        // A ramp slot of `<default>` means "the foreman" — substitute it but
-        // keep the layer it resolved through for display.
+        // A ramp slot of `<default>` means "the foreman" — substitute it (keeping
+        // any `@level` it carries) and keep the layer it resolved through for
+        // display.
+        let is_default = |model: &str| ModelSpec::split(model).0 == DEFAULT_MODEL;
         let sub = |model: &str| -> String {
-            if model == DEFAULT_MODEL {
-                foreman.to_string()
-            } else {
-                model.to_string()
+            match ModelSpec::split(model) {
+                (DEFAULT_MODEL, Some(level)) => {
+                    format!("{}@{}", ModelSpec::split(foreman).0, level.as_str())
+                }
+                (DEFAULT_MODEL, None) => foreman.to_string(),
+                _ => model.to_string(),
             }
         };
         if let Some(ramp) = self.crew.get(category) {
             if let Some(model) = ramp.pick(effort) {
                 return Resolved {
-                    via: if model == DEFAULT_MODEL {
+                    via: if is_default(model) {
                         ResolveVia::Foreman
                     } else {
                         ResolveVia::Category
@@ -415,7 +420,7 @@ impl CrewConfig {
         if let Some(ramp) = self.crew.get(GENERAL) {
             if let Some(model) = ramp.pick(effort) {
                 return Resolved {
-                    via: if model == DEFAULT_MODEL {
+                    via: if is_default(model) {
                         ResolveVia::Foreman
                     } else {
                         ResolveVia::General
@@ -452,9 +457,12 @@ impl CrewConfig {
     }
 
     /// Validate the roster against the set of known slot names (qualified
-    /// `provider/name` models plus bare harness names).
+    /// `provider/name` models plus bare harness names). A slot's `@level` suffix
+    /// is not part of the name; whether the model accepts that level is checked
+    /// where `models.yaml` is at hand (`cowboy crew validate`, `doctor`).
     pub fn validate(&self, available: &BTreeSet<String>) -> Result<()> {
         let known = |m: &str| -> Result<()> {
+            let m = ModelSpec::split(m).0;
             // `<default>` is the foreman sentinel, not a models.yaml entry.
             if m == DEFAULT_MODEL || available.contains(m) {
                 Ok(())
@@ -513,7 +521,7 @@ pub struct CrewDef {
     /// `<default>` slots resolve to it. Unset: the foreman is whatever `/model`
     /// selects.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub foreman: Option<crate::config::ModelRef>,
+    pub foreman: Option<ModelSpec>,
     #[serde(default)]
     pub crew: BTreeMap<String, Ramp>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -1083,6 +1091,41 @@ mod tests {
         let c: CrewConfig = serde_yaml_ng::from_str("crew:\n  general: glm\n").unwrap();
         let err = c.validate(&BTreeSet::new()).unwrap_err().to_string();
         assert!(err.contains("cowboy models migrate"), "{err}");
+    }
+
+    #[test]
+    fn slots_and_the_foreman_carry_a_reasoning_level() {
+        let f = parse_file(
+            "crews:\n  o:\n    foreman: chatgpt/sol@medium\n    crew:\n      \
+             general: chatgpt/sol@high\n      deep:\n        tiny: <default>@low\n        \
+             deep: chatgpt/astra@xhigh\n      ext: codex@high\n",
+        )
+        .unwrap();
+        let c = f.resolve("o").unwrap();
+        let fm = c.foreman.clone().unwrap();
+        assert_eq!(fm.model.to_string(), "chatgpt/sol");
+        assert_eq!(fm.reasoning, Some(crate::config::ReasoningEffort::Medium));
+        // The level travels with the routed slot; `<default>@low` is the foreman's
+        // model at `low`, not the foreman's own level.
+        assert_eq!(
+            c.resolve("deep", Effort::Deep, "chatgpt/sol").model,
+            "chatgpt/astra@xhigh"
+        );
+        let r = c.resolve("deep", Effort::Tiny, "chatgpt/sol");
+        assert_eq!(
+            (r.model.as_str(), r.via),
+            ("chatgpt/sol@low", ResolveVia::Foreman)
+        );
+        // The level is not part of the name the roster is checked against.
+        let known: BTreeSet<String> = ["chatgpt/sol", "chatgpt/astra", "codex"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        c.validate(&known).unwrap();
+        assert!(!crate::models_migrate::crew_needs_migration(&c, |n| n == "codex"));
+        // A foreman written with a level round-trips.
+        let out = serde_yaml_ng::to_string(&f.crews["o"]).unwrap();
+        assert!(out.contains("foreman: chatgpt/sol@medium"), "{out}");
     }
 
     fn steps(pairs: &[(Effort, &str)]) -> Ramp {

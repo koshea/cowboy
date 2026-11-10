@@ -195,6 +195,14 @@ pub const SLASH: &[Slash] = &[
         workstream_only: false,
     },
     Slash {
+        name: "reasoning",
+        args: "[level|default]",
+        help: "show or set this session's reasoning level (kept across /model)",
+        group: Group::Setup,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
         name: "models",
         args: "",
         help: "browse the provider catalogue and add a model",

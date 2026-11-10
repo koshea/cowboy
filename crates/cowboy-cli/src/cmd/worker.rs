@@ -19,6 +19,7 @@ use cowboy_core::daemonproto::{
 use cowboy_core::model::{build_client, ModelClient};
 use tokio_util::sync::CancellationToken;
 
+use crate::agent::commands::ReasoningView;
 use crate::agent::socket_ui::SocketUi;
 use crate::agent::{AgentLoop, ModelPricing};
 use crate::cmd::daemon;
@@ -124,6 +125,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     if let Some(t) = crate::cmd::crew::temperature_override() {
         resolved.temperature = t;
     }
+    // The session's reasoning level: a routed slot's `@level`, else the crew
+    // foreman's. Kept across `/model` switches; `/reasoning` changes it.
+    crate::cmd::crew::set_session_reasoning(crate::cmd::crew::startup_reasoning());
+    crate::cmd::crew::apply_session_reasoning(&mut resolved);
     let context_window = resolved.context_window as usize;
     let model = build_client(&resolved).context("building model client")?;
     if let Some(r) = &running_model {
@@ -346,6 +351,10 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
             .map(ToString::to_string)
             .or_else(|| (!default_name.is_empty()).then_some(default_name)),
     );
+    emitter.set_reasoning(reasoning_view(
+        resolved.reasoning_effort,
+        &resolved.reasoning_levels,
+    ));
 
     // Extracted before `agent_cfg.agent` is moved into the loop.
     let project_commands = agent_cfg.commands.clone();
@@ -382,12 +391,13 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         agent = agent.with_model_fallback(
             name.to_string(),
             Box::new(move |n: &str| {
-                let r = resolve_model(
+                let mut r = resolve_model(
                     &providers,
                     user.as_ref(),
                     project.as_ref(),
                     Some(&ModelRef::parse(n)?),
                 )?;
+                crate::cmd::crew::apply_session_reasoning(&mut r);
                 let cw = r.context_window as usize;
                 let pricing = pricing_of(&r);
                 let client: Box<dyn ModelClient> = build_client(&r)?;
@@ -450,16 +460,19 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         let user = user_models.clone();
         let project = project_models.clone();
         Box::new(move |name: &str| {
-            let r = resolve_model(
+            let mut r = resolve_model(
                 &providers,
                 user.as_ref(),
                 project.as_ref(),
                 Some(&ModelRef::parse(name)?),
             )?;
-            let cw = r.context_window as usize;
-            let pricing = pricing_of(&r);
-            let client: Box<dyn ModelClient> = build_client(&r)?;
-            Ok((client, cw, pricing))
+            crate::cmd::crew::apply_session_reasoning(&mut r);
+            Ok(Built {
+                client: build_client(&r)?,
+                context_window: r.context_window as usize,
+                pricing: pricing_of(&r),
+                reasoning: reasoning_view(r.reasoning_effort, &r.reasoning_levels),
+            })
         })
     };
 
@@ -585,6 +598,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                             Some(
                                 m @ (ClientMsg::SwitchModel(_)
                                 | ClientMsg::SwitchCrew(_)
+                                | ClientMsg::SetReasoning(_)
                                 | ClientMsg::PlanMode(_)),
                             ) => {
                                 deferred.push(m);
@@ -607,6 +621,11 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                     ClientMsg::SwitchCrew(name) => {
                         if let Some(f) = switch_crew(&emitter, &name) {
                             apply_switch(&mut agent, &resolve, &emitter, &f);
+                        }
+                    }
+                    ClientMsg::SetReasoning(level) => {
+                        if set_reasoning(&emitter, level.as_deref()) {
+                            apply_reasoning(&mut agent, &resolve, &emitter);
                         }
                     }
                     ClientMsg::PlanMode(on) => agent.set_planning(on),
@@ -684,6 +703,12 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                         }
                         continue;
                     }
+                    Some(ClientMsg::SetReasoning(level)) => {
+                        if set_reasoning(&emitter, level.as_deref()) {
+                            apply_reasoning(&mut agent, &resolve, &emitter);
+                        }
+                        continue;
+                    }
                     Some(ClientMsg::PlanMode(on)) => {
                         agent.set_planning(on);
                         emitter.emit(UiEventMsg::Notice(
@@ -734,6 +759,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         emitter.set_status(SessionStatus::Running);
         let mut end = false;
         let mut switch_to: Option<String> = None;
+        // A `/reasoning` change made mid-turn: the client is rebuilt once the turn
+        // ends (like a crew's foreman), not by cancelling it.
+        let mut rebuild_reasoning = false;
         {
             let tc = CancellationToken::new();
             let turn = run_turn(&mut agent, &emitter, &root, &next, tc.clone());
@@ -890,6 +918,14 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
                                 switch_to = Some(f);
                             }
                         }
+                        Some(ClientMsg::SetReasoning(level)) => {
+                            if set_reasoning(&emitter, level.as_deref()) {
+                                rebuild_reasoning = true;
+                                emitter.emit(UiEventMsg::Notice(
+                                    "the new level applies when this turn finishes".into(),
+                                ));
+                            }
+                        }
                         // Swapping the model needs &mut agent, so finish the
                         // current turn first, then apply below.
                         Some(ClientMsg::SwitchModel(n)) => {
@@ -932,6 +968,8 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         }
         if let Some(n) = switch_to {
             apply_switch(&mut agent, &resolve, &emitter, &n);
+        } else if rebuild_reasoning {
+            apply_reasoning(&mut agent, &resolve, &emitter);
         }
         if end {
             break 'serve;
@@ -1386,10 +1424,30 @@ fn pricing_of(r: &cowboy_core::config::ResolvedModel) -> ModelPricing {
     }
 }
 
-/// Rebuilds a model client by name (host-owned creds in, built client out).
-/// Yields the client, its context window, and its USD pricing for the cost
-/// estimate.
-type Resolver = Box<dyn Fn(&str) -> Result<(Box<dyn ModelClient>, usize, ModelPricing)>>;
+/// Rebuilds a model client by name (host-owned creds in, built client out),
+/// at the session's reasoning level.
+type Resolver = Box<dyn Fn(&str) -> Result<Built>>;
+
+/// A rebuilt model client, with what the session reports about it.
+struct Built {
+    client: Box<dyn ModelClient>,
+    context_window: usize,
+    /// USD pricing for the cost estimate.
+    pricing: ModelPricing,
+    reasoning: ReasoningView,
+}
+
+/// What `/reasoning` reports for a model built at `effective`.
+fn reasoning_view(
+    effective: Option<cowboy_core::config::ReasoningEffort>,
+    accepted: &[cowboy_core::config::ReasoningEffort],
+) -> ReasoningView {
+    ReasoningView {
+        session: crate::cmd::crew::session_reasoning(),
+        effective,
+        accepted: accepted.to_vec(),
+    }
+}
 
 /// Apply a `/model` switch: re-resolve and swap the client, or report why not.
 /// `/budget on|off`: flip the loop's shared switch and say what it now means.
@@ -1422,12 +1480,15 @@ fn switch_crew(ui: &SocketUi, name: &str) -> Option<String> {
             } else {
                 " — crew mode is off, so nothing is delegated until it is on                  (`cowboy crew use` or the /model picker)"
             };
-            let foreman = c.foreman.as_ref().map(ToString::to_string);
-            ui.emit(UiEventMsg::Notice(match &foreman {
+            ui.emit(UiEventMsg::Notice(match &c.foreman {
                 Some(f) => format!("switched to crew {name} (foreman {f}){mode}"),
                 None => format!("switched to crew {name}{mode}"),
             }));
-            foreman
+            // The foreman runs at its `@level`, or its model's own without one.
+            c.foreman.map(|f| {
+                crate::cmd::crew::set_session_reasoning(f.reasoning);
+                f.model.to_string()
+            })
         }
         Ok(None) => {
             ui.emit(UiEventMsg::Notice(
@@ -1444,14 +1505,85 @@ fn switch_crew(ui: &SocketUi, name: &str) -> Option<String> {
 
 fn apply_switch(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi, name: &str) {
     match resolve(name) {
-        Ok((client, cw, pricing)) => {
-            agent.set_model(client, cw, pricing);
+        Ok(b) => {
+            agent.set_model(b.client, b.context_window, b.pricing);
             ui.set_current_model(name);
             crate::cmd::crew::set_session_foreman(name);
-            ui.emit(UiEventMsg::Notice(format!("switched to model {name}")));
+            let level = match (b.reasoning.session, b.reasoning.effective) {
+                (Some(_), Some(e)) => format!(" (reasoning {})", e.as_str()),
+                _ => String::new(),
+            };
+            ui.emit(UiEventMsg::Notice(format!(
+                "switched to model {name}{level}"
+            )));
+            ui.set_reasoning(b.reasoning);
         }
         Err(e) => ui.emit(UiEventMsg::Notice(format!("model switch failed: {e}"))),
     }
+}
+
+/// `/reasoning [level|default]`: record the session's level. Returns whether it
+/// changed anything that needs the client rebuilt (false for a name that is not
+/// a level, which is answered here).
+fn set_reasoning(ui: &SocketUi, level: Option<&str>) -> bool {
+    use cowboy_core::config::ReasoningEffort;
+    let level = match level {
+        None => None,
+        Some(s) => match ReasoningEffort::parse(s) {
+            Some(l) => Some(l),
+            None => {
+                ui.emit(UiEventMsg::Notice(format!(
+                    "no reasoning level {s:?}; levels: {}",
+                    level_names(&ReasoningEffort::ALL)
+                )));
+                return false;
+            }
+        },
+    };
+    crate::cmd::crew::set_session_reasoning(level);
+    true
+}
+
+/// Rebuild the current model at the session's reasoning level, and say what it
+/// runs at — including when the model does not accept the level asked for.
+fn apply_reasoning(agent: &mut AgentLoop<'_>, resolve: &Resolver, ui: &SocketUi) {
+    let Some(name) = crate::cmd::crew::foreman_model() else {
+        ui.emit(UiEventMsg::Notice(
+            "no model to apply the reasoning level to".into(),
+        ));
+        return;
+    };
+    match resolve(&name) {
+        Ok(b) => {
+            agent.set_model(b.client, b.context_window, b.pricing);
+            ui.emit(UiEventMsg::Notice(reasoning_notice(&name, &b.reasoning)));
+            ui.set_reasoning(b.reasoning);
+        }
+        Err(e) => ui.emit(UiEventMsg::Notice(format!("reasoning change failed: {e}"))),
+    }
+}
+
+/// The notice for a reasoning change on `model`.
+fn reasoning_notice(model: &str, v: &ReasoningView) -> String {
+    match (v.session, v.effective) {
+        (None, Some(e)) => format!("reasoning: {model}'s own level ({})", e.as_str()),
+        (None, None) => format!("reasoning: {model}'s own (no level sent)"),
+        (Some(want), Some(e)) if want != e => format!(
+            "reasoning: {} — {model} accepts {}, so not {}",
+            e.as_str(),
+            level_names(&v.accepted),
+            want.as_str()
+        ),
+        (Some(want), _) => format!("reasoning: {} for {model}", want.as_str()),
+    }
+}
+
+fn level_names(levels: &[cowboy_core::config::ReasoningEffort]) -> String {
+    levels
+        .iter()
+        .map(|l| l.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Run one turn under `tc` and emit the post-turn indicators (diff, processes,

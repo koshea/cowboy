@@ -154,6 +154,8 @@ pub enum Reasoning {
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 impl Reasoning {
@@ -166,6 +168,8 @@ impl Reasoning {
             Reasoning::Low => Some(E::Low),
             Reasoning::Medium => Some(E::Medium),
             Reasoning::High => Some(E::High),
+            Reasoning::Xhigh => Some(E::Xhigh),
+            Reasoning::Max => Some(E::Max),
         }
     }
 }

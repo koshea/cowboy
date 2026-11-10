@@ -396,6 +396,8 @@ pub struct OpenAiClient {
     temperature: f32,
     max_tokens: u32,
     reasoning_effort: Option<ReasoningEffort>,
+    /// The lowest level the model accepts; the out-of-tokens retry's level.
+    reasoning_floor: ReasoningEffort,
     top_p: Option<f32>,
     stop: Vec<String>,
     extra: BTreeMap<String, serde_json::Value>,
@@ -435,7 +437,10 @@ impl OpenAiClient {
             model: model.model.clone(),
             temperature: model.temperature,
             max_tokens: model.max_tokens,
-            reasoning_effort: model.reasoning_effort,
+            reasoning_effort: model
+                .reasoning_effort
+                .map(|r| crate::config::clamp_reasoning(r, &model.reasoning_levels)),
+            reasoning_floor: crate::config::lowest_reasoning(&model.reasoning_levels),
             top_p: model.top_p,
             stop: model.stop.clone(),
             extra: model.extra.clone(),
@@ -936,7 +941,9 @@ impl ModelClient for OpenAiClient {
         self.max_tokens as usize
     }
 
-    /// Same endpoint and budget, `reasoning_effort: minimal`.
+    /// Same endpoint and budget, at the lowest reasoning level the model accepts
+    /// (`minimal` when its levels are unknown — a model that lists them may refuse
+    /// `minimal` outright, which would turn the retry into an error).
     ///
     /// Deliberately unconditional rather than only when an effort is already
     /// configured: a model that truncated while thinking is *doing* extended
@@ -944,11 +951,11 @@ impl ModelClient for OpenAiClient {
     /// sending. Providers that do not understand it ignore it, which leaves the
     /// retry no worse off than repeating the same request.
     fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
-        if self.reasoning_effort == Some(ReasoningEffort::Minimal) {
+        if self.reasoning_effort == Some(self.reasoning_floor) {
             return None; // already as low as it goes
         }
         let mut c = self.clone();
-        c.reasoning_effort = Some(ReasoningEffort::Minimal);
+        c.reasoning_effort = Some(self.reasoning_floor);
         Some(Box::new(c))
     }
 

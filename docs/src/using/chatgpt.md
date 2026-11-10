@@ -12,12 +12,13 @@ cowboy models import chatgpt               # later: your account's models
 cowboy crew new openai --preset chatgpt    # later: the built-in all-OpenAI crew
 ```
 
-The import reads each model's context window and reasoning levels from your
-account's catalogue. The preset crew is described in
+The import reads each model's context window, default reasoning level and accepted
+levels (`reasoning_levels`) from your account's catalogue, so `/reasoning` and a crew
+slot's `@level` are stepped to a level the model takes. The preset crew is described in
 [How-to](../how-to.md#the-built-in-chatgpt-crew).
 
 Then use it like any model: `/model chatgpt/gpt-6.1-sol` in a session, `cowboy models
-use -g chatgpt/gpt-6.1-sol` as the default, a crew slot (`deep: chatgpt/gpt-6.1-sol`),
+use -g chatgpt/gpt-6.1-sol` as the default, a crew slot (`deep: chatgpt/gpt-6.1-sol@high`),
 or a crew's `foreman:` — so switching to, say, an all-OpenAI crew with `/crew openai`
 runs the session on your subscription. See [Several crews](crew.md#several-crews).
 

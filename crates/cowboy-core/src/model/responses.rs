@@ -255,6 +255,8 @@ pub struct ResponsesClient {
     auth: Arc<dyn TokenSource>,
     failures: Arc<dyn FailurePolicy>,
     opts: RequestOptions,
+    /// The lowest level the model accepts; the out-of-tokens retry's level.
+    reasoning_floor: ReasoningEffort,
     stream_idle: Duration,
 }
 
@@ -271,6 +273,9 @@ impl ResponsesClient {
             .default_headers(header_map(&model.headers))
             .build()
             .map_err(oa_err)?;
+        let reasoning_effort = model
+            .reasoning_effort
+            .map(|r| crate::config::clamp_reasoning(r, &model.reasoning_levels));
         Ok(Self {
             http,
             url: format!("{}/responses", model.base_url.trim_end_matches('/')),
@@ -280,7 +285,7 @@ impl ResponsesClient {
                 model: model.model.clone(),
                 temperature: model.temperature,
                 max_tokens: model.max_tokens,
-                reasoning_effort: model.reasoning_effort,
+                reasoning_effort,
                 top_p: model.top_p,
                 extra: model.extra.clone(),
                 strict,
@@ -289,9 +294,10 @@ impl ResponsesClient {
                 } else {
                     ToolLayout::TopLevel
                 },
-                include_reasoning: strict || model.reasoning_effort.is_some(),
+                include_reasoning: strict || reasoning_effort.is_some(),
                 origin: format!("{}#{}", model.base_url.trim_end_matches('/'), model.model),
             },
+            reasoning_floor: crate::config::lowest_reasoning(&model.reasoning_levels),
             stream_idle: model
                 .stream_idle_timeout_seconds
                 .map(Duration::from_secs)
@@ -412,13 +418,14 @@ impl ModelClient for ResponsesClient {
         self.opts.max_tokens as usize
     }
 
-    /// Same endpoint and budget, `reasoning.effort: minimal` — see the trait.
+    /// Same endpoint and budget, at the lowest level the model accepts — see the
+    /// trait.
     fn with_minimal_reasoning(&self) -> Option<Box<dyn ModelClient>> {
-        if self.opts.reasoning_effort == Some(ReasoningEffort::Minimal) {
+        if self.opts.reasoning_effort == Some(self.reasoning_floor) {
             return None;
         }
         let mut c = self.clone();
-        c.opts.reasoning_effort = Some(ReasoningEffort::Minimal);
+        c.opts.reasoning_effort = Some(self.reasoning_floor);
         Some(Box::new(c))
     }
 

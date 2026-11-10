@@ -152,6 +152,7 @@ async fn setup() -> Result<()> {
             max_tokens,
             context_window,
             reasoning_effort,
+            reasoning_levels: Vec::new(),
             top_p: None,
             stop: Vec::new(),
             extra: BTreeMap::new(),
@@ -589,6 +590,7 @@ fn add(a: AddArgs) -> Result<()> {
         max_tokens: a.max_output.unwrap_or(d.max_tokens),
         context_window: a.context.unwrap_or(d.context_window),
         reasoning_effort,
+        reasoning_levels: Vec::new(),
         top_p: None,
         stop: Vec::new(),
         extra: BTreeMap::new(),
@@ -620,14 +622,15 @@ fn add(a: AddArgs) -> Result<()> {
 }
 
 fn parse_reasoning(s: &str) -> Result<Option<ReasoningEffort>> {
-    Ok(match s.to_lowercase().as_str() {
-        "none" | "off" | "" => None,
-        "minimal" => Some(ReasoningEffort::Minimal),
-        "low" => Some(ReasoningEffort::Low),
-        "medium" => Some(ReasoningEffort::Medium),
-        "high" => Some(ReasoningEffort::High),
-        other => bail!("invalid reasoning effort {other:?} (none|minimal|low|medium|high)"),
-    })
+    match s.trim().to_lowercase().as_str() {
+        "none" | "off" | "" => Ok(None),
+        other => match ReasoningEffort::parse(other) {
+            Some(r) => Ok(Some(r)),
+            None => {
+                bail!("invalid reasoning effort {other:?} (none|minimal|low|medium|high|xhigh|max)")
+            }
+        },
+    }
 }
 
 /// Default provider when one isn't named: the only one, else `default`, else err.
@@ -649,19 +652,34 @@ fn sole_provider(providers: &ProvidersConfig) -> Result<String> {
     }
 }
 
-/// Write a model to the user config as `provider/name` (used by the TUI `/models`
-/// form, which knows which provider's catalogue the model came from), and make it
-/// the default if it's the first model. `reasoning` is
-/// `none|minimal|low|medium|high`. Returns the saved reference.
-pub fn save_user_model(
-    provider: &str,
-    name: &str,
-    id: &str,
-    temperature: f32,
-    context_window: u32,
-    max_output: u32,
-    reasoning: &str,
-) -> Result<ModelRef> {
+/// A model from the TUI `/models` form, which knows which provider's catalogue
+/// it came from.
+pub struct FormModel<'a> {
+    pub provider: &'a str,
+    pub name: &'a str,
+    pub id: &'a str,
+    pub temperature: f32,
+    pub context_window: u32,
+    pub max_output: u32,
+    /// `none` or a level name.
+    pub reasoning: &'a str,
+    /// The levels the catalogue says the model accepts.
+    pub levels: &'a [ReasoningEffort],
+}
+
+/// Write a model to the user config as `provider/name`, and make it the default
+/// if it's the first model. Returns the saved reference.
+pub fn save_user_model(m: FormModel) -> Result<ModelRef> {
+    let FormModel {
+        provider,
+        name,
+        id,
+        temperature,
+        context_window,
+        max_output,
+        reasoning,
+        levels,
+    } = m;
     let providers = ProvidersConfig::load_global()?;
     if !providers.providers.contains_key(provider) {
         bail!("unknown provider `{provider}`; see `cowboy providers list`");
@@ -674,6 +692,7 @@ pub fn save_user_model(
         max_tokens: max_output,
         context_window,
         reasoning_effort: parse_reasoning(reasoning)?,
+        reasoning_levels: levels.to_vec(),
         top_p: None,
         stop: Vec::new(),
         extra: BTreeMap::new(),
@@ -734,6 +753,7 @@ mod tests {
             max_tokens: 8_192,
             context_window: 200_000,
             reasoning_effort: None,
+            reasoning_levels: Vec::new(),
             top_p: None,
             stop: Vec::new(),
             extra: BTreeMap::new(),

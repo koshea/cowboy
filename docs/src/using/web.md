@@ -46,7 +46,7 @@ and start time, refreshed every few seconds. Tap one to:
   **Later** queues it to run afterwards instead, and the `⏭ N queued` bar lists and
   clears the queue. On a phone, Enter is a newline and the Send button sends;
 - use the same **slash commands as the TUI** — `/plan`, `/go`, `/after`,
-  `/queue clear`, `/model <provider/name>`, `/stop`, `/accept`, `/ranch`, skills
+  `/queue clear`, `/model <provider/name>`, `/reasoning [<level>]`, `/stop`, `/accept`, `/ranch`, skills
   (`/<name> args`), `/diff`, `/mcp`, `/boundary`, `/crew [<name>]`, `/context`,
   `/jobs`, `/copy`, `/fold`,
   `/clear`; `/help` lists them. They're expanded by the session's worker, so they

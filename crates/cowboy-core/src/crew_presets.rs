@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::config::ModelRef;
+use crate::config::{ModelRef, ModelSpec, ReasoningEffort};
 use crate::crew::{CrewDef, Effort, Ramp};
 use crate::model::ModelEntry;
 
@@ -70,47 +70,103 @@ pub fn chatgpt_models(
     Some((out, notes))
 }
 
-/// The ChatGPT crew's shape over four model references (one per family): fast
-/// work on luna stepping up through terra (the Codex model) and sol (workhorse,
-/// and the foreman) to astra (frontier) for the hardest; debugging, e2e and review
-/// start stronger.
-pub fn chatgpt_crew(refs: &BTreeMap<&'static str, ModelRef>) -> CrewDef {
-    let m = |f: &str| refs[f].to_string();
-    let ramp =
-        |steps: &[(Effort, &str)]| Ramp::Steps(steps.iter().map(|(e, f)| (*e, m(f))).collect());
+/// One family's model for the preset: its reference and the levels it accepts.
+#[derive(Debug, Clone)]
+pub struct Member {
+    pub model: ModelRef,
+    pub levels: Vec<ReasoningEffort>,
+}
+
+/// The ChatGPT crew's shape over one model per family: fast work on luna
+/// stepping up through terra (the Codex model) and sol (workhorse, and the
+/// foreman at `medium`) to astra (frontier) for the hardest. Sol thinks at
+/// `medium` for medium work and `high` above it; astra at `high`, and `xhigh`
+/// where the work is hardest (debugging, review). Debugging, e2e and review
+/// start stronger. A level a model doesn't list is left off, so the model's
+/// own default applies.
+pub fn chatgpt_crew(members: &BTreeMap<&'static str, Member>) -> CrewDef {
+    use ReasoningEffort as R;
+    let spec = |f: &str, level: Option<ReasoningEffort>| -> ModelSpec {
+        let m = &members[f];
+        ModelSpec {
+            model: m.model.clone(),
+            reasoning: level.filter(|l| m.levels.contains(l)),
+        }
+    };
+    let ramp = |steps: &[(Effort, &str, Option<ReasoningEffort>)]| {
+        Ramp::Steps(
+            steps
+                .iter()
+                .map(|(e, f, l)| (*e, spec(f, *l).to_string()))
+                .collect(),
+        )
+    };
     use Effort::*;
-    let light = ramp(&[(Tiny, "luna"), (Large, "terra"), (Deep, "sol")]);
-    let build = ramp(&[
-        (Tiny, "luna"),
-        (Small, "terra"),
-        (Medium, "sol"),
-        (Deep, "astra"),
-    ]);
-    let strong = ramp(&[(Tiny, "terra"), (Small, "sol"), (Deep, "astra")]);
     let mut crew = BTreeMap::new();
-    crew.insert("exploration".to_string(), light);
+    crew.insert(
+        "exploration".to_string(),
+        ramp(&[
+            (Tiny, "luna", None),
+            (Large, "terra", None),
+            (Deep, "sol", Some(R::Medium)),
+        ]),
+    );
     crew.insert(
         "docs".to_string(),
-        ramp(&[(Tiny, "luna"), (Medium, "terra"), (Deep, "sol")]),
+        ramp(&[
+            (Tiny, "luna", None),
+            (Medium, "terra", None),
+            (Deep, "sol", Some(R::Medium)),
+        ]),
     );
     crew.insert(
         "tests".to_string(),
-        ramp(&[(Tiny, "luna"), (Small, "terra"), (Large, "sol")]),
+        ramp(&[
+            (Tiny, "luna", None),
+            (Small, "terra", None),
+            (Medium, "sol", Some(R::Medium)),
+            (Large, "sol", Some(R::High)),
+        ]),
     );
+    let build = ramp(&[
+        (Tiny, "luna", None),
+        (Small, "terra", None),
+        (Medium, "sol", Some(R::Medium)),
+        (Large, "sol", Some(R::High)),
+        (Deep, "astra", Some(R::High)),
+    ]);
     for c in ["backend", "frontend", "refactor", "general"] {
         crew.insert(c.to_string(), build.clone());
     }
-    crew.insert("debugging".to_string(), strong.clone());
+    crew.insert(
+        "debugging".to_string(),
+        ramp(&[
+            (Tiny, "terra", None),
+            (Small, "sol", Some(R::Medium)),
+            (Large, "sol", Some(R::High)),
+            (Deep, "astra", Some(R::Xhigh)),
+        ]),
+    );
     crew.insert(
         "e2e".to_string(),
-        ramp(&[(Tiny, "terra"), (Medium, "sol"), (Deep, "astra")]),
+        ramp(&[
+            (Tiny, "terra", None),
+            (Medium, "sol", Some(R::Medium)),
+            (Large, "sol", Some(R::High)),
+            (Deep, "astra", Some(R::High)),
+        ]),
     );
     crew.insert(
         "review".to_string(),
-        ramp(&[(Tiny, "terra"), (Small, "sol"), (Large, "astra")]),
+        ramp(&[
+            (Tiny, "terra", None),
+            (Small, "sol", Some(R::Medium)),
+            (Large, "astra", Some(R::High)),
+            (Deep, "astra", Some(R::Xhigh)),
+        ]),
     );
     CrewDef {
-        foreman: Some(refs["sol"].clone()),
+        foreman: Some(spec("sol", Some(R::Medium))),
         crew,
         ..CrewDef::default()
     }
@@ -160,15 +216,30 @@ mod tests {
 
     #[test]
     fn the_crew_routes_every_category_and_leads_with_sol() {
-        let refs: BTreeMap<&'static str, ModelRef> = FAMILIES
+        use ReasoningEffort::*;
+        let members: BTreeMap<&'static str, Member> = FAMILIES
             .iter()
-            .map(|f| (*f, ModelRef::new("chatgpt", format!("gpt-{f}")).unwrap()))
+            .map(|f| {
+                let model = ModelRef::new("chatgpt", format!("gpt-{f}")).unwrap();
+                // luna lists no `xhigh`-or-above; astra lists no `xhigh`.
+                let levels = match *f {
+                    "astra" => vec![Low, Medium, High, Max],
+                    _ => vec![Low, Medium, High, Xhigh],
+                };
+                (*f, Member { model, levels })
+            })
             .collect();
-        let def = chatgpt_crew(&refs);
-        assert_eq!(def.foreman.unwrap().to_string(), "chatgpt/gpt-sol");
+        let def = chatgpt_crew(&members);
+        assert_eq!(def.foreman.unwrap().to_string(), "chatgpt/gpt-sol@medium");
         assert!(def.crew.contains_key("general"));
         let review = &def.crew["review"];
+        assert_eq!(review.pick(Effort::Large), Some("chatgpt/gpt-astra@high"));
+        // astra doesn't list `xhigh`: the suffix is dropped, not sent to be refused.
         assert_eq!(review.pick(Effort::Deep), Some("chatgpt/gpt-astra"));
+        assert_eq!(
+            def.crew["general"].pick(Effort::Medium),
+            Some("chatgpt/gpt-sol@medium")
+        );
         assert_eq!(
             def.crew["exploration"].pick(Effort::Tiny),
             Some("chatgpt/gpt-luna")

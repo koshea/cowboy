@@ -245,10 +245,11 @@ skipped, and so are models already configured on that provider. Values come from
 |---|---|
 | `context_window` | the catalogue, when it reports one; else Cowboy's shipped table |
 | `reasoning_effort` | the catalogue's default level, else the shipped table — never a level the catalogue says the model refuses |
+| `reasoning_levels` | the levels the catalogue says the model accepts (the ChatGPT catalogue lists them; most gateways don't) |
 | `max_tokens`, `temperature`, prices | the shipped table (`max_tokens` capped at half the window) |
 
-`refresh` changes only the context window, and the reasoning level when yours is one
-the model refuses. Prices, temperature and output caps are yours and stay. Models a
+`refresh` changes only the context window, the accepted levels, and the reasoning
+level when yours is one the model refuses. Prices, temperature and output caps are yours and stay. Models a
 catalogue no longer lists are reported, not removed. `providers add`, `models setup`
 and a ChatGPT sign-in all end by offering an import.
 
@@ -307,7 +308,20 @@ models:
       output_cost_per_mtok: 15.0
       cached_input_cost_per_mtok: 0.30  # optional: prompt-cache hit price (see below)
       anthropic_cache: true      # optional: see below
+      reasoning_effort: medium   # optional: the level sent (unset: none sent)
+      reasoning_levels: [low, medium, high]   # optional: the levels the model accepts
 ```
+
+**Reasoning levels.** `reasoning_effort` is one of `minimal`, `low`, `medium`,
+`high`, `xhigh` and `max`; leave it out and no level is sent, so the provider's
+default applies. OpenAI's catalogue also lists `ultra`, which it describes as
+reasoning with automatic task delegation. That overlaps the
+[crew](../using/crew.md), so Cowboy reads `ultra` as `max`. When `reasoning_levels`
+is set (an import records it), every level asked for — this setting, a session's
+`/reasoning`, or a crew slot's `@level` — is stepped to one the model accepts: down
+to the highest accepted level below it, or up to the lowest when it is below them
+all. Without the list, a level is sent as asked. A session can change its level with
+`/reasoning` (see [Everyday use](../how-to.md#reasoning-levels)).
 
 Provider and model names may not contain `/`; the provider-side `model:` id can.
 
@@ -345,14 +359,16 @@ request fail at the provider.
 summarization — folding old history into a summary when the context window fills,
 and **truncation recovery**. When a reasoning model spends its whole `max_tokens`
 budget thinking and emits no answer or tool call, Cowboy warns that the output limit
-may be too low and retries the turn asking it to answer now, with minimal reasoning
-effort requested from the provider; if the cut-off reasoning came back, it is first
-distilled into conclusions-so-far to build on. Bounded, so a model that always
+may be too low and retries the turn asking it to answer now, at the lowest reasoning
+level the model accepts (`minimal` when `reasoning_levels` doesn't say); if the
+cut-off reasoning came back, it is first distilled into conclusions-so-far to build
+on. Bounded, so a model that always
 truncates can't spin — see [the agent loop](../using/agent-and-tools.md). Point
 `summarizer` at a small/cheap model to make these auxiliary calls faster and cheaper;
-when unset, the session's main model is used. These calls always request minimal
-reasoning: summarizing is mechanical, and a model that just truncated while thinking
-would otherwise do the same on the summary and come back empty.
+when unset, the session's main model is used. These calls always request the lowest
+reasoning level the model accepts: summarizing is mechanical, and a model that just
+truncated while thinking would otherwise do the same on the summary and come back
+empty.
 
 **Cost display.** Cowboy asks the provider for per-request token usage
 (`stream_options.include_usage`) and, when the stream carries it, bills the

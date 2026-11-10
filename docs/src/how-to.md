@@ -123,13 +123,33 @@ Reading an inbox is the one destructive default, because an inbox is a queue.
 - `/model` — show the current model and the available list.
 - `/model <provider/name>` — switch for the next turn (this session only).
 - `/models` — open the picker: type to filter, **Enter** to select, **Tab** to
-  cycle **solo → each crew** for the highlighted model, **Esc** to cancel.
+  cycle **solo → each crew** for the highlighted model, **←/→** to pick its
+  [reasoning level](#reasoning-levels), **Esc** to cancel.
 - `cowboy models use <provider/name> [--global]` — make a model the persistent default
   (a `/model` switch only lasts the session).
 
 **Solo** = one model does everything. **A crew** = your model is the *foreman* and
 delegates sub-tasks to specialists; see `/crew` for the routing table, and
 `/crew <name>` to switch this session to another [crew](using/crew.md#several-crews).
+
+### Reasoning levels
+
+- `/reasoning` — the level the current model runs at, where it comes from, and the
+  levels the model accepts.
+- `/reasoning <level>` — set it for this session: `minimal`, `low`, `medium`, `high`,
+  `xhigh` or `max`. It is kept across `/model` switches. A model that doesn't accept
+  the level gets the nearest one it does, and the notice says which.
+- `/reasoning default` — go back to each model's own level (its `reasoning_effort`).
+
+In the `/models` picker, **←/→** cycles the highlighted model's level: *as is* (leave
+the session's level alone), *the model's own*, then each level the model accepts.
+Moving the highlight resets it. Both clients have `/reasoning`; the picker is
+TUI-only, as `/models` is. A change made while a turn runs applies when the turn
+finishes. Switching to a crew whose `foreman:` names a level
+([`@level`](using/crew.md#reasoning-levels-per-slot)) sets the session to it; a
+foreman without one returns the session to the model's own level. To change a model's
+level for good, set `reasoning_effort` in
+[`models.yaml`](getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy).
 
 ## Add a second provider
 
@@ -179,7 +199,10 @@ and what plan usage supports: [ChatGPT sign-in](using/chatgpt.md).
 `--preset chatgpt` fills a fixed shape with the newest model of each family your
 account lists: **luna** (fast) for small work, **terra** (the Codex model) for the
 middle, **sol** (the workhorse) as the foreman and for larger work, and **astra**
-(frontier) for the hardest. Debugging, e2e and review start a step stronger. It
+(frontier) for the hardest. Debugging, e2e and review start a step stronger. Sol
+leads at `medium` and thinks at `high` for large and deep work; astra runs at `high`,
+and at `xhigh` for the deepest debugging and review. A level a model doesn't list
+is left off, so it runs at its own. It
 picks by family rather than by fixed model ids, so it keeps working when OpenAI
 ships a new generation. When your account lacks a family, the nearest stronger one
 stands in (then the nearest weaker), and Cowboy says so. Models it needs that you

@@ -1113,6 +1113,7 @@ fn event_loop(
                             selected: 0,
                             crews,
                             mode,
+                            reasoning: None,
                         });
                         app.mode = Mode::ModelPicker;
                     }
@@ -2164,7 +2165,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         "boundary" => boundary_command(app, &ctx.session.root),
         // Expanded by the worker (shared with the web client); its reply comes back
         // as a notice.
-        "budget" => {
+        "budget" | "reasoning" => {
             if let Some(tx) = ctx.task_tx.as_ref() {
                 let _ = tx.send(AgentCmd::Command(input.to_string()));
             }
@@ -2307,25 +2308,32 @@ fn model_choices(
             .map(|d| (r.provider.clone(), d.model.clone()))
     });
 
-    let choice =
-        |provider: &str, id: &str, configured_name: Option<String>, label: Option<String>| {
-            let d = model_defaults::lookup(id);
-            let key = (provider.to_string(), id.to_string());
-            let suggested = label.clone().unwrap_or_else(|| d.name.clone());
-            ModelChoice {
-                provider: provider.to_string(),
-                label: configured_name.clone().unwrap_or_else(|| suggested.clone()),
-                configured: configured_name.is_some(),
-                current: current_key.as_ref() == Some(&key),
-                configured_name,
-                suggested_name: suggested.trim().replace('/', "-"),
-                context_window: d.context_window,
-                max_tokens: d.max_tokens,
-                temperature: d.temperature,
-                reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
-                id: id.to_string(),
-            }
-        };
+    let level_names = |l: &[cowboy_core::config::ReasoningEffort]| -> Vec<String> {
+        l.iter().map(|l| l.as_str().to_string()).collect()
+    };
+    let choice = |provider: &str,
+                  id: &str,
+                  configured_name: Option<String>,
+                  label: Option<String>,
+                  levels: Vec<String>| {
+        let d = model_defaults::lookup(id);
+        let key = (provider.to_string(), id.to_string());
+        let suggested = label.clone().unwrap_or_else(|| d.name.clone());
+        ModelChoice {
+            provider: provider.to_string(),
+            label: configured_name.clone().unwrap_or_else(|| suggested.clone()),
+            configured: configured_name.is_some(),
+            current: current_key.as_ref() == Some(&key),
+            configured_name,
+            suggested_name: suggested.trim().replace('/', "-"),
+            context_window: d.context_window,
+            max_tokens: d.max_tokens,
+            temperature: d.temperature,
+            reasoning: d.reasoning_effort.map(|r| r.as_str().to_string()),
+            levels,
+            id: id.to_string(),
+        }
+    };
 
     let mut seen = std::collections::BTreeSet::new();
     let mut out: Vec<ModelChoice> = Vec::new();
@@ -2343,8 +2351,22 @@ fn model_choices(
             if !model_defaults::is_chat(&e.id) || !seen.insert(key.clone()) {
                 continue;
             }
-            let name = configured.get(&key).map(ToString::to_string);
-            out.push(choice(&pname, &e.id, name, e.label.clone()));
+            let configured_ref = configured.get(&key);
+            // What the catalogue lists now, else what was recorded at import.
+            let mut levels = cowboy_core::model_import::accepted_levels(&e);
+            if levels.is_empty() {
+                if let Some(d) = configured_ref.and_then(|r| merged.get(r)) {
+                    levels = d.reasoning_levels.clone();
+                }
+            }
+            let name = configured_ref.map(ToString::to_string);
+            out.push(choice(
+                &pname,
+                &e.id,
+                name,
+                e.label.clone(),
+                level_names(&levels),
+            ));
         }
     }
     if out.is_empty() && !failures.is_empty() && merged.is_empty() {
@@ -2355,7 +2377,13 @@ fn model_choices(
     // that could not be reached). Include them so they're always selectable.
     for (r, def) in merged {
         if seen.insert((r.provider.clone(), def.model.clone())) {
-            out.push(choice(&r.provider, &def.model, Some(r.to_string()), None));
+            out.push(choice(
+                &r.provider,
+                &def.model,
+                Some(r.to_string()),
+                None,
+                level_names(&def.reasoning_levels),
+            ));
         }
     }
     // Current first, then configured, then by provider and label.
@@ -2383,6 +2411,9 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
         KeyCode::Down => p.move_sel(1),
         // Tab cycles solo → each crew for the selection.
         KeyCode::Tab => p.next_mode(),
+        // ←/→ pick the highlighted model's reasoning level.
+        KeyCode::Left => p.cycle_reasoning(-1),
+        KeyCode::Right => p.cycle_reasoning(1),
         KeyCode::Backspace => {
             p.filter.pop();
             p.clamp();
@@ -2395,6 +2426,7 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
             // it for new sessions, and switch this session's crew *before* the model
             // so an explicitly picked model wins over the crew's own foreman.
             let picked_crew = p.crew().map(str::to_string);
+            let picked_level = p.reasoning_choice();
             let mode_word = match &picked_crew {
                 Some(c) => {
                     let switched = match crate::cmd::crew::set_active_crew(c) {
@@ -2425,14 +2457,34 @@ fn handle_picker_key(key: KeyEvent, app: &mut App, ctx: &mut KeyCtx) {
                 }
                 if let Some(tx) = ctx.task_tx.as_ref() {
                     let _ = tx.send(AgentCmd::SwitchModel(name.clone()));
+                    // After the model (and the crew, whose foreman sets a level of
+                    // its own), so the level picked here is the one that sticks.
+                    if let Some(level) = &picked_level {
+                        let _ = tx.send(AgentCmd::Command(format!("reasoning {level}")));
+                    }
                 }
                 ctx.session.current_model = name.clone();
-                app.push(LineKind::Notice, format!("model → {name} ({mode_word})"));
+                let level_word = match &picked_level {
+                    Some(l) => format!(", reasoning {l}"),
+                    None => String::new(),
+                };
+                app.push(
+                    LineKind::Notice,
+                    format!("model → {name} ({mode_word}{level_word})"),
+                );
                 app.model_picker = None;
                 app.mode = ctx.mode_before_overlay.clone();
             } else {
-                // New model: open the config form prefilled from defaults.
-                app.model_form = Some(ModelForm::from_choice(&choice));
+                // New model: open the config form prefilled from defaults — and
+                // with the level picked here as the one it is saved with.
+                let mut form = ModelForm::from_choice(&choice);
+                if let Some(i) = picked_level
+                    .as_deref()
+                    .and_then(|l| REASONING_OPTS.iter().position(|o| *o == l))
+                {
+                    form.reasoning_idx = i;
+                }
+                app.model_form = Some(form);
                 app.model_picker = None;
                 app.mode = Mode::ModelForm;
             }
@@ -2515,11 +2567,23 @@ fn save_model_form(app: &mut App, ctx: &mut KeyCtx) {
     };
     let reasoning = form.reasoning().to_string();
     let id = form.id.clone();
+    let levels: Vec<_> = form
+        .levels
+        .iter()
+        .filter_map(|l| cowboy_core::config::ReasoningEffort::parse(l))
+        .collect();
 
     let provider = form.provider.clone();
-    match crate::cmd::models::save_user_model(
-        &provider, &name, &id, temp, context, max_output, &reasoning,
-    ) {
+    match crate::cmd::models::save_user_model(crate::cmd::models::FormModel {
+        provider: &provider,
+        name: &name,
+        id: &id,
+        temperature: temp,
+        context_window: context,
+        max_output,
+        reasoning: &reasoning,
+        levels: &levels,
+    }) {
         Ok(saved) => {
             let name = saved.to_string();
             if let Some(tx) = ctx.task_tx.as_ref() {

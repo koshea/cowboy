@@ -22,6 +22,7 @@ fn profile(base_url: String) -> ResolvedModel {
         max_tokens: 256,
         context_window: 8192,
         reasoning_effort: None,
+        reasoning_levels: Vec::new(),
         top_p: None,
         stop: Vec::new(),
         extra: BTreeMap::new(),
@@ -209,6 +210,36 @@ async fn sends_reasoning_effort_top_p_and_extra() {
         .await
         .unwrap();
     assert_eq!(resp.content.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn the_retry_level_is_the_lowest_the_model_accepts() {
+    let server = MockServer::start().await;
+    for want in ["medium", "low"] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({ "reasoning_effort": want }),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(sse(&[content_chunk("ok")]), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+    }
+    let mut p = profile(format!("{}/v1", server.uri()));
+    p.reasoning_levels = vec![ReasoningEffort::Low, ReasoningEffort::Medium];
+    // `max` is not listed: stepped down to `medium`.
+    p.reasoning_effort = Some(ReasoningEffort::Max);
+    let client = OpenAiClient::from_resolved(&p).unwrap();
+    client
+        .chat(&[Message::user("hi")], &[], None)
+        .await
+        .unwrap();
+    let retry = client.with_minimal_reasoning().unwrap();
+    retry.chat(&[Message::user("hi")], &[], None).await.unwrap();
+    assert!(retry.with_minimal_reasoning().is_none());
 }
 
 #[tokio::test]

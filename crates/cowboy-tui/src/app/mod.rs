@@ -155,7 +155,7 @@ pub enum Mode {
 }
 
 /// Reasoning-effort choices offered in the model form (index order).
-pub const REASONING_OPTS: [&str; 5] = ["none", "minimal", "low", "medium", "high"];
+pub const REASONING_OPTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// One model offered in the `/models` picker. Carries both the existing config
 /// (if any) and the shipped defaults used to prefill a new model's form.
@@ -179,6 +179,8 @@ pub struct ModelChoice {
     pub temperature: f32,
     /// Reasoning effort label ("low"/"medium"/"high"/"minimal"), or None.
     pub reasoning: Option<String>,
+    /// The reasoning levels the model accepts, lowest first (empty: unknown).
+    pub levels: Vec<String>,
 }
 
 /// Scrollable model-catalogue picker state.
@@ -192,6 +194,10 @@ pub struct ModelPicker {
     pub crews: Vec<String>,
     /// Index into `crews`.
     pub mode: usize,
+    /// The reasoning level picked for the highlighted model with ←/→: `None`
+    /// leaves the session's level as it is, else an index into
+    /// [`ModelPicker::level_choices`]. Reset whenever the highlight moves.
+    pub reasoning: Option<usize>,
 }
 
 impl ModelPicker {
@@ -213,6 +219,37 @@ impl ModelPicker {
         (self.mode > 0)
             .then(|| self.crews.get(self.mode).map(String::as_str))
             .flatten()
+    }
+
+    /// The level label for "the model's own".
+    pub const DEFAULT_LEVEL: &'static str = "default";
+
+    /// What ←/→ cycles through for the highlighted model: the model's own level,
+    /// then each level it accepts (every level, when it doesn't say).
+    pub fn level_choices(&self) -> Vec<String> {
+        let levels = self
+            .selected_choice()
+            .map(|c| c.levels)
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| REASONING_OPTS[1..].iter().map(|s| s.to_string()).collect());
+        std::iter::once(Self::DEFAULT_LEVEL.to_string())
+            .chain(levels)
+            .collect()
+    }
+
+    /// Step the reasoning pick by `delta`, through "as is" and each choice.
+    pub fn cycle_reasoning(&mut self, delta: isize) {
+        let n = self.level_choices().len() as isize + 1; // + "as is"
+        let cur = self.reasoning.map_or(0, |i| i as isize + 1);
+        let next = (cur + delta).rem_euclid(n);
+        self.reasoning = (next > 0).then(|| next as usize - 1);
+    }
+
+    /// The picked level (`Some("default")` for the model's own), or `None` to
+    /// leave the session's level alone.
+    pub fn reasoning_choice(&self) -> Option<String> {
+        self.reasoning
+            .and_then(|i| self.level_choices().get(i).cloned())
     }
 
     pub fn next_mode(&mut self) {
@@ -248,6 +285,8 @@ impl ModelPicker {
         }
         let cur = self.selected.min(n - 1) as isize;
         self.selected = (cur + delta).rem_euclid(n as isize) as usize;
+        // A level picked for one model means nothing for the next.
+        self.reasoning = None;
     }
     /// Keep the selection valid after the filter changes.
     pub fn clamp(&mut self) {
@@ -255,6 +294,7 @@ impl ModelPicker {
         if self.selected >= n {
             self.selected = n.saturating_sub(1);
         }
+        self.reasoning = None;
     }
 }
 
@@ -269,6 +309,8 @@ pub struct ModelForm {
     pub fields: [String; 4],
     /// Index into [`REASONING_OPTS`].
     pub reasoning_idx: usize,
+    /// The levels the model accepts (from the catalogue), saved with it.
+    pub levels: Vec<String>,
     /// Focused field: 0..=3 text fields, 4 = reasoning effort.
     pub focus: usize,
     pub error: Option<String>,
@@ -294,6 +336,7 @@ impl ModelForm {
                 c.max_tokens.to_string(),
             ],
             reasoning_idx,
+            levels: c.levels.clone(),
             focus: 0,
             error: None,
         }
@@ -2427,7 +2470,37 @@ mod tests {
             max_tokens: 16384,
             temperature: 0.6,
             reasoning: Some("high".into()),
+            levels: vec!["low".into(), "medium".into(), "high".into()],
         }
+    }
+
+    #[test]
+    fn the_picker_reasoning_cycles_as_is_default_then_each_level() {
+        let mut p = ModelPicker {
+            entries: vec![
+                sample_choice("a", "A", true, true),
+                ModelChoice {
+                    levels: Vec::new(),
+                    ..sample_choice("b", "B", true, false)
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(p.reasoning_choice(), None, "opens leaving the level as is");
+        p.cycle_reasoning(1);
+        assert_eq!(p.reasoning_choice().as_deref(), Some("default"));
+        p.cycle_reasoning(3);
+        assert_eq!(p.reasoning_choice().as_deref(), Some("high"));
+        p.cycle_reasoning(1);
+        assert_eq!(p.reasoning_choice(), None, "wraps to as is");
+        p.cycle_reasoning(-1);
+        assert_eq!(p.reasoning_choice().as_deref(), Some("high"));
+        // Moving the highlight resets it; a model with no known levels offers all.
+        p.move_sel(1);
+        assert_eq!(p.reasoning_choice(), None);
+        assert_eq!(p.level_choices().len(), 1 + 6);
+        p.cycle_reasoning(-1);
+        assert_eq!(p.reasoning_choice().as_deref(), Some("max"));
     }
 
     #[test]
@@ -2472,6 +2545,8 @@ mod tests {
             selected: 1,
             crews: vec!["solo".into(), "oss".into(), "premium".into()],
             mode: 1,
+            // default, low, medium: the highlighted model at `medium`.
+            reasoning: Some(2),
         });
         app.mode = Mode::ModelPicker;
         insta::assert_snapshot!(render(&app));

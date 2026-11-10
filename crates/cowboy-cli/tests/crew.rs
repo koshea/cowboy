@@ -163,6 +163,48 @@ fn validate_checks_crews_that_are_not_active() {
 }
 
 #[test]
+fn levels_are_checked_against_what_each_model_accepts() {
+    let (home, proj) = (
+        assert_fs::TempDir::new().unwrap(),
+        assert_fs::TempDir::new().unwrap(),
+    );
+    seed(&home);
+    home.child("cowboy/models.yaml")
+        .write_str(
+            "version: 1\ndefault: bifrost/glm\nmodels:\n  bifrost:\n    glm:\n      model: g\n  \
+             openai:\n    gpt:\n      model: o\n      reasoning_levels: [low, medium, high]\n",
+        )
+        .unwrap();
+    // Levels the models take (or don't list) are valid, and shown in the grid.
+    let ok = CREWS
+        .replace("foreman: openai/gpt", "foreman: openai/gpt@medium")
+        .replace("general: openai/gpt", "general: openai/gpt@high")
+        .replace("general: bifrost/glm", "general: bifrost/glm@max");
+    home.child("cowboy/crew.yaml").write_str(&ok).unwrap();
+    cowboy(&home, &proj)
+        .args(["crew", "validate"])
+        .assert()
+        .success();
+    cowboy(&home, &proj)
+        .args(["crew", "list", "--crew", "premium"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("foreman: openai/gpt@medium"))
+        .stdout(predicate::str::contains("openai/gpt@high"));
+    // One the model doesn't list is reported with what it would run at.
+    home.child("cowboy/crew.yaml")
+        .write_str(&ok.replace("openai/gpt@high", "openai/gpt@xhigh"))
+        .unwrap();
+    cowboy(&home, &proj)
+        .args(["crew", "validate"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`openai/gpt@xhigh`: openai/gpt accepts low, medium, high — it would run at `high`",
+        ));
+}
+
+#[test]
 fn a_single_roster_points_at_the_migration() {
     let (home, proj) = (
         assert_fs::TempDir::new().unwrap(),

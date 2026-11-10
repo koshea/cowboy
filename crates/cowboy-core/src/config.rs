@@ -878,17 +878,32 @@ pub fn summarizer_model_ref(
 }
 
 /// How hard a reasoning model should think. Sent as `reasoning_effort` in the
-/// chat request; absent means the parameter is omitted entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// chat request; absent means the parameter is omitted entirely. Declaration
+/// order is the rank (`Ord` relies on it). `xhigh` and `max` are accepted by
+/// OpenAI's newer models; a model that doesn't list one is stepped down to the
+/// nearest level it does (see [`clamp_reasoning`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
     Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+    Max,
 }
 
 impl ReasoningEffort {
+    /// Every level, lowest first.
+    pub const ALL: [ReasoningEffort; 6] = [
+        ReasoningEffort::Minimal,
+        ReasoningEffort::Low,
+        ReasoningEffort::Medium,
+        ReasoningEffort::High,
+        ReasoningEffort::Xhigh,
+        ReasoningEffort::Max,
+    ];
+
     /// The wire value (also the user-facing label).
     pub fn as_str(self) -> &'static str {
         match self {
@@ -896,7 +911,102 @@ impl ReasoningEffort {
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::Xhigh => "xhigh",
+            ReasoningEffort::Max => "max",
         }
+    }
+
+    /// Parse a level name (case-insensitive). `ultra` is not one: OpenAI describes
+    /// it as reasoning *with automatic task delegation*, which would overlap the
+    /// crew, so it is read as `max`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "minimal" => Self::Minimal,
+            "low" => Self::Low,
+            "medium" => Self::Medium,
+            "high" => Self::High,
+            "xhigh" => Self::Xhigh,
+            "max" | "ultra" => Self::Max,
+            _ => return None,
+        })
+    }
+}
+
+/// `want` as a level the model accepts. With no list of accepted levels, `want`
+/// is sent as is. Otherwise a level it doesn't list steps down to the highest one
+/// below it, or — when `want` is below them all — up to its lowest.
+pub fn clamp_reasoning(want: ReasoningEffort, accepted: &[ReasoningEffort]) -> ReasoningEffort {
+    if accepted.is_empty() || accepted.contains(&want) {
+        return want;
+    }
+    accepted
+        .iter()
+        .copied()
+        .filter(|l| *l < want)
+        .max()
+        .or_else(|| accepted.iter().copied().min())
+        .unwrap_or(want)
+}
+
+/// The lowest level a model accepts (`minimal` when the list is unknown): what
+/// the out-of-tokens retry asks for.
+pub fn lowest_reasoning(accepted: &[ReasoningEffort]) -> ReasoningEffort {
+    accepted
+        .iter()
+        .copied()
+        .min()
+        .unwrap_or(ReasoningEffort::Minimal)
+}
+
+/// A model reference with an optional reasoning level: `provider/name@level`, as
+/// a crew slot or foreman names one. A trailing `@word` is only a level when it
+/// is one; otherwise it is part of the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSpec {
+    pub model: ModelRef,
+    pub reasoning: Option<ReasoningEffort>,
+}
+
+impl ModelSpec {
+    /// Split `s` into its model part and level, without validating the model part.
+    pub fn split(s: &str) -> (&str, Option<ReasoningEffort>) {
+        match s.rsplit_once('@') {
+            Some((m, l)) => match ReasoningEffort::parse(l) {
+                Some(r) => (m, Some(r)),
+                None => (s, None),
+            },
+            None => (s, None),
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        let (m, reasoning) = Self::split(s.trim());
+        Ok(Self {
+            model: ModelRef::parse(m)?,
+            reasoning,
+        })
+    }
+}
+
+impl std::fmt::Display for ModelSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.reasoning {
+            Some(r) => write!(f, "{}@{}", self.model, r.as_str()),
+            None => write!(f, "{}", self.model),
+        }
+    }
+}
+
+impl Serialize for ModelSpec {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
     }
 }
 
@@ -916,6 +1026,12 @@ pub struct ModelDef {
     /// Reasoning effort for reasoning models (omitted when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The levels the model accepts, when known (`cowboy models import` records
+    /// what the catalogue lists). Any level asked for — configured, per session,
+    /// or per crew slot — is stepped to the nearest of these. Empty: unknown, sent
+    /// as asked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<ReasoningEffort>,
     /// Nucleus sampling (config-file only; omitted when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
@@ -972,6 +1088,8 @@ pub struct ResolvedModel {
     pub max_tokens: u32,
     pub context_window: u32,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// See [`ModelDef::reasoning_levels`].
+    pub reasoning_levels: Vec<ReasoningEffort>,
     pub top_p: Option<f32>,
     pub stop: Vec<String>,
     pub extra: BTreeMap<String, serde_json::Value>,
@@ -2093,6 +2211,7 @@ pub fn resolve_model(
         max_tokens: def.max_tokens,
         context_window: def.context_window,
         reasoning_effort: def.reasoning_effort,
+        reasoning_levels: def.reasoning_levels.clone(),
         top_p: def.top_p,
         stop: def.stop.clone(),
         extra: def.extra.clone(),

@@ -414,7 +414,7 @@ pub(super) fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(inner);
 
@@ -480,7 +480,23 @@ pub(super) fn draw_model_picker(f: &mut Frame, area: Rect, p: &ModelPicker) {
             Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
         ),
     ]);
-    f.render_widget(Paragraph::new(footer), rows[2]);
+    // The reasoning level for the highlighted model (←/→).
+    let (level, level_color) = match p.reasoning_choice() {
+        Some(l) if l == ModelPicker::DEFAULT_LEVEL => ("the model's own".to_string(), Color::Cyan),
+        Some(l) => (l, Color::Magenta),
+        None => ("as is".to_string(), Color::DarkGray),
+    };
+    let reasoning = Line::from(vec![
+        Span::styled("←/→", Style::default().fg(Color::White)),
+        Span::styled(" reasoning: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            level,
+            Style::default()
+                .fg(level_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(vec![footer, reasoning]), rows[2]);
 }
 
 pub(super) fn draw_model_form(f: &mut Frame, area: Rect, form: &ModelForm) {

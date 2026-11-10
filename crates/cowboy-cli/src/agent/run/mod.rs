@@ -606,7 +606,16 @@ async fn exec_subagent(plan: SubagentPlan) -> String {
     if let Some(harness) = &plan.harness {
         cmd.env(crate::agent::harness::ENV_HARNESS, harness);
     } else if let Some(model) = &plan.model {
+        // A slot's `@level` travels separately, so `COWBOY_MODEL` stays a plain
+        // `provider/name`.
+        let (model, level) = cowboy_core::config::ModelSpec::split(model);
         cmd.env("COWBOY_MODEL", model);
+        match level {
+            Some(l) => cmd.env(crate::cmd::crew::ENV_REASONING, l.as_str()),
+            // Never inherit the parent's level: an unlevelled slot runs at its
+            // model's own.
+            None => cmd.env_remove(crate::cmd::crew::ENV_REASONING),
+        };
     }
     if let Some(c) = &plan.crew {
         cmd.env(crate::cmd::crew::ENV_CREW, c);
@@ -878,7 +887,9 @@ fn concurrency_notice_from_keys(
 fn provider_key(model: Option<&str>, foreman: Option<&str>) -> String {
     // Models are `provider/name`, so the provider is in the name itself. A routed
     // name that does not parse keys on itself (still grouping identical routes).
-    let of = |m: &str| match cowboy_core::config::ModelRef::parse(m) {
+    let of = |m: &str| match cowboy_core::config::ModelRef::parse(
+        cowboy_core::config::ModelSpec::split(m).0,
+    ) {
         Ok(r) => r.provider,
         Err(_) => m.to_string(),
     };
@@ -5316,17 +5327,20 @@ impl<'a> AgentLoop<'a> {
                     )
                 });
             }
+            // A level on a harness slot has nothing to apply to: the harness runs
+            // its own model at its own settings.
             None => routed
                 .as_ref()
-                .filter(|r| harnesses.get(&r.model).is_some())
-                .map(|r| r.model.clone()),
+                .map(|r| cowboy_core::config::ModelSpec::split(&r.model).0)
+                .filter(|m| harnesses.get(m).is_some())
+                .map(str::to_string),
         };
         // A model slot must be `provider/name`. A bare one is a pre-grouping roster;
         // routing it would hand the child a name it cannot resolve, and the child's
         // fallback to the default would hide that the roster is being ignored.
         if harness.is_none() {
             if let Some(r) = routed.as_ref().filter(|r| !r.model.is_empty()) {
-                if cowboy_core::config::ModelRef::parse(&r.model).is_err() {
+                if cowboy_core::config::ModelSpec::parse(&r.model).is_err() {
                     return Err(format!(
                         "error: the crew roster routes `{category}` to `{}`, which is neither \
                          a harness nor a `provider/name` model — {}",

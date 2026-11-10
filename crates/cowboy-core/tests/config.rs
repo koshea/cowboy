@@ -327,6 +327,7 @@ fn model_def(model: &str) -> ModelDef {
         max_tokens: 8192,
         context_window: 200_000,
         reasoning_effort: None,
+        reasoning_levels: Vec::new(),
         top_p: None,
         stop: Vec::new(),
         extra: std::collections::BTreeMap::new(),
@@ -911,4 +912,52 @@ fn project_models_override_user_models_by_qualified_name() {
     .unwrap_err()
     .to_string();
     assert!(err.contains("rogue") && err.contains("a, b"), "{err}");
+}
+
+#[test]
+fn a_model_spec_carries_an_optional_level() {
+    use cowboy_core::config::{ModelSpec, ReasoningEffort as R};
+    let s = ModelSpec::parse("chatgpt/gpt-6.1-sol@xhigh").unwrap();
+    assert_eq!(s.model.to_string(), "chatgpt/gpt-6.1-sol");
+    assert_eq!(s.reasoning, Some(R::Xhigh));
+    assert_eq!(s.to_string(), "chatgpt/gpt-6.1-sol@xhigh");
+    // `ultra` is read as `max`.
+    assert_eq!(
+        ModelSpec::parse("a/b@ultra").unwrap().reasoning,
+        Some(R::Max)
+    );
+    let s = ModelSpec::parse("default/glm").unwrap();
+    assert_eq!(
+        (s.model.to_string(), s.reasoning),
+        ("default/glm".into(), None)
+    );
+    // A suffix that is not a level is part of the name.
+    assert_eq!(ModelSpec::split("a/b@v2"), ("a/b@v2", None));
+    assert!(
+        ModelSpec::parse("bare@high").is_err(),
+        "the model part needs a provider"
+    );
+    let y: ModelSpec = serde_yaml_ng::from_str("a/b@medium").unwrap();
+    assert_eq!(serde_yaml_ng::to_string(&y).unwrap().trim(), "a/b@medium");
+}
+
+#[test]
+fn a_level_is_stepped_to_one_the_model_accepts() {
+    use cowboy_core::config::{clamp_reasoning, lowest_reasoning, ReasoningEffort as R};
+    let accepted = [R::Low, R::Medium, R::Xhigh];
+    assert_eq!(clamp_reasoning(R::High, &accepted), R::Medium, "down first");
+    assert_eq!(clamp_reasoning(R::Max, &accepted), R::Xhigh);
+    assert_eq!(
+        clamp_reasoning(R::Minimal, &accepted),
+        R::Low,
+        "up when below all"
+    );
+    assert_eq!(clamp_reasoning(R::Xhigh, &accepted), R::Xhigh);
+    assert_eq!(
+        clamp_reasoning(R::Max, &[]),
+        R::Max,
+        "unknown: sent as asked"
+    );
+    assert_eq!(lowest_reasoning(&accepted), R::Low);
+    assert_eq!(lowest_reasoning(&[]), R::Minimal);
 }

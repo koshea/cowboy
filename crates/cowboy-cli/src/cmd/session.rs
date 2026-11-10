@@ -91,6 +91,9 @@ pub async fn run(
     if let Some(t) = crate::cmd::crew::temperature_override() {
         resolved.temperature = t;
     }
+    // …and its reasoning level (a slot's `@level`), else the crew foreman's.
+    crate::cmd::crew::set_session_reasoning(crate::cmd::crew::startup_reasoning());
+    crate::cmd::crew::apply_session_reasoning(&mut resolved);
 
     let interactive = std::io::stdout().is_terminal();
 

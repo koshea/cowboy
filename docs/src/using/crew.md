@@ -93,7 +93,8 @@ crews:
       tests: 0.0                 #   cooler for precise work…
       exploration: 0.6           #   …warmer for ideation
   openai:
-    foreman: chatgpt/gpt-6.1-sol # optional: switching here switches the model too
+    foreman: chatgpt/gpt-6.1-sol@medium # optional: switching here switches the model
+                                 # (and, with `@level`, the reasoning level) too
     crew:
       exploration: chatgpt/gpt-6-luna
       general: <default>
@@ -130,6 +131,36 @@ request:
 
 A `<default>` slot at any step resolves to the foreman. So routing is total —
 every request gets a model, worst case the foreman.
+
+### Reasoning levels per slot
+
+A slot or `foreman:` can name a reasoning level after the model, as `@level`:
+
+```yaml
+crews:
+  openai:
+    foreman: chatgpt/gpt-6.1-sol@medium
+    crew:
+      general:
+        tiny: chatgpt/gpt-6-luna         # the model's own level
+        medium: chatgpt/gpt-6.1-sol@medium
+        large: chatgpt/gpt-6.1-sol@high
+        deep: chatgpt/gpt-6-astra@xhigh
+      tests:
+        tiny: <default>@low              # the foreman's model, at `low`
+```
+
+The levels are `minimal`, `low`, `medium`, `high`, `xhigh` and `max` (`ultra` is read
+as `max`; see [reasoning levels](../getting-started/configuration.md#modelsyaml--user-configcowboy-andor-project-cowboy)).
+A subagent routed to a slot runs at its level; a slot without one runs at its model's
+own `reasoning_effort`, whatever level its parent runs at. A session on a crew whose
+foreman names a level starts at it, and switching to that crew sets it (`/reasoning`
+changes it afterwards). A level on a [harness](#harnesses) slot is ignored, because the
+harness runs its own model.
+
+`cowboy crew validate` (and `doctor`) report a level the model's `reasoning_levels`
+don't include, with the level it would run at instead. It still runs: the level is
+stepped to the nearest one the model accepts.
 
 ## Managing it
 

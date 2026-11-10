@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::sync::RwLock;
 
 use anyhow::{bail, Context, Result};
-use cowboy_core::config::{ModelDef, ModelRef, ModelsConfig};
+use cowboy_core::config::{ModelDef, ModelRef, ModelsConfig, ReasoningEffort};
 use cowboy_core::crew::{self, CrewConfig, CrewDef, CrewFile, Effort};
 use cowboy_core::crew_text;
 
@@ -24,6 +24,9 @@ use crate::cli::CrewCommand;
 
 /// The environment variable a session's crew is passed down in.
 pub const ENV_CREW: &str = "COWBOY_CREW";
+/// A routed subagent's reasoning level (a slot's `@level`), set like
+/// `COWBOY_MODEL`.
+pub const ENV_REASONING: &str = "COWBOY_REASONING";
 
 pub async fn run(command: CrewCommand) -> Result<()> {
     match command {
@@ -58,6 +61,9 @@ static SESSION_CREW: RwLock<Option<String>> = RwLock::new(None);
 /// The model this session's foreman is running on right now (set at startup and
 /// on every `/model` or crew switch), so `<default>` slots follow it.
 static SESSION_FOREMAN: RwLock<Option<String>> = RwLock::new(None);
+/// The reasoning level this session asks every model for (`/reasoning`, a crew
+/// foreman's `@level`, or a routed slot's), or `None` for each model's own.
+static SESSION_REASONING: RwLock<Option<ReasoningEffort>> = RwLock::new(None);
 
 /// The crew this session routes with: a switch made in this session, else
 /// `COWBOY_CREW`, else `None` (the file's active crew).
@@ -84,6 +90,49 @@ pub fn set_session_foreman(name: &str) {
     *SESSION_FOREMAN
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(name.to_string());
+}
+
+/// The session's reasoning level (`None`: each model's own).
+pub fn session_reasoning() -> Option<ReasoningEffort> {
+    *SESSION_REASONING
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Set the session's reasoning level; `None` returns to each model's own.
+pub fn set_session_reasoning(level: Option<ReasoningEffort>) {
+    *SESSION_REASONING
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = level;
+}
+
+/// The level a session starts at: a routed `COWBOY_REASONING`, else — when the
+/// session runs on its crew's foreman rather than a routed `COWBOY_MODEL` — the
+/// foreman's `@level`.
+pub fn startup_reasoning() -> Option<ReasoningEffort> {
+    if let Some(r) = reasoning_override() {
+        return Some(r);
+    }
+    if std::env::var("COWBOY_MODEL").is_ok_and(|m| !m.is_empty()) {
+        return None;
+    }
+    session_crew()
+        .ok()
+        .flatten()
+        .filter(CrewConfig::enabled)
+        .and_then(|c| c.foreman)
+        .and_then(|f| f.reasoning)
+}
+
+/// Apply the session's reasoning level to a resolved model, stepped to one the
+/// model accepts. Without one, the model keeps its configured level.
+pub fn apply_session_reasoning(r: &mut cowboy_core::config::ResolvedModel) {
+    if let Some(level) = session_reasoning() {
+        r.reasoning_effort = Some(cowboy_core::config::clamp_reasoning(
+            level,
+            &r.reasoning_levels,
+        ));
+    }
 }
 
 /// The effective roster for this session (with its name), or `None` with no crews.
@@ -134,8 +183,18 @@ pub fn session_model_override() -> Option<ModelRef> {
             .ok()
             .flatten()
             .filter(CrewConfig::enabled)
-            .and_then(|c| c.foreman),
+            .and_then(|c| c.foreman)
+            .map(|f| f.model),
     }
+}
+
+/// The session's reasoning level as the environment sets it: `COWBOY_REASONING`,
+/// set by subagent routing from a slot's `@level`. `None` when unset or not a
+/// level (the model's own level applies).
+pub fn reasoning_override() -> Option<ReasoningEffort> {
+    std::env::var(ENV_REASONING)
+        .ok()
+        .and_then(|s| ReasoningEffort::parse(&s))
 }
 
 /// The foreman model name for delegation routing (fills `<default>` slots): what
@@ -448,12 +507,15 @@ pub fn crew_problems(f: &CrewFile) -> Result<Vec<String>> {
             out.push(format!("crew `{}`: {e}", cfg.name));
         }
         if let Some(fm) = &cfg.foreman {
-            if !models.contains_key(fm) {
+            if !models.contains_key(&fm.model) {
                 out.push(format!(
-                    "crew `{}`: foreman `{fm}` is not in models.yaml",
-                    cfg.name
+                    "crew `{}`: foreman `{}` is not in models.yaml",
+                    cfg.name, fm.model
                 ));
             }
+        }
+        for p in level_problems(&cfg, &models) {
+            out.push(format!("crew `{}`: {p}", cfg.name));
         }
         for p in provider_problems(&cfg, &providers) {
             out.push(format!("crew `{}`: {p}", cfg.name));
@@ -570,7 +632,7 @@ fn chatgpt_provider(name: Option<&str>) -> Result<String> {
 /// not configured yet are imported first.
 pub async fn add_chatgpt_crew(name: &str, provider: Option<&str>) -> Result<()> {
     use cowboy_core::config::{commit_model_setup_pair, load_model_setup_state, ProvidersConfig};
-    use cowboy_core::crew_presets::{chatgpt_crew, chatgpt_models};
+    use cowboy_core::crew_presets::{chatgpt_crew, chatgpt_models, Member};
     let provider = chatgpt_provider(provider)?;
     let mut f = crew::load_file()?.unwrap_or_default();
     check_new_name(&f, name)?;
@@ -612,15 +674,29 @@ pub async fn add_chatgpt_crew(name: &str, provider: Option<&str>) -> Result<()> 
         )?;
     }
     let mut refs = BTreeMap::new();
+    let mut members = BTreeMap::new();
     for (family, id) in &ids {
         let r = models
             .iter()
             .find(|(r, d)| r.provider == provider && d.model == *id)
             .map(|(r, _)| r)
             .with_context(|| format!("{id} is not configured on `{provider}`"))?;
+        // The levels the catalogue lists now, not what an older import recorded.
+        let levels = entries
+            .iter()
+            .find(|e| e.id == *id)
+            .map(cowboy_core::model_import::accepted_levels)
+            .unwrap_or_default();
+        members.insert(
+            *family,
+            Member {
+                model: r.clone(),
+                levels,
+            },
+        );
         refs.insert(*family, r);
     }
-    let def = chatgpt_crew(&refs);
+    let def = chatgpt_crew(&members);
     let body = serde_yaml_ng::to_string(&def)?;
     if f.crews.is_empty() {
         f.active = Some(name.to_string());
@@ -707,6 +783,45 @@ fn remove(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Every `@level` in a roster (slots and foreman) that its model is known not to
+/// accept. Not fatal at run time — the level is stepped to the nearest one the
+/// model takes — but what the crew says is then not what it does.
+pub fn level_problems(cfg: &CrewConfig, models: &BTreeMap<ModelRef, ModelDef>) -> Vec<String> {
+    use cowboy_core::config::{clamp_reasoning, ModelSpec};
+    let mut specs: BTreeSet<String> = cfg
+        .crew
+        .values()
+        .flat_map(|r| r.models())
+        .map(str::to_string)
+        .collect();
+    if let Some(fm) = &cfg.foreman {
+        specs.insert(fm.to_string());
+    }
+    let mut out = Vec::new();
+    for s in specs {
+        let Ok(ModelSpec {
+            model,
+            reasoning: Some(level),
+        }) = ModelSpec::parse(&s)
+        else {
+            continue;
+        };
+        let Some(def) = models.get(&model) else {
+            continue;
+        };
+        if def.reasoning_levels.is_empty() || def.reasoning_levels.contains(&level) {
+            continue;
+        }
+        let accepted: Vec<_> = def.reasoning_levels.iter().map(|l| l.as_str()).collect();
+        out.push(format!(
+            "`{s}`: {model} accepts {} — it would run at `{}`",
+            accepted.join(", "),
+            clamp_reasoning(level, &def.reasoning_levels).as_str()
+        ));
+    }
+    out
+}
+
 /// Every provider-level reason a roster's model slots (and foreman) cannot run,
 /// one line each: a provider missing from `providers.yaml`, or a ChatGPT
 /// provider nobody has signed in to. Harness and `<default>` slots carry no
@@ -718,13 +833,14 @@ pub fn provider_problems(
     let mut used: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for (cat, ramp) in &cfg.crew {
         for slot in ramp.models() {
+            let slot = cowboy_core::config::ModelSpec::split(slot).0;
             if let Ok(r) = ModelRef::parse(slot) {
                 used.entry(r.provider).or_default().insert(cat.clone());
             }
         }
     }
     if let Some(fm) = &cfg.foreman {
-        used.entry(fm.provider.clone())
+        used.entry(fm.model.provider.clone())
             .or_default()
             .insert("foreman".into());
     }
@@ -855,7 +971,7 @@ mod tests {
     fn a_crews_foreman_counts_as_a_provider_it_uses() {
         let mut cfg: CrewConfig =
             serde_yaml_ng::from_str("crew:\n  general: bifrost/glm\n").unwrap();
-        cfg.foreman = Some(ModelRef::parse("openai/gpt").unwrap());
+        cfg.foreman = Some(cowboy_core::config::ModelSpec::parse("openai/gpt").unwrap());
         let mut providers = ProvidersConfig::default();
         providers
             .providers

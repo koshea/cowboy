@@ -25,6 +25,7 @@ fn model(base: &str) -> ResolvedModel {
         max_tokens: 4096,
         context_window: 200_000,
         reasoning_effort: None,
+        reasoning_levels: Vec::new(),
         top_p: Some(0.9),
         stop: Vec::new(),
         extra: BTreeMap::new(),

@@ -219,12 +219,16 @@ fn users_of(
     };
     let mut crew_categories = BTreeSet::new();
     for c in crews.into_iter().flat_map(|f| f.all()) {
-        let foreman = c.foreman.as_ref().is_some_and(|r| r.provider == provider);
+        let foreman = c
+            .foreman
+            .as_ref()
+            .is_some_and(|r| r.model.provider == provider);
         if foreman {
             crew_categories.insert(format!("{}/foreman", c.name));
         }
         for (cat, ramp) in &c.crew {
             let uses = ramp.models().into_iter().any(|m| {
+                let m = cowboy_core::config::ModelSpec::split(m).0;
                 cowboy_core::config::ModelRef::parse(m).is_ok_and(|r| r.provider == provider)
             });
             if uses {

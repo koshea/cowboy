@@ -16,7 +16,7 @@ expression: render(&app)
 ││                                                                    ││
 ││                                                                    ││
 ╰│                                                                    │╯
- │                                                                    │
-╭│↑/↓ move · Enter select · Esc cancel · Tab mode: crew oss           │╮
+ │↑/↓ move · Enter select · Esc cancel · Tab mode: crew oss           │
+╭│←/→ reasoning: medium                                               │╮
 │╰────────────────────────────────────────────────────────────────────╯│
 ╰──────────────────────────────────────────────────────────────────────╯

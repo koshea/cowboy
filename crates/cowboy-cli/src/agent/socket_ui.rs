@@ -211,6 +211,8 @@ struct Inner {
     models: std::sync::Mutex<(Vec<String>, Option<String>)>,
     /// The iteration budget as `(enforced, turns per message)`, for `/budget`.
     budget: std::sync::Mutex<Option<(bool, u32)>>,
+    /// The session's reasoning level, for `/reasoning`.
+    reasoning: std::sync::Mutex<crate::agent::commands::ReasoningView>,
     /// Where this session's socket lives, so ending can remove it.
     socket_path: std::path::PathBuf,
     /// Fired by [`SocketUi::end`] to stop the accept loop.
@@ -364,6 +366,7 @@ impl SocketUi {
             }),
             models: std::sync::Mutex::new((Vec::new(), None)),
             budget: std::sync::Mutex::new(None),
+            reasoning: std::sync::Mutex::new(Default::default()),
             socket_path: socket_path.to_path_buf(),
             closed: tokio_util::sync::CancellationToken::new(),
         });
@@ -393,6 +396,15 @@ impl SocketUi {
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((enforced, limit));
+    }
+
+    /// Record the reasoning level the current model was built at, for `/reasoning`.
+    pub fn set_reasoning(&self, view: crate::agent::commands::ReasoningView) {
+        *self
+            .inner
+            .reasoning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = view;
     }
 
     /// Record a successful model switch, so `/model` reports the live one.
@@ -429,6 +441,12 @@ impl SocketUi {
             .budget
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let reasoning = self
+            .inner
+            .reasoning
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         // Read per command: crews are edited from the CLI while sessions run.
         let crews = crate::cmd::crew::crew_names();
         let current_crew =
@@ -441,6 +459,7 @@ impl SocketUi {
             budget,
             crews: &crews,
             current_crew: current_crew.as_deref(),
+            reasoning: &reasoning,
         };
         match expand(text, &ctx) {
             Some(Expansion::Send(msgs)) => {

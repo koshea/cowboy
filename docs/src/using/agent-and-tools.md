@@ -339,20 +339,24 @@ logs; it just cannot brick the session.
 If a reasoning model burns its whole output budget thinking and returns no answer
 or tool call, Cowboy warns that its `max_tokens` may be too low and then recovers
 rather than ending the turn. It retries with a directive to answer now, and asks the
-provider for **minimal reasoning effort** on that retry — telling a reasoning model
-not to think is advice it can ignore, so the knob the provider honours is turned as
-well. When the provider returned the cut-off reasoning, it is first distilled into
+provider for **the lowest reasoning level the model accepts** on that retry (`minimal`
+unless the model's [`reasoning_levels`](../getting-started/configuration.md) say
+otherwise; a model that lists its levels may refuse `minimal` outright) — telling a
+reasoning model not to think is advice it can ignore, so the knob the provider
+honours is turned as well. When the provider returned the cut-off reasoning, it is first distilled into
 conclusions-so-far so the retry builds on them instead of re-deriving them; when it
 did not — many providers bill reasoning tokens without ever sending the text — the
 retry goes ahead anyway, because the model still has the whole transcript.
 
 Recovery is bounded (`2` attempts). Only after those are spent does the turn end,
 with an `[incomplete]` result naming the two levers you have: raise `max_tokens` or
-lower `reasoning_effort`. The low-effort request lasts for the retry only, so a model
+lower the reasoning level (`/reasoning` for this session, `reasoning_effort` for
+good). The low-effort request lasts for the retry only, so a model
 that recovers keeps its normal reasoning for the rest of the session. Both the
 compaction and recovery summaries use the optional
 [`summarizer`](../getting-started/configuration.md) model when configured,
-falling back to the main model otherwise, and always request minimal reasoning —
+falling back to the main model otherwise, and always request its lowest reasoning
+level —
 summarizing is mechanical, and a model that just truncated while thinking would
 otherwise do the same on the summary and come back empty.
 
