@@ -11,14 +11,14 @@
 class Cowboy < Formula
   desc "Opinionated local coding agent in a kernel-enforced sandbox"
   homepage "https://github.com/koshea/cowboy"
-  version "0.1.0"
+  version "0.1.1"
   license "MIT"
 
   depends_on arch: :arm64
   depends_on macos: :tahoe
 
   url "https://github.com/koshea/cowboy/releases/download/v#{version}/cowboy-#{version}-aarch64-apple-darwin.tar.gz"
-  sha256 "456cf0ae1e7e10a536d8eb56413c21902a95ada0118e599dab7569e56443308d"
+  sha256 "aa73b6e5da660ba607e437e39c3f01ce5d2572a7ac061a7289217798b0e1a5b0"
 
   def install
     # `cowboy` and `cowboyd` are version-locked to each other; install both.
