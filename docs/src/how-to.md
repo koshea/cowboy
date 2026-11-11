@@ -46,6 +46,7 @@ The rest of what used to live in that menu is a direct key:
 | **Alt-j** | what the background subagents are doing |
 | **Alt-w** | watch a subagent's live output (again to cycle, **Esc** to leave) |
 | **Alt-s** | stop the subagents, leaving the turn running |
+| **Alt-a** | the session's artifacts: read one, **y** copies its `file://` link |
 | **Alt-d** | detach — leave it running in the background and exit |
 
 The common case is still just typing. Reach for **Ctrl-C** when the whole turn is

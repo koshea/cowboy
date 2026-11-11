@@ -402,6 +402,28 @@ fn list(name: Option<&str>) -> Result<()> {
         println!("  {mark} {n}{foreman}");
     }
     println!("  (* = active: what new sessions start with)\n");
+    let d = &f.delegation;
+    let cap = |n: u32| {
+        if n == 0 {
+            "unlimited".to_string()
+        } else {
+            n.to_string()
+        }
+    };
+    let mut by_provider: Vec<String> = d
+        .max_parallel_by_provider
+        .iter()
+        .map(|(p, n)| format!("{p}: {}", cap(*n)))
+        .collect();
+    by_provider.insert(
+        0,
+        format!("{} per provider", cap(d.max_parallel_per_provider)),
+    );
+    println!(
+        "concurrency: {} subagents at once; {}\n",
+        d.max_parallel.max(1),
+        by_provider.join(", ")
+    );
 
     let shown = name.map(str::to_string).or(active);
     let Some(shown) = shown else {
@@ -702,7 +724,29 @@ pub async fn add_chatgpt_crew(name: &str, provider: Option<&str>) -> Result<()> 
         f.active = Some(name.to_string());
     }
     f.crews.insert(name.to_string(), def);
-    crew::save_file(&f, |t| crew_text::append_crew(t, name, &body))?;
+    // The plan's own concurrency, unless the user already chose one for it.
+    let set_cap = !f
+        .delegation
+        .max_parallel_by_provider
+        .contains_key(&provider);
+    if set_cap {
+        f.delegation.max_parallel_by_provider.insert(
+            provider.clone(),
+            cowboy_core::crew_presets::CHATGPT_MAX_PARALLEL,
+        );
+    }
+    crew::save_file(&f, |t| {
+        let t = crew_text::append_crew(t, name, &body)?;
+        if set_cap {
+            crew_text::set_provider_cap(
+                &t,
+                &provider,
+                cowboy_core::crew_presets::CHATGPT_MAX_PARALLEL,
+            )
+        } else {
+            Some(t)
+        }
+    })?;
     for n in &notes {
         println!("  note: {n}");
     }
@@ -710,6 +754,13 @@ pub async fn add_chatgpt_crew(name: &str, provider: Option<&str>) -> Result<()> 
         "added crew `{name}`: luna {}, terra {}, sol {} (foreman), astra {}",
         refs["luna"], refs["terra"], refs["sol"], refs["astra"]
     ));
+    if set_cap {
+        println!(
+            "  up to {} subagents run on `{provider}` at once \
+             (delegation.max_parallel_by_provider)",
+            cowboy_core::crew_presets::CHATGPT_MAX_PARALLEL
+        );
+    }
     if let Ok(problems) = crew_problems(&f) {
         for p in problems
             .iter()

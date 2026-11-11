@@ -24,6 +24,13 @@ const HEADING_FG: Color = Color::Rgb(245, 245, 245);
 pub const LINK_FG: Color = Color::Rgb(120, 170, 255);
 const RULE_FG: Color = Color::Rgb(90, 95, 110);
 
+/// How a link renders: the style the hyperlink overlay looks for in the buffer.
+pub fn link_style() -> Style {
+    Style::default()
+        .fg(LINK_FG)
+        .add_modifier(Modifier::UNDERLINED)
+}
+
 fn syntaxes() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
     S.get_or_init(SyntaxSet::load_defaults_newlines)

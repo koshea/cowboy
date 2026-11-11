@@ -15,7 +15,7 @@ agent can't reach the host directly, so the loop does it).
 | `proc` | host | Start/stop/inspect a long-running background process — a dev server you then send requests to. See [background processes](#background-processes). |
 | `memory` | host | Save/recall durable project memory. |
 | `plan` | host | Maintain a working to-do plan, surfaced in the UI; drives lifecycle events. |
-| `artifact` | host | Publish a named output (contract, summary, review, …) into the session's artifact store. |
+| `artifact` | host | Publish a named output (contract, summary, review, …) into the session's artifact store, list them, or read one (`show`); with `job`, the same for what a subagent published. The reply gives the agent the artifact's `file://` link to hand you; you read them with `/artifacts` (see [the TUI](tui.md#artifacts)). |
 | `handoff` | host | Write a structured handoff summary (`handoff.md`) at the end of a session. |
 | `decision` | host | Record a decision (question, options, choice, rationale) durably. |
 | `blocked` / `unblock` | host | Declare/clear a "cannot proceed" state, surfaced to the user and the Ranch coordinator. |

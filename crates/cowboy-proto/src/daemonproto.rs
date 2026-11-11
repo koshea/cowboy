@@ -515,7 +515,48 @@ pub enum UiEventMsg {
     /// A message the user sent mid-turn, delivered into the running turn rather than
     /// queued behind it.
     SteerDelivered(String),
+    /// The session published an artifact (the `artifact`/`handoff`/`decision` tools).
+    ///
+    /// Deliberately carries no path or URL. The journal lives in the agent-writable
+    /// session dir, so anything in it may have been written by the agent; a client
+    /// that linked a path from here would be letting the agent choose what the user's
+    /// click opens. Clients resolve the file from the host-side index instead (the
+    /// TUI from disk, the web through `/api/session/{id}/artifacts`).
+    ArtifactPublished {
+        id: String,
+        kind: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+    },
     TurnDone,
+}
+
+/// One published artifact, as a client lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactEntry {
+    /// `a0001`, …: unique within its session.
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub created_ms: u64,
+    /// A `file://` link to the bytes on the host, when they are where the host put
+    /// them (see `cowboy_core::artifact::host_file`). `None` means "not viewable":
+    /// the index names a file that is missing or was tampered with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+/// An artifact's body, for a viewer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactBody {
+    pub entry: ArtifactEntry,
+    pub body: String,
+    /// The body was cut at the viewer limit; the link has the rest.
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// One background subagent job, for display.
@@ -952,6 +993,30 @@ mod tests {
             output: 340,
         });
         roundtrip(&UiEventMsg::Cost(0.42));
+        roundtrip(&UiEventMsg::ArtifactPublished {
+            id: "a0001".into(),
+            kind: "review".into(),
+            title: "Review".into(),
+            summary: Some("findings".into()),
+        });
+        roundtrip(&UiEventMsg::ArtifactPublished {
+            id: "a0002".into(),
+            kind: "handoff".into(),
+            title: "Handoff".into(),
+            summary: None,
+        });
+        roundtrip(&ArtifactBody {
+            entry: ArtifactEntry {
+                id: "a0001".into(),
+                kind: "review".into(),
+                title: "Review".into(),
+                summary: None,
+                created_ms: 5,
+                url: Some("file:///p/.cowboy/sessions/s/artifacts/a0001-review.md".into()),
+            },
+            body: "# Review".into(),
+            truncated: false,
+        });
         roundtrip(&UiEventMsg::Blocked(Some("need the contract".into())));
         roundtrip(&UiEventMsg::Blocked(None));
         roundtrip(&UiEventMsg::Plan(vec![

@@ -9,7 +9,9 @@ mod model;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use cowboy_proto::daemonproto::{ClientMsg, InterruptKind, ServerMsg, SessionInfo, SessionStatus};
+use cowboy_proto::daemonproto::{
+    ArtifactBody, ArtifactEntry, ClientMsg, InterruptKind, ServerMsg, SessionInfo, SessionStatus,
+};
 use cowboy_proto::netproto::{ApprovalScope, Verdict};
 use futures::channel::mpsc;
 use futures::{FutureExt, SinkExt, StreamExt};
@@ -284,6 +286,137 @@ fn session(props: &SessionProps) -> Html {
         });
     }
     let queue_open = use_state(|| false);
+
+    // The artifacts panel: the list (fetched from the server each time it opens, and
+    // again whenever the journal announces another) and the artifact being read.
+    let panel_open = use_state(|| false);
+    let artifact_list = use_state(|| None::<Result<Vec<ArtifactEntry>, String>>);
+    let artifact_doc = use_state(|| None::<Doc>);
+    // The artifact asked for most recently, so a slow response for an earlier click
+    // cannot replace the one the user is now waiting on.
+    let wanted = use_mut_ref(String::new);
+    {
+        let artifact_list = artifact_list.clone();
+        let token = props.token.clone();
+        let id = props.id.clone();
+        use_effect_with((*panel_open, model.artifacts.len()), move |(open, _)| {
+            if *open {
+                wasm_bindgen_futures::spawn_local(async move {
+                    artifact_list.set(Some(fetch_artifacts(&id, &token).await));
+                });
+            }
+            || ()
+        });
+    }
+    let open_artifacts = {
+        let panel_open = panel_open.clone();
+        let artifact_doc = artifact_doc.clone();
+        Callback::from(move |_: ()| {
+            artifact_doc.set(None);
+            panel_open.set(true);
+        })
+    };
+    let open_artifact = {
+        let panel_open = panel_open.clone();
+        let artifact_doc = artifact_doc.clone();
+        let wanted = wanted.clone();
+        let token = props.token.clone();
+        let id = props.id.clone();
+        Callback::from(move |want: String| {
+            // `want` is an id (`a0001`), or a file name from a relative link
+            // (`a0001-review.md`): then the id is its prefix, and the artifact must
+            // really be that file — ids are per session, so a link copied from another
+            // session's transcript would otherwise open the wrong document.
+            let aid = want
+                .find(['-', '.'])
+                .map_or(want.as_str(), |i| &want[..i])
+                .to_string();
+            let file = (want != aid).then(|| want.clone());
+            panel_open.set(true);
+            artifact_doc.set(Some(Doc::Loading(aid.clone())));
+            *wanted.borrow_mut() = aid.clone();
+            let artifact_doc = artifact_doc.clone();
+            let wanted = wanted.clone();
+            let (token, id) = (token.clone(), id.clone());
+            wasm_bindgen_futures::spawn_local(async move {
+                let doc = match fetch_artifact(&id, &aid, &token).await {
+                    Ok(b)
+                        if file.as_ref().is_some_and(|f| {
+                            !b.entry
+                                .url
+                                .as_deref()
+                                .is_some_and(|u| u.ends_with(&format!("/artifacts/{f}")))
+                        }) =>
+                    {
+                        Doc::Failed(
+                            aid.clone(),
+                            format!(
+                                "the link names {}, which is not this session's {aid}",
+                                file.clone().unwrap_or_default()
+                            ),
+                        )
+                    }
+                    Ok(b) => Doc::Loaded(b),
+                    Err(e) => Doc::Failed(aid.clone(), e),
+                };
+                if *wanted.borrow() == aid {
+                    artifact_doc.set(Some(doc));
+                }
+            });
+        })
+    };
+    let artifacts_back = {
+        let artifact_doc = artifact_doc.clone();
+        Callback::from(move |_: ()| artifact_doc.set(None))
+    };
+    let close_artifacts = {
+        let panel_open = panel_open.clone();
+        let artifact_doc = artifact_doc.clone();
+        Callback::from(move |_: ()| {
+            artifact_doc.set(None);
+            panel_open.set(false);
+        })
+    };
+    // A link to an artifact in rendered markdown is rewritten to `#artifact=<session>/
+    // <id>` (see `artifact_anchor`); this turns a click on one into opening the viewer,
+    // rather than navigating to a `file://` URL a browser page cannot open.
+    let on_page_click = {
+        let open_artifact = open_artifact.clone();
+        let model = model.clone();
+        let session_id = props.id.clone();
+        Callback::from(move |e: MouseEvent| {
+            let Some(el) = e
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            else {
+                return;
+            };
+            let Some(href) = el
+                .closest("a")
+                .ok()
+                .flatten()
+                .and_then(|a| a.get_attribute("href"))
+            else {
+                return;
+            };
+            let Some((sid, aid)) = href
+                .strip_prefix("#artifact=")
+                .and_then(|r| r.split_once('/'))
+            else {
+                return;
+            };
+            e.prevent_default();
+            // An empty session is "this one" (a relative link from this session's
+            // own transcript).
+            if sid.is_empty() || sid == session_id {
+                open_artifact.emit(aid.to_string());
+            } else {
+                model.dispatch(Action::Notice(format!(
+                    "{aid} belongs to session {sid} — open it from that session"
+                )));
+            }
+        })
+    };
     let input_ref = use_node_ref();
     let scroll_ref = use_node_ref();
     // "Stick to bottom" unless the user scrolled up to read history.
@@ -489,6 +622,7 @@ fn session(props: &SessionProps) -> Html {
         let send = send.clone();
         let folded = folded.clone();
         let back = back.clone();
+        let open_artifacts = open_artifacts.clone();
         Rc::new(move |enqueue: bool| {
             let Some(ta) = input_ref.cast::<HtmlTextAreaElement>() else {
                 return;
@@ -523,6 +657,10 @@ fn session(props: &SessionProps) -> Html {
                     }
                     commands::Outcome::Back => {
                         back.emit(());
+                        true
+                    }
+                    commands::Outcome::Artifacts => {
+                        open_artifacts.emit(());
                         true
                     }
                 }
@@ -601,9 +739,10 @@ fn session(props: &SessionProps) -> Html {
     let busy = model.busy();
     let ended = model.ended();
     let any_live_job = model.subagents.iter().any(|s| s.done.is_none());
+    let artifacts_button = open_artifacts.reform(|_: MouseEvent| ());
 
     html! {
-        <div class="page">
+        <div class="page" onclick={on_page_click}>
             <header class="bar">
                 <button class="ghost" onclick={on_back}>{ "‹" }</button>
                 <span class="title">
@@ -615,6 +754,11 @@ fn session(props: &SessionProps) -> Html {
                         <span class="title-sub muted">{ model.title.clone() }</span>
                     }
                 </span>
+                if !watching && !model.artifacts.is_empty() {
+                    <button class="ghost artifacts-button" onclick={artifacts_button} title="the artifacts this session published (/artifacts)">
+                        { format!("📎 {}", model.artifacts.len()) }
+                    </button>
+                }
                 <span class="muted stats">
                     if let Some(status) = model.status {
                         { format!("{} · ", status_label(&status)) }
@@ -687,7 +831,7 @@ fn session(props: &SessionProps) -> Html {
             }
 
             <main class="transcript" ref={scroll_ref} onscroll={on_scroll}>
-                { for model.blocks.iter().map(|b| render_block(b, *folded)) }
+                { for model.blocks.iter().map(|b| render_block(b, *folded, (!watching).then_some(&open_artifact))) }
                 if !watching && !ended && !busy && !openers.is_empty()
                     && !model.blocks.iter().any(|b| matches!(b, Block::User(_)))
                 {
@@ -717,6 +861,16 @@ fn session(props: &SessionProps) -> Html {
             </main>
 
             if !watching {
+                if *panel_open {
+                    { render_artifacts(
+                        artifact_list.as_ref(),
+                        artifact_doc.as_ref(),
+                        open_artifact.clone(),
+                        artifacts_back,
+                        close_artifacts,
+                        model.clone(),
+                    ) }
+                }
                 if let Some(ask) = model.asks.first() { { render_ask(ask, send_fn.clone()) } }
                 if let Some(ap) = model.approvals.first() { { render_approval(ap, send_fn.clone()) } }
 
@@ -950,8 +1104,25 @@ fn title(m: &Model) -> String {
     }
 }
 
-fn render_block(b: &Block, folded: bool) -> Html {
+fn render_block(b: &Block, folded: bool, on_artifact: Option<&Callback<String>>) -> Html {
     match b {
+        Block::Artifact(a) => {
+            let open = on_artifact.map(|cb| {
+                let (cb, id) = (cb.clone(), a.id.clone());
+                Callback::from(move |_: MouseEvent| cb.emit(id.clone()))
+            });
+            html! {
+                <div class="artifact-card">
+                    <button class="ghost artifact-open" onclick={open} disabled={on_artifact.is_none()}>
+                        <span class="artifact-title">{ "📎 " }{ a.title.clone() }</span>
+                        <span class="muted">{ format!(" · {} · {}", a.kind, a.id) }</span>
+                    </button>
+                    if let Some(s) = &a.summary {
+                        <div class="muted artifact-summary">{ s.clone() }</div>
+                    }
+                </div>
+            }
+        }
         Block::User(t) => html! { <div class="msg user">{ t.clone() }</div> },
         Block::Agent(t) => html! { <div class="agent">{ markdown(t) }</div> },
         Block::Tool(t) => html! { <div class="tool">{ "✎ " }{ t.clone() }</div> },
@@ -987,6 +1158,191 @@ fn render_block(b: &Block, folded: bool) -> Html {
     }
 }
 
+/// The artifact the viewer is showing.
+#[derive(Clone, PartialEq)]
+enum Doc {
+    Loading(String),
+    Loaded(ArtifactBody),
+    Failed(String, String),
+}
+
+async fn get_text(url: &str, token: &str) -> Result<String, String> {
+    let resp = Request::get(url)
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.ok() {
+        return Err(match resp.status() {
+            404 => "not found — missing, or not where cowboy wrote it".to_string(),
+            s => format!("the server answered {s}"),
+        });
+    }
+    resp.text().await.map_err(|e| e.to_string())
+}
+
+async fn fetch_artifacts(session: &str, token: &str) -> Result<Vec<ArtifactEntry>, String> {
+    let url = format!(
+        "/api/session/{}/artifacts",
+        js_sys::encode_uri_component(session)
+    );
+    serde_json::from_str(&get_text(&url, token).await?).map_err(|e| e.to_string())
+}
+
+async fn fetch_artifact(session: &str, id: &str, token: &str) -> Result<ArtifactBody, String> {
+    let url = format!(
+        "/api/session/{}/artifacts/{}",
+        js_sys::encode_uri_component(session),
+        js_sys::encode_uri_component(id)
+    );
+    serde_json::from_str(&get_text(&url, token).await?).map_err(|e| e.to_string())
+}
+
+/// The artifacts panel: the session's list, or one artifact being read. The TUI's
+/// `/artifacts` overlay, as a sheet.
+fn render_artifacts(
+    list: Option<&Result<Vec<ArtifactEntry>, String>>,
+    doc: Option<&Doc>,
+    on_open: Callback<String>,
+    on_back: Callback<()>,
+    on_close: Callback<()>,
+    model: UseReducerHandle<Model>,
+) -> Html {
+    let close = on_close.reform(|_: MouseEvent| ());
+    let back = on_back.reform(|_: MouseEvent| ());
+    let body = match doc {
+        None => match list {
+            None => html! { <p class="muted">{ "loading…" }</p> },
+            Some(Err(e)) => {
+                html! { <p class="error">{ format!("couldn't load the artifacts: {e}") }</p> }
+            }
+            Some(Ok(items)) if items.is_empty() => {
+                html! { <p class="muted">{ "this session hasn't published any artifacts" }</p> }
+            }
+            Some(Ok(items)) => html! {
+                <ul class="artifact-list">
+                    { for items.iter().map(|a| {
+                        let (cb, id) = (on_open.clone(), a.id.clone());
+                        let onclick = Callback::from(move |_: MouseEvent| cb.emit(id.clone()));
+                        html! {
+                            <li>
+                                <button class="artifact-row" {onclick} disabled={a.url.is_none()}>
+                                    <span class="artifact-title">{ a.title.clone() }</span>
+                                    <span class="muted">{ format!(" · {} · {}", a.kind, a.id) }</span>
+                                    if let Some(s) = &a.summary {
+                                        <span class="muted artifact-summary">{ s.clone() }</span>
+                                    }
+                                    if a.url.is_none() {
+                                        <span class="error artifact-summary">{ "not viewable — the file isn't where cowboy wrote it" }</span>
+                                    }
+                                </button>
+                            </li>
+                        }
+                    }) }
+                </ul>
+            },
+        },
+        Some(Doc::Loading(id)) => html! { <p class="muted">{ format!("loading {id}…") }</p> },
+        Some(Doc::Failed(id, e)) => {
+            html! { <p class="error">{ format!("couldn't load {id}: {e}") }</p> }
+        }
+        Some(Doc::Loaded(b)) => {
+            let e = &b.entry;
+            let link = e.url.clone().map(|url| {
+                let copy = {
+                    let (url, model) = (url.clone(), model.clone());
+                    Callback::from(move |_: MouseEvent| {
+                        let msg = if copy_text(&url) {
+                            "copied the artifact's link"
+                        } else {
+                            "couldn't copy — the browser refused clipboard access"
+                        };
+                        model.dispatch(Action::Notice(msg.into()));
+                    })
+                };
+                html! {
+                    <div class="artifact-link">
+                        <code title="opens on the machine running cowboy">{ url }</code>
+                        <button class="ghost" onclick={copy}>{ "copy link" }</button>
+                    </div>
+                }
+            });
+            let content = if matches!(e.kind.as_str(), "patch" | "diff") {
+                html! { <pre class="artifact-diff">{ for b.body.lines().map(diff_line) }</pre> }
+            } else {
+                markdown(&b.body)
+            };
+            html! {
+                <>
+                    <h2 class="artifact-heading">{ e.title.clone() }</h2>
+                    <p class="muted artifact-meta">
+                        { format!("{} · {}", e.kind, e.id) }
+                        if let Some(s) = &e.summary { { format!(" — {s}") } }
+                    </p>
+                    { link.unwrap_or_default() }
+                    <div class="artifact-body">{ content }</div>
+                    if b.truncated {
+                        <p class="muted">{ "… cut at 1 MiB — the link has the whole file" }</p>
+                    }
+                </>
+            }
+        }
+    };
+    html! {
+        <div class="artifacts">
+            <header class="artifacts-bar">
+                if doc.is_some() {
+                    <button class="ghost" onclick={back} title="all artifacts">{ "‹ all" }</button>
+                }
+                <span class="artifacts-title">{ "Artifacts" }</span>
+                <button class="ghost" onclick={close} title="close">{ "✕" }</button>
+            </header>
+            <div class="artifacts-content">{ body }</div>
+        </div>
+    }
+}
+
+/// `#artifact=<session>/<id>` for a `file://` link to a session artifact
+/// (`…/.cowboy/sessions/<session>/artifacts/<id>-….md`), so a click opens the viewer:
+/// a browser page cannot follow a `file://` link, and on a phone the file is not on
+/// this machine anyway. A session-relative `artifacts/<id>-….md` — what the index
+/// records, and what a model tends to write — becomes `#artifact=/<file>`: this
+/// session's, with the file name kept so the viewer can check it names the artifact
+/// it opens. Every part is restricted to the characters ids and names use, so the
+/// anchor is inert whatever the model wrote; the server still resolves and
+/// validates the artifact itself.
+fn artifact_anchor(url: &str) -> Option<String> {
+    let name_ok = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    let id_of = |file: &str| -> Option<String> {
+        let id = &file[..file.find(['-', '.'])?];
+        (id.len() > 1 && id.starts_with('a') && id[1..].bytes().all(|b| b.is_ascii_digit()))
+            .then(|| id.to_string())
+    };
+    if let Some(file) = url.trim_start_matches("./").strip_prefix("artifacts/") {
+        return (name_ok(file) && !file.contains("..") && id_of(file).is_some())
+            .then(|| format!("#artifact=/{file}"));
+    }
+    let path = url
+        .get(..7)
+        .filter(|p| p.eq_ignore_ascii_case("file://"))
+        .map(|_| &url[7..])?;
+    let mut segs = path.rsplit('/');
+    let (file, dir, session, sessions) = (segs.next()?, segs.next()?, segs.next()?, segs.next()?);
+    if dir != "artifacts" || sessions != "sessions" {
+        return None;
+    }
+    let id = id_of(file)?;
+    let session_ok = !session.is_empty()
+        && session
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    session_ok.then(|| format!("#artifact={session}/{id}"))
+}
+
 /// Render agent markdown to sanitized HTML. Raw HTML embedded in the model's
 /// output is shown as escaped text (never executed), and link hrefs are limited
 /// to safe schemes — the agent's output is untrusted, so this must not be an XSS
@@ -1010,7 +1366,9 @@ fn markdown_html(src: &str) -> String {
             title,
             id,
         }) => {
-            let dest_url = if is_safe_url(&dest_url) {
+            let dest_url = if let Some(anchor) = artifact_anchor(&dest_url) {
+                anchor.into()
+            } else if is_safe_url(&dest_url) {
                 dest_url
             } else {
                 "#".into()
@@ -1407,5 +1765,43 @@ mod markdown_tests {
         let out = markdown_html("<script>alert(1)</script>");
         assert!(!out.contains("<script>"), "{out}");
         assert!(out.contains("&lt;script&gt;"), "{out}");
+    }
+
+    /// The agent is told to give the user an artifact's `file://` link. A page cannot
+    /// follow one, so it opens the viewer instead.
+    #[test]
+    fn a_link_to_an_artifact_opens_the_viewer() {
+        let out = markdown_html(
+            "see [the review](file:///home/me/p/.cowboy/sessions/1794-2/artifacts/a0001-review.md)",
+        );
+        assert!(out.contains("href=\"#artifact=1794-2/a0001\""), "{out}");
+        // What a real foreman wrote in its final: the index's relative path.
+        let out = markdown_html("[Release findings](artifacts/a0001-release-review-v0-2-2.md)");
+        assert!(
+            out.contains("href=\"#artifact=/a0001-release-review-v0-2-2.md\""),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn only_a_well_formed_artifact_link_becomes_an_anchor() {
+        for url in [
+            // Not an artifact path.
+            "file:///etc/passwd",
+            "file:///p/.cowboy/sessions/s/handoff.md",
+            "file:///p/.cowboy/sessions/s/artifacts/notes.md",
+            // An id or session that could carry markup into the attribute.
+            "file:///p/.cowboy/sessions/s\"onclick=x/artifacts/a0001-x.md",
+            "file:///p/.cowboy/sessions/s/artifacts/a00x1-x.md",
+            "https://example.com/.cowboy/sessions/s/artifacts/a0001-x.md",
+            "artifacts/a0001-x\".md",
+            "artifacts/../secrets/a0001.md",
+            "artifacts/notes.md",
+        ] {
+            assert_eq!(super::artifact_anchor(url), None, "{url}");
+        }
+        // Everything else about a `file:` link stays refused.
+        let out = markdown_html("[x](file:///etc/passwd)");
+        assert!(out.contains("href=\"#\""), "{out}");
     }
 }

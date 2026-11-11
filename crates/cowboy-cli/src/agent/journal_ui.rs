@@ -202,6 +202,9 @@ impl AgentUi for JournalUi {
     fn steering(&mut self, text: &str) {
         self.emit(UiEventMsg::SteerDelivered(text.to_string()));
     }
+    fn artifact_published(&mut self, a: &cowboy_core::artifact::ArtifactRef, _url: Option<&str>) {
+        self.emit(crate::agent::socket_ui::artifact_event(a));
+    }
     fn final_message(&mut self, message: &str) {
         // Journal it AND print to stdout: the parent captures the subagent's
         // result from the child's stdout (the `COWBOY_PRINT_FINAL_ONLY` contract).

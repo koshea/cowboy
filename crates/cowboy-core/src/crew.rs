@@ -241,6 +241,14 @@ pub struct Delegation {
     /// further by `max_parallel`.
     #[serde(default = "default_max_parallel_per_provider")]
     pub max_parallel_per_provider: u32,
+    /// Per-provider overrides of `max_parallel_per_provider`, keyed by the provider's
+    /// name in `providers.yaml` (`harness:<name>` for a harness). `0` = unlimited for
+    /// that provider. For a provider whose limits differ from the rest — a ChatGPT
+    /// subscription that takes more concurrent requests than a pay-per-token API
+    /// key — without raising the cap for every provider. Still bounded by
+    /// `max_parallel`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub max_parallel_by_provider: BTreeMap<String, u32>,
     /// How deep delegation may nest (foreman = depth 0).
     #[serde(default = "default_max_depth")]
     pub max_depth: u32,
@@ -272,6 +280,15 @@ pub struct Delegation {
 }
 
 impl Delegation {
+    /// The concurrency cap for one provider: its own entry in
+    /// `max_parallel_by_provider`, else `max_parallel_per_provider`. `0` = unlimited.
+    pub fn provider_cap(&self, provider: &str) -> u32 {
+        self.max_parallel_by_provider
+            .get(provider)
+            .copied()
+            .unwrap_or(self.max_parallel_per_provider)
+    }
+
     /// The initial grant for an effort, clamped to the ceiling (a grant larger than
     /// the total it may never exceed would be a lie to the worker).
     pub fn grant_for(&self, effort: Effort) -> u32 {
@@ -291,6 +308,7 @@ impl Default for Delegation {
             enabled: true,
             max_parallel: default_max_parallel(),
             max_parallel_per_provider: default_max_parallel_per_provider(),
+            max_parallel_by_provider: BTreeMap::new(),
             max_depth: default_max_depth(),
             allow_recursive_delegation: false,
             iterations: Grants::default(),
@@ -555,6 +573,10 @@ pub struct DelegationOverride {
     pub max_parallel: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_per_provider: Option<u32>,
+    /// Merged over the shared map key by key, so a crew can set one provider's cap
+    /// without restating the others.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_by_provider: Option<BTreeMap<String, u32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -589,6 +611,10 @@ impl DelegationOverride {
             request_timeout_seconds,
             stall_window
         );
+        if let Some(caps) = &self.max_parallel_by_provider {
+            d.max_parallel_by_provider
+                .extend(caps.iter().map(|(k, v)| (k.clone(), *v)));
+        }
         d
     }
 }
@@ -1069,6 +1095,28 @@ fn default_stall_window() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider can have its own concurrency cap, and a crew can override one
+    /// provider's without restating the rest.
+    #[test]
+    fn a_provider_cap_is_set_per_provider_and_merged_per_crew() {
+        let f = parse_file(
+            "delegation:\n  max_parallel_per_provider: 2\n  max_parallel_by_provider:\n    \
+             chatgpt: 4\n    fireworks: 3\ncrews:\n  a:\n    crew:\n      general: x/m\n  \
+             b:\n    crew:\n      general: x/m\n    delegation:\n      \
+             max_parallel_by_provider:\n        fireworks: 1\n",
+        )
+        .unwrap();
+        let a = f.resolve("a").unwrap().delegation;
+        assert_eq!(a.provider_cap("chatgpt"), 4);
+        assert_eq!(a.provider_cap("fireworks"), 3);
+        assert_eq!(a.provider_cap("anthropic"), 2, "the shared default");
+        let b = f.resolve("b").unwrap().delegation;
+        assert_eq!(b.provider_cap("fireworks"), 1, "the crew's own entry wins");
+        assert_eq!(b.provider_cap("chatgpt"), 4, "and the rest are kept");
+        // Typos are still refused rather than silently ignored.
+        assert!(parse_file("delegation:\n  max_parallel_by_providers: {}\ncrews: {}\n").is_err());
+    }
 
     #[test]
     fn one_roster_routes_to_several_providers() {

@@ -107,6 +107,65 @@ pub fn set_enabled(text: &str, enabled: bool) -> Option<String> {
     Some(join(&ls))
 }
 
+/// Set `delegation.max_parallel_by_provider.<provider>` to `n`, keeping the rest of
+/// the file. `None` for a layout this doesn't handle (a flow-style map, a provider name
+/// that would need quoting) — the caller then re-serializes.
+pub fn set_provider_cap(text: &str, provider: &str, n: u32) -> Option<String> {
+    if provider.is_empty()
+        || !provider
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return None;
+    }
+    let mut ls = lines(text);
+    let Some(head) = top_level(&ls, "delegation") else {
+        ls.push(format!(
+            "delegation:\n  max_parallel_by_provider:\n    {provider}: {n}"
+        ));
+        return Some(join(&ls));
+    };
+    let end = block_end(&ls, head);
+    let child = (head + 1..end)
+        .find(|&i| !is_filler(&ls[i]))
+        .map(|i| indent(&ls[i]))
+        .unwrap_or(2);
+    let pad = " ".repeat(child);
+    let Some(map) = (head + 1..end).find(|&i| {
+        indent(&ls[i]) == child && split_value(&ls[i], "max_parallel_by_provider").is_some()
+    }) else {
+        ls.insert(head + 1, format!("{pad}max_parallel_by_provider:"));
+        ls.insert(head + 2, format!("{pad}  {provider}: {n}"));
+        return Some(join(&ls));
+    };
+    // Block style only: `max_parallel_by_provider: {…}` keeps its value on this line.
+    let after = ls[map].trim_start()["max_parallel_by_provider:".len()..]
+        .split(" #")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !after.is_empty() {
+        return None;
+    }
+    let map_end = block_end(&ls, map);
+    let entry = (map + 1..map_end)
+        .find(|&i| !is_filler(&ls[i]))
+        .map(|i| indent(&ls[i]))
+        .unwrap_or(child + 2);
+    let epad = " ".repeat(entry);
+    match (map + 1..map_end)
+        .find(|&i| indent(&ls[i]) == entry && split_value(&ls[i], provider).is_some())
+    {
+        Some(i) => {
+            let (_, comment) = split_value(&ls[i], provider)?;
+            ls[i] = format!("{epad}{provider}: {n}{comment}");
+        }
+        None => ls.insert(map + 1, format!("{epad}{provider}: {n}")),
+    }
+    Some(join(&ls))
+}
+
 /// The header line, block end and the comment lines just above the header (which
 /// belong to it) for crew `name` under `crews:`, plus the child indent.
 fn crew_block(ls: &[String], name: &str) -> Option<(usize, usize, usize, usize)> {
@@ -214,6 +273,38 @@ mod tests {
 
     fn parse(t: &str) -> crate::crew::CrewFile {
         crate::crew::parse_file(t).unwrap()
+    }
+
+    #[test]
+    fn a_provider_cap_is_added_or_updated_in_place() {
+        let t = set_provider_cap(FILE, "chatgpt", 4).unwrap();
+        assert!(t.contains("  # fan-out\n"), "{t}");
+        let f = parse(&t);
+        assert_eq!(f.delegation.provider_cap("chatgpt"), 4);
+        assert_eq!(
+            f.delegation.max_parallel, 4,
+            "the rest of the block is kept"
+        );
+
+        let t = set_provider_cap(&t, "fireworks", 3).unwrap();
+        let t = set_provider_cap(&t, "chatgpt", 6).unwrap();
+        let f = parse(&t);
+        assert_eq!(f.delegation.provider_cap("chatgpt"), 6);
+        assert_eq!(f.delegation.provider_cap("fireworks"), 3);
+        assert_eq!(
+            t.matches("chatgpt:").count(),
+            1,
+            "updated, not duplicated: {t}"
+        );
+
+        // No delegation block at all.
+        let bare = "version: 1\ncrews:\n  a:\n    crew:\n      general: x/m\n";
+        let f = parse(&set_provider_cap(bare, "chatgpt", 4).unwrap());
+        assert_eq!(f.delegation.provider_cap("chatgpt"), 4);
+        // A layout it doesn't edit, and a name that would need quoting: decline.
+        let flow = "delegation:\n  max_parallel_by_provider: {a: 1}\ncrews: {}\n";
+        assert_eq!(set_provider_cap(flow, "chatgpt", 4), None);
+        assert_eq!(set_provider_cap(FILE, "my provider", 4), None);
     }
 
     #[test]

@@ -76,6 +76,9 @@ active: oss                      # the crew new sessions start with
 delegation:                      # shared by every crew
   enabled: true                  # crew mode on (solo when off; Tab in the /model picker)
   max_parallel: 4                # local fan-out hint (not a quota)
+  max_parallel_per_provider: 2   # per provider, unless it has an entry below
+  max_parallel_by_provider:      # optional: providers with their own cap (0 = unlimited)
+    chatgpt: 4                   #   one ChatGPT plan takes more than an API key
   max_depth: 1                   # foreman delegates; workers don't, by default
   allow_recursive_delegation: false
 crews:
@@ -268,10 +271,24 @@ rather than arguing indefinitely.
 
 Fan-out is capped by `delegation.max_parallel` (a local throughput hint; the
 gateway is the real backpressure) and by `delegation.max_parallel_per_provider`,
-which keeps a burst of same-model workers off one provider's rate limit. Both
-caps are **session-wide**, so they still hold when dispatches span several turns.
+which keeps a burst of same-model workers off one provider's rate limit. A provider
+can have its own cap under `delegation.max_parallel_by_provider`, keyed by its name
+in `providers.yaml` (`harness:<name>` for a harness), where `0` means unlimited for
+that provider alone. `cowboy crew new --preset chatgpt` sets the ChatGPT provider to
+4, unless you already gave it a cap, since one plan is one pool with limits of its
+own. A crew's `delegation:` block can override single entries without restating the
+rest. All caps are **session-wide**, so they still hold when dispatches span several
+turns, and are read when the session starts. `cowboy crew list` shows the caps in
+effect, and when a batch queues, the notice names the cap holding it back
+(`5 subagents: 4 running, 1 queued (max 4 on chatgpt)`).
 Independent read/explore/review work parallelizes safely in the shared sandbox;
 isolated parallel *writers* compose with [Ranch](../ranch/overview.md) worktrees.
+
+When a worker finishes, the foreman gets its final answer **and the text of every
+artifact it published** (handoffs excepted, since they restate the final). A worker
+often ends with "full evidence: artifact a0001", and its session directory is not
+somewhere the foreman can open. The foreman can re-read one later with `artifact show`
+and the job's id.
 
 Once the roster is set up, delegation is frictionless — no per-task approvals, no
 budget gates. Configure the crew once, then let it work.

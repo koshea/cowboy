@@ -193,6 +193,11 @@ async fn the_chatgpt_preset_imports_its_models_and_adds_a_valid_crew() {
     );
     // This catalogue lists no `xhigh`, so the slot is left at astra's own level.
     assert_eq!(debugging.pick(Effort::Deep), Some("chatgpt/gpt-6-astra"));
+    // One plan, one pool: the preset gives the provider its own, higher cap.
+    assert_eq!(
+        f.delegation.provider_cap("chatgpt"),
+        cowboy_core::crew_presets::CHATGPT_MAX_PARALLEL
+    );
     cowboy(&home).args(["crew", "validate"]).assert().success();
     // A second preset crew reuses the configured models instead of importing again.
     cowboy(&home)

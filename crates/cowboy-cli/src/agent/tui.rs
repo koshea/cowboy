@@ -327,6 +327,9 @@ impl AgentUi for TuiUi {
     fn blocked(&mut self, reason: Option<&str>) {
         self.wire(UiEventMsg::Blocked(reason.map(str::to_string)));
     }
+    fn artifact_published(&mut self, a: &cowboy_core::artifact::ArtifactRef, _url: Option<&str>) {
+        self.wire(crate::agent::socket_ui::artifact_event(a));
+    }
     fn final_message(&mut self, message: &str) {
         self.wire(UiEventMsg::Final(message.to_string()));
     }
@@ -459,6 +462,12 @@ fn apply_wire(app: &mut App, msg: UiEventMsg) {
         }
         UiEventMsg::QueueChanged { pending } => app.queued = pending,
         UiEventMsg::SteerDelivered(text) => app.push(LineKind::Notice, format!("↳ {text}")),
+        UiEventMsg::ArtifactPublished {
+            id, kind, title, ..
+        } => {
+            app.commit_stream();
+            app.push_artifact(&id, &kind, &title);
+        }
         // Handled in the event loop (needs loop-local turn bookkeeping).
         UiEventMsg::TurnDone => {}
     }
@@ -572,6 +581,12 @@ fn set_running(app: &mut App, prompts: &mut PendingPrompts, running: bool) {
     } else {
         (Mode::Running, Mode::Idle, "ready")
     };
+    // Behind an overlay that remembers where it returns to, the change lands there.
+    if let Some(mode) = app.overlay_return_mode() {
+        if *mode == from {
+            *mode = to.clone();
+        }
+    }
     if prompts.active.is_some() {
         if let Some(mode) = prompts.return_mode.as_mut() {
             if *mode == from {
@@ -665,6 +680,9 @@ fn approval_view(d: ApprovalDetail) -> cowboy_tui::ApprovalView {
 pub struct SessionCtx {
     /// Project root (for `/diff`).
     pub root: PathBuf,
+    /// The session's id, which locates its artifacts (`.cowboy/sessions/<id>/`).
+    /// `None` when attached by bare socket path, where it isn't known.
+    pub session_id: Option<String>,
     /// Available model names (for `/model`).
     pub models: Vec<String>,
     /// The currently active model name.
@@ -1062,7 +1080,14 @@ fn event_loop(
     'main: loop {
         while let Ok(ev) = events.try_recv() {
             match ev {
-                UiEvent::Wire(msg) => apply_live_wire(&mut app, &mut prompts, &echo, msg),
+                UiEvent::Wire(msg) => {
+                    // Re-read the index before the line is drawn, so the line can carry
+                    // the host-validated link (the event itself carries no path).
+                    if matches!(msg, UiEventMsg::ArtifactPublished { .. }) {
+                        refresh_artifacts(&mut app, &session);
+                    }
+                    apply_live_wire(&mut app, &mut prompts, &echo, msg)
+                }
                 UiEvent::Ask(id, question, options, reply) => {
                     prompts.add(
                         &mut app,
@@ -1502,6 +1527,111 @@ fn scroll_help(app: &mut App, delta: isize) {
     }
 }
 
+fn artifact_item(e: cowboy_core::daemonproto::ArtifactEntry) -> cowboy_tui::ArtifactItem {
+    cowboy_tui::ArtifactItem {
+        id: e.id,
+        kind: e.kind,
+        title: e.title,
+        summary: e.summary,
+        url: e.url,
+    }
+}
+
+/// Reload the session's artifacts from its host-side index — the same read the web
+/// UI's `/api/session/{id}/artifacts` does, so both clients list the same thing.
+fn refresh_artifacts(app: &mut App, session: &SessionCtx) {
+    let Some(id) = &session.session_id else {
+        return;
+    };
+    let items = crate::cmd::artifact::entries(&session.root, id)
+        .into_iter()
+        .map(artifact_item)
+        .collect();
+    app.set_artifacts(items);
+}
+
+/// Open the artifacts overlay (`/artifacts`, Alt-a). A view like help: the turn keeps
+/// running behind it, and read-only clients may open it too.
+fn open_artifacts(app: &mut App, session: &SessionCtx) {
+    if session.session_id.is_none() {
+        app.push(
+            LineKind::Notice,
+            "artifacts: this client doesn't know which session it is attached to",
+        );
+        return;
+    }
+    if matches!(
+        app.mode,
+        Mode::Help | Mode::ModelPicker | Mode::ModelForm | Mode::WatchingSubagent | Mode::Artifacts
+    ) {
+        return;
+    }
+    refresh_artifacts(app, session);
+    app.open_artifacts(app.mode.clone());
+}
+
+/// Keys while the artifacts overlay is up: pick from the list, then read and scroll.
+fn handle_artifacts_key(key: KeyEvent, app: &mut App, session: &SessionCtx) {
+    let Some(view) = app.artifacts_view.as_mut() else {
+        app.mode = Mode::Idle;
+        return;
+    };
+    let mut copy = None;
+    if let Some(doc) = view.doc.as_mut() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('q') => {
+                view.doc = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => doc.scroll_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => doc.scroll_by(1),
+            KeyCode::PageUp => doc.scroll_by(-doc.page()),
+            KeyCode::PageDown | KeyCode::Char(' ') => doc.scroll_by(doc.page()),
+            KeyCode::Home | KeyCode::Char('g') => doc.scroll_by(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => doc.scroll_by(isize::MAX / 2),
+            KeyCode::Char('y') => copy = doc.item.url.clone(),
+            _ => {}
+        }
+    } else {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.close_artifacts();
+                return;
+            }
+            KeyCode::Up | KeyCode::Char('k') => view.move_sel(-1),
+            KeyCode::Down | KeyCode::Char('j') => view.move_sel(1),
+            KeyCode::Char('y') => copy = view.selected_item().and_then(|i| i.url.clone()),
+            KeyCode::Enter | KeyCode::Right => {
+                let Some(item) = view.selected_item().cloned() else {
+                    return;
+                };
+                let body = session
+                    .session_id
+                    .as_deref()
+                    .and_then(|sid| crate::cmd::artifact::body(&session.root, sid, &item.id));
+                match body {
+                    Some(b) => {
+                        view.doc = Some(cowboy_tui::ArtifactDoc::new(
+                            artifact_item(b.entry),
+                            &b.body,
+                            b.truncated,
+                        ));
+                    }
+                    None => {
+                        app.status = format!(
+                            "can't read {} — the file isn't where cowboy wrote it",
+                            item.id
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(url) = copy {
+        app.request_copy(url);
+    }
+}
+
 /// This project's skills as `(name, hint)`, for help and autocomplete.
 fn help_skills(session: &SessionCtx) -> Vec<(String, String)> {
     cowboy_core::skills::discover(&session.root)
@@ -1533,6 +1663,17 @@ fn accepts_paste(access: Access, mode: &Mode) -> bool {
 
 /// Returns true if the loop should exit.
 fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bool {
+    // The artifacts overlay takes every key, scrolling included — except Ctrl-C, which
+    // closes it and then does what it always does (interrupt, clear, end).
+    if app.mode == Mode::Artifacts {
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if !ctrl_c {
+            handle_artifacts_key(key, app, ctx.session);
+            return false;
+        }
+        app.close_artifacts();
+    }
     // Slash-command autocomplete popup: Up/Down navigate, Tab accepts, Esc
     // dismisses. (Enter falls through to submit what's typed; typing refines.)
     if app.has_completions() {
@@ -1638,6 +1779,13 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
             return false;
         }
         _ => {}
+    }
+
+    // Alt-a: the artifacts overlay. Ahead of the read-only gate, because reading what
+    // a session produced is exactly what a replay or a watch-only attach is for.
+    if key.code == KeyCode::Char('a') && key.modifiers.contains(KeyModifiers::ALT) {
+        open_artifacts(app, ctx.session);
+        return false;
     }
 
     // Persistent read-only access is orthogonal to the transient mode. After
@@ -2148,6 +2296,7 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
         },
         "mcp" => mcp_command(app, &ctx.session.root),
         "context" => context_command(app),
+        "artifacts" => open_artifacts(app, ctx.session),
         // Collapse the mechanics of turns you have already read, so a long session
         // can be scanned as a conversation rather than scrolled through as a log.
         "fold" => {
@@ -2739,6 +2888,7 @@ mod tests {
                 hist_pos: None,
                 session: SessionCtx {
                     root: PathBuf::from("/nonexistent"),
+                    session_id: None,
                     models: Vec::new(),
                     current_model: String::new(),
                     ranch_id: None,

@@ -72,6 +72,12 @@ fn show(root: &Path, session: Option<&str>, id: &str) -> Result<()> {
                 r.kind.as_str(),
                 r.path.display()
             );
+            let session_id = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if let Some(file) =
+                viewer_session_dir(root, session_id).and_then(|d| artifact::host_file(&d, &r))
+            {
+                println!("{}", artifact::file_url(&file));
+            }
             if let Some(s) = &r.summary {
                 println!("{s}\n");
             }
@@ -80,6 +86,72 @@ fn show(root: &Path, session: Option<&str>, id: &str) -> Result<()> {
         }
         None => bail!("no artifact `{id}` in this session"),
     }
+}
+
+// --- for the TUI and the web UI ----------------------------------------------
+
+/// The session directory a viewer reads `id`'s artifacts from: under the canonical
+/// `root`, and only for an id that is a single path component — the id arrives from
+/// a client, and `session_dir` would happily join `../..`.
+///
+/// Built from the root rather than canonicalizing the session dir itself, so a
+/// `.cowboy` or `sessions/<id>` the agent swapped for a symlink is not followed.
+pub(crate) fn viewer_session_dir(root: &Path, id: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut parts = Path::new(id).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(Component::Normal(_)), None)
+    ) {
+        return None;
+    }
+    Some(crate::session::session_dir(
+        &std::fs::canonicalize(root).ok()?,
+        id,
+    ))
+}
+
+fn entry(dir: &Path, r: &artifact::ArtifactRef) -> cowboy_core::daemonproto::ArtifactEntry {
+    cowboy_core::daemonproto::ArtifactEntry {
+        id: r.id.clone(),
+        kind: r.kind.as_str().to_string(),
+        title: r.title.clone(),
+        summary: r.summary.clone(),
+        created_ms: r.created_ms,
+        url: artifact::host_file(dir, r).map(|f| artifact::file_url(&f)),
+    }
+}
+
+/// Session `id`'s artifacts, in publish order, each with its link when it has one.
+pub fn entries(root: &Path, id: &str) -> Vec<cowboy_core::daemonproto::ArtifactEntry> {
+    let Some(dir) = viewer_session_dir(root, id) else {
+        return Vec::new();
+    };
+    artifact::list_in(&dir)
+        .iter()
+        .map(|r| entry(&dir, r))
+        .collect()
+}
+
+/// One artifact's body for a viewer, read only from the validated host file and cut
+/// at [`artifact::VIEW_MAX_BYTES`]. `None` for an unknown id or a file that is not
+/// where the host put it.
+pub fn body(
+    root: &Path,
+    id: &str,
+    artifact_id: &str,
+) -> Option<cowboy_core::daemonproto::ArtifactBody> {
+    let dir = viewer_session_dir(root, id)?;
+    let r = artifact::list_in(&dir)
+        .into_iter()
+        .find(|a| a.id == artifact_id)?;
+    let file = artifact::host_file(&dir, &r)?;
+    let (body, truncated) = artifact::read_for_view(&file)?;
+    Some(cowboy_core::daemonproto::ArtifactBody {
+        entry: entry(&dir, &r),
+        body,
+        truncated,
+    })
 }
 
 fn add(
@@ -124,5 +196,49 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let head: String = s.chars().take(max.saturating_sub(1)).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_viewer_lists_and_reads_a_sessions_artifacts() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let dir = crate::session::session_dir(tmp.path(), "s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        artifact::add_in(
+            &dir,
+            "s1",
+            ArtifactKind::Review,
+            "Review",
+            "# body",
+            None,
+            1,
+        )
+        .unwrap();
+
+        let listed = entries(tmp.path(), "s1");
+        assert_eq!(listed.len(), 1);
+        let url = listed[0].url.as_deref().expect("a link");
+        assert!(
+            url.starts_with("file:///") && url.ends_with("a0001-review.md"),
+            "{url}"
+        );
+
+        let b = body(tmp.path(), "s1", "a0001").expect("a body");
+        assert_eq!(b.body, "# body");
+        assert!(!b.truncated);
+        assert!(body(tmp.path(), "s1", "a0009").is_none());
+    }
+
+    #[test]
+    fn a_session_id_from_a_client_cannot_walk_out_of_the_sessions_dir() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        for id in ["../..", "a/b", "/etc", ""] {
+            assert!(viewer_session_dir(tmp.path(), id).is_none(), "{id:?}");
+            assert!(entries(tmp.path(), id).is_empty(), "{id:?}");
+        }
     }
 }

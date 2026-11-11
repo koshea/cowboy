@@ -114,8 +114,9 @@ pub async fn run(
         };
         // A direct `cowboy` session is never a ranch workstream (those are launched
         // by `cowboy ranch start` and picked up via `cowboy ranch attach`).
-        let ctx_for = |root: PathBuf| SessionCtx {
+        let ctx_for = |root: PathBuf, id: &str| SessionCtx {
             root,
+            session_id: Some(id.to_string()),
             models: model_names.clone(),
             current_model: current_model.clone(),
             ranch_id: None,
@@ -144,17 +145,18 @@ pub async fn run(
                         &worker_sock,
                         &title,
                         intro,
-                        ctx_for(root),
+                        ctx_for(root, &id),
                     );
                 }
                 DaemonResp::LeaseDenied { held_by, .. } => {
                     match decide_collision(&held_by, &flags)? {
                         Collision::Attach => {
-                            return attach_existing(&held_by.id, ctx_for(held_by.root), false)
-                                .await;
+                            let ctx = ctx_for(held_by.root, &held_by.id);
+                            return attach_existing(&held_by.id, ctx, false).await;
                         }
                         Collision::ReadOnly => {
-                            return attach_existing(&held_by.id, ctx_for(held_by.root), true).await;
+                            let ctx = ctx_for(held_by.root, &held_by.id);
+                            return attach_existing(&held_by.id, ctx, true).await;
                         }
                         Collision::NewWorktree => {
                             root = create_worktree_for(&root, task.as_deref()).await?;

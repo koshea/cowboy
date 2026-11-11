@@ -34,6 +34,7 @@ pub async fn run(target: String) -> Result<()> {
     if p.exists() && p.extension().is_some_and(|e| e == "sock") {
         let ctx = SessionCtx {
             root: std::env::current_dir().unwrap_or_default(),
+            session_id: None,
             models: Vec::new(),
             current_model: String::new(),
             ranch_id: None,
@@ -69,6 +70,7 @@ pub async fn run(target: String) -> Result<()> {
     };
     let ctx = SessionCtx {
         root: info.root.clone(),
+        session_id: Some(info.id.clone()),
         models: Vec::new(),
         current_model: String::new(),
         ranch_id: info.ranch_id.clone(),

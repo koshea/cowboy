@@ -36,6 +36,12 @@ pub(super) fn style_for(kind: LineKind) -> (&'static str, Style) {
         ),
         LineKind::Notice => ("", Style::default().fg(Color::DarkGray)),
         LineKind::Error => ("✗ ", Style::default().fg(Color::Red)),
+        LineKind::Artifact => (
+            "📎 ",
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ),
     }
 }
 
@@ -95,6 +101,7 @@ pub(super) fn spacer_before(prev: Option<LineKind>, cur: LineKind) -> bool {
             | LineKind::Tool
             | LineKind::Agent
             | LineKind::Diff
+            | LineKind::Artifact
     ) && prev != LineKind::Banner
         && prev != LineKind::Art
 }
@@ -191,8 +198,180 @@ pub fn draw(f: &mut Frame, app: &App) {
                 draw_model_form(f, area, form);
             }
         }
+        Mode::Artifacts => {
+            if let Some(v) = &app.artifacts_view {
+                draw_artifacts(f, area, v);
+            }
+        }
         _ => {}
     }
+}
+
+/// The artifacts overlay: the session's list, or one artifact being read.
+///
+/// Full-screen-ish like help, since an artifact is a document: a review or a contract
+/// wants the width, and a fixed modal would truncate it.
+pub(super) fn draw_artifacts(f: &mut Frame, area: Rect, v: &ArtifactsView) {
+    let rect = centered(
+        area,
+        area.width.saturating_sub(4).min(110),
+        area.height.saturating_sub(2),
+    );
+    f.render_widget(Clear, rect);
+    let title = match &v.doc {
+        Some(d) => format!(" {} · {} · {} ", d.item.title, d.item.kind, d.item.id),
+        None => format!(" Artifacts ({}) ", v.items.len()),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .title(Span::styled(
+            trunc(&title, rect.width.saturating_sub(4) as usize),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().fg(Color::Blue));
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    let body = Rect {
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + inner.height.saturating_sub(1),
+        height: 1,
+        ..inner
+    };
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let hint = match &v.doc {
+        Some(d) => {
+            draw_artifact_doc(f, body, d);
+            let more = d.total.get().saturating_sub(d.scroll + d.viewport.get());
+            let pos = if more > 0 {
+                format!("{more} more below · ")
+            } else {
+                String::new()
+            };
+            let copy = if d.item.url.is_some() {
+                "y copies the link · "
+            } else {
+                ""
+            };
+            format!("↑↓ PgUp PgDn scroll · {pos}{copy}Esc back")
+        }
+        None => {
+            draw_artifact_list(f, body, v);
+            if v.items.is_empty() {
+                "Esc closes".to_string()
+            } else {
+                "↑↓ select · Enter read · Esc closes".to_string()
+            }
+        }
+    };
+    f.render_widget(Paragraph::new(Line::from(Span::styled(hint, dim))), footer);
+}
+
+fn draw_artifact_list(f: &mut Frame, area: Rect, v: &ArtifactsView) {
+    if v.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "this session hasn't published any artifacts",
+                Style::default().fg(Color::DarkGray),
+            )),
+            area,
+        );
+        return;
+    }
+    // Two rows per artifact: the heading, then its summary (or why it can't be read).
+    let per = 2usize;
+    let fits = (area.height as usize / per).max(1);
+    let top = v.selected.saturating_sub(fits - 1);
+    let width = area.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, a) in v.items.iter().enumerate().skip(top).take(fits) {
+        let sel = i == v.selected;
+        let head = Style::default()
+            .fg(if sel { Color::Black } else { Color::White })
+            .bg(if sel { Color::Blue } else { Color::Reset })
+            .add_modifier(Modifier::BOLD);
+        let marker = if sel { "› " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            trunc(
+                &format!("{marker}{:<6} {:<15} {}", a.id, a.kind, a.title),
+                width,
+            ),
+            head,
+        )));
+        let (detail, style) = match (&a.url, &a.summary) {
+            (None, _) => (
+                "not viewable — the file isn't where cowboy wrote it".to_string(),
+                Style::default().fg(Color::Red),
+            ),
+            (Some(_), Some(s)) => (s.clone(), Style::default().fg(Color::Gray)),
+            (Some(_), None) => (String::new(), Style::default()),
+        };
+        lines.push(Line::from(Span::styled(
+            trunc(&format!("         {detail}"), width),
+            style,
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_artifact_doc(f: &mut Frame, area: Rect, d: &ArtifactDoc) {
+    // The link, then a rule, then the body — which scrolls under them.
+    let link_row = Rect { height: 1, ..area };
+    let body = Rect {
+        y: area.y + 2,
+        height: area.height.saturating_sub(2),
+        ..area
+    };
+    match &d.item.url {
+        Some(url) => {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    trunc(url, area.width as usize),
+                    markdown::link_style(),
+                )),
+                link_row,
+            );
+            // Clickable (ctrl/cmd-click in most terminals). The URL is host-built for
+            // this artifact — see `App::is_artifact_link` — and has no control bytes.
+            let shown = url.chars().count().min(area.width as usize) as u16;
+            if shown > 0 && !url.chars().any(|c| c.is_control()) {
+                write_hyperlink(
+                    f.buffer_mut(),
+                    area.x,
+                    area.x + area.width,
+                    area.y,
+                    0,
+                    shown - 1,
+                    url,
+                );
+            }
+        }
+        None => f.render_widget(
+            Paragraph::new(Span::styled(
+                "(no link: the file isn't where cowboy wrote it)",
+                Style::default().fg(Color::Red),
+            )),
+            link_row,
+        ),
+    }
+    let mut lines = d.lines.clone();
+    if d.truncated {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "… cut at 1 MiB — the link has the whole file",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    d.viewport.set(body.height as usize);
+    d.total.set(para.line_count(body.width));
+    let scroll = d.scroll.min(u16::MAX as usize) as u16;
+    f.render_widget(para.scroll((scroll, 0)), body);
 }
 
 /// Render a watched subagent's nested transcript full-screen, with a header
@@ -573,13 +752,19 @@ pub(super) fn trunc(s: &str, max: usize) -> String {
 }
 
 /// Which line kinds survive a fold: the prompt that opened the turn, the answer it
-/// closed with, and anything that went wrong. The mechanics in between — commands,
-/// their output, file actions, diffs — are what folding is for. An error is never
-/// hidden: a collapsed turn must not be able to swallow the reason it failed.
+/// closed with, what it published, and anything that went wrong. The mechanics in
+/// between — commands, their output, file actions, diffs — are what folding is for. An
+/// error is never hidden: a collapsed turn must not be able to swallow the reason it
+/// failed.
 fn survives_fold(kind: LineKind) -> bool {
     matches!(
         kind,
-        LineKind::User | LineKind::Final | LineKind::Error | LineKind::Banner | LineKind::Art
+        LineKind::User
+            | LineKind::Final
+            | LineKind::Error
+            | LineKind::Banner
+            | LineKind::Art
+            | LineKind::Artifact
     )
 }
 
@@ -696,6 +881,19 @@ pub(super) fn build_transcript_lines(app: &App) -> Vec<Line<'static>> {
             }
             continue;
         }
+        // A published artifact: its heading, then its host-built link styled as a link
+        // so the hyperlink overlay makes it clickable.
+        if entry.kind == LineKind::Artifact {
+            let (head, url) = artifact_line_parts(&entry.text);
+            lines.push(Line::from(Span::styled(format!("{prefix}{head}"), style)));
+            if let Some(url) = url {
+                lines.push(Line::from(vec![
+                    Span::raw(" ".repeat(prefix.chars().count())),
+                    Span::styled(url.to_string(), markdown::link_style()),
+                ]));
+            }
+            continue;
+        }
         // Agent/Final prose is Markdown: headings, emphasis, lists, links, and
         // syntax-highlighted code blocks. A leading marker keeps the speaker cue.
         if matches!(entry.kind, LineKind::Agent | LineKind::Final)
@@ -798,6 +996,9 @@ pub(super) fn transcript_link_urls(app: &App) -> Vec<String> {
         {
             urls.extend(markdown::link_urls(&e.text));
         }
+        if e.kind == LineKind::Artifact {
+            urls.extend(artifact_line_parts(&e.text).1.map(str::to_string));
+        }
     }
     if !app.streaming.is_empty() && markdown::looks_like_markdown(&app.streaming) {
         urls.extend(markdown::link_urls(&app.streaming));
@@ -886,11 +1087,51 @@ pub(super) fn compute_link_hits(
     hits
 }
 
+/// An [`LineKind::Artifact`] line's heading and its link, if it has one.
+fn artifact_line_parts(text: &str) -> (&str, Option<&str>) {
+    match text.split_once('\n') {
+        Some((head, url)) if url.starts_with("file://") => (head, Some(url)),
+        Some((head, _)) => (head, None),
+        None => (text, None),
+    }
+}
+
+/// Write `url` as an OSC 8 hyperlink over the already-rendered cells `col0..=col1` of
+/// row `y` (absolute buffer coordinates, `x0` the area's left edge, `right` its right
+/// edge). Following ratatui's own hyperlink example, the label is emitted in 2-char
+/// chunks placed every 2 cells.
+///
+/// Each chunk cell declares its real width (`ForcedWidth`). Without that, ratatui sizes
+/// the cell by the escape string's printable characters, and the diff then skips that
+/// many cells — so only the first chunk of a link reached the terminal, and the rest
+/// of the row (border included) was never drawn. The caller has checked the URL.
+fn write_hyperlink(buf: &mut Buffer, x0: u16, right: u16, y: u16, col0: u16, col1: u16, url: &str) {
+    use ratatui::buffer::CellDiffOption;
+    use unicode_width::UnicodeWidthStr;
+    // Reconstruct the label from the already-rendered cells.
+    let label: String = (col0..=col1)
+        .map(|x| buf[(x0 + x, y)].symbol().to_string())
+        .collect();
+    let chars: Vec<char> = label.chars().collect();
+    for (i, chunk) in chars.chunks(2).enumerate() {
+        let piece: String = chunk.iter().collect();
+        let cx = x0 + col0 + (i as u16) * 2;
+        if cx >= right {
+            break;
+        }
+        let hyper = format!("\x1b]8;;{url}\x07{piece}\x1b]8;;\x07");
+        let width = (piece.width() as u16).clamp(1, right - cx);
+        buf[(cx, y)]
+            .set_symbol(&hyper)
+            .set_diff_option(CellDiffOption::ForcedWidth(
+                std::num::NonZeroU16::new(width).unwrap_or(std::num::NonZeroU16::MIN),
+            ));
+    }
+}
+
 /// Overlay OSC 8 hyperlinks onto the rendered transcript: for each visible link
 /// placement, rewrite its cells' symbols to wrap the label text in the escape
-/// (`ESC ] 8 ; ; URL BEL text ESC ] 8 ; ; BEL`). Following ratatui's own
-/// hyperlink example, the text is emitted in 2-char chunks placed every 2 cells
-/// to work around ratatui's escape-width miscalculation (issue #902).
+/// (`ESC ] 8 ; ; URL BEL text ESC ] 8 ; ; BEL`).
 pub(super) fn overlay_hyperlinks(buf: &mut Buffer, app: &App, text_rect: Rect, offset_top: usize) {
     let hits = link_hits(app, text_rect.width);
     let top = offset_top;
@@ -899,26 +1140,26 @@ pub(super) fn overlay_hyperlinks(buf: &mut Buffer, app: &App, text_rect: Rect, o
         // The destination is model output being written into an escape sequence, so it
         // is checked before it goes anywhere near the terminal. Skipping leaves the
         // label rendered and styled, minus the clickable destination — see
-        // `markdown::is_safe_url`.
-        if !markdown::is_safe_url(&h.url) {
+        // `markdown::is_safe_url`. The one `file:` exception is a link the host built
+        // for one of this session's artifacts, which the model cannot mint — and a
+        // relative `artifacts/…` path naming one is pointed at that link.
+        let target = if markdown::is_safe_url(&h.url) {
+            h.url.clone()
+        } else if let Some(link) = app.artifact_link(&h.url) {
+            link
+        } else {
             continue;
-        }
-        let sy = (h.row - top) as u16;
-        let y = text_rect.y + sy;
-        // Reconstruct the label from the already-rendered cells.
-        let label: String = (h.col0..=h.col1)
-            .map(|x| buf[(text_rect.x + x, y)].symbol().to_string())
-            .collect();
-        let chars: Vec<char> = label.chars().collect();
-        for (i, chunk) in chars.chunks(2).enumerate() {
-            let piece: String = chunk.iter().collect();
-            let cx = text_rect.x + h.col0 + (i as u16) * 2;
-            if cx >= text_rect.x + text_rect.width {
-                break;
-            }
-            let hyper = format!("\x1b]8;;{}\x07{}\x1b]8;;\x07", h.url, piece);
-            buf[(cx, y)].set_symbol(&hyper);
-        }
+        };
+        let y = text_rect.y + (h.row - top) as u16;
+        write_hyperlink(
+            buf,
+            text_rect.x,
+            text_rect.x + text_rect.width,
+            y,
+            h.col0,
+            h.col1,
+            &target,
+        );
     }
 }
 
@@ -1166,6 +1407,7 @@ pub(super) fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             Mode::ModelPicker => "models",
             Mode::ModelForm => "models",
             Mode::WatchingSubagent => "watching",
+            Mode::Artifacts => "artifacts",
             Mode::Done => "done",
         },
     };

@@ -39,6 +39,10 @@ pub enum LineKind {
     Final,
     Notice,
     Error,
+    /// The session published an artifact. The text is `title · kind · id`, then the
+    /// host-validated `file://` link on a second line when there is one — rendered as a
+    /// clickable link, since a link the host built is one it can vouch for.
+    Artifact,
 }
 
 /// The session-intro animation.
@@ -151,6 +155,8 @@ pub enum Mode {
     ModelForm,
     /// Watching a subagent's live output (the watched session in `App::watching`).
     WatchingSubagent,
+    /// Browsing or reading the session's artifacts (state in `App::artifacts_view`).
+    Artifacts,
     Done,
 }
 
@@ -435,6 +441,100 @@ impl HelpView {
     }
 }
 
+/// One published artifact, as the TUI lists it. The view mirror of the wire's
+/// `ArtifactEntry`, kept here so this crate stays free of the protocol.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArtifactItem {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: Option<String>,
+    /// The host-validated `file://` link, or `None` when the file is not viewable.
+    pub url: Option<String>,
+}
+
+/// The artifacts overlay: the session's list, and the artifact being read, if any.
+#[derive(Debug, Clone)]
+pub struct ArtifactsView {
+    pub items: Vec<ArtifactItem>,
+    pub selected: usize,
+    pub doc: Option<ArtifactDoc>,
+    /// The mode to return to on close. Kept here, not by the caller, so a turn that
+    /// starts or ends while the overlay is open can update it (see
+    /// [`App::overlay_return_mode`]) — otherwise closing would restore a stale
+    /// `Running` and leave a spinner going after the turn ended.
+    pub back_to: Mode,
+}
+
+impl ArtifactsView {
+    pub fn move_sel(&mut self, delta: isize) {
+        let n = self.items.len();
+        if n > 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+        }
+    }
+
+    pub fn selected_item(&self) -> Option<&ArtifactItem> {
+        self.items.get(self.selected)
+    }
+
+    /// Replace the list (a new artifact was published), keeping the selection on the
+    /// same artifact when it is still there.
+    pub fn set_items(&mut self, items: Vec<ArtifactItem>) {
+        let keep = self.selected_item().map(|i| i.id.clone());
+        self.items = items;
+        self.selected = keep
+            .and_then(|id| self.items.iter().position(|i| i.id == id))
+            .unwrap_or(0)
+            .min(self.items.len().saturating_sub(1));
+    }
+}
+
+/// One artifact open for reading.
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactDoc {
+    pub item: ArtifactItem,
+    /// Rendered once on open: re-parsing a large markdown body on every frame (the
+    /// throbber redraws ~10×/s) would be wasted work.
+    pub lines: Vec<Line<'static>>,
+    pub truncated: bool,
+    /// First visible wrapped row.
+    pub scroll: usize,
+    /// Rows the last render could show, and the wrapped rows it produced — measured,
+    /// like [`HelpView`]'s, because wrapping depends on the width.
+    pub viewport: std::cell::Cell<usize>,
+    pub total: std::cell::Cell<usize>,
+}
+
+impl ArtifactDoc {
+    pub fn new(item: ArtifactItem, body: &str, truncated: bool) -> Self {
+        let lines = if matches!(item.kind.as_str(), "patch" | "diff") {
+            render::render_diff(body)
+        } else {
+            markdown::render(body, Style::default())
+        };
+        Self {
+            item,
+            lines,
+            truncated,
+            scroll: 0,
+            viewport: std::cell::Cell::new(1),
+            total: std::cell::Cell::new(0),
+        }
+    }
+
+    /// Scroll by `delta` rows, clamped to a full last page (see [`HelpView::scroll_by`]).
+    pub fn scroll_by(&mut self, delta: isize) {
+        let max = self.total.get().saturating_sub(self.viewport.get().max(1));
+        self.scroll = (self.scroll as isize + delta).clamp(0, max as isize) as usize;
+    }
+
+    /// A page, for PgUp/PgDn.
+    pub fn page(&self) -> isize {
+        self.viewport.get().saturating_sub(1).max(1) as isize
+    }
+}
+
 /// One aggregated network-activity row: a verdict + destination, with how many
 /// times it's been seen (gateway decisions repeat a lot for chatty hosts).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -685,6 +785,12 @@ pub struct App {
     pub approval: Option<ApprovalView>,
     /// Keys/commands reference (set while `mode == Help`).
     pub help: Option<HelpView>,
+    /// The session's artifacts as the client last loaded them. Also the allowlist for
+    /// `file://` links: a link the host built for one of these is clickable, while any
+    /// other `file:` link in model output stays inert (see `markdown::is_safe_url`).
+    pub artifacts: Vec<ArtifactItem>,
+    /// The artifacts overlay (set while `mode == Artifacts`).
+    pub artifacts_view: Option<ArtifactsView>,
     /// Slash-command autocomplete popup (set while the input is `/<partial>`).
     pub completion: Option<CompletionState>,
     /// Text awaiting copy to the system clipboard. The event loop drains it
@@ -797,6 +903,8 @@ impl App {
             choice: None,
             approval: None,
             help: None,
+            artifacts: Vec::new(),
+            artifacts_view: None,
             completion: None,
             pending_copy: None,
             watching: None,
@@ -842,6 +950,78 @@ impl App {
     pub fn close_help(&mut self, back_to: Mode) {
         self.help = None;
         self.mode = back_to;
+    }
+
+    /// Open the artifacts overlay on `self.artifacts`, returning to `back_to` on close.
+    pub fn open_artifacts(&mut self, back_to: Mode) {
+        let mut view = ArtifactsView {
+            items: Vec::new(),
+            selected: 0,
+            doc: None,
+            back_to,
+        };
+        view.set_items(self.artifacts.clone());
+        self.artifacts_view = Some(view);
+        self.mode = Mode::Artifacts;
+    }
+
+    pub fn close_artifacts(&mut self) {
+        if let Some(v) = self.artifacts_view.take() {
+            self.mode = v.back_to;
+        }
+    }
+
+    /// The mode an open overlay that tracks its own return will restore, so a
+    /// running/idle change behind it can land there instead of being lost.
+    pub fn overlay_return_mode(&mut self) -> Option<&mut Mode> {
+        self.artifacts_view.as_mut().map(|v| &mut v.back_to)
+    }
+
+    /// Replace the known artifacts, refreshing an open list in place.
+    pub fn set_artifacts(&mut self, items: Vec<ArtifactItem>) {
+        if let Some(v) = self.artifacts_view.as_mut() {
+            v.set_items(items.clone());
+        }
+        self.artifacts = items;
+    }
+
+    /// Whether `url` is the host-built link of one of this session's artifacts, and
+    /// so may be made clickable even though it is a `file:` URL.
+    pub fn is_artifact_link(&self, url: &str) -> bool {
+        self.artifact_link(url).is_some()
+    }
+
+    /// The host-built link `url` refers to: the link itself, or the session-relative
+    /// path a model tends to write instead (`artifacts/a0001-review.md`, as the
+    /// artifact index records it). Only ever one of this session's own links comes
+    /// back, so the model can name an artifact but never choose a destination.
+    pub fn artifact_link(&self, url: &str) -> Option<String> {
+        if url.chars().any(|c| c.is_control()) {
+            return None;
+        }
+        let rel = url.trim_start_matches("./");
+        let relative = rel.starts_with("artifacts/") && !rel.contains("..");
+        self.artifacts
+            .iter()
+            .filter_map(|a| a.url.as_deref())
+            .find(|u| *u == url || (relative && u.ends_with(&format!("/{rel}"))))
+            .map(str::to_string)
+    }
+
+    /// Record a published artifact in the transcript, with its link when the client
+    /// could resolve one.
+    pub fn push_artifact(&mut self, id: &str, kind: &str, title: &str) {
+        let url = self
+            .artifacts
+            .iter()
+            .find(|a| a.id == id)
+            .and_then(|a| a.url.clone());
+        let mut text = format!("{title} · {kind} · {id}  (Alt-a to read)");
+        if let Some(u) = url {
+            text.push('\n');
+            text.push_str(&u);
+        }
+        self.push(LineKind::Artifact, text);
     }
 
     /// Pick the next subagent to watch (cycles through the crew, most-recent
@@ -1804,17 +1984,35 @@ mod tests {
 
     fn render(app: &App) -> String {
         let mut term = Terminal::new(TestBackend::new(72, 18)).unwrap();
-        term.draw(|f| draw(f, app)).unwrap();
-        let buf = term.backend().buffer().clone();
+        // The frame's own buffer, not the backend's: the backend only receives ratatui's
+        // diff, which skips the cells after an OSC 8 symbol (ratatui #902) and would
+        // drop the rest of a hyperlinked row from the snapshot.
+        let frame = term.draw(|f| draw(f, app)).unwrap();
+        let buf = frame.buffer.clone();
         let mut out = String::new();
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
+                out.push_str(&visible(buf[(x, y)].symbol()));
             }
             out = out.trim_end().to_string();
             out.push('\n');
         }
         out
+    }
+
+    /// What a terminal shows for a cell: an OSC 8 hyperlink cell carries a 2-char chunk
+    /// of its label (see `render::write_hyperlink`) whose second char the next cell
+    /// still holds, so only the first is visible here.
+    fn visible(symbol: &str) -> String {
+        match symbol.strip_prefix("\x1b]8;;") {
+            Some(rest) => rest
+                .split('\x07')
+                .nth(1)
+                .and_then(|piece| piece.chars().next())
+                .map(String::from)
+                .unwrap_or_default(),
+            None => symbol.to_string(),
+        }
     }
 
     #[test]
@@ -2385,6 +2583,219 @@ mod tests {
             None,
         );
         insta::assert_snapshot!(render(&app));
+    }
+
+    fn artifact(id: &str, title: &str, url: Option<&str>) -> ArtifactItem {
+        ArtifactItem {
+            id: id.into(),
+            kind: "review".into(),
+            title: title.into(),
+            summary: Some(format!("about {title}")),
+            url: url.map(str::to_string),
+        }
+    }
+
+    const REVIEW_URL: &str = "file:///p/.cowboy/sessions/s1/artifacts/a0001-review.md";
+
+    fn has_osc8(app: &App, w: u16, h: u16, url: &str) -> bool {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        let needle = format!("\x1b]8;;{url}\x07");
+        (0..buf.area.width)
+            .flat_map(|x| (0..buf.area.height).map(move |y| (x, y)))
+            .any(|(x, y)| buf[(x, y)].symbol().contains(&needle))
+    }
+
+    #[test]
+    fn snapshot_artifacts_list() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_artifacts(vec![
+            artifact("a0001", "Review", Some(REVIEW_URL)),
+            artifact("a0002", "Tampered", None),
+        ]);
+        app.open_artifacts(Mode::Idle);
+        app.artifacts_view.as_mut().unwrap().move_sel(1);
+        insta::assert_snapshot!(render(&app));
+    }
+
+    #[test]
+    fn snapshot_artifact_doc() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.open_artifacts(Mode::Idle);
+        let item = app.artifacts[0].clone();
+        app.artifacts_view.as_mut().unwrap().doc = Some(ArtifactDoc::new(
+            item,
+            "# Findings\n\n- **one**: the cursor skips a row\n- two\n",
+            false,
+        ));
+        insta::assert_snapshot!(render(&app));
+    }
+
+    /// The reader's link row is clickable: that is the point of giving the user a
+    /// `file://` link at all.
+    #[test]
+    fn the_artifact_reader_link_is_a_hyperlink() {
+        let mut app = App::new("cowboy");
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.open_artifacts(Mode::Idle);
+        let item = app.artifacts[0].clone();
+        app.artifacts_view.as_mut().unwrap().doc = Some(ArtifactDoc::new(item, "body", false));
+        assert!(has_osc8(&app, 100, 20, REVIEW_URL));
+    }
+
+    /// What the *terminal* receives, after ratatui's diff — not just what the buffer
+    /// holds. The diff sized each hyperlink cell by its escape string, skipped that many
+    /// cells, and so sent only the first two characters of a link and none of the rest
+    /// of its row. Every chunk, and the border after it, must arrive.
+    #[test]
+    fn a_hyperlinked_row_reaches_the_terminal_whole() {
+        let mut app = App::new("cowboy");
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.open_artifacts(Mode::Idle);
+        let item = app.artifacts[0].clone();
+        app.artifacts_view.as_mut().unwrap().doc = Some(ArtifactDoc::new(item, "body", false));
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = (0..buf.area.height)
+            .find(|&y| (0..buf.area.width).any(|x| buf[(x, y)].symbol().contains("\x1b]8;;")))
+            .expect("a hyperlink row");
+        // As a terminal prints it: a hyperlink cell prints its whole chunk and advances
+        // past it, and the diff skipped the cell the chunk's second character covers.
+        let mut shown = String::new();
+        let mut x = 0;
+        while x < buf.area.width {
+            let sym = buf[(x, row)].symbol();
+            match sym
+                .strip_prefix("\x1b]8;;")
+                .and_then(|r| r.split('\x07').nth(1))
+            {
+                Some(piece) => {
+                    let piece = piece.trim_end_matches("\x1b]8;;");
+                    shown.push_str(piece);
+                    x += piece.chars().count().max(1) as u16;
+                }
+                None => {
+                    shown.push_str(sym);
+                    x += 1;
+                }
+            }
+        }
+        assert!(
+            shown.contains(REVIEW_URL),
+            "the whole link arrives: {shown:?}"
+        );
+        assert!(
+            shown.trim_end().ends_with('│'),
+            "and so does the border: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_artifact_scrolls_to_its_end_and_no_further() {
+        let mut app = App::new("cowboy");
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.open_artifacts(Mode::Idle);
+        let item = app.artifacts[0].clone();
+        let body: String = (0..60).map(|i| format!("line {i}\n\n")).collect();
+        app.artifacts_view.as_mut().unwrap().doc = Some(ArtifactDoc::new(item, &body, false));
+        render(&app);
+        let doc = app.artifacts_view.as_mut().unwrap().doc.as_mut().unwrap();
+        doc.scroll_by(10_000);
+        let end = doc.scroll;
+        assert_eq!(end, doc.total.get() - doc.viewport.get());
+        assert!(render(&app).contains("line 59"));
+        let doc = app.artifacts_view.as_mut().unwrap().doc.as_mut().unwrap();
+        doc.scroll_by(1);
+        assert_eq!(doc.scroll, end);
+    }
+
+    /// A transcript artifact line links to its file, and a *model-written* `file:` link
+    /// becomes clickable only when it is exactly the host-built link of one of the
+    /// session's artifacts. Any other `file:` URL stays inert, as before: a link opens
+    /// whatever handler the desktop picks, and the model must not choose that.
+    #[test]
+    fn only_host_built_artifact_links_are_clickable_file_urls() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.push_artifact("a0001", "review", "Review");
+        assert!(
+            has_osc8(&app, 120, 16, REVIEW_URL),
+            "the artifact line links"
+        );
+
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.push(
+            LineKind::Agent,
+            format!("see [the review]({REVIEW_URL}) and [this](file:///etc/x.desktop)"),
+        );
+        assert!(has_osc8(&app, 120, 16, REVIEW_URL), "a listed link works");
+        assert!(
+            !has_osc8(&app, 120, 16, "file:///etc/x.desktop"),
+            "an unlisted file: link must stay inert"
+        );
+
+        // The session-relative path the index records — what a model actually wrote
+        // in a real final — links to the same host-built URL; a relative path naming
+        // no artifact of this session does not.
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Idle;
+        app.set_artifacts(vec![artifact("a0001", "Review", Some(REVIEW_URL))]);
+        app.push(
+            LineKind::Agent,
+            "see [the review](artifacts/a0001-review.md) and [this](artifacts/a0009-x.md)",
+        );
+        assert!(
+            has_osc8(&app, 120, 16, REVIEW_URL),
+            "a relative path resolves"
+        );
+        assert!(!has_osc8(&app, 120, 16, "artifacts/a0009-x.md"));
+        assert_eq!(
+            app.artifact_link("artifacts/../artifacts/a0001-review.md"),
+            None
+        );
+    }
+
+    /// The overlay remembers where it returns to, and a turn ending behind it updates
+    /// that — closing must not bring back a spinner for a turn that is over.
+    #[test]
+    fn closing_artifacts_returns_to_the_mode_they_were_opened_from() {
+        let mut app = App::new("cowboy");
+        app.mode = Mode::Running;
+        app.open_artifacts(Mode::Running);
+        assert_eq!(app.mode, Mode::Artifacts);
+        *app.overlay_return_mode().unwrap() = Mode::Idle;
+        app.close_artifacts();
+        assert_eq!(app.mode, Mode::Idle);
+        assert!(app.artifacts_view.is_none());
+    }
+
+    #[test]
+    fn a_new_artifact_keeps_the_list_selection_on_the_same_one() {
+        let mut v = ArtifactsView {
+            items: Vec::new(),
+            selected: 0,
+            doc: None,
+            back_to: Mode::Idle,
+        };
+        v.set_items(vec![
+            artifact("a0001", "one", None),
+            artifact("a0002", "two", None),
+        ]);
+        v.move_sel(1);
+        v.set_items(vec![
+            artifact("a0001", "one", None),
+            artifact("a0002", "two", None),
+            artifact("a0003", "three", None),
+        ]);
+        assert_eq!(v.selected_item().unwrap().id, "a0002");
     }
 
     #[test]

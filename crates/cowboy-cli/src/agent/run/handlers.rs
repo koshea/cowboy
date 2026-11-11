@@ -87,29 +87,133 @@ impl AgentLoop<'_> {
         }
     }
 
+    /// What a finished job published, bodies inline, to append to its result.
+    ///
+    /// A worker's final is often a short summary pointing at an artifact ("full
+    /// evidence: a0001"). The foreman could not open that file — it lives in the
+    /// child's session directory — and in one release review it dispatched a second,
+    /// weaker subagent just to reconstruct two P1 findings the first had already
+    /// written up with reproductions. Handoffs are skipped: they restate the final.
+    pub(super) fn job_artifacts_note(&self, job: &str) -> Option<String> {
+        use cowboy_core::artifact::{self, ArtifactKind};
+        let dir = crate::cmd::artifact::viewer_session_dir(self.root(), job)?;
+        let arts: Vec<_> = artifact::list_in(&dir)
+            .into_iter()
+            .filter(|a| a.kind != ArtifactKind::Handoff)
+            .collect();
+        if arts.is_empty() {
+            return None;
+        }
+        let mut s = String::from(
+            "Artifacts it published (included here because you cannot open its session \
+             directory; `artifact show` with `job` re-reads one):",
+        );
+        for a in &arts {
+            let head = format!("\n\n--- {} [{}] {} ---", a.id, a.kind.as_str(), a.title);
+            s.push_str(&head);
+            match artifact::host_file(&dir, a).and_then(|f| artifact::read_for_view(&f)) {
+                Some((body, truncated)) => {
+                    s.push('\n');
+                    s.push_str(body.trim_end());
+                    if truncated {
+                        s.push_str("\n…(cut at 1 MiB)");
+                    }
+                }
+                None => s.push_str(" (not readable: the file is not where the host wrote it)"),
+            }
+        }
+        Some(truncate_middle(&s, self.behavior.max_command_output_bytes))
+    }
+
+    /// Tell the front-end an artifact was published, and return its `file://` link
+    /// for the reply. The link is built here, host-side, from the canonical session
+    /// dir — never taken from anything the agent can write (see
+    /// [`cowboy_core::artifact::host_file`]).
+    fn announce_artifact(&mut self, a: &cowboy_core::artifact::ArtifactRef) -> Option<String> {
+        let url = self.logger.as_ref().and_then(|l| {
+            cowboy_core::artifact::host_file(l.dir(), a)
+                .map(|f| cowboy_core::artifact::file_url(&f))
+        });
+        self.ui.artifact_published(a, url.as_deref());
+        url
+    }
+
+    /// The tool reply's lines for one artifact: what it is and where the user reads it.
+    /// Spelled out because the model has no other way to know — without it, a model
+    /// asked "where is a0001?" invented an "Artifacts panel".
+    fn artifact_reply(&self, a: &cowboy_core::artifact::ArtifactRef, url: Option<&str>) -> String {
+        let session = self.logger.as_ref().map(|l| l.id()).unwrap_or_default();
+        let mut s = format!("{} [{}] {}", a.id, a.kind.as_str(), a.title);
+        match url {
+            Some(u) => s.push_str(&format!("\n  link for the user (a host path): {u}")),
+            None => s.push_str("\n  (no link: the file is not where the host wrote it)"),
+        }
+        s.push_str(&format!(
+            "\n  the user can also read it with /artifacts in the TUI or web UI, or \
+             `cowboy artifact show {} --session {session}`",
+            a.id
+        ));
+        s
+    }
+
     /// Host-side `artifact` tool: publish a typed output under the session dir,
-    /// or list this session's artifacts. Requires an active session log.
-    pub(super) fn run_artifact(&self, args: &ArtifactArgs) -> String {
+    /// list this session's (or a subagent job's) artifacts, or read one.
+    pub(super) fn run_artifact(&mut self, args: &ArtifactArgs) -> String {
         use cowboy_core::artifact::{self, ArtifactKind};
         let Some(logger) = &self.logger else {
             return "error: artifacts require an active session log".into();
         };
-        let dir = logger.dir();
+        let session_id = logger.id().to_string();
+        // A job's artifacts are read host-side: its session directory is not somewhere
+        // the agent can reliably open (on Linux the workspace is remapped), which is
+        // how a foreman once spent a whole extra subagent reconstructing findings that
+        // were sitting in a file it could not reach.
+        let dir = match (&args.job, args.action.as_str()) {
+            (Some(job), "list" | "show") => {
+                let Some(id) = self.jobs.resolve_id(job) else {
+                    return format!("error: no job `{job}` in this session (see `jobs`)");
+                };
+                match crate::cmd::artifact::viewer_session_dir(self.root(), &id) {
+                    Some(d) => d,
+                    None => return format!("error: job `{id}` has no session directory"),
+                }
+            }
+            _ => logger.dir().to_path_buf(),
+        };
         match args.action.as_str() {
+            "show" => {
+                let Some(want) = args.id.as_deref().map(str::trim) else {
+                    return "error: `show` needs the artifact `id` (e.g. a0001)".into();
+                };
+                let Some(a) = artifact::list_in(&dir).into_iter().find(|a| a.id == want) else {
+                    return format!("error: no artifact `{want}` there (use `list`)");
+                };
+                match artifact::host_file(&dir, &a).and_then(|f| artifact::read_for_view(&f)) {
+                    Some((body, truncated)) => {
+                        let body = truncate_middle(&body, self.behavior.max_command_output_bytes);
+                        let cut = if truncated { "\n…(cut at 1 MiB)" } else { "" };
+                        format!("{} [{}] {}\n\n{body}{cut}", a.id, a.kind.as_str(), a.title)
+                    }
+                    None => format!(
+                        "error: {} is not readable — the file is not where the host wrote it",
+                        a.id
+                    ),
+                }
+            }
             "list" => {
-                let arts = artifact::list_in(dir);
+                let arts = artifact::list_in(&dir);
                 if arts.is_empty() {
                     return "no artifacts published".into();
                 }
                 arts.iter()
                     .map(|a| {
-                        format!(
-                            "{} [{}] {} — {}",
-                            a.id,
-                            a.kind.as_str(),
-                            a.title,
-                            a.path.display()
-                        )
+                        let url = artifact::host_file(&dir, a).map(|f| artifact::file_url(&f));
+                        match url {
+                            Some(u) => format!("{} [{}] {} — {u}", a.id, a.kind.as_str(), a.title),
+                            None => {
+                                format!("{} [{}] {} — (no link)", a.id, a.kind.as_str(), a.title)
+                            }
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
@@ -146,8 +250,8 @@ impl AgentLoop<'_> {
                     .map(ArtifactKind::parse)
                     .unwrap_or(ArtifactKind::Notes);
                 match artifact::add_in(
-                    dir,
-                    logger.id(),
+                    &dir,
+                    &session_id,
                     kind,
                     &title,
                     &content,
@@ -161,12 +265,10 @@ impl AgentLoop<'_> {
                                 kind: a.kind.as_str().to_string(),
                             },
                         );
+                        let url = self.announce_artifact(&a);
                         format!(
-                            "published artifact {} [{}] {} → {}",
-                            a.id,
-                            a.kind.as_str(),
-                            a.title,
-                            a.path.display()
+                            "published artifact {}",
+                            self.artifact_reply(&a, url.as_deref())
                         )
                     }
                     Err(e) => format!("error: {e}"),
@@ -266,19 +368,20 @@ impl AgentLoop<'_> {
     /// Host-side `handoff` tool: render the structured summary to `handoff.md`
     /// (the well-known path `cowboy handoff` reads) and register it as a Handoff
     /// artifact so it shows up in the artifact index.
-    pub(super) fn run_handoff(&self, args: &HandoffArgs) -> String {
+    pub(super) fn run_handoff(&mut self, args: &HandoffArgs) -> String {
         use cowboy_core::artifact::{self, ArtifactKind};
         let Some(logger) = &self.logger else {
             return "error: handoff requires an active session log".into();
         };
-        let dir = logger.dir();
+        let dir = logger.dir().to_path_buf();
+        let session_id = logger.id().to_string();
         let md = render_handoff_md(args);
         if let Err(e) = std::fs::write(dir.join("handoff.md"), &md) {
             return format!("error: writing handoff.md: {e}");
         }
         match artifact::add_in(
-            dir,
-            logger.id(),
+            &dir,
+            &session_id,
             ArtifactKind::Handoff,
             "Handoff",
             &md,
@@ -289,6 +392,7 @@ impl AgentLoop<'_> {
                 self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::HandoffCreated {
                     artifact_id: a.id.clone(),
                 });
+                self.announce_artifact(&a);
                 format!("handoff written ({})", a.id)
             }
             Err(e) => format!("handoff written to handoff.md, but indexing failed: {e}"),
@@ -307,11 +411,12 @@ impl AgentLoop<'_> {
         let Some(logger) = &self.logger else {
             return format!("decision (unrecorded — no session log): {answer}");
         };
-        let dir = logger.dir();
+        let dir = logger.dir().to_path_buf();
+        let session_id = logger.id().to_string();
         let selected = (!answer.trim().is_empty()).then(|| answer.clone());
         let d = cowboy_core::decision::record_in(
-            dir,
-            logger.id(),
+            &dir,
+            &session_id,
             &args.question,
             options.clone(),
             selected,
@@ -326,15 +431,17 @@ impl AgentLoop<'_> {
             if answer.trim().is_empty() { "(no answer)" } else { answer.trim() },
             args.rationale.as_deref().unwrap_or("(none)"),
         );
-        let _ = cowboy_core::artifact::add_in(
-            dir,
-            logger.id(),
+        if let Ok(a) = cowboy_core::artifact::add_in(
+            &dir,
+            &session_id,
             cowboy_core::artifact::ArtifactKind::DecisionRecord,
             &format!("Decision {}", d.id),
             &body,
             None,
             now_ms(),
-        );
+        ) {
+            self.announce_artifact(&a);
+        }
         self.emit_lifecycle(cowboy_core::lifecycle::LifecycleEvent::DecisionRecorded {
             decision_id: d.id.clone(),
         });

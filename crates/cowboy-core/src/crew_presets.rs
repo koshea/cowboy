@@ -70,6 +70,12 @@ pub fn chatgpt_models(
     Some((out, notes))
 }
 
+/// How many ChatGPT-plan subagents may run at once. Higher than the shared
+/// per-provider default of 2, which is tuned for pay-per-token API keys: one plan
+/// is one pool with its own limits, and at 2 a five-reviewer fan-out on it ran in
+/// three waves, with the last reviewer waiting a quarter of an hour to start.
+pub const CHATGPT_MAX_PARALLEL: u32 = 4;
+
 /// One family's model for the preset: its reference and the levels it accepts.
 #[derive(Debug, Clone)]
 pub struct Member {

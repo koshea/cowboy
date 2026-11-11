@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│ ╭ Artifacts (2) ───────────────────────────────────────────────────╮ │
+│ │  a0001  review          Review                                   │ │
+│ │         about Review                                             │ │
+│ │› a0002  review          Tampered                                 │ │
+│ │         not viewable — the file isn't where cowboy wrote it      │ │
+│ │                                                                  │ │
+│ │                                                                  │─╯
+│ │                                                                  │─╮
+│ │                                                                  │t│
+│ │                                                                  │ │
+│ │                                                                  │ │
+│ │                                                                  │ │
+╰─│                                                                  │─╯
+  │                                                                  │
+╭ │↑↓ select · Enter read · Esc closes                               │─╮
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+╰──────────────────────────────────────────────────────────────────────╯

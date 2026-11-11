@@ -160,6 +160,91 @@ pub fn get_in(session_dir: &Path, id: &str) -> Option<(ArtifactRef, String)> {
     Some((r, body))
 }
 
+/// The most of an artifact's body a viewer loads. The bytes are agent-written, so a
+/// viewer must not be made to pull an arbitrarily large file into memory to show it.
+pub const VIEW_MAX_BYTES: usize = 1 << 20;
+
+/// The host file behind `r`, for linking or showing it to the user — or `None`
+/// when it is not exactly where [`add_in`] puts artifacts.
+///
+/// SECURITY: the session dir is inside the workspace, which the agent can write, so
+/// the index, the bytes *and the directories above them* are agent-controlled. The
+/// result ends up behind a `file://` link the user clicks, and a terminal hands that
+/// to `xdg-open`/`open`, which launches whatever handler the file looks like. So the
+/// file must be a regular file, carry an extension `add_in` writes, and resolve —
+/// every symlink followed — to exactly `session_dir/artifacts/<name>`. A symlinked
+/// `artifacts/` (or `.cowboy/`, or the file itself) fails the comparison.
+///
+/// `session_dir` must therefore be canonical: built from a canonicalized root, as the
+/// worker's is. A non-canonical one fails closed rather than open.
+pub fn host_file(session_dir: &Path, r: &ArtifactRef) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut parts = r
+        .path
+        .components()
+        .filter(|c| !matches!(c, Component::CurDir));
+    let (Some(Component::Normal(dir)), Some(Component::Normal(name)), None) =
+        (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if dir != "artifacts" {
+        return None;
+    }
+    let ext = Path::new(name).extension()?.to_str()?;
+    if !matches!(ext, "md" | "patch" | "diff") {
+        return None;
+    }
+    let expected = session_dir.join("artifacts").join(name);
+    if !std::fs::symlink_metadata(&expected)
+        .ok()?
+        .file_type()
+        .is_file()
+    {
+        return None;
+    }
+    (std::fs::canonicalize(&expected).ok()? == expected).then_some(expected)
+}
+
+/// `path` as a `file://` URL, percent-encoded so the result is one token with no
+/// spaces or control characters — safe to print, to put in an OSC 8 hyperlink, and
+/// for a terminal's URL detection to find in full.
+pub fn file_url(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
+    let mut url = String::from("file://");
+    for b in bytes {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            url.push(b as char);
+        } else {
+            url.push_str(&format!("%{b:02X}"));
+        }
+    }
+    url
+}
+
+/// Read a body for display: at most [`VIEW_MAX_BYTES`], lossily decoded, and whether
+/// it was cut short.
+pub fn read_for_view(path: &Path) -> Option<(String, bool)> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(VIEW_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let truncated = buf.len() > VIEW_MAX_BYTES;
+    buf.truncate(VIEW_MAX_BYTES);
+    // A cut can land inside a multi-byte character; lossy decoding turns the stub
+    // into one replacement character rather than failing the whole view.
+    Some((String::from_utf8_lossy(&buf).into_owned(), truncated))
+}
+
 /// Publish an artifact: write its bytes under `artifacts/` and append a ref to
 /// the index. `now_ms` is injected so callers (and tests) control the clock.
 pub fn add_in(
@@ -365,5 +450,91 @@ mod tests {
         let text = serde_json::to_string(&unsafe_ref).unwrap();
         let unsafe_path = parse_index(&text).unwrap_err();
         assert!(unsafe_path.to_string().contains("unsafe path"));
+    }
+
+    fn canonical_tmp() -> PathBuf {
+        std::fs::canonicalize(tmp()).unwrap()
+    }
+
+    #[test]
+    fn a_published_artifact_has_a_host_file_and_a_link() {
+        let dir = canonical_tmp();
+        let a = add_in(
+            &dir,
+            "s",
+            ArtifactKind::Review,
+            "the review",
+            "# hi",
+            None,
+            1,
+        )
+        .unwrap();
+        let file = host_file(&dir, &a).expect("a fresh artifact is linkable");
+        assert_eq!(file, dir.join(&a.path));
+        let url = file_url(&file);
+        assert!(url.starts_with("file:///"), "{url}");
+        assert!(url.ends_with("/artifacts/a0001-the-review.md"), "{url}");
+        assert_eq!(read_for_view(&file), Some(("# hi".to_string(), false)));
+    }
+
+    #[test]
+    fn a_file_url_is_one_printable_token() {
+        let url = file_url(Path::new("/home/me/my proj/ü\n.md"));
+        assert_eq!(url, "file:///home/me/my%20proj/%C3%BC%0A.md");
+        assert!(!url.chars().any(|c| c.is_control() || c == ' '));
+    }
+
+    /// The session dir is agent-writable, and a link to it is something the user clicks
+    /// and the desktop *opens*. Each of these is a way the agent could make that link
+    /// launch something other than one of this session's markdown or patch files.
+    #[cfg(unix)]
+    #[test]
+    fn host_file_refuses_anything_the_agent_could_have_redirected() {
+        use std::os::unix::fs::symlink;
+        let dir = canonical_tmp();
+        let a = add_in(&dir, "s", ArtifactKind::Notes, "ok", "x", None, 1).unwrap();
+        let reference = |path: &str| ArtifactRef {
+            path: PathBuf::from(path),
+            ..a.clone()
+        };
+        let outside = canonical_tmp().join("payload.md");
+        std::fs::write(&outside, "evil").unwrap();
+
+        // The file itself is a symlink out of the session.
+        symlink(&outside, dir.join("artifacts/a0002-link.md")).unwrap();
+        assert_eq!(host_file(&dir, &reference("artifacts/a0002-link.md")), None);
+        // An extension add_in never writes (a launcher, a script).
+        std::fs::write(dir.join("artifacts/a0003-x.desktop"), "[Desktop Entry]").unwrap();
+        assert_eq!(
+            host_file(&dir, &reference("artifacts/a0003-x.desktop")),
+            None
+        );
+        // A file outside `artifacts/`, or nested below it.
+        std::fs::write(dir.join("events.md"), "x").unwrap();
+        assert_eq!(host_file(&dir, &reference("events.md")), None);
+        std::fs::create_dir_all(dir.join("artifacts/sub")).unwrap();
+        std::fs::write(dir.join("artifacts/sub/a.md"), "x").unwrap();
+        assert_eq!(host_file(&dir, &reference("artifacts/sub/a.md")), None);
+        // A directory with an allowed-looking name.
+        std::fs::create_dir_all(dir.join("artifacts/a0004-dir.md")).unwrap();
+        assert_eq!(host_file(&dir, &reference("artifacts/a0004-dir.md")), None);
+
+        // `artifacts/` itself swapped for a symlink to somewhere else.
+        let other = canonical_tmp();
+        std::fs::create_dir_all(other.join("artifacts")).unwrap();
+        std::fs::write(other.join("artifacts/a0001-ok.md"), "evil").unwrap();
+        std::fs::rename(dir.join("artifacts"), dir.join("moved")).unwrap();
+        symlink(other.join("artifacts"), dir.join("artifacts")).unwrap();
+        assert_eq!(host_file(&dir, &a), None);
+    }
+
+    #[test]
+    fn a_large_body_is_cut_for_viewing() {
+        let dir = tmp();
+        let path = dir.join("big.md");
+        std::fs::write(&path, "x".repeat(VIEW_MAX_BYTES + 10)).unwrap();
+        let (body, truncated) = read_for_view(&path).unwrap();
+        assert!(truncated);
+        assert_eq!(body.len(), VIEW_MAX_BYTES);
     }
 }

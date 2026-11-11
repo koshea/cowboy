@@ -20,6 +20,7 @@ pub async fn replay(session_id: String, tui: bool) -> Result<()> {
     let journal = crate::session::session_dir(&root, &id).join("events.jsonl");
     let ctx = SessionCtx {
         root: root.clone(),
+        session_id: Some(id.clone()),
         models: Vec::new(),
         current_model: String::new(),
         ranch_id: None,

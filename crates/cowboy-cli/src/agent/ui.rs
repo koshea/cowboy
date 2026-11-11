@@ -73,6 +73,15 @@ pub trait AgentUi {
     /// A message the user sent mid-turn was delivered into the running turn.
     /// Default: ignored.
     fn steering(&mut self, _text: &str) {}
+    /// The session published an artifact. `url` is its host-built `file://` link (when
+    /// the file is where the host put it), for a front-end that prints rather than
+    /// resolving it itself. Default: ignored.
+    fn artifact_published(
+        &mut self,
+        _artifact: &cowboy_core::artifact::ArtifactRef,
+        _url: Option<&str>,
+    ) {
+    }
     /// The agent finished with a final summary.
     fn final_message(&mut self, message: &str);
     /// Ask the user a question and return their answer. `options` (possibly
@@ -236,6 +245,19 @@ impl AgentUi for ConsoleUi {
         } else {
             println!("\n\x1b[1;32m✓ {message}\x1b[0m");
         }
+    }
+
+    fn artifact_published(&mut self, a: &cowboy_core::artifact::ArtifactRef, url: Option<&str>) {
+        if self.final_only {
+            return;
+        }
+        println!(
+            "\x1b[34m📎 {} [{}] {}\x1b[0m{}",
+            a.id,
+            a.kind.as_str(),
+            a.title,
+            url.map(|u| format!("\n   {u}")).unwrap_or_default()
+        );
     }
 
     fn ask_user(&mut self, question: &str, options: &[String]) -> String {

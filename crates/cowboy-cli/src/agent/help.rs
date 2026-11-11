@@ -147,6 +147,14 @@ pub const SLASH: &[Slash] = &[
         workstream_only: false,
     },
     Slash {
+        name: "artifacts",
+        args: "",
+        help: "the artifacts this session published — read one, or copy its link (Alt-a)",
+        group: Group::Inspect,
+        aliases: &[],
+        workstream_only: false,
+    },
+    Slash {
         name: "fold",
         args: "",
         help: "collapse finished turns to one line each (keeps prompts and answers)",
@@ -343,6 +351,11 @@ pub const KEYS: &[Hotkey] = &[
     Hotkey {
         keys: "Alt-f",
         help: "fold / unfold the turns you have already read",
+        group: Group::Inspect,
+    },
+    Hotkey {
+        keys: "Alt-a",
+        help: "the session's artifacts: read one, y copies its file:// link",
         group: Group::Inspect,
     },
     Hotkey {

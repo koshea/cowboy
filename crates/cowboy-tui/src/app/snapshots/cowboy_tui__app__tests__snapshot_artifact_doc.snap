@@ -1,0 +1,22 @@
+---
+source: crates/cowboy-tui/src/app/mod.rs
+expression: render(&app)
+---
+╭ cowboy ───────────────────────────────────────╮╭ network ────────────╮
+│ ╭ Review · review · a0001 ─────────────────────────────────────────╮ │
+│ │file:///p/.cowboy/sessions/s1/artifacts/a0001-review.md           │ │
+│ │                                                                  │ │
+│ │# Findings                                                        │ │
+│ │                                                                  │ │
+│ │• one: the cursor skips a row                                     │ │
+│ │• two                                                             │─╯
+│ │                                                                  │─╮
+│ │                                                                  │t│
+│ │                                                                  │ │
+│ │                                                                  │ │
+│ │                                                                  │ │
+╰─│                                                                  │─╯
+  │                                                                  │
+╭ │↑↓ PgUp PgDn scroll · y copies the link · Esc back                │─╮
+│ ╰──────────────────────────────────────────────────────────────────╯ │
+╰──────────────────────────────────────────────────────────────────────╯

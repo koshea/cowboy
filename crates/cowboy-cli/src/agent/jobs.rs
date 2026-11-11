@@ -299,6 +299,9 @@ pub struct JobRegistry {
     provider_sems: HashMap<String, Arc<Semaphore>>,
     /// Concurrent workers allowed per provider; 0 = unlimited.
     per_provider: usize,
+    /// Providers with a cap of their own (`delegation.max_parallel_by_provider`),
+    /// overriding `per_provider`.
+    provider_caps: HashMap<String, usize>,
 }
 
 impl JobRegistry {
@@ -308,7 +311,22 @@ impl JobRegistry {
             jobs: HashMap::new(),
             provider_sems: HashMap::new(),
             per_provider,
+            provider_caps: HashMap::new(),
         }
+    }
+
+    /// Give some providers a cap of their own.
+    pub fn with_provider_caps(mut self, caps: impl IntoIterator<Item = (String, usize)>) -> Self {
+        self.provider_caps = caps.into_iter().collect();
+        self
+    }
+
+    /// The cap for `provider`; 0 = unlimited.
+    pub fn cap_for(&self, provider: &str) -> usize {
+        self.provider_caps
+            .get(provider)
+            .copied()
+            .unwrap_or(self.per_provider)
     }
 
     /// Register a job and start it.
@@ -321,10 +339,11 @@ impl JobRegistry {
         spec: JobSpec,
         spawn: impl FnOnce(&JobSpec, Option<Arc<Semaphore>>) -> Box<dyn JobHandle>,
     ) {
-        let permits = (self.per_provider > 0).then(|| {
+        let cap = self.cap_for(&spec.provider);
+        let permits = (cap > 0).then(|| {
             self.provider_sems
                 .entry(spec.provider.clone())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.per_provider)))
+                .or_insert_with(|| Arc::new(Semaphore::new(cap)))
                 .clone()
         });
         let handle = spawn(&spec, permits);
@@ -718,6 +737,23 @@ mod tests {
         assert!(
             dispatch(&mut reg, spec("j1", "anthropic")).is_none(),
             "no semaphore is handed out when the throttle is off"
+        );
+    }
+
+    /// A provider with a cap of its own gets that many permits; the rest keep the
+    /// shared one. The reason it exists: on one ChatGPT subscription, a cap of 2
+    /// queued five reviewers into three waves.
+    #[test]
+    fn a_provider_can_have_a_cap_of_its_own() {
+        let mut reg = JobRegistry::new(2)
+            .with_provider_caps([("chatgpt".to_string(), 4), ("local".to_string(), 0)]);
+        let c = dispatch(&mut reg, spec("j1", "chatgpt")).expect("a permit source");
+        assert_eq!(c.available_permits(), 4);
+        let f = dispatch(&mut reg, spec("j2", "fireworks")).expect("a permit source");
+        assert_eq!(f.available_permits(), 2);
+        assert!(
+            dispatch(&mut reg, spec("j3", "local")).is_none(),
+            "0 is unlimited for that provider alone"
         );
     }
 

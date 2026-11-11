@@ -835,7 +835,7 @@ fn read_subagent_usage(root: &std::path::Path, id: &str) -> SubagentUsage {
 /// `per_provider` at a time.
 fn concurrency_notice(
     plans: &[(String, SubagentPlan)],
-    per_provider: usize,
+    cap: impl Fn(&str) -> usize,
     max_parallel: usize,
     foreman: Option<&str>,
 ) -> String {
@@ -843,41 +843,49 @@ fn concurrency_notice(
         .iter()
         .map(|(_, plan)| plan.provider_key(foreman))
         .collect();
-    concurrency_notice_from_keys(&keys, per_provider, max_parallel)
+    concurrency_notice_from_keys(&keys, cap, max_parallel)
 }
 
 /// The concurrency-notice math, over already-resolved provider keys (one per
-/// planned subagent). Split out so it can be unit-tested without building plans.
+/// planned subagent) and each provider's cap (0 = unlimited). Split out so it can be
+/// unit-tested without building plans.
 fn concurrency_notice_from_keys(
     provider_keys: &[String],
-    per_provider: usize,
+    cap: impl Fn(&str) -> usize,
     max_parallel: usize,
 ) -> String {
     let total = provider_keys.len();
-    let mut per_provider_counts: std::collections::HashMap<&str, usize> =
-        std::collections::HashMap::new();
+    let mut per_provider_counts: std::collections::BTreeMap<&str, usize> =
+        std::collections::BTreeMap::new();
     for k in provider_keys {
         *per_provider_counts.entry(k.as_str()).or_insert(0) += 1;
     }
-    let cap = if per_provider == 0 {
-        usize::MAX
-    } else {
-        per_provider
+    let limit = |p: &str| match cap(p) {
+        0 => usize::MAX,
+        n => n,
     };
     let runnable: usize = per_provider_counts
-        .values()
-        .map(|&n| n.min(cap))
+        .iter()
+        .map(|(p, &n)| n.min(limit(p)))
         .sum::<usize>()
         .min(max_parallel.max(1));
     let queued = total.saturating_sub(runnable);
     if queued == 0 {
-        format!("↳ running {total} subagents in parallel")
-    } else {
-        format!(
-            "↳ {total} subagents: {runnable} running, {queued} queued \
-             (max {per_provider}/provider)"
-        )
+        return format!("↳ running {total} subagents in parallel");
     }
+    // Name what is doing the limiting, so the fix is obvious: a provider's own cap
+    // (`max_parallel_by_provider`), or the session-wide one (`max_parallel`).
+    let binding: Vec<String> = per_provider_counts
+        .iter()
+        .filter(|(p, &n)| n > limit(p))
+        .map(|(p, _)| format!("max {} on {p}", cap(p)))
+        .collect();
+    let why = if binding.is_empty() {
+        format!("max {} at once", max_parallel.max(1))
+    } else {
+        binding.join(", ")
+    };
+    format!("↳ {total} subagents: {runnable} running, {queued} queued ({why})")
 }
 
 /// The provider a subagent will hit, used to group the per-provider concurrency
@@ -1177,6 +1185,12 @@ impl<'a> AgentLoop<'a> {
             stall_count: 0,
             jobs: crate::agent::jobs::JobRegistry::new(
                 delegation.max_parallel_per_provider as usize,
+            )
+            .with_provider_caps(
+                delegation
+                    .max_parallel_by_provider
+                    .iter()
+                    .map(|(p, n)| (p.clone(), *n as usize)),
             ),
             job_tx,
             job_rx,
@@ -2580,23 +2594,17 @@ impl<'a> AgentLoop<'a> {
             let dir = l.dir();
             let mut produced: Vec<String> = cowboy_core::artifact::list_in(dir)
                 .into_iter()
-                .map(|a| {
-                    format!(
-                        "  {:<8} {}  ({})",
-                        a.kind.as_str(),
-                        a.title,
-                        dir.join(&a.path).display()
-                    )
-                })
+                .map(|a| format!("  {:<8} {}  {}", a.kind.as_str(), a.id, a.title))
                 .collect();
             let handoff = dir.join("handoff.md");
             if handoff.is_file() {
-                produced.push(format!("  handoff  written  ({})", handoff.display()));
+                produced.push("  handoff  written".to_string());
             }
             if !produced.is_empty() {
                 sections.push(format!(
                     "Already produced (recorded by the host, not self-reported — read these \
-                     instead of redoing the work):\n{}",
+                     instead of redoing the work; their text follows this result, and \
+                     `artifact show` with this job's id re-reads one):\n{}",
                     produced.join("\n")
                 ));
             }
@@ -4920,24 +4928,23 @@ impl<'a> AgentLoop<'a> {
             return results;
         }
         let foreman = crate::cmd::crew::foreman_model();
-        let per_provider = crew_cfg
-            .as_ref()
-            .map(|c| c.delegation.max_parallel_per_provider)
-            .unwrap_or(2) as usize;
         let max_parallel = crew_cfg
             .as_ref()
             .map(|c| c.delegation.max_parallel.max(1) as usize)
             .unwrap_or(4);
         // Announce true concurrency, not just the batch size: with a per-provider cap,
         // a batch of same-provider subagents runs a few at a time and the rest queue.
-        // Saying "running N in parallel" when only 2 can run is misleading.
+        // Saying "running N in parallel" when only 2 can run is misleading. The caps
+        // are the registry's — the ones actually enforced this session.
         if plans.len() > 1 {
-            self.ui.notice(&concurrency_notice(
+            let jobs = &self.jobs;
+            let notice = concurrency_notice(
                 &plans,
-                per_provider,
+                |p| jobs.cap_for(p),
                 max_parallel,
                 foreman.as_deref(),
-            ));
+            );
+            self.ui.notice(&notice);
         }
 
         // Harness jobs forward the network requests their own sandbox cannot ask about.
@@ -5117,7 +5124,11 @@ impl<'a> AgentLoop<'a> {
                     // Middle truncation, not head: a worker's result ends with its
                     // conclusion and handoff, which is the part the foreman needs.
                     let capped = truncate_middle(&result, self.behavior.max_command_output_bytes);
-                    let body = format!("[subagent {label} · job {id}] finished:\n{capped}");
+                    let mut body = format!("[subagent {label} · job {id}] finished:\n{capped}");
+                    if let Some(published) = self.job_artifacts_note(&id) {
+                        body.push_str("\n\n");
+                        body.push_str(&published);
+                    }
                     self.push_user_note(body);
                 }
                 JobNews::Note { id, label, text } => {
@@ -5620,6 +5631,8 @@ mod tests {
         ask_answer: Option<String>,
         /// Whether a person is "attached" to answer asks.
         attended: bool,
+        /// Published artifacts, with the link the loop built for each.
+        artifacts: Vec<(String, Option<String>)>,
     }
     impl AgentUi for RecordingUi {
         fn model_delta(&mut self, _text: &str) {}
@@ -5651,6 +5664,13 @@ mod tests {
         }
         fn notice(&mut self, msg: &str) {
             self.notices.push(msg.to_string());
+        }
+        fn artifact_published(
+            &mut self,
+            a: &cowboy_core::artifact::ArtifactRef,
+            url: Option<&str>,
+        ) {
+            self.artifacts.push((a.id.clone(), url.map(str::to_string)));
         }
     }
 
@@ -6975,6 +6995,66 @@ mod tests {
             kinds.last(),
             Some(LifecycleEvent::SessionCompleted { .. })
         ));
+    }
+
+    /// The model is told where the user reads what it published — a `file://` link and
+    /// `/artifacts` — and the front-end hears about it. Before this the reply named a
+    /// session-relative path, and a model asked "where is a0001?" invented an
+    /// "Artifacts panel" that did not exist.
+    #[tokio::test]
+    async fn publishing_an_artifact_replies_with_its_link_and_tells_the_ui() {
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                reasoning_items: None,
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call(
+                    "1",
+                    "artifact",
+                    r#"{"action":"publish","kind":"review","title":"the review","content":"x"}"#,
+                )],
+            },
+            ChatResponse {
+                reasoning_items: None,
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let runtime = FakeSandbox::new();
+        // Canonical, as the worker's root is: the link is only built for a file whose
+        // real path is exactly where the host wrote it.
+        let root = std::fs::canonicalize(runtime.root()).unwrap();
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+        let file = logger.dir().join("artifacts/a0001-the-review.md");
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        agent.run("go").await.unwrap();
+        let reply = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Tool && m.content.starts_with("published artifact"))
+            .map(|m| m.content.clone())
+            .expect("a publish reply");
+        drop(agent);
+
+        let url = cowboy_core::artifact::file_url(&file);
+        assert!(reply.contains(&url), "{reply}");
+        assert!(reply.contains("/artifacts"), "{reply}");
+        assert_eq!(ui.artifacts, vec![("a0001".to_string(), Some(url))]);
     }
 
     #[tokio::test]
@@ -8711,26 +8791,33 @@ mod tests {
 
     #[test]
     fn concurrency_notice_reflects_the_per_provider_cap() {
+        let two = |_: &str| 2;
         // Five subagents all on the same provider, cap 2 → 2 run, 3 queue.
         let keys = vec!["fireworks".to_string(); 5];
-        let n = concurrency_notice_from_keys(&keys, 2, 4);
-        assert_eq!(n, "↳ 5 subagents: 2 running, 3 queued (max 2/provider)");
+        let n = concurrency_notice_from_keys(&keys, two, 4);
+        assert_eq!(n, "↳ 5 subagents: 2 running, 3 queued (max 2 on fireworks)");
 
         // Spread across three providers, cap 2 → all run, none queued.
         let keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let n = concurrency_notice_from_keys(&keys, 2, 4);
+        let n = concurrency_notice_from_keys(&keys, two, 4);
         assert_eq!(n, "↳ running 3 subagents in parallel");
 
         // The global max_parallel still bounds it: 3 providers each under the cap,
-        // but max_parallel=2 means only 2 run at once.
+        // but max_parallel=2 means only 2 run at once — and the notice says so.
         let keys = vec!["a".into(), "b".into(), "c".into()];
-        let n = concurrency_notice_from_keys(&keys, 2, 2);
-        assert_eq!(n, "↳ 3 subagents: 2 running, 1 queued (max 2/provider)");
+        let n = concurrency_notice_from_keys(&keys, two, 2);
+        assert_eq!(n, "↳ 3 subagents: 2 running, 1 queued (max 2 at once)");
 
         // Throttle disabled (0) → all run.
         let keys = vec!["fireworks".to_string(); 5];
-        let n = concurrency_notice_from_keys(&keys, 0, 8);
+        let n = concurrency_notice_from_keys(&keys, |_| 0, 8);
         assert_eq!(n, "↳ running 5 subagents in parallel");
+
+        // A provider with its own cap: chatgpt takes 4, fireworks still 2.
+        let caps = |p: &str| if p == "chatgpt" { 4 } else { 2 };
+        let keys = vec!["chatgpt".to_string(); 5];
+        let n = concurrency_notice_from_keys(&keys, caps, 8);
+        assert_eq!(n, "↳ 5 subagents: 4 running, 1 queued (max 4 on chatgpt)");
     }
 
     #[tokio::test]
@@ -8780,6 +8867,98 @@ mod tests {
         agent.jobs.dispatch(spec, |_, _| {
             Box::new(tokio::spawn(std::future::pending::<()>()).abort_handle())
         });
+    }
+
+    /// A worker's findings reach the foreman even when its final only points at an
+    /// artifact. Observed: a reviewer finished with "full evidence: artifact a0001",
+    /// the foreman could not open the child's session directory, and it spent a second
+    /// subagent reconstructing two P1 findings from scratch.
+    #[tokio::test]
+    async fn a_finished_job_brings_its_artifacts_and_they_can_be_reread() {
+        let runtime = FakeSandbox::new();
+        let root = std::fs::canonicalize(runtime.root()).unwrap();
+        let child = crate::session::session_dir(&root, "j1");
+        std::fs::create_dir_all(&child).unwrap();
+        let add = |kind, title: &str, body: &str| {
+            cowboy_core::artifact::add_in(&child, "j1", kind, title, body, None, 1).unwrap()
+        };
+        add(
+            cowboy_core::artifact::ArtifactKind::Review,
+            "EAV findings",
+            "## P1 joined order\nrepro: take 2 drops run-1",
+        );
+        add(
+            cowboy_core::artifact::ArtifactKind::Handoff,
+            "Handoff",
+            "HANDOFF-ONLY TEXT",
+        );
+        let logger = crate::session::SessionLogger::create(&root).unwrap();
+
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(ScriptedModel::new(vec![ChatResponse {
+                reasoning_items: None,
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("f", "final", r#"{"message":"all done"}"#)],
+            }])),
+            runtime,
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_logger(Some(logger));
+        register_fake_job(&mut agent, "j1");
+        agent
+            .job_tx
+            .send(crate::agent::jobs::JobEvent::Finished {
+                id: "j1".into(),
+                ok: true,
+                result: "Three bugs. Full evidence: artifact a0001.".into(),
+            })
+            .unwrap();
+        agent.run("review it").await.unwrap();
+
+        let injected = agent
+            .messages
+            .iter()
+            .find(|m| m.role == Role::User && m.content.starts_with("[subagent"))
+            .expect("the result is delivered");
+        assert!(
+            injected.content.contains("repro: take 2 drops run-1"),
+            "{}",
+            injected.content
+        );
+        assert!(
+            !injected.content.contains("HANDOFF-ONLY TEXT"),
+            "a handoff restates the final and is left out"
+        );
+
+        let shown = agent.run_artifact(&ArtifactArgs {
+            action: "show".into(),
+            id: Some("a0001".into()),
+            job: Some("j1".into()),
+            path: None,
+            content: None,
+            kind: None,
+            title: None,
+            summary: None,
+        });
+        assert!(shown.contains("repro: take 2 drops run-1"), "{shown}");
+        let unknown = agent.run_artifact(&ArtifactArgs {
+            action: "list".into(),
+            id: None,
+            job: Some("nope".into()),
+            path: None,
+            content: None,
+            kind: None,
+            title: None,
+            summary: None,
+        });
+        assert!(unknown.starts_with("error: no job"), "{unknown}");
     }
 
     #[tokio::test]

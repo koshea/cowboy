@@ -337,6 +337,8 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/api/sessions", get(list_sessions))
         .route("/api/session/{id}/ws", get(ws_handler))
         .route("/api/session/{id}/launchpad", get(launchpad))
+        .route("/api/session/{id}/artifacts", get(artifacts))
+        .route("/api/session/{id}/artifacts/{aid}", get(artifact_body))
         .route("/api/subagent/{parent}/{sub}/ws", get(subagent_ws_handler))
         // Static SPA assets (the trunk-built .js/.wasm). Unauthenticated — they're
         // inert code; the token still gates every /api route. /api/* and / are
@@ -498,6 +500,53 @@ async fn launchpad(
     .await
     .unwrap_or_default();
     Json(openers).into_response()
+}
+
+/// A session's published artifacts, for the web UI's artifacts panel. Read host-side
+/// from the session's index on each request, so the list also covers artifacts from
+/// before the journal announced them. Empty for an unknown session.
+async fn artifacts(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(info) = (state.session)(id.clone()).await else {
+        return Json(Vec::<cowboy_core::daemonproto::ArtifactEntry>::new()).into_response();
+    };
+    let list = tokio::task::spawn_blocking(move || crate::cmd::artifact::entries(&info.root, &id))
+        .await
+        .unwrap_or_default();
+    Json(list).into_response()
+}
+
+/// One artifact's body. 404 for an unknown session or artifact, and for one whose
+/// file is not where the host wrote it — the session dir is agent-writable, so the
+/// file is only read through `artifact::host_file`.
+async fn artifact_body(
+    State(state): State<Arc<AppState>>,
+    Path((id, aid)): Path<(String, String)>,
+    headers: HeaderMap,
+    Query(q): Query<WsQuery>,
+) -> Response {
+    if !authed(&state, &headers, q.token.as_deref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(info) = (state.session)(id.clone()).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let body =
+        tokio::task::spawn_blocking(move || crate::cmd::artifact::body(&info.root, &id, &aid))
+            .await
+            .ok()
+            .flatten();
+    match body {
+        Some(b) => Json(b).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn ws_handler(
@@ -1070,7 +1119,13 @@ mod tests {
         let client = reqwest::Client::new();
         // The SPA shell, an unauthenticated API route, an authenticated one that will
         // 401, and the static fallback — the four shapes a response can take.
-        for path in ["/", "/api/health", "/api/sessions", "/does-not-exist.js"] {
+        for path in [
+            "/",
+            "/api/health",
+            "/api/sessions",
+            "/api/session/s1/artifacts/a0001",
+            "/does-not-exist.js",
+        ] {
             let resp = client
                 .get(format!("http://127.0.0.1:{port}{path}"))
                 .send()
@@ -1292,6 +1347,86 @@ mod tests {
             tokio_tungstenite::connect_async(&url).await.is_err(),
             "unauthenticated WS upgrade must fail"
         );
+    }
+
+    /// The artifacts panel's two routes: the list carries each artifact's link, the
+    /// body comes back for a known id, and neither answers without the token.
+    #[tokio::test]
+    async fn artifact_routes_list_and_serve_a_sessions_artifacts() {
+        let project = assert_fs::TempDir::new().unwrap();
+        let root = project.path().to_path_buf();
+        let dir = crate::session::session_dir(&root, "s1");
+        std::fs::create_dir_all(&dir).unwrap();
+        cowboy_core::artifact::add_in(
+            &dir,
+            "s1",
+            cowboy_core::artifact::ArtifactKind::Review,
+            "Review",
+            "# findings",
+            Some("what we found".into()),
+            1,
+        )
+        .unwrap();
+        let info = replay_info(None, "s1", SessionStatus::Running);
+        let info = SessionInfo { root, ..info };
+        let port = serve_test(AppState {
+            token: "t".into(),
+            resolve: Arc::new(|_| Box::pin(async { None })),
+            session: Arc::new(move |id| {
+                let info = info.clone();
+                Box::pin(async move { (id == "s1").then_some(info) })
+            }),
+        })
+        .await;
+        let client = reqwest::Client::new();
+        let get = |path: &str, token: bool| {
+            let req = client.get(format!("http://127.0.0.1:{port}{path}"));
+            if token { req.bearer_auth("t") } else { req }.send()
+        };
+
+        let list: Vec<cowboy_core::daemonproto::ArtifactEntry> =
+            get("/api/session/s1/artifacts", true)
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].summary.as_deref(), Some("what we found"));
+        assert!(list[0]
+            .url
+            .as_deref()
+            .is_some_and(|u| u.starts_with("file:///")));
+
+        let body: cowboy_core::daemonproto::ArtifactBody =
+            get("/api/session/s1/artifacts/a0001", true)
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+        assert_eq!(body.body, "# findings");
+
+        for (path, token, status) in [
+            (
+                "/api/session/s1/artifacts/a0002",
+                true,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "/api/session/nope/artifacts/a0001",
+                true,
+                StatusCode::NOT_FOUND,
+            ),
+            ("/api/session/s1/artifacts", false, StatusCode::UNAUTHORIZED),
+            (
+                "/api/session/s1/artifacts/a0001",
+                false,
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            assert_eq!(get(path, token).await.unwrap().status(), status, "{path}");
+        }
     }
 
     /// Mount the router on an ephemeral port; returns the port.

@@ -533,8 +533,14 @@ pub struct ProposeScopeChangeArgs {
 /// Arguments for the `artifact` tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ArtifactArgs {
-    /// "publish" (store an output) or "list" (show this session's artifacts).
+    /// "publish" (store an output), "list" (show the artifacts), or "show" (read one).
     pub action: String,
+    /// For `show`: the artifact id, e.g. `a0001`.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// For `list`/`show`: a subagent job id, to read what that job published.
+    #[serde(default)]
+    pub job: Option<String>,
     /// For `publish`: a workspace-relative file to publish (e.g. `docs/api.md`).
     #[serde(default)]
     pub path: Option<String>,
@@ -713,8 +719,11 @@ pub fn definitions() -> Vec<ToolDef> {
                           consume — a contract, summary, test result, patch, notes, etc. \
                           `publish` with a workspace `path` or inline `content`, a `kind`, a \
                           `title`, and a one-line `summary`; `list` shows this session's \
-                          artifacts. Prefer publishing a concrete artifact (e.g. an API/schema \
-                          contract) over describing it only in prose."
+                          artifacts, and `show` with an `id` reads one. Add `job` to list \
+                          or read what a subagent job published. Prefer publishing a concrete artifact (e.g. an API/schema \
+                          contract) over describing it only in prose. The user reads artifacts \
+                          with /artifacts in the TUI or web UI; the reply gives a file:// link \
+                          to quote when you point them at one."
                 .into(),
             parameters: schema_for::<ArtifactArgs>(),
         },

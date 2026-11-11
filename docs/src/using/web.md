@@ -48,7 +48,7 @@ and start time, refreshed every few seconds. Tap one to:
 - use the same **slash commands as the TUI** — `/plan`, `/go`, `/after`,
   `/queue clear`, `/model <provider/name>`, `/reasoning [<level>]`, `/stop`, `/accept`, `/ranch`, skills
   (`/<name> args`), `/diff`, `/mcp`, `/boundary`, `/crew [<name>]`, `/context`,
-  `/jobs`, `/copy`, `/fold`,
+  `/jobs`, `/artifacts`, `/copy`, `/fold`,
   `/clear`; `/help` lists them. They're expanded by the session's worker, so they
   behave identically from either client;
 - **answer questions** and **approve or deny** access prompts with the TUI's choices
@@ -61,7 +61,19 @@ and start time, refreshed every few seconds. Tap one to:
 - **watch a subagent** — when the agent fans work out to a [crew](crew.md), the
   subagents appear as chips above the transcript; tap one to open its live output
   read-only (and tap back to return). A chip marked `?` is a worker waiting on the
-  foreman (a turn grant or a question); a pending one isn't tappable until it starts.
+  foreman (a turn grant or a question); a pending one isn't tappable until it starts;
+- **read the session's artifacts** — each one the agent publishes appears in the
+  transcript as a card, and the header shows a `📎 N` count. A card, the count, or
+  `/artifacts` opens a full-height panel listing them all, and tapping one renders
+  it (markdown, or a coloured diff for a patch). The panel also shows the artifact's
+  `file://` link with a copy button: a browser page cannot open a `file://` link,
+  but the link is useful on the machine running cowboy. When the agent's answer
+  links to one of this session's artifacts (by its `file://` link or the relative
+  `artifacts/…` path), the link opens the panel instead. The
+  list and bodies come from `GET /api/session/<id>/artifacts[/<artifact-id>]`
+  (token required), read host-side from the session's index. A file that is not
+  where cowboy wrote it is listed as not viewable and is never served (see
+  [the TUI's artifacts](tui.md#artifacts)).
 
 Network activity and the session's background processes are under collapsible
 panels below the header.

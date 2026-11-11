@@ -79,6 +79,11 @@ pub const HELP: &[(&str, &str, &str)] = &[
         "",
         "leave the session running and go back to the list",
     ),
+    (
+        "artifacts",
+        "",
+        "the artifacts this session published, and a viewer for each",
+    ),
     ("quit", "", "end the session (aliases /exit, /q, /end)"),
 ];
 
@@ -92,6 +97,8 @@ pub enum Outcome {
     Fold(bool),
     Copy,
     Back,
+    /// Open the artifacts panel.
+    Artifacts,
 }
 
 /// Interpret `input` (with its leading `/`).
@@ -108,6 +115,7 @@ pub fn interpret(input: &str, model: &Model) -> Outcome {
         "unfold" => Outcome::Fold(false),
         "copy" => Outcome::Copy,
         "detach" => Outcome::Back,
+        "artifacts" => Outcome::Artifacts,
         "queue" if rest.is_empty() => Outcome::Notice(queue_text(model)),
         "jobs" => Outcome::Notice(jobs_text(model)),
         "context" => Outcome::Notice(context_text(model)),

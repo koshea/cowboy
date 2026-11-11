@@ -16,7 +16,8 @@ work turn by turn.
   presses end the session.
 - **Direct keys** replace what used to be a Ctrl-C menu: **Alt-j** lists the
   subagents, **Alt-w** watches one, **Alt-s** stops them, **Alt-f** folds the turns
-  you have already read, **Alt-d** detaches.
+  you have already read, **Alt-a** opens the [artifacts](#artifacts), **Alt-d**
+  detaches.
 - **F1** opens the keys-and-commands reference, scrollable and grouped; `/help
   <topic>` filters it (`/help subagent`).
 - The status bar shows background work and deferred input (`3 jobs (1 asking) ·
@@ -83,6 +84,37 @@ Prompts, answers and **errors always stay visible** — folding hides the work, 
 the conversation, and a collapsed turn must never be able to swallow the reason it
 failed. The turn in progress is never folded: it is the one you are reading.
 `/unfold` (or Alt-f again) expands everything.
+
+## Artifacts
+
+What the agent publishes with the `artifact`, `handoff` and `decision` tools (a
+review, a contract, a handoff) shows up in the transcript as it happens, with a
+link to the file:
+
+```text
+📎 Review of all changes since v0.2.2 · review · a0001  (Alt-a to read)
+   file:///home/me/proj/.cowboy/sessions/1794409207160-2/artifacts/a0001-review-of-….md
+```
+
+The link is clickable (Ctrl- or Cmd-click in most terminals) and opens the file
+with your desktop's handler for markdown. `/artifacts` or **Alt-a** opens the list
+of everything this session published, including anything from before you attached.
+**Enter** reads one in a scrollable viewer, **y** copies its link, and **Esc** goes
+back. The overlay works in a read-only attach or a `cowboy logs --tui` replay too,
+since reading what a session produced is what those are for.
+
+The agent is given the same link when it publishes, so it can point you at the file
+in its answer. That link is clickable only when it is exactly the link cowboy built
+for one of this session's artifacts, or the session-relative path the index records
+(`artifacts/a0001-….md`), which models tend to write instead. Any other `file:` link
+in model output stays inert, as before.
+
+Links are only offered for a file that is where cowboy wrote it. The session
+directory is inside the workspace, which the agent can write, and clicking a
+`file://` link hands the file to whatever program the desktop associates with it.
+So cowboy links to a file only when it is a regular `.md`, `.patch` or `.diff`
+file in the session's `artifacts/` directory, with no symlink anywhere on its real
+path. Anything else is listed as *not viewable*.
 
 ## What the status bar tells you
 

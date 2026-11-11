@@ -25,6 +25,19 @@ pub enum Block {
     },
     Notice(String),
     Final(String),
+    /// The session published an artifact; rendered as a card that opens the viewer.
+    Artifact(ArtifactMeta),
+}
+
+/// An artifact as the journal announced it. The list a viewer shows comes from the
+/// server (`/api/session/{id}/artifacts`), which also covers artifacts from before
+/// the journal carried them; this is what the transcript and the badge need.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ArtifactMeta {
+    pub id: String,
+    pub kind: String,
+    pub title: String,
+    pub summary: Option<String>,
 }
 
 /// Connection lifecycle, shown as a banner.
@@ -177,6 +190,8 @@ pub struct Model {
     pub net: Vec<String>,
     /// Background processes as `(name, state)`.
     pub processes: Vec<(String, String)>,
+    /// Artifacts the session published, in order, one per id.
+    pub artifacts: Vec<ArtifactMeta>,
     /// Journal events this client could not parse (a newer worker), skipped.
     pub skipped: u64,
 }
@@ -555,6 +570,25 @@ impl Model {
                 }
             }
             UiEventMsg::Processes(p) => self.processes = p,
+            UiEventMsg::ArtifactPublished {
+                id,
+                kind,
+                title,
+                summary,
+            } => {
+                self.commit();
+                let meta = ArtifactMeta {
+                    id,
+                    kind,
+                    title,
+                    summary,
+                };
+                match self.artifacts.iter_mut().find(|a| a.id == meta.id) {
+                    Some(a) => *a = meta.clone(),
+                    None => self.artifacts.push(meta.clone()),
+                }
+                self.blocks.push(Block::Artifact(meta));
+            }
         }
     }
 }
@@ -639,6 +673,46 @@ mod tests {
     /// --workspace` never compiles it, and the stale bundle in `dist/` kept embedding
     /// happily. Matching every variant explicitly (no `_ =>` arm) is what makes the
     /// compiler catch the next one; this keeps that honest.
+    /// A published artifact lands in the transcript and the list, once per id — and a
+    /// replay of the same journal rebuilds the same state, since that is how a
+    /// reconnecting or refreshed page gets it.
+    #[test]
+    fn an_artifact_is_listed_once_and_rebuilds_from_replay() {
+        let published = |id: &str, title: &str| UiEventMsg::ArtifactPublished {
+            id: id.into(),
+            kind: "review".into(),
+            title: title.into(),
+            summary: None,
+        };
+        let journal = vec![
+            UiEventMsg::Delta("writing it up".into()),
+            published("a0001", "Review"),
+            published("a0002", "Handoff"),
+            // A re-announcement (a replayed line) must not list the artifact twice.
+            published("a0001", "Review v2"),
+        ];
+        let replay = |events: &[UiEventMsg]| {
+            let mut m = Model::default();
+            for e in events {
+                m.apply_event(e.clone());
+            }
+            m
+        };
+        let m = replay(&journal);
+        assert_eq!(
+            m.artifacts
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect::<Vec<_>>(),
+            ["a0001", "a0002"]
+        );
+        assert_eq!(m.artifacts[0].title, "Review v2");
+        // The streamed text was committed before the card, not swallowed by it.
+        assert!(matches!(m.blocks.first(), Some(Block::Agent(t)) if t == "writing it up"));
+        assert!(matches!(m.blocks.get(1), Some(Block::Artifact(a)) if a.id == "a0001"));
+        assert!(replay(&journal) == m, "replay must rebuild identical state");
+    }
+
     #[test]
     fn context_usage_lands_in_the_header_stats() {
         let mut m = Model::default();

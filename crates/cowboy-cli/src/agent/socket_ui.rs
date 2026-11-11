@@ -837,6 +837,17 @@ impl SocketUi {
     }
 }
 
+/// The journal event for a published artifact. No path: see
+/// [`UiEventMsg::ArtifactPublished`] for why clients resolve it themselves.
+pub(crate) fn artifact_event(a: &cowboy_core::artifact::ArtifactRef) -> UiEventMsg {
+    UiEventMsg::ArtifactPublished {
+        id: a.id.clone(),
+        kind: a.kind.as_str().to_string(),
+        title: a.title.clone(),
+        summary: a.summary.clone(),
+    }
+}
+
 impl AgentUi for SocketUi {
     fn model_delta(&mut self, text: &str) {
         self.emit(UiEventMsg::Delta(text.to_string()));
@@ -921,6 +932,9 @@ impl AgentUi for SocketUi {
     }
     fn steering(&mut self, text: &str) {
         self.emit(UiEventMsg::SteerDelivered(text.to_string()));
+    }
+    fn artifact_published(&mut self, a: &cowboy_core::artifact::ArtifactRef, _url: Option<&str>) {
+        self.emit(artifact_event(a));
     }
     fn final_message(&mut self, message: &str) {
         self.emit(UiEventMsg::Final(message.to_string()));
