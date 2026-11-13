@@ -11,7 +11,7 @@ members = [
 exclude = ["examples", "crates/cowboy-web-ui"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 # Kept in step with rust-toolchain.toml: the pin is what builds are tested with,
 # this is what cargo checks before it starts, so an older toolchain fails with
@@ -23,11 +23,11 @@ repository = "https://github.com/koshea/cowboy"
 
 [workspace.dependencies]
 # internal
-cowboy-core = { version = "0.1.1", path = "crates/cowboy-core" }
-cowboy-proto = { version = "0.1.1", path = "crates/cowboy-proto" }
-cowboy-sandbox = { version = "0.1.1", path = "crates/cowboy-sandbox" }
-cowboy-gateway = { version = "0.1.1", path = "crates/cowboy-gateway" }
-cowboy-tui = { version = "0.1.1", path = "crates/cowboy-tui" }
+cowboy-core = { version = "0.2.0", path = "crates/cowboy-core" }
+cowboy-proto = { version = "0.2.0", path = "crates/cowboy-proto" }
+cowboy-sandbox = { version = "0.2.0", path = "crates/cowboy-sandbox" }
+cowboy-gateway = { version = "0.2.0", path = "crates/cowboy-gateway" }
+cowboy-tui = { version = "0.2.0", path = "crates/cowboy-tui" }
 
 # cli / runtime
 clap = { version = "4", features = ["derive"] }
