@@ -274,6 +274,7 @@ mod tests {
                 agent_home: Path::new("/Users/dev/.cache/cowboy/home/proj"),
                 git_identity: None,
                 overlay: None,
+                container_socket_dir: None,
                 platform: Platform::MacOs,
             },
             &host(),

@@ -252,6 +252,7 @@ pub async fn run(
         // ask, so every `ask` denies — stated explicitly rather than left to a
         // missing listener.
         let approver = autodeny_approver(session_dir.clone());
+        let network_watch = approver.watch();
         let runtime = crate::cmd::sandbox::open_with(root, security, approver)?;
         log_policy_in_force(runtime.policy());
         // A subagent journals to its session's `events.jsonl` (so the parent/UI can
@@ -281,6 +282,7 @@ pub async fn run(
             &mut *ui,
         )
         .with_logger(logger)
+        .with_network_watch(network_watch)
         .with_memory_context(memory_ctx)
         .with_project_commands(&project_commands, verify)
         .with_project_context(&skills_index, &project_instructions)

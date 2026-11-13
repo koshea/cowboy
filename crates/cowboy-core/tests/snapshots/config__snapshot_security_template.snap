@@ -38,10 +38,11 @@ sandbox:
   # Not enforced on macOS, which has no per-session equivalent.
   memory: 8g
   cpus: 2
-  # macOS only: loopback is shared with your machine there, so commands reach
-  # localhost through the egress proxy (decided by `default_host`). List a port
-  # to let commands connect to it directly — for a protocol that cannot use a
-  # proxy, like a database the agent started. Linux sandboxes have their own.
+  # Host loopback ports commands may reach. Linux: the sandbox has its own
+  # loopback, and a listed port is the exception, reaching your machine's
+  # 127.0.0.1:<port> through the relay. macOS: loopback is shared, so commands
+  # reach localhost through the egress proxy (`default_host`); a listed port is
+  # reachable directly, for a protocol that cannot use a proxy.
   # loopback_ports: [5432]
 
 network_policy:
@@ -88,18 +89,23 @@ network_policy:
 
 secrets:
   # Env vars injected from the host (values read at runtime, never stored here).
+  # `source_command` runs on the host per command (cached for a minute), so a
+  # short-lived token stays fresh: e.g. `gcloud auth print-access-token`.
   env: []
     # - name: GITHUB_TOKEN
     #   source_env: COWBOY_GITHUB_TOKEN
     #   required: false
     #   approval: required
-  # Host credential files/dirs granted (read-only by default) into the container
-  # so the agent can use CLIs like gh/gcloud/kubectl. The container HOME is /tmp,
-  # so mount under /tmp/... where the tools look. `cowboy secrets add <preset>`
-  # prints ready-to-paste entries. You must also allow the matching network host.
+    # - name: CLOUDSDK_AUTH_ACCESS_TOKEN
+    #   source_command: gcloud auth print-access-token
+  # Host credential files/dirs granted (read-only by default) into the sandbox
+  # so the agent can use CLIs like gh/kubectl. The agent's HOME is /home/agent,
+  # so mount under /home/agent/... where the tools look. `cowboy secrets add
+  # <preset> --repo` prints ready-to-paste entries. You must also allow the
+  # matching network host.
   files: []
     # - source: ~/.config/gh
-    #   target: /tmp/.config/gh
+    #   target: /home/agent/.config/gh
     #   read_only: true
     #   required: false
     #   approval: required   # prompt for per-session approval before mounting

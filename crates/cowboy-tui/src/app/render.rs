@@ -164,11 +164,22 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_completions(f, app, rows[2]);
     }
 
+    app.prompt_links.borrow_mut().clear();
     match &app.mode {
+        Mode::AwaitingInput(q) if !question_links(q).is_empty() => {
+            // A question carrying a link gets the choice layout, which keeps the
+            // link whole and clickable; the plain modal would cut it at the edge.
+            let c = Choice {
+                question: q.clone(),
+                options: Vec::new(),
+                selected: 0,
+            };
+            draw_choice(f, area, &c, &app.input_text(), app);
+        }
         Mode::AwaitingInput(q) => draw_modal(f, area, "Question", q, "type your answer · Enter"),
         Mode::AwaitingChoice => {
             if let Some(c) = &app.choice {
-                draw_choice(f, area, c, &app.input_text());
+                draw_choice(f, area, c, &app.input_text(), app);
             }
         }
         Mode::Approval(p) => {
@@ -437,6 +448,47 @@ pub(super) fn centered(area: Rect, w: u16, h: u16) -> Rect {
 ///
 /// Hand-rolled because ratatui's `Wrap` applies to a whole `Paragraph`, and here only the
 /// second column may wrap — the key column has to stay a column.
+/// A question line that is a bare link: an http(s) URL with nothing else on it.
+fn link_line(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let web = t.starts_with("https://") || t.starts_with("http://");
+    (web && !t.contains(char::is_whitespace) && crate::markdown::is_safe_url(t)).then_some(t)
+}
+
+/// The links a question shows, in order (see [`link_line`]).
+pub fn question_links(question: &str) -> Vec<String> {
+    question
+        .lines()
+        .filter_map(link_line)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Wrap a prompt's question to `width`, keeping its line breaks. A link line is
+/// cut into width-sized pieces rather than word-wrapped: a sign-in URL is one
+/// several-hundred-character word, which word wrapping left whole on one row for
+/// the box edge to cut off. Returns the rows and, per row, the link it is part of.
+fn wrap_question(question: &str, width: usize) -> Vec<(String, Option<String>)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for line in question.lines() {
+        if let Some(url) = link_line(line) {
+            let chars: Vec<char> = url.chars().collect();
+            for piece in chars.chunks(width) {
+                out.push((piece.iter().collect(), Some(url.to_string())));
+            }
+        } else if line.trim().is_empty() {
+            out.push((String::new(), None));
+        } else {
+            out.extend(wrap_words(line, width).into_iter().map(|l| (l, None)));
+        }
+    }
+    if out.is_empty() {
+        out.push((String::new(), None));
+    }
+    out
+}
+
 fn wrap_words(s: &str, width: usize) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -1852,7 +1904,7 @@ pub(super) fn draw_approval(f: &mut Frame, area: Rect, view: &ApprovalView) {
 /// gets shortened — never the options. It used to size itself as "options + 6"
 /// rows, so a long question with long options wrapped past the bottom edge and the
 /// user saw a question with no choices at all.
-pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
+pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str, app: &App) {
     let w = area.width.saturating_sub(6).min(80);
     let inner = w.saturating_sub(2).max(10) as usize;
     let typing = !typed.trim().is_empty();
@@ -1927,26 +1979,44 @@ pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
         ))
     };
     opt_lines.push(own);
-    let hint = if c.options.is_empty() {
-        "type your answer · Enter sends"
-    } else {
-        "↑↓ select · 1-9 pick · Enter choose · or just start typing"
+    let has_link = !question_links(&c.question).is_empty();
+    let hint = match (c.options.is_empty(), has_link) {
+        (true, false) => "type your answer · Enter sends",
+        (true, true) => "click the link or Ctrl+Y copies it · type your answer · Enter sends",
+        (false, false) => "↑↓ select · 1-9 pick · Enter choose · or just start typing",
+        (false, true) => "click the link or Ctrl+Y copies it · ↑↓ select · Enter choose · or type",
     };
 
     // Then the question, in whatever height is left (at least two lines).
     let chrome = 2 + 1 + 1; // borders, the gap under the question, the hint
     let max_h = area.height as usize;
     let room = max_h.saturating_sub(chrome + opt_lines.len()).max(2);
-    let mut q_lines = wrap_words(&c.question, inner);
+    let mut q_lines = wrap_question(&c.question, inner);
     if q_lines.len() > room {
         q_lines.truncate(room);
-        if let Some(last) = q_lines.last_mut() {
-            let keep: String = last.chars().take(inner.saturating_sub(1)).collect();
-            *last = format!("{keep}…");
+        if let Some((last, link)) = q_lines.last_mut() {
+            if link.is_none() {
+                let keep: String = last.chars().take(inner.saturating_sub(1)).collect();
+                *last = format!("{keep}…");
+            }
         }
     }
+    let link_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::UNDERLINED);
+    let q_links: Vec<(usize, usize, String)> = q_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (l, u))| u.clone().map(|u| (i, l.chars().count(), u)))
+        .collect();
 
-    let mut lines: Vec<Line> = q_lines.into_iter().map(Line::from).collect();
+    let mut lines: Vec<Line> = q_lines
+        .into_iter()
+        .map(|(l, u)| match u {
+            Some(_) => Line::from(Span::styled(l, link_style)),
+            None => Line::from(l),
+        })
+        .collect();
     lines.push(Line::from(""));
     lines.extend(opt_lines);
     lines.push(Line::from(Span::styled(hint, dim)));
@@ -1968,6 +2038,22 @@ pub(super) fn draw_choice(f: &mut Frame, area: Rect, c: &Choice, typed: &str) {
         .style(Style::default().fg(Color::Magenta));
     // Pre-wrapped above, so no `Wrap`: its re-flow is what made the height a guess.
     f.render_widget(Paragraph::new(lines).block(block), rect);
+
+    // Make each link row clickable: an OSC 8 hyperlink for terminals that follow
+    // them, and a hit area for our own click handling (mouse capture means the
+    // terminal's own link detection and selection never see the click).
+    let (x0, right) = (rect.x + 1, rect.x + rect.width.saturating_sub(1));
+    let bottom = rect.y + rect.height.saturating_sub(1);
+    let mut hits = app.prompt_links.borrow_mut();
+    for (row, len, url) in q_links {
+        let y = rect.y + 1 + row as u16;
+        if len == 0 || y >= bottom {
+            continue;
+        }
+        let col1 = (len as u16 - 1).min(right.saturating_sub(x0 + 1));
+        write_hyperlink(f.buffer_mut(), x0, right, y, 0, col1, &url);
+        hits.push((Rect::new(x0, y, col1 + 1, 1), url));
+    }
 }
 
 pub(super) fn draw_modal(f: &mut Frame, area: Rect, title: &str, body: &str, footer: &str) {

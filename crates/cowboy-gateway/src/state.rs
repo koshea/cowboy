@@ -26,6 +26,10 @@ pub struct GatewayState {
     /// The host's resolver search domains, lowercased and without trailing dots.
     /// Used only to un-qualify a name before the tunnel heuristics look at it.
     search_domains: Vec<String>,
+    /// Ports on the **host's** loopback the sandbox may reach (see
+    /// [`Self::decide_host_loopback`]). Runtime-mutable, because the container proxy
+    /// publishes ports as containers start.
+    host_ports: Mutex<std::collections::BTreeSet<u16>>,
 }
 
 impl GatewayState {
@@ -42,7 +46,73 @@ impl GatewayState {
             cache: Mutex::new(HashMap::new()),
             dns_rate,
             search_domains: Vec::new(),
+            host_ports: Mutex::new(Default::default()),
         }
+    }
+
+    /// Let the sandbox reach the host's `127.0.0.1:port`.
+    pub fn add_host_port(&self, port: u16) {
+        self.host_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(port);
+    }
+
+    /// Stop the sandbox reaching the host's `127.0.0.1:port`. Connections already
+    /// open are not cut; new ones are refused.
+    pub fn remove_host_port(&self, port: u16) {
+        self.host_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&port);
+    }
+
+    /// The host loopback ports the sandbox may reach, in order.
+    pub fn host_ports(&self) -> Vec<u16> {
+        self.host_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Decide a connection the sandbox aimed at **loopback**, which can only have
+    /// reached the relay because the port is published (the nft redirect covers
+    /// published ports only). Decided here again regardless: the set in this engine
+    /// is the authority, and the ruleset only a transparency mechanism, so a port
+    /// unpublished a moment ago is refused even if the ruleset still names it.
+    ///
+    /// Never an `ask`, and never by `default_host`: the host's loopback is your
+    /// databases, model servers and editor, and a port reaches it only because the
+    /// host itself published it.
+    pub async fn decide_host_loopback(
+        &self,
+        port: u16,
+        protocol: Protocol,
+    ) -> (Verdict, NetworkAttempt) {
+        let attempt = NetworkAttempt {
+            protocol,
+            host: None,
+            ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            port,
+            command_pid: None,
+        };
+        let published = self
+            .host_ports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&port);
+        let (verdict, reason) = if published {
+            (Verdict::Allow, format!("published host port {port}"))
+        } else {
+            (
+                Verdict::Deny,
+                format!("host loopback port {port} is not published to the sandbox"),
+            )
+        };
+        self.approver.event(&attempt, verdict, reason).await;
+        (verdict, attempt)
     }
 
     /// Teach the engine which suffixes the host resolver appends to unqualified
@@ -211,6 +281,21 @@ impl GatewayState {
     /// The longest matching suffix wins, and a name that is *exactly* a search
     /// domain is left alone (there would be nothing left to judge).
     fn strip_search_domain<'a>(&self, qname: &'a str) -> &'a str {
+        // Repeatedly: a name already under a search domain (a Tailscale host's full
+        // name) that fails to resolve is retried by the resolver with the search
+        // domain appended again, and one strip left that whole first name to be
+        // scored as a high-entropy subdomain.
+        let mut name = self.strip_search_domain_once(qname);
+        loop {
+            let next = self.strip_search_domain_once(name);
+            if next.len() == name.len() {
+                return name;
+            }
+            name = next;
+        }
+    }
+
+    fn strip_search_domain_once<'a>(&self, qname: &'a str) -> &'a str {
         let name = qname.trim_end_matches('.');
         let lower = name.to_ascii_lowercase();
         let mut best = name;
@@ -228,6 +313,16 @@ impl GatewayState {
             }
         }
         best
+    }
+
+    /// Whether the user allowed a connection to `name` (on any port) this session.
+    fn allowed_this_session(&self, name: &str) -> bool {
+        let prefix = format!("host:{}:", name.trim_end_matches('.').to_ascii_lowercase());
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(k, v)| *v == Verdict::Allow && k.starts_with(&prefix))
     }
 
     #[allow(dead_code)]
@@ -301,12 +396,18 @@ impl GatewayState {
         if dns.tunnel_detection && verdict != Verdict::Deny {
             let unqualified = self.strip_search_domain(qname);
             let why = dns_policy::tunnel_reason(unqualified, dns).or_else(|| {
-                if verdict != Verdict::Ask {
+                // A name the user approved a connection to this session is as trusted
+                // as an allow-listed one: rate-limiting its lookups would refuse the
+                // very host they just said yes to.
+                if verdict != Verdict::Ask
+                    || self.allowed_this_session(qname)
+                    || self.allowed_this_session(unqualified)
+                {
                     return None;
                 }
                 let parent = dns_policy::registrable_parent(unqualified);
                 self.dns_rate
-                    .over_limit(&parent)
+                    .over_limit(&parent, unqualified)
                     .then(|| format!("high query rate for {parent}"))
             });
             if let Some(why) = why {
@@ -654,6 +755,40 @@ mod tests {
         );
     }
 
+    /// Once the user allows a connection to a host, its lookups are no longer
+    /// rate-limited: a client retrying the host it was just allowed to reach used
+    /// to have every lookup refused as a suspected tunnel.
+    #[tokio::test]
+    async fn a_host_allowed_this_session_is_not_rate_limited() {
+        let mut p = NetworkPolicy::default();
+        p.allow.domains.clear();
+        p.dns.max_subdomains_per_min = 2;
+        let s = GatewayState::new(
+            p,
+            DnsMap::new(),
+            std::sync::Arc::new(FakeApprover::answering(Verdict::Allow)),
+        );
+        let distinct = |i: u32| format!("h{i}.example.test");
+        for i in 0..2 {
+            assert_eq!(s.decide_dns(&distinct(i), "A").await, Verdict::Allow);
+        }
+        assert_eq!(s.decide_dns(&distinct(2), "A").await, Verdict::Deny);
+        // The user approves a connection to that host…
+        let attempt = NetworkAttempt {
+            protocol: Protocol::Tls,
+            host: Some(distinct(2)),
+            ip: Some("93.184.216.34".parse().unwrap()),
+            port: 443,
+            command_pid: None,
+        };
+        assert_eq!(s.decide(&attempt).await, Verdict::Allow);
+        // …and its lookups resolve again.
+        for _ in 0..10 {
+            assert_eq!(s.decide_dns(&distinct(2), "A").await, Verdict::Allow);
+        }
+        assert_eq!(s.decide_dns(&distinct(3), "A").await, Verdict::Deny);
+    }
+
     /// The host resolver qualifies unqualified names with each of its search
     /// domains, so the gateway sees those attempts before it sees the real name.
     /// Without accounting for that, `duckduckgo.com` + `search follow-chinstrap.ts.net`
@@ -702,6 +837,23 @@ mod tests {
         assert_eq!(s.strip_search_domain("example.com"), "example.com");
         assert_eq!(s.strip_search_domain("notexample.com"), "notexample.com");
         assert_eq!(s.strip_search_domain("other.net"), "other.net");
+    }
+
+    /// A Tailscale host's full name that failed once comes back with the search
+    /// domain appended a second time. Stripping only once left the whole first name
+    /// to be scored, and `litellm-test.follow-chinstrap.ts.net` reads as a 28-char
+    /// high-entropy subdomain: 1,328 refusals in one session.
+    #[tokio::test]
+    async fn a_doubled_search_domain_is_not_mistaken_for_a_tunnel() {
+        let s = state(NetworkPolicy::default())
+            .with_search_domains(vec!["follow-chinstrap.ts.net".into()]);
+        let doubled = "litellm-test.follow-chinstrap.ts.net.follow-chinstrap.ts.net";
+        assert_eq!(s.strip_search_domain(doubled), "litellm-test");
+        assert_eq!(s.decide_dns(doubled, "A").await, Verdict::Allow);
+        assert_eq!(
+            s.strip_search_domain("follow-chinstrap.ts.net.follow-chinstrap.ts.net"),
+            "follow-chinstrap.ts.net"
+        );
     }
 
     /// The longest match wins, so a nested search domain doesn't leave a stub of

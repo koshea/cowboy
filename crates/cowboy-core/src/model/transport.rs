@@ -45,6 +45,14 @@ pub trait FailurePolicy: Send + Sync {
         is_retryable_status(status)
     }
 
+    /// How many retries a retryable failure gets, at most (never more than the
+    /// transport's own ceiling). For a code that is usually final but has been seen
+    /// to flap, a short budget tells the two apart without making a real refusal
+    /// wait out the full backoff.
+    fn retry_limit(&self, _status: reqwest::StatusCode, _body: &str) -> u32 {
+        u32::MAX
+    }
+
     /// The error for a response that will not be retried.
     fn error(&self, status: reqwest::StatusCode, body: &str, request_id: Option<&str>) -> Error {
         default_error(status, body, request_id)
@@ -126,7 +134,8 @@ pub async fn send_with_retry(
                 let rid = request_id(&r);
                 let delay = retry_after(&r);
                 let text = r.text().await.unwrap_or_default();
-                if attempt < MAX_RETRIES && policy.retryable(status, &text) {
+                let limit = MAX_RETRIES.min(policy.retry_limit(status, &text));
+                if attempt < limit && policy.retryable(status, &text) {
                     // A provider signal of 0 (`Retry-After: 0`, or a reset header that
                     // already elapsed) is not a licence to retry instantly and re-hammer
                     // the endpoint — treat a zero/absent signal as "use our jittered

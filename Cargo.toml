@@ -66,12 +66,14 @@ jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_r
 reqwest = { version = "0.13", features = ["form"] }  # match async-openai's reqwest so the Client type unifies; `form` for OAuth token requests
 
 # MCP (Model Context Protocol) client — host-side. Client-only: stdio subprocess
-# transport for local servers + streamable-HTTP (over reqwest) for remote ones. No
-# server/macros features (we never expose an MCP server).
+# transport for local servers + streamable-HTTP (over reqwest) for remote ones, and
+# `auth` for the MCP OAuth flow (discovery, dynamic registration, PKCE, refresh).
+# No server/macros features (we never expose an MCP server).
 rmcp = { version = "3", default-features = false, features = [
     "client",
     "transport-child-process",
     "transport-streamable-http-client-reqwest",
+    "auth",
 ] }
 
 # tui
@@ -108,6 +110,7 @@ walkdir = "2.5.0"
 hickory-proto = "0.26"
 tls-parser = "0.12"
 httparse = "1"
+url = "2"           # query strings for the container proxy (already in the tree via reqwest)
 
 # sandbox enforcement (Linux-only, applied in-process by the shim just before exec)
 # landlock: the official landlock-lsm crate. seccompiler: rust-vmm's pure-Rust

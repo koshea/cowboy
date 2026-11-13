@@ -228,8 +228,8 @@ pub const SLASH: &[Slash] = &[
     },
     Slash {
         name: "mcp",
-        args: "",
-        help: "the connected MCP servers (manage them with `cowboy mcp`)",
+        args: "[server]",
+        help: "MCP servers: sign in (OAuth), sign out, test a connection",
         group: Group::Setup,
         aliases: &[],
         workstream_only: false,
@@ -341,6 +341,11 @@ pub const KEYS: &[Hotkey] = &[
     Hotkey {
         keys: "drag, then y",
         help: "select and copy (Esc clears); /copy takes the whole last answer",
+        group: Group::Inspect,
+    },
+    Hotkey {
+        keys: "click / Ctrl-Y",
+        help: "click a link to open it; Ctrl-Y copies the link in an open question",
         group: Group::Inspect,
     },
     Hotkey {

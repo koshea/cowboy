@@ -44,6 +44,16 @@ const TEMPORARY: &[&str] = &[
     "subscription_sharing_user_unavailable",
 ];
 
+/// Documented as final, but observed to flap: a session on an eligible plan got
+/// one 403 `subscription_sharing_user_not_eligible` mid-task, and the very next
+/// request succeeded. Eligibility does not change between two requests, so a
+/// couple of quick retries separate a hiccup from a real refusal, and a real one
+/// still surfaces within seconds.
+const FLAPPING: &[&str] = &["subscription_sharing_user_not_eligible"];
+
+/// Retries for a [`FLAPPING`] code.
+const FLAPPING_RETRIES: u32 = 2;
+
 impl ChatGptFailures {
     fn login_hint(&self) -> String {
         format!("`cowboy providers login {}`", self.provider)
@@ -61,8 +71,10 @@ impl ChatGptFailures {
                  there (and Cowboy's app limit is 100%). Other providers keep working."
             )),
             "subscription_sharing_user_not_eligible" => Error::Model(format!(
-                "ChatGPT plan usage is not available for this account, workspace or policy \
-                 ({code}); use another provider (or an API key) for these models"
+                "ChatGPT refused plan usage for this account, workspace or policy ({code}), \
+                 also on retry. If your plan is eligible and has usage left, this is on \
+                 OpenAI's side and usually clears: send the message again. If it persists, \
+                 use another provider (or an API key) for these models"
             )),
             "subscription_sharing_unsupported_capability" => Error::Model(format!(
                 "ChatGPT plan usage does not support part of this request ({code}{}); the \
@@ -114,10 +126,17 @@ fn with_rid(e: Error, status: Option<reqwest::StatusCode>, rid: Option<&str>) ->
 impl FailurePolicy for ChatGptFailures {
     fn retryable(&self, status: reqwest::StatusCode, body: &str) -> bool {
         match parse(body).error.and_then(|e| e.code) {
-            Some(c) if TEMPORARY.contains(&c.as_str()) => true,
+            Some(c) if TEMPORARY.contains(&c.as_str()) || FLAPPING.contains(&c.as_str()) => true,
             // Any other documented plan-usage code is a decision, not a hiccup.
             Some(c) if self.explain(&c, None).is_some() => false,
             _ => super::is_retryable_status(status),
+        }
+    }
+
+    fn retry_limit(&self, _status: reqwest::StatusCode, body: &str) -> u32 {
+        match parse(body).error.and_then(|e| e.code) {
+            Some(c) if FLAPPING.contains(&c.as_str()) => FLAPPING_RETRIES,
+            _ => u32::MAX,
         }
     }
 
@@ -218,12 +237,14 @@ mod tests {
 
     #[test]
     fn decisions_stop_immediately_with_their_reason() {
+        // `user_not_eligible` is the exception: it flaps, so it gets a short retry
+        // budget before the same message.
+        let b = body("subscription_sharing_user_not_eligible");
+        assert!(p().retryable(S::FORBIDDEN, &b));
+        assert_eq!(p().retry_limit(S::FORBIDDEN, &b), FLAPPING_RETRIES);
+        let e = p().error(S::FORBIDDEN, &b, None).to_string();
+        assert!(e.contains("also on retry"), "{e}");
         for (code, status, needle) in [
-            (
-                "subscription_sharing_user_not_eligible",
-                S::FORBIDDEN,
-                "not available",
-            ),
             (
                 "subscription_sharing_unsupported_capability",
                 S::BAD_REQUEST,

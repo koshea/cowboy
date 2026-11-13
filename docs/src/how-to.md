@@ -382,14 +382,47 @@ Finished branches are left for you to merge. Scope changes go through
 ## Manage credentials the agent may use
 
 ```bash
-cowboy secrets add gh --repo        # print a grant snippet for a preset
-cowboy secrets list                 # show grants + whether the host source exists
+cowboy secrets add gcloud           # this repo, every worktree (your home overlay)
+cowboy secrets add gh --repo        # print a grant snippet for the committed security.yaml
+cowboy secrets list                 # show grants + whether each host source works
 ```
 
-Presets cover common tools (`gh`, `aws`, `gcloud`, `kubectl`, `git`, `ssh`) — see
-`cowboy secrets add --help`. Grants live in `.cowboy/security.yaml` (or the home
-overlay); the credential is exposed read-only and its *value* never lands in
-config. See [Configuration](getting-started/configuration.md).
+Presets cover common tools (`gh`, `gcloud`, `gcloud-adc`, `aws`, `kubectl`, `git`,
+`ssh`) — see `cowboy secrets add --help`. Without `--repo` or `--global` a grant is
+written to `~/.config/cowboy/secrets/projects/<repo-key>.yaml`, keyed by the main
+repository, so it applies to every worktree of it. Grants live there or in
+`.cowboy/security.yaml`; files are exposed read-only and a credential's *value*
+never lands in config. Re-adding a preset replaces the grant an older version of it
+wrote. See [Configuration](getting-started/configuration.md).
+
+**gcloud.** The `gcloud` preset does not mount `~/.config/gcloud`: that holds your
+refresh tokens, and gcloud will not run from a read-only config directory. Instead
+the sandbox gets `CLOUDSDK_AUTH_ACCESS_TOKEN` (from `gcloud auth print-access-token`,
+an hour-long token refreshed from the host) and `CLOUDSDK_CORE_PROJECT` (your active
+project), plus `googleapis.com` on the allow-list. gcloud keeps its own writable
+config in the agent's `HOME`. `gcloud auth list` shows no accounts inside; that is
+expected, and commands are still authenticated. Google client libraries read
+application-default credentials rather than that token: `cowboy secrets add
+gcloud-adc` mounts `application_default_credentials.json` read-only, which does hand
+the agent a long-lived refresh token.
+
+## Let the agent run containers
+
+For Testcontainers or a Compose stack of its own, turn on the container proxy in
+`.cowboy/security.yaml` (host-owned; a repo cannot turn it on for itself):
+
+```yaml
+sandbox:
+  containers:
+    enabled: true
+```
+
+with your engine running (`systemctl --user enable --now podman.socket` for rootless
+podman). The agent then has `DOCKER_HOST` and `docker-compose`; containers may mount
+only the project, get no privilege and no route out, and published ports appear on
+the sandbox's `localhost`. Set a project name (`COMPOSE_PROJECT_NAME=cowboy-x`) if
+the repo's stack defaults to the same names as your own. See
+[Containers](security/containers.md) for exactly what is allowed.
 
 ## Give the agent a tool it doesn't have
 
@@ -399,8 +432,11 @@ preference:
 
 1. **Commit a mise config.** `mise.toml` (or `.tool-versions`) declares per-project
    language runtimes and CLIs, and Cowboy runs `mise install` automatically at
-   session start. This is the portable answer: every contributor's session comes up
-   with the same toolchain, and nothing is installed system-wide.
+   session start, and mise's shims lead the sandbox's `PATH`, so the pinned
+   `node`, `pnpm` or `gcloud` is what a bare command runs (on the host your shell's
+   `mise activate` does this; the sandbox runs no shell rc). This is the portable
+   answer: every contributor's session comes up with the same toolchain, and
+   nothing is installed system-wide.
 
 2. **Install it on the host.** For system libraries and build headers
    (`libpq-dev` for the `pg` gem, say), install the package the way you normally
@@ -446,9 +482,13 @@ cowboy mcp add filesystem --transport stdio \
   --command npx --arg -y --arg @modelcontextprotocol/server-filesystem --arg /workspace \
   --description "read/write files under /workspace"
 
-# A remote HTTP server (use ${VAR} for secrets — never paste the token itself):
-cowboy mcp add linear --transport http --url https://mcp.linear.app/sse \
-  --header "Authorization=Bearer \${LINEAR_TOKEN}" --description "issue tracking"
+# A remote HTTP server that signs in with OAuth (see below):
+cowboy mcp add linear --transport http --url https://mcp.linear.app/mcp \
+  --description "issue tracking" --tool '*'
+
+# ...or one that takes a token (use ${VAR} — never paste the token itself):
+cowboy mcp add docs --transport http --url https://mcp.example.com/mcp \
+  --header "Authorization=Bearer \${DOCS_TOKEN}" --description "docs search"
 
 cowboy mcp list                 # configured servers + status
 cowboy mcp test linear          # connect and list the server's tools
@@ -459,13 +499,45 @@ cowboy mcp remove linear        # delete it
 In a session, the agent is told **which servers are connected and what each is
 for** (one line each) — it doesn't carry every tool's schema in every request.
 When it needs a server it uses the built-in `mcp` tool to **discover** that
-server's tools (full schemas, on demand) and **call** them. Type `/mcp` in the
-TUI to see the connected servers yourself.
+server's tools (full schemas, on demand) and **call** them. Type `/mcp` in a
+session to see the servers, how each one authenticates, and to sign in, sign out
+or test one (`/mcp linear` goes straight to it).
 
 Use `--tool <name>` (repeatable) on `add` to expose specific tools from a server.
 The allowlist is **fail-closed**: omitting `--tool` exposes *no* tools, and
 `--tool '*'` exposes all of them. `${VAR}` in `--env`/`--header` values is expanded
 from your host environment at connect time, so secrets never live in the config file.
+
+### Sign in to an MCP server (OAuth)
+
+Hosted servers such as Linear, Notion and Sentry sign you in with OAuth rather
+than a token in config. Cowboy implements the MCP authorization flow: it discovers
+the server's authorization server, registers itself, and opens the sign-in page.
+
+```bash
+cowboy mcp login linear     # opens your browser; finish signing in there
+cowboy mcp list             # remote servers show (signed in) / (not signed in)
+cowboy mcp logout linear    # forget the login on this machine
+```
+
+Or, in a session, `/mcp` → pick the server → **Sign in**. The menu is a prompt, so
+it works the same in the TUI and the web UI. The sign-in link in it is clickable in
+both; in the TUI, Ctrl-Y copies it (the TUI captures the mouse, so your terminal's
+own selection does not reach a dialog), and the web UI has a **Copy link** button.
+The browser comes back to a listener on
+`127.0.0.1` on the machine running the session; when it is on another device (your
+phone, say), its last page fails to load. Copy that page's address and paste it into
+the prompt (or into the terminal, for `cowboy mcp login`). After signing in, the
+server is tested and the agent's next call uses the new login, with no restart.
+
+The login is stored host-side in `~/.config/cowboy/auth/mcp/`, keyed by the
+server's **URL**, so the same server in your `mcp.yaml` and in several repos'
+`.mcp.json` files is signed in once. Tokens refresh on their own; sessions that
+share a login take turns refreshing it. Nothing about the login enters the sandbox:
+MCP traffic is host-side. When a server that needs signing in is called, the agent
+is told to ask you to run `/mcp`. A server with an `Authorization` header in its
+config uses that header, never a stored login. `logout` only forgets the token
+locally; to end the grant itself, revoke Cowboy in the service's settings.
 
 ### Project servers from `.mcp.json`
 

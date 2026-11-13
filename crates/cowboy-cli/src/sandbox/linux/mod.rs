@@ -58,7 +58,7 @@ impl Session {
         // never told which one it is: it sends every query to a loopback port and
         // the answer comes back from this side.
         let upstream = cowboy_gateway::dns::host_resolver();
-        let engine = ctx.engine;
+        let engine = ctx.engine.clone();
         let resolve = channels.resolve;
         std::thread::Builder::new()
             .name("cowboy-dns-broker".into())
@@ -66,7 +66,25 @@ impl Session {
                 super::transport::broker::serve_dns_blocking(resolve, engine, handle, upstream);
             })
             .context("spawning the dns policy broker")?;
-        Ok(Self { inner })
+        let session = Self { inner };
+        // `sandbox.loopback_ports`: the same meaning as on macOS, the host's
+        // loopback service on that port, reachable from inside.
+        for &port in ctx.loopback_ports {
+            ctx.engine.add_host_port(port);
+        }
+        session.sync_host_ports(&ctx.engine)?;
+        Ok(session)
+    }
+
+    /// The session holder's pid, which names its namespaces.
+    pub fn holder_pid(&self) -> u32 {
+        self.inner.pid()
+    }
+
+    /// Bring the ruleset's published ports in line with the engine's set. The
+    /// engine decides either way; this only makes the published ports *reachable*.
+    pub fn sync_host_ports(&self, engine: &cowboy_gateway::state::GatewayState) -> Result<()> {
+        self.inner.set_host_ports(&engine.host_ports())
     }
 
     /// Whether the namespaces still exist. A holder that died (OOM, external kill)

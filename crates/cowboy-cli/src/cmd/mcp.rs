@@ -18,6 +18,8 @@ pub async fn run(command: McpCommand) -> Result<()> {
         McpCommand::Enable { name } => set_enabled(&name, true),
         McpCommand::Disable { name } => set_enabled(&name, false),
         McpCommand::Test { name } => test(&name).await,
+        McpCommand::Login { name } => login(&name).await,
+        McpCommand::Logout { name } => logout(&name),
         McpCommand::Trust => trust(),
         McpCommand::Untrust => untrust(),
     }
@@ -47,7 +49,11 @@ fn list() -> Result<()> {
             } else {
                 format!("  tools: {}", s.tools.join(", "))
             };
-            println!("  {name}  [{state}]  {}{allow}", s.transport_label());
+            println!(
+                "  {name}  [{state}]  {}{}{allow}",
+                s.transport_label(),
+                auth_note(s)
+            );
             if !s.description.is_empty() {
                 println!("      {}", s.description);
             }
@@ -67,7 +73,7 @@ fn list() -> Result<()> {
                 } else {
                     ""
                 };
-                println!("  {name}  {}{note}", s.transport_label());
+                println!("  {name}  {}{}{note}", s.transport_label(), auth_note(s));
             }
             if state == crate::mcp::trust::TrustState::Untrusted
                 || state == crate::mcp::trust::TrustState::Stale
@@ -153,13 +159,102 @@ fn set_enabled(name: &str, enabled: bool) -> Result<()> {
     Ok(())
 }
 
-async fn test(name: &str) -> Result<()> {
-    let mut cfg = load()?;
-    // Also allow testing a trusted project (.mcp.json) server (host config wins).
-    let root = crate::cmd::project_root()?;
-    for (n, s) in crate::mcp::trust::trusted_servers(&root) {
-        cfg.servers.entry(n).or_insert(s);
+/// `  (signed in)` for a server that uses OAuth; nothing otherwise.
+fn auth_note(s: &McpServer) -> String {
+    let kind = crate::mcp::auth::AuthKind::of(s);
+    if kind.uses_oauth() {
+        format!("  ({})", kind.label())
+    } else {
+        String::new()
     }
+}
+
+/// Host servers plus this repo's trusted `.mcp.json` ones (host config wins).
+fn effective() -> Result<McpConfig> {
+    let mut cfg = load()?;
+    if let Ok(root) = crate::cmd::project_root() {
+        for (n, s) in crate::mcp::trust::trusted_servers(&root) {
+            cfg.servers.entry(n).or_insert(s);
+        }
+    }
+    Ok(cfg)
+}
+
+/// The URL of a server that signs in with OAuth.
+fn oauth_url(cfg: &McpConfig, name: &str) -> Result<String> {
+    let s = cfg
+        .servers
+        .get(name)
+        .with_context(|| format!("no MCP server `{name}` (host config, or a trusted .mcp.json)"))?;
+    match (&s.transport, crate::mcp::auth::AuthKind::of(s)) {
+        (_, crate::mcp::auth::AuthKind::Local) => {
+            bail!("`{name}` is a local process; it handles its own authentication")
+        }
+        (_, crate::mcp::auth::AuthKind::Header) => {
+            bail!("`{name}` authenticates with the Authorization header in its config")
+        }
+        (McpTransport::Http { url, .. }, _) => Ok(url.clone()),
+        (McpTransport::Stdio { .. }, _) => unreachable!("a stdio server is Local"),
+    }
+}
+
+async fn login(name: &str) -> Result<()> {
+    use tokio::io::AsyncBufReadExt;
+    let cfg = effective()?;
+    let url = oauth_url(&cfg, name)?;
+    let mut login = crate::mcp::auth::Login::begin(&url).await?;
+    let link = login.url().to_string();
+    println!("Sign in to `{name}` in your browser:\n\n  {link}\n");
+    if crate::mcp::auth::open_browser(&link) {
+        println!("(asked your browser to open it)");
+    }
+    println!(
+        "Waiting for the browser (up to 5 minutes). If it is on another machine, paste \
+         the address its last page tried to load and press Enter."
+    );
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let pasted = async {
+        loop {
+            match stdin.next_line().await {
+                Ok(Some(line)) if !line.trim().is_empty() => return Some(line),
+                Ok(Some(_)) => continue,
+                _ => return None,
+            }
+        }
+    };
+    let callback = tokio::select! {
+        r = tokio::time::timeout(crate::mcp::auth::LOGIN_TIMEOUT, login.callback()) => {
+            r.context("timed out waiting for the browser; run the login again")??
+        }
+        // A closed stdin (a script) is not an answer; keep waiting on the browser.
+        Some(line) = pasted => line,
+    };
+    login.finish(&callback).await?;
+    crate::ui::ok(&format!("signed in to `{name}`"));
+    let manager = crate::mcp::McpManager::new(cfg);
+    match manager.exposed_tools(name).await {
+        Ok((exposed, total)) => println!(
+            "  connected: {} of its {total} tools exposed by the allowlist",
+            exposed.len()
+        ),
+        Err(e) => crate::ui::warn(&format!("signed in, but connecting failed: {e}")),
+    }
+    Ok(())
+}
+
+fn logout(name: &str) -> Result<()> {
+    let url = oauth_url(&effective()?, name)?;
+    if crate::mcp::auth::sign_out(&url)? {
+        crate::ui::ok(&format!("signed out of `{name}` on this machine"));
+        println!("  (revoke Cowboy's access in the service's settings to end the grant itself)");
+    } else {
+        println!("`{name}` was not signed in");
+    }
+    Ok(())
+}
+
+async fn test(name: &str) -> Result<()> {
+    let cfg = effective()?;
     if !cfg.servers.contains_key(name) {
         bail!("no MCP server `{name}` (host config, or a trusted .mcp.json)");
     }

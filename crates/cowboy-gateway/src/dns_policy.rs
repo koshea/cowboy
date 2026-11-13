@@ -97,15 +97,24 @@ fn shannon_entropy(s: &str) -> f64 {
         .sum::<f64>()
 }
 
-/// Sliding 1-minute per-parent query-rate tracker. Many distinct lookups under one
-/// parent in a short window is the strongest tunnel signal.
+/// Per-parent, per-minute lookup tracker. Many **distinct** names under one parent
+/// in a short window is the strongest tunnel signal: each name is a payload chunk.
+///
+/// The same name asked again carries nothing new, so repeats are counted against a
+/// separate, much higher ceiling. Counting every query (as this once did) refused a
+/// test that retried one host in a loop — 884 times in one session — and made its
+/// failures look like the network rather than the retry.
 pub struct RateTracker {
     inner: Mutex<HashMap<String, Window>>,
     max_per_min: u32,
 }
 
+/// How many times more queries than distinct names a parent may see per minute.
+const REPEAT_FACTOR: u32 = 10;
+
 struct Window {
-    count: u32,
+    names: std::collections::HashSet<String>,
+    queries: u32,
     start: Instant,
 }
 
@@ -117,13 +126,13 @@ impl RateTracker {
         }
     }
 
-    /// Record a query for `parent` (now) and report whether it's over the
-    /// per-minute limit. Uses a fixed 60s tumbling window per parent.
-    pub fn over_limit(&self, parent: &str) -> bool {
-        self.over_limit_at(parent, Instant::now())
+    /// Record a lookup of `name` under `parent` (now) and report whether the parent
+    /// is over its per-minute limits. A fixed 60s tumbling window per parent.
+    pub fn over_limit(&self, parent: &str, name: &str) -> bool {
+        self.over_limit_at(parent, name, Instant::now())
     }
 
-    fn over_limit_at(&self, parent: &str, now: Instant) -> bool {
+    fn over_limit_at(&self, parent: &str, name: &str, now: Instant) -> bool {
         if self.max_per_min == 0 {
             return false; // disabled
         }
@@ -131,16 +140,25 @@ impl RateTracker {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let w = map.entry(parent.to_string()).or_insert(Window {
-            count: 0,
+        let w = map.entry(parent.to_string()).or_insert_with(|| Window {
+            names: Default::default(),
+            queries: 0,
             start: now,
         });
         if now.duration_since(w.start) >= Duration::from_secs(60) {
-            w.count = 0;
+            w.names.clear();
+            w.queries = 0;
             w.start = now;
         }
-        w.count += 1;
-        w.count > self.max_per_min
+        w.queries = w.queries.saturating_add(1);
+        // Bounded: past the limit the parent is refused anyway, so there is no need
+        // to remember more names than that.
+        if w.names.len() <= self.max_per_min as usize {
+            w.names
+                .insert(name.trim_end_matches('.').to_ascii_lowercase());
+        }
+        w.names.len() > self.max_per_min as usize
+            || w.queries > self.max_per_min.saturating_mul(REPEAT_FACTOR)
     }
 }
 
@@ -204,15 +222,31 @@ mod tests {
     fn rate_tracker_trips_over_limit_and_resets() {
         let rt = RateTracker::new(3);
         let t0 = Instant::now();
-        assert!(!rt.over_limit_at("evil.com", t0)); // 1
-        assert!(!rt.over_limit_at("evil.com", t0)); // 2
-        assert!(!rt.over_limit_at("evil.com", t0)); // 3
-        assert!(rt.over_limit_at("evil.com", t0)); // 4 > 3
-                                                   // A different parent has its own window.
-        assert!(!rt.over_limit_at("github.com", t0));
+        assert!(!rt.over_limit_at("evil.com", "a.evil.com", t0)); // 1
+        assert!(!rt.over_limit_at("evil.com", "b.evil.com", t0)); // 2
+        assert!(!rt.over_limit_at("evil.com", "c.evil.com", t0)); // 3
+        assert!(rt.over_limit_at("evil.com", "d.evil.com", t0)); // 4 > 3
+                                                                 // A different parent has its own window.
+        assert!(!rt.over_limit_at("github.com", "github.com", t0));
         // After the window elapses, it resets.
         let later = t0 + Duration::from_secs(61);
-        assert!(!rt.over_limit_at("evil.com", later));
+        assert!(!rt.over_limit_at("evil.com", "e.evil.com", later));
+    }
+
+    /// A client retrying one host is not a tunnel: repeats of a name carry no new
+    /// payload, so they count against a far higher ceiling than distinct names.
+    #[test]
+    fn repeating_one_name_is_not_a_tunnel() {
+        let rt = RateTracker::new(3);
+        let t0 = Instant::now();
+        for i in 0..3 * REPEAT_FACTOR {
+            assert!(
+                !rt.over_limit_at("ts.net", "litellm.ts.net", t0),
+                "repeat {i} refused"
+            );
+        }
+        // ...but an unbounded hammer still trips the backstop.
+        assert!(rt.over_limit_at("ts.net", "litellm.ts.net", t0));
     }
 
     proptest! {

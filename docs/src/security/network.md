@@ -99,6 +99,20 @@ IP, with optional port restriction); otherwise the default for the destination's
 A domain allow only ever grants a **public** address, so it cannot become a path to an
 internal one. `ask` goes to you; with no approver it fails closed.
 
+## The host's loopback (Linux)
+
+Inside a Linux sandbox `127.0.0.1` is the sandbox's own loopback, so your databases
+and dev servers are not reachable at all. A **published** port is the exception: a
+connection to `127.0.0.1:<port>` inside is redirected to the relay and dialled on the
+host's loopback. Ports are published by `sandbox.loopback_ports` in `security.yaml`,
+or at runtime by a host component (the container proxy, for a container's published
+port). The engine's own set decides, and a host-loopback connection is **never**
+put to `default_host` or to you: a port reaches your loopback because the host
+published it, and an unpublished one is refused. The ruleset only names the
+published ports so they reach the relay at all; a port left there by a failed
+update is still refused. A sandbox process listening on a published port is
+shadowed by it.
+
 ## DNS
 
 DNS is a decision point, not a blind relay — otherwise a lookup of
@@ -121,7 +135,12 @@ Every gate is host-side:
 - **Tunnel shapes are refused** (`network_policy.dns.tunnel_detection`, default
   on): very long or high-entropy names, deeply chunked subdomains, or a high query
   rate to one parent. This catches `<payload>.allowed.com`, which a name allow-list
-  alone cannot. The shape checks first remove any of the host's own **search
+  alone cannot. The rate limit counts **distinct** names per parent per minute
+  (`max_subdomains_per_min`, default 40), since each name is a payload chunk;
+  repeats of one name carry nothing new and count against a ceiling ten times
+  higher, so a client retrying one host is not mistaken for a tunnel. It applies
+  only to unknown names: allow-listed domains, and hosts you allowed a connection
+  to this session, are exempt. The shape checks first remove any of the host's own **search
   domains** (`/etc/resolv.conf`) from the end of the name: the resolver appends
   those itself, and with `search corp.example` a plain `duckduckgo.com` arrives as
   `duckduckgo.com.corp.example`, whose subdomain region is long and
@@ -153,8 +172,26 @@ global, or deny. *Once* covers only the connection that asked (the gateway does 
 cache it); *session* and any deny are cached for the rest of the session. Project
 approvals persist host-side per project, global ones in one host-wide file that
 every project reads (both under `~/.config/cowboy/approvals/`, never in the
-workspace), and merge into the policy on the next run. Non-interactive runs fail
+workspace), and merge into the policy on the next run. A saved approval for a host
+that resolved to a **private** address (a Tailscale `100.x` node, a LAN machine) is
+saved with that exact address too, since a host approval alone only ever covers
+public addresses; it then applies to that host at that address and port, and a
+rebind to another private address is asked about again. Non-interactive runs fail
 closed and log the decision.
+
+While a prompt is open:
+
+- A connection to the same destination for the same reason **waits for that
+  prompt** instead of queueing another. It shares the answer when the answer stands
+  for the session (any deny, or an allow wider than once); "allow once" belongs to
+  one connection, so a waiting one then asks for itself.
+- **The agent pauses.** It neither plans its next step nor starts its next command
+  until you answer or the prompt times out, and a notice says so. Afterwards, and
+  in every command's result, the model is told what the network did while it ran:
+  prompts still open, what was refused and why (`refused host:53 — dns tunnel
+  suspected (×40)`), and what you decided. Before this, the model saw only its
+  client's error and retried while the prompt sat on screen. It is pacing, not
+  enforcement: the verdict stays the gateway's.
 
 The prompt also names **the command that wants the destination**, because the
 destination alone rarely settles the question: `cargo test` reaching crates.io is a

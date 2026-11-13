@@ -38,8 +38,8 @@ pub(crate) struct StartContext<'a> {
     /// processes).
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub scratch: &'a Path,
-    /// Loopback ports commands may reach directly (`sandbox.loopback_ports`, macOS).
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// Host loopback ports commands may reach (`sandbox.loopback_ports`): directly
+    /// on macOS, through the relay on Linux.
     pub loopback_ports: &'a [u16],
     /// Where to send bring-up notices.
     pub report: &'a (dyn Fn(String) + Sync),
@@ -60,6 +60,57 @@ struct Background {
     child: Option<tokio::process::Child>,
     /// Held for the process's lifetime; see [`exec::Prepared::ticket`].
     _ticket: Option<Box<dyn Ticket>>,
+}
+
+/// Host loopback ports the sandbox may reach (Linux): the configured
+/// `sandbox.loopback_ports`, plus whatever the session's containers publish.
+///
+/// Shared with the container proxy's task, which holds no `&NativeSandbox`. The
+/// engine's set decides; the session ruleset only makes the ports reachable, and is
+/// brought in line here after each change.
+pub(crate) struct HostPorts {
+    engine: Arc<GatewayState>,
+    /// The session holder, whose namespaces hold the ruleset; 0 with no session.
+    holder: std::sync::atomic::AtomicU32,
+    configured: BTreeSet<u16>,
+    containers: Mutex<BTreeSet<u16>>,
+}
+
+impl HostPorts {
+    fn sync(&self) -> Result<()> {
+        let pid = self.holder.load(Ordering::SeqCst);
+        if pid == 0 {
+            return Ok(());
+        }
+        #[cfg(target_os = "linux")]
+        return super::session::set_host_ports_for(pid, &self.engine.host_ports());
+        #[cfg(not(target_os = "linux"))]
+        Ok(())
+    }
+
+    /// Make the container-published set exactly `ports`. The engine is updated
+    /// before the ruleset, so a port is refused the moment it is withdrawn.
+    fn set_containers(&self, ports: BTreeSet<u16>) {
+        let mut cur = self.containers.lock().expect("host ports poisoned");
+        if *cur == ports {
+            return;
+        }
+        for p in cur.difference(&ports) {
+            if !self.configured.contains(p) {
+                self.engine.remove_host_port(*p);
+            }
+        }
+        for p in ports.difference(&cur) {
+            if *p != super::RELAY_PORT && *p != super::DNS_PORT {
+                self.engine.add_host_port(*p);
+            }
+        }
+        *cur = ports;
+        drop(cur);
+        if let Err(e) = self.sync() {
+            tracing::warn!(error = %e, "could not update the published container ports");
+        }
+    }
 }
 
 pub struct NativeSandbox {
@@ -95,6 +146,13 @@ pub struct NativeSandbox {
     git_identity: crate::project::GitIdentity,
     /// Extra paths/env for a harness job's sandbox (see [`Self::set_overlay`]).
     overlay: Mutex<Option<cowboy_sandbox::plan::PlanOverlay>>,
+    /// `source_command` env secrets, resolved host-side before each command.
+    command_env: Arc<super::command_env::CommandEnv>,
+    /// Host loopback ports the sandbox may reach, shared with the container proxy.
+    host_ports: Arc<HostPorts>,
+    /// The container proxy (`sandbox.containers`), started with the session.
+    #[cfg(target_os = "linux")]
+    containers: tokio::sync::Mutex<Option<super::containers::ContainerProxy>>,
     /// The policy engine that answers the relay.
     ///
     /// Constructed up front rather than attached later: a sandbox with no engine
@@ -128,7 +186,17 @@ impl NativeSandbox {
                 // isn't mistaken for an exfiltration payload.
                 .with_search_domains(cowboy_gateway::dns::host_search_domains()),
         );
+        let command_env = Arc::new(super::command_env::CommandEnv::new(&security, &root));
+        let host_ports = Arc::new(HostPorts {
+            engine: policy_engine.clone(),
+            holder: std::sync::atomic::AtomicU32::new(0),
+            configured: security.sandbox.loopback_ports.iter().copied().collect(),
+            containers: Mutex::new(BTreeSet::new()),
+        });
         Ok(Self {
+            host_ports,
+            #[cfg(target_os = "linux")]
+            containers: tokio::sync::Mutex::new(None),
             policy_engine,
             root,
             security,
@@ -145,6 +213,7 @@ impl NativeSandbox {
             cgroup_key,
             git_identity: crate::project::GitIdentity::from_host(),
             overlay: Mutex::new(None),
+            command_env,
         })
     }
 
@@ -212,6 +281,7 @@ impl NativeSandbox {
         // subdirectories), so nothing inside can swap this file for a symlink.
         let git_identity = crate::project::write_git_identity(&scratch, &self.git_identity);
         let overlay = self.overlay.lock().unwrap().clone();
+        let container_dir = self.container_socket_dir(&scratch)?;
         let inputs = PlanInputs {
             root: &self.root,
             security: &self.security,
@@ -222,9 +292,32 @@ impl NativeSandbox {
             agent_home: &agent_home,
             git_identity: git_identity.as_deref(),
             overlay: overlay.as_ref(),
+            container_socket_dir: container_dir.as_deref(),
             platform: cowboy_sandbox::plan::Platform::host(),
         };
         SandboxPlan::build(&inputs, self.probe.as_ref()).map_err(anyhow::Error::new)
+    }
+
+    /// [`Self::plan`] plus the `source_command` env secrets: the plan a command
+    /// actually runs with. Kept apart so describing the plan never runs a host
+    /// credential helper; the values are never logged.
+    async fn exec_plan(&self) -> Result<SandboxPlan> {
+        let mut plan = self.plan()?;
+        if self.command_env.is_empty() {
+            return Ok(plan);
+        }
+        let resolver = self.command_env.clone();
+        let resolved = tokio::task::spawn_blocking(move || resolver.resolve())
+            .await
+            .context("resolving command-sourced secrets")?;
+        for name in self.command_env.newly_failed(&resolved.failed) {
+            self.report(format!(
+                "credential env {name} not set: its source_command failed or printed \
+                 nothing on the host (check it with `cowboy secrets list`)"
+            ));
+        }
+        super::command_env::apply(&mut plan.env, &resolved.values);
+        Ok(plan)
     }
 
     /// Session grants first, then persisted ones, minus anything the denylist
@@ -394,9 +487,107 @@ impl NativeSandbox {
                 loopback_ports: &self.security.sandbox.loopback_ports,
                 report: &report,
             })?;
+            #[cfg(target_os = "linux")]
+            self.host_ports
+                .holder
+                .store(session.holder_pid(), Ordering::SeqCst);
             *guard = Some(session);
+            #[cfg(target_os = "linux")]
+            self.start_containers().await;
         }
         Ok(guard)
+    }
+
+    /// Let commands reach the host's `127.0.0.1:port` (Linux), for a port a host
+    /// component published, such as a container's.
+    pub async fn publish_host_port(&self, port: u16) -> Result<()> {
+        if port == 0 || port == super::RELAY_PORT || port == super::DNS_PORT {
+            anyhow::bail!("port {port} cannot be published to the sandbox");
+        }
+        self.policy_engine.add_host_port(port);
+        self.host_ports.sync()
+    }
+
+    /// Stop commands reaching the host's `127.0.0.1:port`; open connections are not
+    /// cut.
+    pub async fn unpublish_host_port(&self, port: u16) -> Result<()> {
+        self.policy_engine.remove_host_port(port);
+        self.host_ports.sync()
+    }
+
+    /// The host directory for the container proxy's socket, created owner-only,
+    /// when `sandbox.containers` is on (Linux).
+    fn container_socket_dir(&self, scratch: &Path) -> Result<Option<PathBuf>> {
+        if !self.security.sandbox.containers.enabled || !cfg!(target_os = "linux") {
+            return Ok(None);
+        }
+        let dir = scratch.join("engine");
+        std::fs::create_dir_all(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(Some(dir))
+    }
+
+    /// Start the container proxy for a new session, when configured. Failing to
+    /// is reported, not fatal: the sandbox works without an engine.
+    #[cfg(target_os = "linux")]
+    async fn start_containers(&self) {
+        let cfg = &self.security.sandbox.containers;
+        if !cfg.enabled {
+            return;
+        }
+        let Some(upstream) = super::containers::engine_socket(cfg.engine_socket.as_deref()) else {
+            self.report(
+                "sandbox.containers is on, but no container engine socket was found \
+                 (start podman.socket, or set sandbox.containers.engine_socket)"
+                    .to_string(),
+            );
+            return;
+        };
+        let scratch = match crate::project::ensure_scratch_dir(&self.scratch_key)
+            .and_then(|s| self.container_socket_dir(&s).map(|d| (s, d)))
+        {
+            Ok((s, Some(d))) => (s, d),
+            _ => return,
+        };
+        let (scratch, dir) = scratch;
+        let scope = super::containers::filter::Scope {
+            session: self.cgroup_key.clone(),
+            paths: vec![
+                (
+                    PathBuf::from(&self.security.sandbox.workdir),
+                    self.root.clone(),
+                ),
+                ("/tmp".into(), scratch.join("tmp")),
+                ("/var/tmp".into(), scratch.join("var-tmp")),
+            ],
+            denied: vec![self.root.join(".cowboy")],
+            registries: cfg.allow_registries.clone(),
+            build: cfg.build,
+        };
+        let ports = self.host_ports.clone();
+        let on_ports: super::containers::PortsFn = Arc::new(move |set| ports.set_containers(set));
+        match super::containers::ContainerProxy::start(
+            dir.join(cowboy_sandbox::plan::CONTAINER_SOCKET_NAME),
+            upstream.clone(),
+            scope,
+            cfg.max_containers,
+            on_ports,
+        )
+        .await
+        {
+            Ok(proxy) => {
+                self.report(format!(
+                    "containers: the agent can use {} through cowboy's filtering proxy",
+                    upstream.display()
+                ));
+                *self.containers.lock().await = Some(proxy);
+            }
+            Err(e) => self.report(format!("containers are unavailable: {e:#}")),
+        }
     }
 
     /// Run a command in this session, streaming output.
@@ -408,7 +599,7 @@ impl NativeSandbox {
         cancel: tokio_util::sync::CancellationToken,
         chunks: StatusTx,
     ) -> Result<(ExecResult, String)> {
-        let plan = self.plan()?;
+        let plan = self.exec_plan().await?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
         let shell_command = exec::with_cwd(&plan.workdir, command, cwd);
@@ -439,7 +630,7 @@ impl NativeSandbox {
                 "process {name} is already running; stop it first (or use a different name)"
             );
         }
-        let plan = self.plan()?;
+        let plan = self.exec_plan().await?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
         let generation = self.grant_generation.load(Ordering::SeqCst);
@@ -612,6 +803,13 @@ impl Sandbox for NativeSandbox {
         for name in names {
             let _ = self.stop_process(&name).await;
         }
+        // Before the session: the sweep removes the session's containers, and
+        // unpublishing their ports needs the session's namespaces.
+        #[cfg(target_os = "linux")]
+        if let Some(mut proxy) = self.containers.lock().await.take() {
+            proxy.shutdown().await;
+        }
+        self.host_ports.holder.store(0, Ordering::SeqCst);
         if let Some(mut s) = self.session.lock().await.take() {
             s.stop();
         }
@@ -667,7 +865,7 @@ impl Sandbox for NativeSandbox {
     }
 
     async fn shell(&self) -> Result<ExecResult> {
-        let plan = self.plan()?;
+        let plan = self.exec_plan().await?;
         let guard = self.session().await?;
         let session = guard.as_ref().expect("session started");
         let prepared = session.prepare(&plan, "bash -l")?;

@@ -38,6 +38,9 @@ struct Collected {
     env: Vec<(String, String)>,     // (name, source_env)
     env_cmd: Vec<(String, String)>, // (name, source_command)
     files: Vec<(String, String)>,   // (source, target)
+    /// Host sources whose existing file grants this add supersedes (a preset's
+    /// own sources and guards), so re-adding a preset upgrades an older grant.
+    replaces: Vec<String>,
     domains: Vec<String>,
     notes: Vec<String>,
 }
@@ -54,6 +57,7 @@ fn collect(args: &SecretsAddArgs) -> Result<Collected> {
                 .iter()
                 .map(|(n, cmd)| (n.to_string(), cmd.to_string())),
         );
+        c.replaces.extend(p.sources().map(str::to_string));
         c.domains.extend(p.domains.iter().map(|d| d.to_string()));
         c.notes.push(format!("{name}: {}", p.note));
     }
@@ -65,7 +69,10 @@ fn collect(args: &SecretsAddArgs) -> Result<Collected> {
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("cred");
-                (f.clone(), format!("/tmp/{base}"))
+                (
+                    f.clone(),
+                    format!("{}/{base}", cowboy_sandbox::plan::AGENT_HOME),
+                )
             }
         };
         c.files.push((src, target));
@@ -103,29 +110,77 @@ fn add(args: SecretsAddArgs) -> Result<()> {
     .context("cannot resolve home config directory")?;
 
     let mut us = usersecrets::read(&path);
-    for (name, source_env) in c.env {
-        if !us.env.iter().any(|e| e.name == name) {
-            us.env.push(SecretEnv {
-                name,
-                source_env,
-                source_command: None,
-                required: false,
-                approval: None,
-            });
+    let changes = merge(&mut us, c.env, c.env_cmd, c.files, &c.replaces, c.domains);
+    usersecrets::write(&path, &us)?;
+
+    let scope = if args.global {
+        "all projects"
+    } else {
+        "this repo (all worktrees)"
+    };
+    crate::ui::ok(&format!("wrote credential grant to {}", path.display()));
+    println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
+    for line in &changes {
+        println!("  {line}");
+    }
+    for n in &c.notes {
+        println!("  {n}");
+    }
+    Ok(())
+}
+
+/// Fold new grants into an overlay. An env var of the same name, and a file grant
+/// from one of `replaces` (or of the same source), are *replaced* rather than kept
+/// beside the new one: presets change (gcloud moved from a config mount to a
+/// token), and re-running `cowboy secrets add <preset>` is how a user picks that
+/// up. Returns a line per replaced or removed grant, for the user.
+fn merge(
+    us: &mut usersecrets::UserSecrets,
+    env: Vec<(String, String)>,
+    env_cmd: Vec<(String, String)>,
+    files: Vec<(String, String)>,
+    replaces: &[String],
+    domains: Vec<String>,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    let new_env = env
+        .into_iter()
+        .map(|(name, source_env)| SecretEnv {
+            name,
+            source_env,
+            source_command: None,
+            required: false,
+            approval: None,
+        })
+        .chain(env_cmd.into_iter().map(|(name, cmd)| SecretEnv {
+            name,
+            source_env: String::new(),
+            source_command: Some(cmd),
+            required: false,
+            approval: None,
+        }));
+    for e in new_env {
+        if let Some(old) = us.env.iter_mut().find(|x| x.name == e.name) {
+            if old.source_env != e.source_env || old.source_command != e.source_command {
+                changes.push(format!("replaced env {}", e.name));
+                // The user's approval/required choices survive the upgrade.
+                old.source_env = e.source_env;
+                old.source_command = e.source_command;
+            }
+        } else {
+            us.env.push(e);
         }
     }
-    for (name, cmd) in c.env_cmd {
-        if !us.env.iter().any(|e| e.name == name) {
-            us.env.push(SecretEnv {
-                name,
-                source_env: String::new(),
-                source_command: Some(cmd),
-                required: false,
-                approval: None,
-            });
+    let new_sources: Vec<&str> = files.iter().map(|(s, _)| s.as_str()).collect();
+    us.files.retain(|f| {
+        let superseded = replaces.contains(&f.source) || new_sources.contains(&f.source.as_str());
+        let kept = files.iter().any(|(s, t)| *s == f.source && *t == f.target);
+        if superseded && !kept {
+            changes.push(format!("removed file {} → {}", f.source, f.target));
         }
-    }
-    for (source, target) in c.files {
+        !superseded || kept
+    });
+    for (source, target) in files {
         if !us
             .files
             .iter()
@@ -140,24 +195,22 @@ fn add(args: SecretsAddArgs) -> Result<()> {
             });
         }
     }
-    for d in c.domains {
-        if !us.allow.domains.contains(&d) {
+    for d in domains {
+        // `*.x.com` and `x.com` are the same rule; keep the one that reads right.
+        if let Some(old) = us
+            .allow
+            .domains
+            .iter_mut()
+            .find(|x| x.strip_prefix("*.") == Some(d.as_str()))
+        {
+            *old = d;
+        } else if !us.allow.domains.contains(&d) {
             us.allow.domains.push(d);
         }
     }
-    usersecrets::write(&path, &us)?;
-
-    let scope = if args.global {
-        "all projects"
-    } else {
-        "this repo (all worktrees)"
-    };
-    crate::ui::ok(&format!("wrote credential grant to {}", path.display()));
-    println!("  applies to {scope} (merged with the repo's security.yaml at session start)");
-    for n in &c.notes {
-        println!("  {n}");
-    }
-    Ok(())
+    let mut seen = std::collections::BTreeSet::new();
+    us.allow.domains.retain(|d| seen.insert(d.clone()));
+    changes
 }
 
 /// Print a paste-ready block for the repo's committed security.yaml.
@@ -198,7 +251,8 @@ fn print_repo_snippet(c: &Collected) {
 
 fn list() -> Result<()> {
     let key = project_key()?;
-    let paths = ConfigPaths::for_root(crate::cmd::project_root()?);
+    let root = crate::cmd::project_root()?;
+    let paths = ConfigPaths::for_root(root.clone());
     let repo = SecurityConfig::load(&paths.security).ok();
     let global = usersecrets::global_file()
         .map(|p| usersecrets::read(&p))
@@ -226,7 +280,7 @@ fn list() -> Result<()> {
         for e in envs {
             any = true;
             if let Some(cmd) = &e.source_command {
-                let mark = if crate::project::source_command_ok(cmd) {
+                let mark = if crate::project::source_command_ok(cmd, Some(&root)) {
                     "ok"
                 } else {
                     "FAILED on host"
@@ -267,4 +321,118 @@ fn list() -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preset_parts(name: &str) -> Collected {
+        collect(&SecretsAddArgs {
+            preset: Some(name.into()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn add_preset(us: &mut usersecrets::UserSecrets, name: &str) -> Vec<String> {
+        let c = preset_parts(name);
+        merge(us, c.env, c.env_cmd, c.files, &c.replaces, c.domains)
+    }
+
+    /// Re-adding a preset is the upgrade path: the old gcloud grant mounted the
+    /// whole config dir (refresh tokens included) at the pre-move HOME, and must not
+    /// survive next to the token-based one.
+    #[test]
+    fn re_adding_a_preset_replaces_its_older_grant() {
+        let mut us = usersecrets::UserSecrets {
+            files: vec![SecretMount {
+                source: "~/.config/gcloud".into(),
+                target: "/tmp/.config/gcloud".into(),
+                read_only: true,
+                required: false,
+                approval: None,
+            }],
+            ..Default::default()
+        };
+        us.allow.domains = vec!["accounts.google.com".into(), "*.googleapis.com".into()];
+
+        let changes = add_preset(&mut us, "gcloud");
+        assert!(us.files.is_empty(), "{:?}", us.files);
+        assert!(changes.iter().any(|c| c.contains("~/.config/gcloud")));
+        let names: Vec<_> = us.env.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_CORE_PROJECT"]
+        );
+        assert_eq!(
+            us.allow.domains,
+            [
+                "accounts.google.com".to_string(),
+                "googleapis.com".to_string()
+            ]
+        );
+
+        // Idempotent: a second add changes nothing and says so.
+        let before = (us.env.clone(), us.files.clone(), us.allow.domains.clone());
+        assert!(add_preset(&mut us, "gcloud").is_empty());
+        assert_eq!(
+            before,
+            (us.env.clone(), us.files.clone(), us.allow.domains.clone())
+        );
+    }
+
+    #[test]
+    fn a_retargeted_preset_file_is_moved_and_unrelated_grants_are_kept() {
+        let mount = |source: &str, target: &str| SecretMount {
+            source: source.into(),
+            target: target.into(),
+            read_only: true,
+            required: false,
+            approval: Some("required".into()),
+        };
+        let mut us = usersecrets::UserSecrets {
+            files: vec![
+                mount("~/.config/gh", "/tmp/.config/gh"),
+                mount("~/.npmrc", "/home/agent/.npmrc"),
+            ],
+            env: vec![SecretEnv {
+                name: "GH_TOKEN".into(),
+                source_env: String::new(),
+                source_command: Some("gh auth token".into()),
+                required: true,
+                approval: Some("required".into()),
+            }],
+            ..Default::default()
+        };
+        add_preset(&mut us, "gh");
+        let files: Vec<_> = us
+            .files
+            .iter()
+            .map(|f| (f.source.as_str(), f.target.as_str()))
+            .collect();
+        assert_eq!(
+            files,
+            [
+                ("~/.npmrc", "/home/agent/.npmrc"),
+                ("~/.config/gh", "/home/agent/.config/gh")
+            ]
+        );
+        // Unchanged env keeps the user's own choices.
+        assert!(us.env[0].required);
+        assert_eq!(us.env[0].approval.as_deref(), Some("required"));
+    }
+
+    #[test]
+    fn a_bare_file_defaults_into_the_agent_home() {
+        let c = collect(&SecretsAddArgs {
+            file: vec!["~/.npmrc".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(
+            c.files,
+            [("~/.npmrc".to_string(), "/home/agent/.npmrc".to_string())]
+        );
+    }
 }

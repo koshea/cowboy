@@ -28,7 +28,7 @@ secrets:
   env:
     - { name: GITHUB_TOKEN, source_env: COWBOY_GITHUB_TOKEN, required: false }
   files:                         # grant host credentials so CLIs work in the sandbox
-    - { source: ~/.config/gh, target: /tmp/.config/gh, read_only: true }
+    - { source: ~/.config/gh, target: /home/agent/.config/gh, read_only: true }
 ```
 
 > **Renamed.** This section used to be `container:`. If yours still says that,
@@ -67,12 +67,16 @@ Use `cowboy secrets add` when a CLI genuinely needs credentials.
 (`network_policy.dns`: strict allowlist gating, tunnel detection, allowed record
 types) — is documented in [Network egress](../security/network.md).
 
-**Granting credentials.** `secrets.env` injects an env var (from a host env var or
-a `source_command` like `gh auth token`); `secrets.files` mounts a host credential
-dir/file **read-only** so a CLI (`gh`, `gcloud`, `kubectl`, …) works inside the
-sandbox. The credential *value* never lands in config.
-`cowboy secrets add <preset>` prints ready-to-paste grants — see the
-[how-to](../how-to.md).
+**Granting credentials.** `secrets.env` injects an env var, either from a host env
+var (`source_env`) or from a host command's output (`source_command`, like
+`gh auth token`). A `source_command` runs on the host, in the project root, before a
+command whenever its last value is over a minute old, so a short-lived token stays
+fresh for the whole session; only its trimmed output enters the sandbox.
+`secrets.files` mounts a host credential dir/file **read-only** under the agent's
+`HOME` (`/home/agent/...`) so a CLI (`gh`, `kubectl`, …) works inside the sandbox. A
+dotfile target under `/tmp`, the old `HOME`, is moved there. The credential *value*
+never lands in config. `cowboy secrets add <preset>` writes ready-made grants — see
+the [how-to](../how-to.md).
 
 **Resource limits.** `cpus`/`memory` are enforced with an unprivileged cgroup v2
 (a number/size, `auto` to size from the host, or omit for unlimited). They bound the

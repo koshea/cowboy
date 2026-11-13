@@ -166,20 +166,38 @@ fn append_to(dir: &Path, file: &Path, attempt: &NetworkAttempt) -> std::io::Resu
     let _lock = lock(&dir.join(".lock"))?;
 
     let mut all = read_file(file);
-    let entry = Approval {
-        host: attempt.host.clone(),
-        cidr: attempt
-            .host
-            .is_none()
-            .then(|| attempt.ip.map(|ip| format!("{ip}/32")))
-            .flatten(),
-        port: attempt.port,
-    };
+    let entry = entry_for(attempt);
     if !all.contains(&entry) {
         all.push(entry);
         write_private(file, &serde_json::to_string_pretty(&all)?)?;
     }
     Ok(())
+}
+
+/// The approval to save for an answered prompt.
+///
+/// A host approval is honoured only while the host resolves to a **public** address
+/// (see `cowboy_core::policy::approval_matches`), so a host that resolved to a
+/// private one (a Tailscale `100.x` node, a LAN box) is also saved with that exact
+/// address, which the prompt showed. Saving the host alone looked like it worked
+/// and then asked again every session, and denied outright in subagents, which
+/// cannot ask.
+fn entry_for(attempt: &NetworkAttempt) -> Approval {
+    let public =
+        cowboy_core::policy::classify(attempt.ip) == cowboy_core::policy::DestClass::External;
+    let pin_address = attempt.host.is_none() || !public;
+    Approval {
+        host: attempt.host.clone(),
+        cidr: pin_address
+            .then(|| {
+                attempt.ip.map(|ip| match ip {
+                    std::net::IpAddr::V4(_) => format!("{ip}/32"),
+                    std::net::IpAddr::V6(_) => format!("{ip}/128"),
+                })
+            })
+            .flatten(),
+        port: attempt.port,
+    }
 }
 
 /// Write owner-only.
@@ -274,6 +292,37 @@ mod tests {
         assert_eq!(all[0].host.as_deref(), Some("example.com"));
         // The approvals file is under the config dir, not the project workspace.
         assert!(!proj.path().join(".cowboy/approvals.json").exists());
+    }
+
+    /// A host approved while it resolved to a private address (a Tailscale node) is
+    /// saved with that address, so the saved approval actually applies next session.
+    /// Saved as a host alone it never matched — host approvals cover public
+    /// addresses only — and the user was asked again, or a subagent was denied.
+    #[test]
+    fn a_private_host_approval_is_saved_with_its_address_and_applies() {
+        let cfg = assert_fs::TempDir::new().unwrap();
+        let proj = assert_fs::TempDir::new().unwrap();
+        let tailnet = attempt_on("litellm.example.ts.net", Some("100.91.41.20"), 443);
+        append_in(cfg.path(), proj.path(), &tailnet).unwrap();
+        let public = attempt_on("example.com", Some("93.184.216.34"), 443);
+        append_in(cfg.path(), proj.path(), &public).unwrap();
+        let all = load_in(cfg.path(), proj.path());
+        assert_eq!(all[0].cidr.as_deref(), Some("100.91.41.20/32"));
+        assert_eq!(
+            all[1].cidr, None,
+            "a public host is not pinned to one address"
+        );
+
+        let mut policy = NetworkPolicy::default();
+        merge_into(&mut policy, &all);
+        let verdict = |a: &NetworkAttempt| cowboy_core::policy::evaluate(&policy, a).0;
+        assert_eq!(verdict(&tailnet), cowboy_core::netproto::Verdict::Allow);
+        // Only that address and port: another private address under the same name
+        // (a rebind) is still asked about.
+        let moved = attempt_on("litellm.example.ts.net", Some("100.64.0.9"), 443);
+        assert_ne!(verdict(&moved), cowboy_core::netproto::Verdict::Allow);
+        let other_port = attempt_on("litellm.example.ts.net", Some("100.91.41.20"), 22);
+        assert_ne!(verdict(&other_port), cowboy_core::netproto::Verdict::Allow);
     }
 
     /// The list of destinations a project may reach is not other users' business, and

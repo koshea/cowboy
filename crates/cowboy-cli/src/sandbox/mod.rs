@@ -17,6 +17,9 @@
 //! Both fail closed, and both keep every policy decision on the host side.
 
 pub mod attribution;
+pub mod command_env;
+#[cfg(target_os = "linux")]
+pub mod containers;
 pub mod exec;
 pub mod grants;
 pub mod native;

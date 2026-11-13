@@ -164,6 +164,12 @@ pub async fn run() -> Result<()> {
         Remedy::Fix,
         check_credentials(&security, &root),
     );
+    report.check(
+        "containers",
+        Category::Host,
+        Remedy::Fix,
+        check_containers(&security),
+    );
 
     println!("\n{}", style::bold("daemon"));
     report.check(
@@ -555,6 +561,39 @@ fn check_credentials(result: &cowboy_core::Result<SecurityConfig>, root: &Path) 
     } else {
         Status::Ok(format!("{count} grant(s), all present"))
     }
+}
+
+/// `sandbox.containers`: off is fine; on needs an engine to proxy. A warning, not a
+/// failure, like resource limits: the sandbox is correct without it.
+fn check_containers(result: &cowboy_core::Result<SecurityConfig>) -> Status {
+    let Ok(config) = result else {
+        return Status::Skipped("security.yaml did not load (see above)".into());
+    };
+    let cfg = &config.sandbox.containers;
+    if !cfg.enabled {
+        return Status::Ok("off (sandbox.containers.enabled)".into());
+    }
+    if !cfg!(target_os = "linux") {
+        return Status::Warn("sandbox.containers is Linux-only for now".into());
+    }
+    #[cfg(target_os = "linux")]
+    match crate::sandbox::containers::engine_socket(cfg.engine_socket.as_deref()) {
+        Some(sock) if sock.exists() => Status::Ok(format!(
+            "on, through cowboy's filtering proxy to {}",
+            sock.display()
+        )),
+        Some(sock) => Status::Warn(format!(
+            "on, but {} does not exist (start podman.socket?)",
+            sock.display()
+        )),
+        None => Status::Warn(
+            "on, but no engine socket found (start podman.socket, or set \
+             sandbox.containers.engine_socket)"
+                .into(),
+        ),
+    }
+    #[cfg(not(target_os = "linux"))]
+    Status::Skipped(String::new())
 }
 
 #[cfg(unix)]

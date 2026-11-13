@@ -860,10 +860,11 @@ pub enum SecretsCommand {
     /// your personal host-side overlay; --repo prints a snippet to paste instead.
     #[command(after_help = "\
 Examples:
-  cowboy secrets add gh                       # a known preset (gh, gcloud, kubectl, aws, git, ssh)
+  cowboy secrets add gh                       # a known preset (see PRESET below)
+  cowboy secrets add gcloud                   # gcloud CLI: a fresh access token + your project
   cowboy secrets add --env GITHUB_TOKEN       # pass a host env var through by name
   cowboy secrets add --env TOKEN=MY_HOST_VAR  # ...under a different name inside
-  cowboy secrets add --file ~/.netrc          # bind a host file read-only
+  cowboy secrets add --file ~/.netrc          # bind a host file read-only at ~/.netrc
   cowboy secrets add gh --global              # every project, not just this one
   cowboy secrets add gh --repo                # print a security.yaml snippet instead of writing
 
@@ -872,17 +873,20 @@ agent cannot write.")]
     Add(SecretsAddArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Default, Args)]
 pub struct SecretsAddArgs {
-    /// A known tool preset: gh, gcloud, kubectl, aws, git, ssh.
+    /// A known tool preset: gh, gcloud, gcloud-adc, kubectl, aws, git, ssh.
+    /// Re-adding one replaces the grant an older version of it wrote.
     pub preset: Option<String>,
     /// Grant an env var into the sandbox: `NAME` or `NAME=HOST_ENV`.
     #[arg(long = "env", value_name = "NAME[=HOST_ENV]")]
     pub env: Vec<String>,
-    /// Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET`.
+    /// Grant a host file/dir read-only: `SRC` (at `/home/agent/<name>`, the
+    /// agent's HOME) or `SRC:TARGET`.
     #[arg(long = "file", value_name = "SRC[:TARGET]")]
     pub file: Vec<String>,
-    /// Write to the cross-project user overlay instead of this worktree's.
+    /// Write to the cross-project user overlay instead of this repo's (which
+    /// applies to all of its worktrees).
     #[arg(long)]
     pub global: bool,
     /// Print a snippet to paste into the repo's .cowboy/security.yaml instead of
@@ -921,6 +925,17 @@ Pass --tool '*' to expose everything, or name each tool. Check the result with
     Disable { name: String },
     /// Connect to a server and list its tools (a connectivity check).
     Test { name: String },
+    /// Sign in to a remote server with OAuth (opens a browser). The login is
+    /// stored host-side, keyed by the server's URL, so every project using that
+    /// server shares it. In a session, `/mcp` does the same.
+    #[command(after_help = "\
+The browser returns to a listener on 127.0.0.1. If it runs on another machine, its
+last page will not load: copy that page's address and paste it here.
+
+Servers with an Authorization header in their config use the header instead.")]
+    Login { name: String },
+    /// Forget a server's stored OAuth login on this machine.
+    Logout { name: String },
     /// Trust this repo's `.mcp.json` servers (review + approve them; required
     /// before the agent can use repo-defined servers). Re-run if the file changes.
     Trust,

@@ -500,9 +500,13 @@ pub struct PlanInputs<'a> {
     pub agent_home: &'a Path,
     /// A host-written git config carrying the user's identity (`user.name`,
     /// `user.email` from their global config), bound read-only at
-    /// [`GIT_IDENTITY_AT`] and used as git's *system* config. `None` when the host
-    /// has no identity to lend.
+    /// [`GIT_IDENTITY_AT`] and used as git's *system* config, with the settings a
+    /// checkout shared with the host needs. `None` when it could not be written.
     pub git_identity: Option<&'a Path>,
+    /// The host directory holding the container proxy's socket, when
+    /// `sandbox.containers` is on: bound read-only at [`CONTAINER_SOCKET_AT`], with
+    /// `DOCKER_HOST` pointed at it. Never the engine's own socket.
+    pub container_socket_dir: Option<&'a Path>,
     /// Extra paths and environment for one kind of sandbox — an external agent
     /// harness (see `cowboy_core::harness`). `None` for everything else.
     pub overlay: Option<&'a PlanOverlay>,
@@ -531,6 +535,10 @@ pub struct OverlayBind {
     pub writable: bool,
     pub why: String,
 }
+
+/// Where [`PlanInputs::container_socket_dir`] is bound, and the socket in it.
+pub const CONTAINER_SOCKET_AT: &str = "/run/cowboy";
+pub const CONTAINER_SOCKET_NAME: &str = "docker.sock";
 
 /// Where [`PlanInputs::git_identity`] is bound, and what `GIT_CONFIG_SYSTEM` names.
 ///
@@ -564,10 +572,24 @@ pub const SCRATCH_DIRS: &[(&str, &str)] =
 /// the workspace the agent can write and the user can commit.
 pub const AGENT_HOME: &str = "/home/agent";
 
-/// Where the container put the agent's `HOME`, and so where the credential presets
-/// still point their targets. Read as home-relative on macOS, which cannot place a
-/// file at an arbitrary target and links it into the agent's `HOME` instead.
+/// Where the container put the agent's `HOME`, and so where credential grants
+/// written before the move still point their targets. Read as home-relative on
+/// macOS, which cannot place a file at an arbitrary target and links it into the
+/// agent's `HOME` instead; on Linux a dotfile target under it is moved to
+/// [`AGENT_HOME`] (see [`legacy_home_target`]).
 const LEGACY_HOME: &str = "/tmp";
+
+/// The [`AGENT_HOME`] equivalent of a credential target aimed at the old HOME
+/// (`/tmp/.config/gh` → `/home/agent/.config/gh`), or `None` if it was not.
+///
+/// Only dotfiles: those are what a tool looks for in `~`, while a plain
+/// `/tmp/name` may be deliberately placed in scratch.
+fn legacy_home_target(target: &str) -> Option<String> {
+    let rel = Path::new(target).strip_prefix(LEGACY_HOME).ok()?;
+    let first = rel.components().next()?.as_os_str().to_str()?;
+    (first.starts_with('.') && first != "." && first != "..")
+        .then(|| format!("{AGENT_HOME}/{}", rel.display()))
+}
 
 impl SandboxPlan {
     /// Build the plan, or fail if configuration or a grant would breach the
@@ -715,6 +737,23 @@ impl SandboxPlan {
                     }
                 }
             }
+            // mise's shims, first on `PATH`, for any project that uses mise. On the
+            // host `mise activate` in your shell rc does this; the sandbox runs no rc,
+            // and the agent image used to bake the shims into `PATH`. Without them a
+            // project's pinned `pnpm`, `node` or `gcloud` was "command not found", or
+            // quietly the system's own version. First, so the project's pins win.
+            if project_uses_mise(probe, inputs.root) {
+                let host_store = probe.expand(HOST_MISE_STORE);
+                let store = match overlays
+                    .iter()
+                    .find(|o| Some(&o.lower) == host_store.as_ref())
+                {
+                    Some(shared) => shared.target.clone(),
+                    // Not shared: mise keeps its store under the agent's own HOME.
+                    None => format!("{}/.local/share/mise", at(inputs.agent_home, AGENT_HOME)),
+                };
+                user_bin_dirs.insert(0, format!("{store}/shims"));
+            }
         }
 
         // 2. Session-scoped scratch, EARLY so anything later can be mounted on top of
@@ -840,8 +879,8 @@ impl SandboxPlan {
             }
             let target = if mac {
                 // Exposed where it is, and linked into the agent's HOME when that is
-                // where the tool will look for it (`~/.aws/credentials`). The presets
-                // still write `/tmp/…`, from when the container's HOME was `/tmp`;
+                // where the tool will look for it (`~/.aws/credentials`). Older grants
+                // still say `/tmp/…`, from when the container's HOME was `/tmp`;
                 // either way the tool is looking in its home directory.
                 let home_relative = Path::new(&grant.target)
                     .strip_prefix(AGENT_HOME)
@@ -858,6 +897,15 @@ impl SandboxPlan {
                     )),
                 }
                 source.to_string_lossy().into_owned()
+            } else if let Some(moved) = legacy_home_target(&grant.target) {
+                // A dotfile under `/tmp` was aimed at the old HOME; there it would
+                // sit in scratch where no tool looks.
+                notes.push(format!(
+                    "credential target {} is mounted at {moved}: the agent's HOME is \
+                     {AGENT_HOME}, no longer {LEGACY_HOME}",
+                    grant.target
+                ));
+                moved
             } else {
                 grant.target.clone()
             };
@@ -926,6 +974,38 @@ impl SandboxPlan {
                 target,
                 "ranch store (user-gated, read-only)",
             ));
+        }
+
+        // 7a. The container proxy (sandbox.containers): its socket's directory,
+        //     read-only, and the environment Docker clients read. Read-only so the
+        //     agent cannot swap the socket for one of its own; connecting needs no
+        //     write access to the mount. Ryuk (Testcontainers' reaper) wants the engine
+        //     socket and privilege, which the proxy refuses, so it is off: the session
+        //     sweeps its own containers instead.
+        if let Some(dir) = inputs.container_socket_dir {
+            let target = at(dir, CONTAINER_SOCKET_AT);
+            binds.push(Bind::ro(
+                dir.to_path_buf(),
+                target.clone(),
+                "the container proxy (sandbox.containers)",
+            ));
+            tool_env.push((
+                "DOCKER_HOST".into(),
+                format!("unix://{target}/{CONTAINER_SOCKET_NAME}"),
+            ));
+            tool_env.push(("TESTCONTAINERS_RYUK_DISABLED".into(), "true".into()));
+            tool_env.push(("TESTCONTAINERS_HOST_OVERRIDE".into(), "127.0.0.1".into()));
+            // Where distributions install the Compose v2 plugin, so `docker-compose`
+            // runs without the `docker` front end (on a podman host, that front end
+            // is podman, which speaks a different API).
+            for plugins in [
+                "/usr/libexec/docker/cli-plugins",
+                "/usr/lib/docker/cli-plugins",
+            ] {
+                if probe.exists(Path::new(plugins)) {
+                    user_bin_dirs.push(plugins.to_string());
+                }
+            }
         }
 
         // 7b. The user's git identity, as git's system config (see GIT_IDENTITY_AT).
@@ -1390,8 +1470,9 @@ fn build_env(
         }
     }
     // Static secrets sourced from host env vars. `source_command` secrets are not
-    // here on purpose — they are resolved fresh per command so short-lived tokens
-    // refresh mid-session. Values are never logged.
+    // here on purpose: the plan is pure, and they are resolved host-side per command
+    // (cowboy-cli's `NativeSandbox`) so short-lived tokens refresh mid-session.
+    // Values are never logged.
     for s in &sec.secrets.env {
         if s.source_command.is_some() || s.source_env.is_empty() {
             continue;
@@ -1518,6 +1599,7 @@ mod tests {
             agent_home: Path::new("/cache/cowboy/home/proj"),
             git_identity: None,
             overlay: None,
+            container_socket_dir: None,
             platform: Platform::Linux,
         }
     }
@@ -1567,6 +1649,47 @@ mod tests {
             .iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// The container proxy's socket arrives read-only with the env Docker clients
+    /// read, and the engine's own socket never does.
+    #[test]
+    fn the_container_proxy_socket_is_bound_read_only_with_docker_host() {
+        let sec = SecurityConfig::default();
+        let probe = host();
+        let inputs = PlanInputs {
+            root: Path::new("/srv/proj"),
+            security: &sec,
+            grants: &[],
+            mask_file: Path::new("/run/cowboy-mask"),
+            relay_port: 8443,
+            scratch: Path::new("/scratch/s1"),
+            agent_home: Path::new("/home/dev/.cache/cowboy/home/proj"),
+            git_identity: None,
+            overlay: None,
+            container_socket_dir: Some(Path::new("/scratch/s1/engine")),
+            platform: Platform::Linux,
+        };
+        let plan = SandboxPlan::build(&inputs, &probe).unwrap();
+        let b = plan
+            .binds
+            .iter()
+            .find(|b| b.target == CONTAINER_SOCKET_AT)
+            .expect("the proxy socket dir is bound");
+        assert_eq!(b.source, Path::new("/scratch/s1/engine"));
+        assert_eq!(b.mode, BindMode::ReadOnly);
+        assert_eq!(
+            env_of(&plan, "DOCKER_HOST"),
+            Some("unix:///run/cowboy/docker.sock")
+        );
+        assert_eq!(env_of(&plan, "TESTCONTAINERS_RYUK_DISABLED"), Some("true"));
+        assert!(!plan
+            .binds
+            .iter()
+            .any(|b| b.source.to_string_lossy().contains("podman")));
+        // Off: nothing of it.
+        let plan = plan_with(&sec, &[], &host()).unwrap();
+        assert!(env_of(&plan, "DOCKER_HOST").is_none());
     }
 
     /// The user's tools are exposed read-only and **at their host paths**. The path is
@@ -1701,6 +1824,28 @@ mod tests {
     /// agent rewrite a binary the user later runs on the host. The overlay is the
     /// only shape that is both usable and safe, so assert it *is* an overlay and
     /// that the store never appears in the bind list under either mode.
+    /// A mise project's tools resolve: the shims lead `PATH`, from the shared store
+    /// when it is shared and from the agent's own store when not, and nothing is
+    /// added for a project that does not use mise. Losing them with the Docker image
+    /// made `pnpm` "command not found" in every mise project.
+    #[test]
+    fn a_mise_projects_shims_lead_the_path() {
+        let sec = SecurityConfig::default();
+        let shared = host().with_existing(["/home/dev/.local/share/mise", "/srv/proj/mise.toml"]);
+        let path = |plan: &SandboxPlan| env_of(plan, "PATH").unwrap().to_string();
+        let p = path(&plan_with(&sec, &[], &shared).unwrap());
+        assert!(p.starts_with("/home/dev/.local/share/mise/shims:"), "{p}");
+
+        let mut own = sec.clone();
+        own.sandbox.share_mise_store = false;
+        let p = path(&plan_with(&own, &[], &shared).unwrap());
+        assert!(p.starts_with("/home/agent/.local/share/mise/shims:"), "{p}");
+
+        let no_mise = host().with_existing(["/home/dev/.local/share/mise"]);
+        let p = path(&plan_with(&sec, &[], &no_mise).unwrap());
+        assert!(!p.contains("mise"), "{p}");
+    }
+
     #[test]
     fn the_hosts_mise_store_is_shared_copy_on_write() {
         let sec = SecurityConfig::default();
@@ -2254,14 +2399,17 @@ mod tests {
         let mut sec = SecurityConfig::default();
         sec.secrets.files.push(SecretMount {
             source: "~/.config/gh".into(),
-            target: "/tmp/.config/gh".into(),
+            target: "/home/agent/.config/gh".into(),
             read_only: true,
             required: false,
             approval: None,
         });
         // Absent from the fake host: skipped without complaint.
         let plan = plan_with(&sec, &[], &host()).unwrap();
-        assert!(!plan.binds.iter().any(|b| b.target == "/tmp/.config/gh"));
+        assert!(!plan
+            .binds
+            .iter()
+            .any(|b| b.target == "/home/agent/.config/gh"));
 
         sec.secrets.files[0].required = true;
         let err = plan_with(&sec, &[], &host()).expect_err("required grant must fail");
@@ -2273,9 +2421,51 @@ mod tests {
         let b = plan
             .binds
             .iter()
-            .find(|b| b.target == "/tmp/.config/gh")
+            .find(|b| b.target == "/home/agent/.config/gh")
             .unwrap();
         assert_eq!(b.mode, BindMode::ReadOnly);
+    }
+
+    /// Grants written while the HOME was `/tmp` (every preset, and the user
+    /// overlays they produced) must still reach the tool: `/tmp` is scratch now, and
+    /// a credential there is one no CLI looks for.
+    #[test]
+    fn a_credential_aimed_at_the_old_home_is_mounted_in_the_agent_home() {
+        let mut sec = SecurityConfig::default();
+        for (source, target) in [
+            ("~/.config/gh", "/tmp/.config/gh"),
+            ("~/notes", "/tmp/notes"),
+        ] {
+            sec.secrets.files.push(SecretMount {
+                source: source.into(),
+                target: target.into(),
+                read_only: true,
+                required: false,
+                approval: None,
+            });
+        }
+        let probe = host().with_existing(["/home/dev/.config/gh", "/home/dev/notes"]);
+        let plan = plan_with(&sec, &[], &probe).unwrap();
+        let target_of = |src: &str| {
+            plan.binds
+                .iter()
+                .find(|b| b.source == Path::new(src))
+                .map(|b| b.target.clone())
+                .unwrap()
+        };
+        assert_eq!(target_of("/home/dev/.config/gh"), "/home/agent/.config/gh");
+        // Not a dotfile: deliberately placed in scratch, so left there.
+        assert_eq!(target_of("/home/dev/notes"), "/tmp/notes");
+        assert!(
+            plan.notes.iter().any(|n| n.contains("/tmp/.config/gh")),
+            "the move is reported: {:?}",
+            plan.notes
+        );
+        // Landlock follows the bind, so the moved target is the one with a rule.
+        assert!(plan
+            .landlock
+            .read_only
+            .contains(&PathBuf::from("/home/agent/.config/gh")));
     }
 
     /// Landlock rules are derived from the binds so the two cannot disagree about

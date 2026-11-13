@@ -108,10 +108,12 @@ pub struct SandboxConfig {
     /// toolchain the host already has (measured at ~2G for one project).
     #[serde(default = "default_true")]
     pub share_mise_store: bool,
-    /// Loopback ports sandboxed commands may connect to directly (macOS).
+    /// Host loopback ports sandboxed commands may connect to.
     ///
-    /// On Linux the sandbox has its own loopback, so this has nothing to do there. On
-    /// macOS loopback is shared with the host — your databases, model servers and
+    /// On Linux the sandbox has its own loopback, and a port listed here is the one
+    /// exception: `127.0.0.1:<port>` inside reaches the **host's** listener, through
+    /// the relay and the policy engine (every other loopback port stays the
+    /// sandbox's own). On macOS loopback is shared with the host — your databases, model servers and
     /// Docker are all on it — so a command reaches `localhost` only through the
     /// session's proxy, where `network_policy.default_host` decides. That covers HTTP;
     /// list a port here for a protocol that cannot use a proxy (a Postgres the agent
@@ -119,6 +121,74 @@ pub struct SandboxConfig {
     /// started it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loopback_ports: Vec<u16>,
+    /// A container engine for the agent (Docker API), through cowboy's filtering
+    /// proxy. Off by default, and only ever enabled here: the personal overlay and
+    /// `agent.yaml` cannot turn it on. See `docs/src/security/containers.md`.
+    #[serde(default, skip_serializing_if = "ContainerSettings::is_default")]
+    pub containers: ContainerSettings,
+}
+
+/// `sandbox.containers`: what the agent may do with a container engine.
+///
+/// The agent never sees the engine's own socket. It gets cowboy's proxy, which
+/// refuses host mounts outside the project, privilege, host namespaces and image
+/// push, and puts every container on an internal network with no route out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerSettings {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Registries images may be pulled from, suffix-matched (`docker.io` also
+    /// matches `registry-1.docker.io`). Empty means no pulls: only images already
+    /// present can run.
+    #[serde(default = "default_registries")]
+    pub allow_registries: Vec<String>,
+    /// Allow `docker build` (and Testcontainers' `ImageFromDockerfile`). Off: a
+    /// Dockerfile's `RUN` is arbitrary code with the build's network.
+    #[serde(default)]
+    pub build: bool,
+    /// Most containers one session may have at once.
+    #[serde(default = "default_max_containers")]
+    pub max_containers: u32,
+    /// The engine's socket. Default: `$DOCKER_HOST` when it names a unix socket,
+    /// then rootless podman's (`$XDG_RUNTIME_DIR/podman/podman.sock`), then
+    /// `/var/run/docker.sock`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_socket: Option<String>,
+}
+
+fn default_registries() -> Vec<String> {
+    [
+        "docker.io",
+        "ghcr.io",
+        "quay.io",
+        "gcr.io",
+        "mcr.microsoft.com",
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
+fn default_max_containers() -> u32 {
+    40
+}
+
+impl Default for ContainerSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_registries: default_registries(),
+            build: false,
+            max_containers: default_max_containers(),
+            engine_socket: None,
+        }
+    }
+}
+
+impl ContainerSettings {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A CPU limit: an explicit core count, or `auto` (resolved from the host).
@@ -328,8 +398,9 @@ pub struct SecretsConfig {
 pub struct SecretMount {
     /// Host path (a leading `~` and `${VAR}` are expanded), e.g. `~/.config/gh`.
     pub source: String,
-    /// Container path the credential is mounted at, e.g. `/tmp/.config/gh`
-    /// (the container `HOME` is `/tmp`, where CLIs look).
+    /// Sandbox path the credential is mounted at, e.g. `/home/agent/.config/gh`
+    /// (the agent's `HOME`, where CLIs look). A dotfile under `/tmp`, the old
+    /// `HOME`, is moved there.
     pub target: String,
     /// Mount read-only (the default; protects the host credential).
     #[serde(default = "default_true")]
@@ -371,8 +442,9 @@ pub struct SecretEnv {
     /// `source_command`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub source_env: String,
-    /// Host command whose stdout (trimmed) is the value. Run at session start on
-    /// the host — handy for keyring-backed tokens (`gh auth token`,
+    /// Host command whose stdout (trimmed) is the value. Run on the host, in the
+    /// project root, before a command when the last value is over a minute old —
+    /// for keyring-backed or short-lived tokens (`gh auth token`,
     /// `gcloud auth print-access-token`). Takes precedence over `source_env`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_command: Option<String>,
@@ -1231,6 +1303,7 @@ impl Default for SandboxConfig {
             host_tools: true,
             share_mise_store: true,
             loopback_ports: Vec::new(),
+            containers: ContainerSettings::default(),
         }
     }
 }
@@ -2329,10 +2402,11 @@ sandbox:
   # Not enforced on macOS, which has no per-session equivalent.
   memory: 8g
   cpus: 2
-  # macOS only: loopback is shared with your machine there, so commands reach
-  # localhost through the egress proxy (decided by `default_host`). List a port
-  # to let commands connect to it directly — for a protocol that cannot use a
-  # proxy, like a database the agent started. Linux sandboxes have their own.
+  # Host loopback ports commands may reach. Linux: the sandbox has its own
+  # loopback, and a listed port is the exception, reaching your machine's
+  # 127.0.0.1:<port> through the relay. macOS: loopback is shared, so commands
+  # reach localhost through the egress proxy (`default_host`); a listed port is
+  # reachable directly, for a protocol that cannot use a proxy.
   # loopback_ports: [5432]
 
 network_policy:
@@ -2379,18 +2453,23 @@ network_policy:
 
 secrets:
   # Env vars injected from the host (values read at runtime, never stored here).
+  # `source_command` runs on the host per command (cached for a minute), so a
+  # short-lived token stays fresh: e.g. `gcloud auth print-access-token`.
   env: []
     # - name: GITHUB_TOKEN
     #   source_env: COWBOY_GITHUB_TOKEN
     #   required: false
     #   approval: required
-  # Host credential files/dirs granted (read-only by default) into the container
-  # so the agent can use CLIs like gh/gcloud/kubectl. The container HOME is /tmp,
-  # so mount under /tmp/... where the tools look. `cowboy secrets add <preset>`
-  # prints ready-to-paste entries. You must also allow the matching network host.
+    # - name: CLOUDSDK_AUTH_ACCESS_TOKEN
+    #   source_command: gcloud auth print-access-token
+  # Host credential files/dirs granted (read-only by default) into the sandbox
+  # so the agent can use CLIs like gh/kubectl. The agent's HOME is /home/agent,
+  # so mount under /home/agent/... where the tools look. `cowboy secrets add
+  # <preset> --repo` prints ready-to-paste entries. You must also allow the
+  # matching network host.
   files: []
     # - source: ~/.config/gh
-    #   target: /tmp/.config/gh
+    #   target: /home/agent/.config/gh
     #   read_only: true
     #   required: false
     #   approval: required   # prompt for per-session approval before mounting

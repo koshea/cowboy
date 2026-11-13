@@ -233,8 +233,10 @@ impl GitIdentity {
         }
     }
 
-    /// The config file's contents, or `None` if there is nothing to lend.
-    pub fn render(&self) -> Option<String> {
+    /// The sandbox's system git config: the host's own `/etc/gitconfig`, the
+    /// settings git needs to work on a checkout it shares with the host, and the
+    /// identity when there is one to lend.
+    pub fn render(&self) -> String {
         // A value with a newline would let one setting smuggle in another section.
         let clean = |v: &Option<String>| {
             v.as_ref()
@@ -242,26 +244,46 @@ impl GitIdentity {
                 .map(|s| s.replace('\\', "\\\\").replace('"', "\\\""))
         };
         let (name, email) = (clean(&self.name), clean(&self.email));
-        if name.is_none() && email.is_none() {
-            return None;
-        }
         // Replacing the system config must not drop the host's own: include it.
-        let mut s = String::from("[include]\n\tpath = /etc/gitconfig\n[user]\n");
+        let mut s = String::from("[include]\n\tpath = /etc/gitconfig\n");
+        s.push_str(SHARED_CHECKOUT_CONFIG);
+        if name.is_some() || email.is_some() {
+            s.push_str("[user]\n");
+        }
         if let Some(n) = name {
             s.push_str(&format!("\tname = \"{n}\"\n"));
         }
         if let Some(e) = email {
             s.push_str(&format!("\temail = \"{e}\"\n"));
         }
-        Some(s)
+        s
     }
 }
 
-/// Write `identity` into the (host-only) scratch root for the plan to bind, or
-/// return `None` if there is nothing to write or it can't be written — a missing
-/// identity costs a commit author, not the command, so this never fails the plan.
+/// Git settings for a checkout the host and the sandbox both use. System scope, so a
+/// repo's own config still wins.
+///
+/// `checkStat = minimal`: the agent is uid 0 in its user namespace, so every file
+/// it stats is owned by uid 0, while the index the host wrote records your uid. By
+/// default git counts an owner mismatch as a possible change and re-reads every
+/// tracked file to compare contents. On a 34k-file repo that took `git status` from
+/// 0.1s to 1.9s, on every call. Minimal still compares size and whole-second mtime
+/// and ctime, which is what catches real edits.
+///
+/// `untrackedCache = false`: git ties the cache to the worktree path, and the
+/// sandbox sees the project at its workdir rather than its host path, so a cache
+/// the host built is always rejected here, with "untracked cache is disabled on this
+/// system or location" on every command. Off, git skips it quietly. The cost is
+/// that a sandbox index write drops the host's cache, which the host's git rebuilds
+/// on its next status.
+const SHARED_CHECKOUT_CONFIG: &str = "[core]\n\tcheckStat = minimal\n\tuntrackedCache = false\n";
+
+/// Write the sandbox's system git config (see [`GitIdentity::render`]) into the
+/// (host-only) scratch root for the plan to bind, or return `None` if it can't be
+/// written — that costs a commit author and git speed, not the command, so this
+/// never fails the plan.
 pub fn write_git_identity(scratch: &Path, identity: &GitIdentity) -> Option<PathBuf> {
-    let contents = identity.render()?;
+    let contents = identity.render();
     let path = scratch.join("gitconfig");
     if std::fs::read_to_string(&path).is_ok_and(|c| c == contents) {
         return Some(path);
@@ -379,23 +401,25 @@ pub fn session_name_for(root: &Path) -> String {
 /// Run a host command and return its trimmed stdout as a secret value, or
 /// `None` if it fails / produces nothing / exceeds the timeout. Used for
 /// keyring-backed tokens (`gh auth token`). The command comes from host-owned
-/// config; never logged.
+/// config; never logged. Runs in `cwd` when given (the project root, so a
+/// project-pinned tool resolves the same way it would for the user there).
 ///
 /// stdin is `/dev/null` so a credential helper that would otherwise prompt
 /// interactively fails fast instead of blocking, and a bounded timeout backstops
 /// anything that still hangs — this runs (cached) on every shell exec, so a hang
 /// here would otherwise deadlock the whole session.
-fn run_value_command(cmd: &str) -> Option<String> {
+pub(crate) fn run_value_command(cmd: &str, cwd: Option<&Path>) -> Option<String> {
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let cmd = cmd.to_string();
+    let cwd = cwd.map(Path::to_path_buf);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&cmd)
-            .stdin(std::process::Stdio::null())
-            .output();
-        let _ = tx.send(out);
+        let mut c = std::process::Command::new("sh");
+        c.arg("-c").arg(&cmd).stdin(std::process::Stdio::null());
+        if let Some(dir) = &cwd {
+            c.current_dir(dir);
+        }
+        let _ = tx.send(c.output());
     });
     let out = rx.recv_timeout(TIMEOUT).ok()?.ok()?;
     if !out.status.success() {
@@ -408,8 +432,8 @@ fn run_value_command(cmd: &str) -> Option<String> {
 /// Whether a `source_command` produces a value on the host, using the same
 /// bounded/`stdin`-null execution as the live path (so `cowboy secrets list`
 /// can't hang on an interactive credential helper). Does not expose the value.
-pub(crate) fn source_command_ok(cmd: &str) -> bool {
-    run_value_command(cmd).is_some()
+pub(crate) fn source_command_ok(cmd: &str, cwd: Option<&Path>) -> bool {
+    run_value_command(cmd, cwd).is_some()
 }
 
 /// The repository root that's shared by every worktree: `git rev-parse
@@ -583,7 +607,7 @@ mod tests {
             name: Some("Kevin O'Shea \"K\"".into()),
             email: Some("k@example.com".into()),
         };
-        let text = id.render().unwrap();
+        let text = id.render();
         assert!(text.contains("path = /etc/gitconfig"), "{text}");
         assert!(text.contains("name = \"Kevin O'Shea \\\"K\\\"\""), "{text}");
         assert!(text.contains("email = \"k@example.com\""), "{text}");
@@ -592,8 +616,12 @@ mod tests {
             name: Some("x\n[credential]\n\thelper = evil".into()),
             email: None,
         };
-        assert_eq!(smuggle.render(), None);
-        assert_eq!(GitIdentity::default().render(), None);
+        assert!(!smuggle.render().contains("[user]"), "{}", smuggle.render());
+        // Nothing to lend still carries the shared-checkout settings.
+        let bare = GitIdentity::default().render();
+        assert!(!bare.contains("[user]"));
+        assert!(bare.contains("checkStat = minimal"), "{bare}");
+        assert!(bare.contains("untrackedCache = false"), "{bare}");
     }
 
     /// Git itself reads the file as intended: `git config --file` sees the name.

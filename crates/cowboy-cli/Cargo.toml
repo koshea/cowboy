@@ -57,6 +57,9 @@ qrcode.workspace = true   # terminal QR of the `cowboy web` access URL
 # The Linux boundary (Landlock + seccomp, applied by the shim). macOS confines with
 # Seatbelt through `sandbox_init` in libSystem, which needs no crate.
 [target.'cfg(target_os = "linux")'.dependencies]
+# The container proxy (Linux): Docker API request heads, and query strings.
+httparse.workspace = true
+url.workspace = true
 landlock.workspace = true
 seccompiler.workspace = true
 

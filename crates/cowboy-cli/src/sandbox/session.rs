@@ -259,6 +259,64 @@ impl SessionSandbox {
         Ok(())
     }
 
+    /// Make the session's published host ports exactly `ports` (see
+    /// `transport::nft::HOST_PORTS_SET`).
+    ///
+    /// Runs `nft` from the host, joined into the session's user and network
+    /// namespaces, where the worker (which created them) holds `CAP_NET_ADMIN`. No
+    /// agent process can: their bounding set is empty. Deliberately **not** joined to
+    /// the session cgroup, so an agent that exhausted `pids.max` cannot stop the host
+    /// updating its own ruleset.
+    pub fn set_host_ports(&self, ports: &[u16]) -> Result<()> {
+        set_host_ports_for(self.pid, ports)
+    }
+
+    /// The holder's pid, which names the session's namespaces.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// [`SessionSandbox::set_host_ports`] by holder pid, for a caller that holds only
+/// the pid (the container proxy's port updates, from their own task).
+pub fn set_host_ports_for(pid: u32, ports: &[u16]) -> Result<()> {
+    {
+        use std::io::Write;
+        let user = cstring(PathBuf::from(format!("/proc/{pid}/ns/user")))?;
+        let net = cstring(PathBuf::from(format!("/proc/{pid}/ns/net")))?;
+        let mut cmd = Command::new("nft");
+        cmd.args(["-f", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        // SAFETY: only async-signal-safe raw syscalls run between fork and exec.
+        unsafe {
+            cmd.pre_exec(move || {
+                join(&user, libc::CLONE_NEWUSER)?;
+                join(&net, libc::CLONE_NEWNET)?;
+                Ok(())
+            });
+        }
+        let mut child = cmd
+            .spawn()
+            .context("spawning nft for the published host ports")?;
+        child
+            .stdin
+            .take()
+            .context("nft stdin")?
+            .write_all(super::transport::nft::host_ports_script(ports).as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "nft refused the published host ports: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl SessionSandbox {
     /// What resource ceilings are in force, for the caller to report at bring-up.
     /// `None` when the host cannot enforce any.
     pub fn limits_in_force(&self) -> Option<String> {

@@ -14,6 +14,7 @@
 
 - [The boundary](security/model.md)
 - [Network egress](security/network.md)
+- [Containers](security/containers.md)
 - [Sandbox design decisions](security/sandbox-decisions.md)
 
 # Using Cowboy

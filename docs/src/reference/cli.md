@@ -402,6 +402,31 @@ Enable a configured server
 List configured MCP servers (name, transport, enabled)
 
 
+### `cowboy mcp login`
+
+Sign in to a remote server with OAuth (opens a browser). The login is stored host-side, keyed by the server's URL, so every project using that server shares it. In a session, `/mcp` does the same
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+```text
+The browser returns to a listener on 127.0.0.1. If it runs on another machine, its
+last page will not load: copy that page's address and paste it here.
+
+Servers with an Authorization header in their config use the header instead.
+```
+
+
+### `cowboy mcp logout`
+
+Forget a server's stored OAuth login on this machine
+
+| Arg | Description |
+|-----|-------------|
+| `<NAME>` |  |
+
+
 ### `cowboy mcp remove`
 
 Remove an MCP server
@@ -1007,18 +1032,19 @@ Add a credential grant (a known preset and/or explicit env/file grants) to your 
 
 | Arg | Description |
 |-----|-------------|
-| `<PRESET>` | A known tool preset: gh, gcloud, kubectl, aws, git, ssh |
+| `<PRESET>` | A known tool preset: gh, gcloud, gcloud-adc, kubectl, aws, git, ssh. Re-adding one replaces the grant an older version of it wrote |
 | `--env` | Grant an env var into the sandbox: `NAME` or `NAME=HOST_ENV` |
-| `--file` | Grant a host file/dir read-only: `SRC` or `SRC:CONTAINER_TARGET` |
-| `--global` | Write to the cross-project user overlay instead of this worktree's |
+| `--file` | Grant a host file/dir read-only: `SRC` (at `/home/agent/<name>`, the agent's HOME) or `SRC:TARGET` |
+| `--global` | Write to the cross-project user overlay instead of this repo's (which applies to all of its worktrees) |
 | `--repo` | Print a snippet to paste into the repo's .cowboy/security.yaml instead of writing your personal (home-dir) overlay |
 
 ```text
 Examples:
-  cowboy secrets add gh                       # a known preset (gh, gcloud, kubectl, aws, git, ssh)
+  cowboy secrets add gh                       # a known preset (see PRESET below)
+  cowboy secrets add gcloud                   # gcloud CLI: a fresh access token + your project
   cowboy secrets add --env GITHUB_TOKEN       # pass a host env var through by name
   cowboy secrets add --env TOKEN=MY_HOST_VAR  # ...under a different name inside
-  cowboy secrets add --file ~/.netrc          # bind a host file read-only
+  cowboy secrets add --file ~/.netrc          # bind a host file read-only at ~/.netrc
   cowboy secrets add gh --global              # every project, not just this one
   cowboy secrets add gh --repo                # print a security.yaml snippet instead of writing
 

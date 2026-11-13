@@ -52,10 +52,14 @@ pub fn ruleset(cfg: &TransportConfig) -> String {
     let dns = cfg.dns_port;
     format!(
         "table ip cowboy {{
+  set {HOST_PORTS_SET} {{
+    type inet_service;
+  }}
   chain out {{
     type nat hook output priority dstnat; policy accept;
     udp dport 53 dnat to 127.0.0.1:{dns}
     tcp dport 53 dnat to 127.0.0.1:{dns}
+    ip daddr 127.0.0.1 tcp dport @{HOST_PORTS_SET} dnat to 127.0.0.1:{relay}
     ip daddr 127.0.0.0/8 return
     meta l4proto tcp dnat to 127.0.0.1:{relay}
   }}
@@ -74,6 +78,30 @@ table ip6 cowboy {{
 }}
 "
     )
+}
+
+/// The nft set of published host ports: loopback connections to these go to the
+/// relay, and so to the host's loopback, instead of the sandbox's own.
+///
+/// Updated at runtime from the host (`set_host_ports`), never by the agent, whose
+/// commands have no capabilities. And only for transparency: the engine's own set
+/// decides, so a port left here by a failed update is still refused.
+pub const HOST_PORTS_SET: &str = "hostports";
+
+/// The script that makes the set exactly `ports`.
+pub fn host_ports_script(ports: &[u16]) -> String {
+    let mut s = format!("flush set ip cowboy {HOST_PORTS_SET}\n");
+    if !ports.is_empty() {
+        let list = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        s.push_str(&format!(
+            "add element ip cowboy {HOST_PORTS_SET} {{ {list} }}\n"
+        ));
+    }
+    s
 }
 
 /// Apply the ruleset via `nft -f -`.
@@ -265,6 +293,30 @@ mod tests {
         assert!(r.contains("table ip6 cowboy"));
         let v6 = r.split("table ip6 cowboy").nth(1).unwrap();
         assert!(v6.contains("policy drop"));
+    }
+
+    /// Published host ports are redirected **before** the loopback bypass (or they
+    /// would never reach the relay) and only for `127.0.0.1` and the set, so the
+    /// sandbox's own loopback services keep working. DNS still comes first.
+    #[test]
+    fn published_host_ports_reach_the_relay_and_nothing_else_does() {
+        let r = ruleset(&cfg());
+        let out = r.split("chain out").nth(1).unwrap();
+        let host = out
+            .find("ip daddr 127.0.0.1 tcp dport @hostports dnat to 127.0.0.1:8443")
+            .expect("the published-port redirect");
+        assert!(out.find("udp dport 53").unwrap() < host);
+        assert!(host < out.find("ip daddr 127.0.0.0/8 return").unwrap());
+        assert!(r.contains("set hostports"));
+    }
+
+    #[test]
+    fn the_host_ports_script_replaces_the_set() {
+        assert_eq!(host_ports_script(&[]), "flush set ip cowboy hostports\n");
+        assert_eq!(
+            host_ports_script(&[5432, 6379]),
+            "flush set ip cowboy hostports\nadd element ip cowboy hostports { 5432, 6379 }\n"
+        );
     }
 
     /// Re-running bring-up must not accumulate rules.

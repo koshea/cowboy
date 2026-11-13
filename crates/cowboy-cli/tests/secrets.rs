@@ -21,7 +21,7 @@ fn add_repo_prints_grant_and_network_domains() {
         .assert()
         .success()
         .stdout(predicate::str::contains("source: ~/.config/gh"))
-        .stdout(predicate::str::contains("target: /tmp/.config/gh"))
+        .stdout(predicate::str::contains("target: /home/agent/.config/gh"))
         .stdout(predicate::str::contains("read_only: true"))
         .stdout(predicate::str::contains("api.github.com"));
 }
@@ -46,7 +46,9 @@ fn add_writes_personal_per_project_overlay() {
         .args(["secrets", "list"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("~/.config/gh → /tmp/.config/gh"))
+        .stdout(predicate::str::contains(
+            "~/.config/gh → /home/agent/.config/gh",
+        ))
         .stdout(predicate::str::contains("[user-project]"));
 }
 

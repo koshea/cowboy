@@ -222,6 +222,7 @@ mod tests {
             agent_home: Path::new("/cache/cowboy/home/proj"),
             git_identity: None,
             overlay: None,
+            container_socket_dir: None,
             platform: cowboy_sandbox::plan::Platform::Linux,
         };
         SandboxPlan::build(&inputs, &probe).unwrap()

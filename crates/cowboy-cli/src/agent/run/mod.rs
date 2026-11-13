@@ -497,6 +497,9 @@ pub struct AgentLoop<'a> {
     /// are enabled; set via [`AgentLoop::enable_mcp`], which also adds the `mcp`
     /// tool and lists the servers in the system prompt.
     mcp: Option<std::sync::Arc<crate::mcp::McpManager>>,
+    /// Open network approval prompts and recent refusals (see
+    /// [`crate::sandbox::policy::NetworkWatch`]). `None` in tests.
+    network: Option<crate::sandbox::policy::NetworkWatch>,
     /// (name, builder) for the model to reroute to when the configured one is
     /// permanently unavailable at the provider. See [`Self::with_model_fallback`].
     fallback_model: Option<(String, ModelBuilder)>,
@@ -782,6 +785,15 @@ async fn watch_turn_requests(
             }
         }
     }
+}
+
+/// `- line` per entry.
+fn bullet_lines(lines: &[String]) -> String {
+    lines
+        .iter()
+        .map(|l| format!("- {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How often each side polls the control directory. Short enough that a foreman's
@@ -1247,6 +1259,7 @@ impl<'a> AgentLoop<'a> {
             last_raw_tool_sig: None,
             planning: false,
             mcp: None,
+            network: None,
             fallback_model: None,
             pinned_crew: None,
             fallback_used: false,
@@ -2029,6 +2042,66 @@ impl<'a> AgentLoop<'a> {
     }
 
     /// Attach a session logger (records transcript, commands, final summary).
+    /// Let the loop see network approval prompts, so it pauses while one is open and
+    /// tells the model what was refused.
+    pub fn with_network_watch(mut self, watch: crate::sandbox::policy::NetworkWatch) -> Self {
+        self.network = Some(watch);
+        self
+    }
+
+    /// Wait while a network approval prompt is open, then tell the model what came
+    /// of it. Pacing only: the gateway holds the verdict, and a prompt nobody
+    /// answers still times out to a deny.
+    ///
+    /// Without this the model sees only its command failing (a refused lookup, a
+    /// client-side connect timeout) and retries, while the prompt that would have
+    /// let it through sits on screen.
+    async fn wait_for_network_approvals(&mut self) {
+        let Some(watch) = self.network.clone() else {
+            return;
+        };
+        let pending = watch.pending();
+        if pending.is_empty() {
+            return;
+        }
+        self.ui.notice(&format!(
+            "⏸ paused: waiting for you to answer the network prompt for {}",
+            pending.join(", ")
+        ));
+        watch.wait_clear(&self.cancel).await;
+        if self.cancel.is_cancelled() {
+            return;
+        }
+        self.ui.notice("▶ network prompt answered — continuing");
+        let notes = watch.take_notes();
+        if !notes.is_empty() {
+            self.push_user_note(format!(
+                "[network] While you waited for the user to approve network access:\n{}",
+                bullet_lines(&notes)
+            ));
+        }
+    }
+
+    /// What the network did while a command ran, for its observation: prompts still
+    /// open, refusals, and decisions. Empty when nothing happened.
+    fn network_note(&self) -> String {
+        let Some(watch) = &self.network else {
+            return String::new();
+        };
+        let mut lines = Vec::new();
+        for dest in watch.pending() {
+            lines.push(format!(
+                "{dest} is waiting for the user's approval (a prompt is open). Do not retry \
+                 it or work around it: the session pauses until they answer."
+            ));
+        }
+        lines.extend(watch.take_notes());
+        if lines.is_empty() {
+            return String::new();
+        }
+        format!("\n[network while this ran]\n{}", bullet_lines(&lines))
+    }
+
     pub fn with_logger(mut self, logger: Option<SessionLogger>) -> Self {
         self.logger = logger;
         self
@@ -2770,6 +2843,14 @@ impl<'a> AgentLoop<'a> {
                 let usage = self.context_usage();
                 self.ui.context_usage(&usage);
 
+                // Don't plan the next step while the user is being asked about the
+                // network: the answer is what the step depends on.
+                self.wait_for_network_approvals().await;
+                if self.cancel.is_cancelled() {
+                    self.ui.notice("interrupted");
+                    return Ok(None);
+                }
+
                 let response = match self.call_model().await {
                     Ok(r) => r,
                     Err(_) if self.cancel.is_cancelled() => {
@@ -2781,7 +2862,13 @@ impl<'a> AgentLoop<'a> {
                     // once and re-run the turn, rather than failing the whole session.
                     Err(e) if self.model_unavailable(&e) && self.try_fallback_model() => continue,
                     Err(e) => {
-                        self.ui.notice(&format!("model error: {e}"));
+                        // Most model errors already say "model error:"; don't say it twice.
+                        let text = e.to_string();
+                        self.ui.notice(&if text.starts_with("model error") {
+                            text
+                        } else {
+                            format!("model error: {text}")
+                        });
                         return Err(e);
                     }
                 };
@@ -4056,6 +4143,9 @@ impl<'a> AgentLoop<'a> {
                     let Some(args) = self.parse_or_report::<ShellArgs>(call) else {
                         continue;
                     };
+                    // A prompt opened by an earlier call in this batch: wait for it
+                    // rather than run the next command into the same refusal.
+                    self.wait_for_network_approvals().await;
                     self.ui.command_start(&args.command);
                     let started = std::time::Instant::now();
                     let timeout_secs = self.shell_timeout(&args);
@@ -4093,7 +4183,7 @@ impl<'a> AgentLoop<'a> {
                         result.exit_code,
                         timeout_secs,
                         MAX_SHELL_TIMEOUT_SECONDS,
-                    );
+                    ) + &self.network_note();
                     // Truncate the assembled observation, not just the output: the
                     // `[exit code]` prefix has to be inside the budget or
                     // `push_tool_result` truncates again — head-only — and cuts off
@@ -6162,6 +6252,135 @@ mod tests {
             .map(|m| m.content.clone())
             .unwrap();
         assert!(obs.contains("(no output)"), "{obs}");
+    }
+
+    /// What the network refused while a command ran is part of its observation, so a
+    /// model sees "refused by policy" rather than only its client's error.
+    #[tokio::test]
+    async fn a_command_observation_says_what_the_network_refused() {
+        use cowboy_gateway::Approver as _;
+        let (atx, _arx) = tokio::sync::mpsc::unbounded_channel();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let approver = crate::sandbox::policy::ChannelApprover::new(atx, etx);
+        let model = ScriptedModel::new(vec![
+            ChatResponse {
+                reasoning_items: None,
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("1", "shell", r#"{"command":"pytest"}"#)],
+            },
+            ChatResponse {
+                reasoning_items: None,
+                truncated: false,
+                usage: None,
+                reasoning: None,
+                content: None,
+                tool_calls: vec![tool_call("2", "final", r#"{"message":"done"}"#)],
+            },
+        ]);
+        let attempt = cowboy_core::netproto::NetworkAttempt {
+            protocol: cowboy_core::netproto::Protocol::Dns,
+            host: Some("litellm.test".into()),
+            ip: None,
+            port: 53,
+            command_pid: None,
+        };
+        for _ in 0..5 {
+            approver
+                .event(
+                    &attempt,
+                    cowboy_core::netproto::Verdict::Deny,
+                    "dns tunnel suspected".into(),
+                )
+                .await;
+        }
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::printing("ConnectionError\n"),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_network_watch(approver.watch());
+        agent.run("run the tests").await.unwrap();
+        let observation = agent
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .find(|c| c.contains("ConnectionError"))
+            .expect("the shell observation")
+            .to_string();
+        assert!(
+            observation.contains("[network while this ran]")
+                && observation.contains("refused litellm.test:53 — dns tunnel suspected (×5)"),
+            "{observation}"
+        );
+    }
+
+    /// While a network prompt is open the loop does not plan its next step: it waits
+    /// for the answer and then tells the model what it was.
+    #[tokio::test]
+    async fn the_loop_pauses_while_a_network_prompt_is_open() {
+        use cowboy_gateway::Approver as _;
+        let (atx, mut arx) = tokio::sync::mpsc::unbounded_channel();
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        let approver = std::sync::Arc::new(crate::sandbox::policy::ChannelApprover::new(atx, etx));
+        let attempt = cowboy_core::netproto::NetworkAttempt {
+            protocol: cowboy_core::netproto::Protocol::Tls,
+            host: Some("litellm.test".into()),
+            ip: None,
+            port: 443,
+            command_pid: None,
+        };
+        // A connection is waiting on the user before the turn starts.
+        let asking = {
+            let approver = approver.clone();
+            tokio::spawn(async move { approver.answer(&attempt, None).await })
+        };
+        let req = arx.recv().await.expect("the prompt");
+        let model = ScriptedModel::new(vec![ChatResponse {
+            reasoning_items: None,
+            truncated: false,
+            usage: None,
+            reasoning: None,
+            content: None,
+            tool_calls: vec![tool_call("1", "final", r#"{"message":"done"}"#)],
+        }]);
+        let mut ui = RecordingUi::default();
+        let mut agent = AgentLoop::new(
+            Box::new(model),
+            FakeSandbox::printing(""),
+            cowboy_core::config::AgentBehavior::default(),
+            200_000,
+            CancellationToken::new(),
+            &mut ui,
+        )
+        .with_network_watch(approver.watch());
+        let answer = async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = req.reply.send((
+                cowboy_core::netproto::Verdict::Allow,
+                cowboy_core::netproto::ApprovalScope::Session,
+            ));
+        };
+        let (result, ()) = tokio::join!(agent.run("call the proxy"), answer);
+        assert_eq!(result.unwrap().as_deref(), Some("done"));
+        assert!(asking.await.unwrap().verdict == cowboy_core::netproto::Verdict::Allow);
+        let told =
+            agent.messages.iter().map(|m| m.content.as_str()).any(|c| {
+                c.contains("[network]") && c.contains("the user allowed litellm.test:443")
+            });
+        assert!(told, "the model is told what the user decided");
+        drop(agent);
+        assert!(
+            ui.notices.iter().any(|n| n.starts_with("⏸ paused")),
+            "{:?}",
+            ui.notices
+        );
     }
 
     #[tokio::test]

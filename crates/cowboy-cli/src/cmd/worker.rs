@@ -280,6 +280,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
     // exist until the network came up) and an eager, detached Docker call to create
     // that network early so the loop would settle. Both are gone.
     let approver = control_approver(emitter.clone(), Some(session_dir.clone()), root.clone());
+    let network_watch = approver.watch();
     let runtime = crate::cmd::sandbox::open_with(root.clone(), security, approver)?;
     crate::cmd::session::log_policy_in_force(runtime.policy());
     // Captured before the runtime moves into the agent loop, so the session can be
@@ -376,6 +377,7 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         &mut ui,
     )
     .with_logger(logger)
+    .with_network_watch(network_watch)
     .with_summarizer(summarizer)
     .with_memory_context(memory_ctx)
     .with_project_commands(&project_commands, verify)
@@ -450,7 +452,9 @@ pub async fn run(args: WorkerArgs) -> Result<()> {
         crate::mcp::trust::TrustState::NoFile => {}
     }
     if mcp_cfg.any_enabled() {
-        agent.enable_mcp(std::sync::Arc::new(crate::mcp::McpManager::new(mcp_cfg)));
+        let manager = std::sync::Arc::new(crate::mcp::McpManager::new(mcp_cfg));
+        emitter.set_mcp(manager.clone());
+        agent.enable_mcp(manager);
     }
 
     // Rebuilds the model client for `/model <name>` (provider creds stay
@@ -1129,11 +1133,16 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
     let present_file = |f: &cowboy_core::config::SecretMount| {
         expand_path(&f.source).map(|p| p.exists()).unwrap_or(false)
     };
+    // A `source_command` secret is resolved per command, so it is "present" for as
+    // long as it is configured: it must be asked about up front, not slip through.
+    let env_present = |e: &cowboy_core::config::SecretEnv| {
+        e.source_command.is_some() || std::env::var(&e.source_env).is_ok()
+    };
     let env_pending = security
         .secrets
         .env
         .iter()
-        .any(|e| e.needs_approval() && std::env::var(&e.source_env).is_ok());
+        .any(|e| e.needs_approval() && env_present(e));
     let file_pending = security
         .secrets
         .files
@@ -1148,10 +1157,14 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
 
     let mut kept_env = Vec::with_capacity(security.secrets.env.len());
     for e in std::mem::take(&mut security.secrets.env) {
-        if e.needs_approval() && std::env::var(&e.source_env).is_ok() {
+        if e.needs_approval() && env_present(&e) {
+            let from = match &e.source_command {
+                Some(cmd) => format!("`{cmd}` (run on the host)"),
+                None => format!("${}", e.source_env),
+            };
             let prompt = format!(
-                "credential: inject env {} (from ${}) into the sandbox?",
-                e.name, e.source_env
+                "credential: inject env {} (from {from}) into the sandbox?",
+                e.name
             );
             // Tagged `Credential` so the modal does not title a credential prompt
             // "Network request", which is what it did while `dest` was the only field.
@@ -1159,7 +1172,7 @@ async fn gate_credential_grants(security: &mut cowboy_core::config::SecurityConf
                 kind: ApprovalKind::Credential,
                 rows: vec![
                     ("inject env".into(), e.name.clone()),
-                    ("from".into(), format!("${}", e.source_env)),
+                    ("from".into(), from.clone()),
                 ],
                 note: Some(
                     "the value is read host-side and passed into the sandbox for this session"

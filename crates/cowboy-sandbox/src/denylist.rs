@@ -140,6 +140,25 @@ const SENSITIVE_STORES: &[(&str, &str)] = &[
     ("~/.gemini", "your Gemini / Antigravity login"),
 ];
 
+/// Linux container engines, in addition to [`SENSITIVE_STORES`]. A process that
+/// can talk to the engine socket is the user (`docker run -v $HOME:/h …`), and one
+/// that can write the image store can plant code the user's next `docker run`
+/// executes. The agent gets an engine only through cowboy's container proxy.
+const SENSITIVE_STORES_LINUX: &[(&str, &str)] = &[
+    (
+        "${XDG_RUNTIME_DIR}/podman",
+        "your container engine's socket",
+    ),
+    (
+        "${XDG_RUNTIME_DIR}/docker.sock",
+        "your container engine's socket",
+    ),
+    ("/run/podman", "the container engine's socket"),
+    ("/run/docker.sock", "the container engine's socket"),
+    ("/var/run/docker.sock", "the container engine's socket"),
+    ("~/.local/share/containers", "your container image store"),
+];
+
 /// macOS secret stores, in addition to [`SENSITIVE_STORES`]. Separate so a Linux
 /// plan does not list paths that cannot exist there; the ancestor rule means each
 /// also refuses a grant of `~/Library` itself.
@@ -209,11 +228,15 @@ impl Denylist {
         }
 
         let platform_stores: &[(&str, &str)] = match platform {
-            Platform::Linux => &[],
+            Platform::Linux => SENSITIVE_STORES_LINUX,
             Platform::MacOs => SENSITIVE_STORES_MACOS,
         };
         for (raw, what) in SENSITIVE_STORES.iter().chain(platform_stores) {
-            if let Some(path) = probe.expand(raw) {
+            // An unset variable (no `XDG_RUNTIME_DIR`) names nothing to protect.
+            if let Some(path) = probe
+                .expand(raw)
+                .filter(|p| !p.to_string_lossy().contains("${"))
+            {
                 entries.push(Entry {
                     path,
                     reason: DenyReason::SensitiveStore { what },
@@ -347,6 +370,27 @@ fn names_host_owned_config(path: &Path) -> bool {
         || path
             .file_name()
             .is_some_and(|n| n == SECURITY_FILE || n == MODELS_FILE || n == PROVIDERS_FILE)
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use crate::probe::FakeHost;
+
+    /// The engine socket is the user; a grant of it, or of a directory above it,
+    /// would hand the agent the host. Only on Linux, where these paths mean that.
+    #[test]
+    fn container_engine_sockets_are_never_grantable_on_linux() {
+        let d = Denylist::build_for(&FakeHost::new(), Path::new("/srv/proj"), Platform::Linux);
+        for p in [
+            "/run/podman/podman.sock",
+            "/var/run/docker.sock",
+            "/run",
+            "/home/dev/.local/share/containers/storage",
+        ] {
+            assert!(d.check(Path::new(p)).is_some(), "{p}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -574,9 +618,14 @@ mod tests {
             ..FakeHost::default()
         };
         let d = Denylist::build(&probe, Path::new("/srv/work/proj"));
-        // No `~`-relative entry survives, but host-owned config is still refused
-        // because that check is by name, not by absolute path.
-        assert!(d.is_empty());
+        // No `~`-relative entry survives (only the fixed engine-socket paths do), but
+        // host-owned config is still refused because that check is by name, not by
+        // absolute path.
+        assert!(
+            d.paths().iter().all(|p| !p.starts_with("/home")),
+            "{:?}",
+            d.paths()
+        );
         assert_eq!(
             d.check(Path::new("/p/.cowboy/security.yaml")),
             Some(DenyReason::HostOwnedConfig)

@@ -1451,6 +1451,49 @@ fn diff_line(line: &str) -> Html {
     html! { <span class={classes!("dl", cls)}>{ line.to_string() }{ "\n" }</span> }
 }
 
+/// A bare http(s) URL on a line of its own (a sign-in link), or `None`.
+fn link_line(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let web = t.starts_with("https://") || t.starts_with("http://");
+    (web && !t.contains(char::is_whitespace) && !t.chars().any(|c| c.is_ascii_control()))
+        .then_some(t)
+}
+
+/// A prompt's question, with a link line rendered as a real link and a Copy
+/// button: as plain text a several-hundred-character URL could not be tapped, and
+/// selecting all of it on a phone is not realistic.
+fn render_question(question: &str) -> Html {
+    if !question.lines().any(|l| link_line(l).is_some()) {
+        return html! { <p class="q">{ question.to_string() }</p> };
+    }
+    let parts = question.lines().map(|line| match link_line(line) {
+        Some(url) => {
+            let copy = {
+                let url = url.to_string();
+                Callback::from(move |e: MouseEvent| {
+                    let label = if copy_text(&url) { "Copied" } else { "Copy failed" };
+                    if let Some(el) = e
+                        .target()
+                        .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                    {
+                        el.set_inner_text(label);
+                    }
+                })
+            };
+            html! {
+                <span class="q-link">
+                    <a href={url.to_string()} target="_blank" rel="noopener noreferrer">
+                        { url.to_string() }
+                    </a>
+                    <button class="copy-link" onclick={copy}>{ "Copy link" }</button>
+                </span>
+            }
+        }
+        None => html! { <>{ line.to_string() }<br /></> },
+    });
+    html! { <p class="q">{ for parts }</p> }
+}
+
 fn render_ask(ask: &model::Ask, send: impl Fn(ClientMsg) + Clone + 'static) -> Html {
     let input_id = format!("ask-reply-{}", ask.id);
     let submit = {
@@ -1503,7 +1546,7 @@ fn render_ask(ask: &model::Ask, send: impl Fn(ClientMsg) + Clone + 'static) -> H
     html! {
         <div class="modal">
             <div class="modal-card ask-card">
-                <p class="q">{ ask.question.clone() }</p>
+                { render_question(&ask.question) }
                 if !ask.options.is_empty() {
                     <div class="choices">{ for opts }</div>
                 }

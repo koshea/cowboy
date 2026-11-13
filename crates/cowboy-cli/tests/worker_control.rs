@@ -617,9 +617,8 @@ fn reasoning_is_set_per_session_and_follows_the_foreman() {
         &mut c,
         "reasoning: high — p/m accepts low, medium, high, so not max"
     ));
-    c.send(&ClientMsg::Command("reasoning".into()));
     assert!(
-        wait_for_reply(&mut c, "this session asks for max"),
+        ask_until(&mut c, "reasoning", "this session asks for max"),
         "the report names the level asked for and the one sent"
     );
     // Kept across a model switch (p/big lists no levels, so `max` is sent as is).
@@ -654,25 +653,37 @@ fn a_session_starts_at_its_crew_foremans_level() {
         .unwrap();
     let ws = start(&fx, None);
     let mut c = Client::connect(&ws, Duration::from_secs(8));
-    c.send(&ClientMsg::Command("reasoning".into()));
-    assert!(wait_for_reply(
+    assert!(ask_until(
         &mut c,
+        "reasoning",
         "reasoning: high (set for this session)"
     ));
     c.send(&ClientMsg::End);
     std::thread::sleep(Duration::from_millis(300));
 }
 
-/// Read events until a `CommandReply` containing `needle`.
-fn wait_for_reply(c: &mut Client, needle: &str) -> bool {
+/// Send a read-only command until its reply contains `needle`.
+///
+/// A report reads state the worker sets on its own schedule (at start-up, or after
+/// applying a change it has already announced), so a single ask can arrive first
+/// and get a true answer about the state before. On a loaded machine that race was
+/// lost often enough to fail the suite.
+fn ask_until(c: &mut Client, command: &str, needle: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
-        match c.recv_outcome() {
-            Recv::Msg(m) if matches!(&*m, ServerMsg::CommandReply { text } if text.contains(needle)) => {
-                return true
+        c.send(&ClientMsg::Command(command.into()));
+        let round = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < round {
+            match c.recv_outcome() {
+                Recv::Msg(m) if matches!(&*m, ServerMsg::CommandReply { .. }) => {
+                    if matches!(&*m, ServerMsg::CommandReply { text } if text.contains(needle)) {
+                        return true;
+                    }
+                    break;
+                }
+                Recv::Msg(_) | Recv::Garbage | Recv::Timeout => continue,
+                Recv::Closed => return false,
             }
-            Recv::Msg(_) | Recv::Garbage | Recv::Timeout => continue,
-            Recv::Closed => return false,
         }
     }
     false

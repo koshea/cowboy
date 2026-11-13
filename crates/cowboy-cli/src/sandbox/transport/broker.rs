@@ -195,6 +195,36 @@ async fn decide(request: &ConnectRequest, state: &GatewayState) -> Decision {
         return Decision::Refuse("unparseable destination".into());
     };
     let protocol = classify(&request.peek);
+
+    // Loopback means the host's own loopback, reached only for a published port.
+    // It must never fall through to the ordinary flow: there the class default
+    // (`default_host`) would ask, and an approval would dial an arbitrary host
+    // service. v4-mapped `::ffff:127.0.0.1` is unwrapped the way `classify` does.
+    let loopback = match ip {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+        IpAddr::V4(v4) => v4.is_loopback(),
+    };
+    if loopback {
+        let (verdict, _) = state.decide_host_loopback(request.dst_port, protocol).await;
+        if verdict != Verdict::Allow {
+            return Decision::Refuse(format!(
+                "host loopback port {} is not published",
+                request.dst_port
+            ));
+        }
+        // Always the v4 loopback, whatever form the request named.
+        let dest = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), request.dst_port);
+        return match dial(dest).await {
+            Ok(fd) => Decision::Allow {
+                upstream: fd,
+                reason: "published host port".into(),
+            },
+            Err(e) => Decision::Refuse(format!("upstream dial failed: {e}")),
+        };
+    }
+
     note_name_mismatch(&request.peek, ip, state);
 
     // Authorization by what the resolver recorded for this IP, never by the
@@ -334,6 +364,56 @@ mod tests {
         // if this ever gained a `&GatewayState` parameter, that would be the smell.
         let as_tls = classify(&[0x16, 0x03, 0x01]);
         assert_eq!(as_tls, Protocol::Tls);
+    }
+
+    fn engine() -> std::sync::Arc<cowboy_gateway::state::GatewayState> {
+        let policy = cowboy_core::config::NetworkPolicy {
+            // Even an allow-everything default must not open the host's loopback.
+            default_host: cowboy_core::config::DefaultVerdict::Allow,
+            ..Default::default()
+        };
+        std::sync::Arc::new(cowboy_gateway::state::GatewayState::new(
+            policy,
+            cowboy_gateway::dns::DnsMap::new(),
+            std::sync::Arc::new(cowboy_gateway::DenyAll),
+        ))
+    }
+
+    fn to(ip: &str, port: u16) -> ConnectRequest {
+        ConnectRequest {
+            dst_ip: ip.into(),
+            dst_port: port,
+            peek: Vec::new(),
+            command_pid: None,
+        }
+    }
+
+    /// The host's loopback is reachable only on a published port, and an
+    /// unpublished one is refused outright rather than put to `default_host`.
+    #[tokio::test]
+    async fn host_loopback_needs_a_published_port() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let state = engine();
+        assert!(matches!(
+            decide(&to("127.0.0.1", port), &state).await,
+            Decision::Refuse(_)
+        ));
+        state.add_host_port(port);
+        assert!(matches!(
+            decide(&to("127.0.0.1", port), &state).await,
+            Decision::Allow { .. }
+        ));
+        // The mapped form is the same address, not a way around the check.
+        state.remove_host_port(port);
+        assert!(matches!(
+            decide(&to("::ffff:127.0.0.1", port), &state).await,
+            Decision::Refuse(_)
+        ));
+        assert!(matches!(
+            decide(&to("127.0.0.9", port), &state).await,
+            Decision::Refuse(_)
+        ));
     }
 
     #[test]

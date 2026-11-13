@@ -59,7 +59,12 @@ $ cowboy sandbox plan
 - **Your git identity** — only `user.name` and `user.email` from your global git
   config, as git's lowest-precedence (system) config, so the agent's commits are
   attributed to you. A repo's own identity still wins. Nothing else from
-  `~/.gitconfig` (credential helpers, URL rewrites, aliases) is exposed.
+  `~/.gitconfig` (credential helpers, URL rewrites, aliases) is exposed. The same
+  file sets `core.checkStat=minimal` and `core.untrackedCache=false` for the
+  checkout the sandbox shares with you: files appear owned by uid 0 inside, which
+  by default makes git re-read every tracked file on each `git status` (0.1s
+  became 1.9s on a 34k-file repo), and git rejects the host's untracked cache
+  because the project sits at a different path.
 - **Nothing else.** Other projects and the rest of the machine are simply absent.
   Your home directory is not *browsable*: only the directories named above are
   exposed. `~` inside the sandbox is a skeleton that exists only to hold those
@@ -218,7 +223,7 @@ things you will see:
 | What exists | only what is bound | stat-able only along the way to what is exposed; `~/.ssh` does not appear to exist |
 | Config mask | an empty file bound over it, last | a deny rule, last |
 | Egress | transparent interception in a namespace with no device | an **explicit proxy**: outbound is allowed to one loopback port only |
-| Loopback | the sandbox's own | the host's: direct connections are refused; they go through the proxy and `default_host`, or `sandbox.loopback_ports` |
+| Loopback | the sandbox's own, except a published host port (`sandbox.loopback_ports`, or one a host component publishes), which reaches the host's listener through the relay | the host's: direct connections are refused; they go through the proxy and `default_host`, or `sandbox.loopback_ports` |
 | Process reaping | the PID namespace | the process group, plus a session sweep by profile |
 | Resource limits | cgroup v2 | none (a `doctor` warning) |
 

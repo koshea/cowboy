@@ -763,6 +763,9 @@ pub struct App {
     /// Inner text rect of the transcript, captured each frame so the event loop
     /// can hit-test mouse coordinates against the transcript only.
     pub transcript_area: std::cell::Cell<Rect>,
+    /// Where the open prompt drew its links, as `(row rect, url)`, for a click to
+    /// open one. Rebuilt every frame; empty when no prompt shows a link.
+    pub prompt_links: std::cell::RefCell<Vec<(Rect, String)>>,
     /// Bumped whenever the transcript/streaming/reasoning content changes, so the
     /// per-frame line build can be memoized: re-parsing Markdown + re-running
     /// syntax highlighting on every throbber tick (when nothing changed) would be
@@ -895,6 +898,7 @@ impl App {
             scroll_offset: std::cell::Cell::new(0),
             followed_before_select: false,
             transcript_area: std::cell::Cell::new(Rect::ZERO),
+            prompt_links: std::cell::RefCell::new(Vec::new()),
             content_ver: std::cell::Cell::new(0),
             line_cache: std::cell::RefCell::new(None),
             link_cache: std::cell::RefCell::new(None),
@@ -1040,6 +1044,25 @@ impl App {
         Some((m.id.clone(), m.label.clone()))
     }
 
+    /// The first link in the open question, for Ctrl+Y.
+    pub fn prompt_link(&self) -> Option<String> {
+        let question = match &self.mode {
+            Mode::AwaitingChoice => self.choice.as_ref().map(|c| c.question.as_str()),
+            Mode::AwaitingInput(q) => Some(q.as_str()),
+            _ => None,
+        }?;
+        render::question_links(question).into_iter().next()
+    }
+
+    /// The prompt link drawn at screen cell `(col, row)`, if any.
+    pub fn prompt_link_at(&self, col: u16, row: u16) -> Option<String> {
+        self.prompt_links
+            .borrow()
+            .iter()
+            .find(|(r, _)| r.contains(ratatui::layout::Position::new(col, row)))
+            .map(|(_, u)| u.clone())
+    }
+
     /// Request that `text` be copied to the system clipboard. The actual OSC 52
     /// write is deferred to the event loop (see [`App::pending_copy`]).
     pub fn request_copy(&mut self, text: impl Into<String>) {
@@ -1098,6 +1121,29 @@ impl App {
         }
         let line = self.scroll_offset.get() + (row - r.y) as usize;
         Some((line, col - r.x))
+    }
+
+    /// The link drawn at screen cell `(col, row)` of the transcript, resolved to what
+    /// opening it should open: a safe web URL, or the host's link for one of this
+    /// session's artifacts. Clicks are captured with the mouse, so the terminal's
+    /// own OSC 8 handling never sees a plain click (Ghostty, for one, then only
+    /// follows a link on a modifier-click it also does not get).
+    pub fn transcript_link_at(&self, col: u16, row: u16) -> Option<String> {
+        let (line, x) = self.screen_to_logical(col, row)?;
+        let width = self.transcript_area.get().width;
+        let hit = render::link_hits(self, width)
+            .into_iter()
+            .find(|h| h.row == line && (h.col0..=h.col1).contains(&x))?;
+        if crate::markdown::is_safe_url(&hit.url) {
+            Some(hit.url)
+        } else {
+            self.artifact_link(&hit.url)
+        }
+    }
+
+    /// The selection is a bare click (no drag), so it can be read as a click.
+    pub fn selection_is_click(&self) -> bool {
+        self.selection.is_some_and(|s| s.anchor == s.cursor)
     }
 
     /// Begin a selection at an absolute screen position, but only if it lands in
@@ -2597,6 +2643,61 @@ mod tests {
 
     const REVIEW_URL: &str = "file:///p/.cowboy/sessions/s1/artifacts/a0001-review.md";
 
+    /// A sign-in prompt's link must survive the dialog whole: as one long word it
+    /// used to sit on a single row the box edge cut off, so it could be neither
+    /// read, copied (mouse capture blocks terminal selection) nor clicked.
+    #[test]
+    fn a_long_link_in_a_prompt_is_kept_whole_clickable_and_copyable() {
+        let url = format!(
+            "https://mcp.example.com/authorize?response_type=code&client_id=abc&state={}",
+            "s".repeat(200)
+        );
+        let mut app = App::new("cowboy");
+        app.begin_choice(
+            format!("Sign in to `linear`:\n\n{url}\n\nWaiting for the browser."),
+            vec![ChoiceOption {
+                label: "Cancel".into(),
+                description: None,
+                recommended: false,
+            }],
+        );
+        assert_eq!(app.prompt_link().as_deref(), Some(url.as_str()));
+
+        let mut term = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let links = app.prompt_links.borrow().clone();
+        assert!(
+            links.len() > 1,
+            "the link wraps over several rows: {links:?}"
+        );
+        // Every piece, read back from the screen, spells the whole URL. Each link
+        // cell carries a 2-char chunk of the label and covers the cell after it.
+        let shown: String = links
+            .iter()
+            .flat_map(|(r, _)| (r.x..r.x + r.width).map(move |x| (x, r.y)))
+            .filter_map(|(x, y)| {
+                let sym = buf[(x, y)].symbol();
+                sym.strip_prefix("\x1b]8;;")
+                    .and_then(|rest| rest.split('\x07').nth(1))
+                    .map(|piece| piece.trim_end_matches("\x1b]8;;").to_string())
+            })
+            .collect();
+        assert_eq!(shown, url);
+        assert!(links.iter().all(|(_, u)| *u == url));
+        let needle = format!("\x1b]8;;{url}\x07");
+        assert!((0..buf.area.width).any(|x| buf[(x, links[1].0.y)].symbol().contains(&needle)));
+        let (r, _) = &links[0];
+        assert_eq!(app.prompt_link_at(r.x, r.y).as_deref(), Some(url.as_str()));
+        assert_eq!(app.prompt_link_at(0, 0), None);
+
+        // No prompt, no link targets.
+        app.mode = Mode::Idle;
+        term.draw(|f| draw(f, &app)).unwrap();
+        assert!(app.prompt_links.borrow().is_empty());
+        assert_eq!(app.prompt_link(), None);
+    }
+
     fn has_osc8(app: &App, w: u16, h: u16, url: &str) -> bool {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
@@ -3201,6 +3302,30 @@ mod tests {
         assert!(texts.iter().any(|t| t.contains("Plan")));
         assert!(texts.iter().any(|t| t.contains("• step")));
         assert!(texts.iter().any(|t| t.contains("one")));
+    }
+
+    /// A plain click on a transcript link resolves to its URL. The TUI captures the
+    /// mouse, so a terminal's own OSC 8 handling (Ghostty's included) never sees it.
+    #[test]
+    fn a_click_on_a_transcript_link_finds_its_url() {
+        let mut app = App::new("cowboy");
+        app.push(LineKind::Agent, "see [the docs](https://example.com/x) now");
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let (x, y) = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buf[(x, y)]
+                    .symbol()
+                    .contains("\x1b]8;;https://example.com/x")
+            })
+            .expect("a rendered link cell");
+        assert_eq!(
+            app.transcript_link_at(x, y).as_deref(),
+            Some("https://example.com/x")
+        );
+        assert_eq!(app.transcript_link_at(0, buf.area.height - 1), None);
     }
 
     #[test]

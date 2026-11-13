@@ -10,6 +10,8 @@
 //! the session (cached), and exposes two operations the agent's `mcp` tool drives:
 //! `list_tools` (discovery — full schemas on demand) and `call_tool`.
 
+pub mod auth;
+pub mod menu;
 pub mod trust;
 
 use std::collections::HashMap;
@@ -55,6 +57,20 @@ impl McpManager {
             .collect()
     }
 
+    /// Every enabled server with its configuration, in name order — for `/mcp`.
+    pub fn enabled_servers(&self) -> Vec<(String, McpServer)> {
+        self.config
+            .enabled()
+            .map(|(n, s)| (n.clone(), s.clone()))
+            .collect()
+    }
+
+    /// Drop the cached connection to `name`, so the next use dials again — after a
+    /// sign-in or sign-out, which change how it authenticates.
+    pub async fn forget(&self, name: &str) {
+        self.clients.lock().await.remove(name);
+    }
+
     /// Look up an enabled server by name.
     fn server(&self, name: &str) -> Result<&McpServer> {
         match self.config.servers.get(name) {
@@ -87,7 +103,34 @@ impl McpManager {
     }
 
     /// Establish a fresh connection over the server's configured transport.
+    ///
+    /// A server that wants a sign-in gets an error that says so and how, since the
+    /// agent relays it: rmcp's own is just "Auth required".
     async fn dial(&self, name: &str, server: &McpServer) -> Result<Client> {
+        let auth = auth::AuthKind::of(server);
+        self.dial_inner(name, server).await.map_err(|e| {
+            let msg = e.to_string();
+            if !auth::is_auth_required(&msg) {
+                return e;
+            }
+            match auth {
+                auth::AuthKind::SignedIn => anyhow!(
+                    "MCP server `{name}` rejected the stored sign-in; the user must sign in \
+                     again with /mcp (or `cowboy mcp login {name}`)"
+                ),
+                auth::AuthKind::SignedOut => anyhow!(
+                    "MCP server `{name}` needs the user to sign in: /mcp in the session, or \
+                     `cowboy mcp login {name}` in a terminal"
+                ),
+                _ => anyhow!(
+                    "MCP server `{name}` refused the configured credentials (check its \
+                     Authorization header)"
+                ),
+            }
+        })
+    }
+
+    async fn dial_inner(&self, name: &str, server: &McpServer) -> Result<Client> {
         let connect = async {
             match &server.transport {
                 McpTransport::Stdio { command, args, env } => {
@@ -112,10 +155,27 @@ impl McpManager {
                 }
                 McpTransport::Http { url, headers } => {
                     let headers = mcp::expand_map(headers);
-                    let transport = http_transport(url, &headers)?;
-                    ().serve(transport)
-                        .await
-                        .map_err(|e| anyhow!("MCP handshake failed: {e}"))
+                    let client = http_client(&headers)?;
+                    let config = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                    let manager = if auth::AuthKind::of(server).uses_oauth() {
+                        auth::manager_for(url).await?
+                    } else {
+                        None
+                    };
+                    match manager {
+                        Some(manager) => {
+                            let client = rmcp::transport::auth::AuthClient::new(client, manager);
+                            let transport =
+                                StreamableHttpClientTransport::with_client(client, config);
+                            ().serve(transport).await
+                        }
+                        None => {
+                            let transport =
+                                StreamableHttpClientTransport::with_client(client, config);
+                            ().serve(transport).await
+                        }
+                    }
+                    .map_err(|e| anyhow!("MCP handshake failed: {e}"))
                 }
             }
         };
@@ -144,6 +204,22 @@ impl McpManager {
                 Ok(out)
             }
         }
+    }
+
+    /// The tools of `name` this session may call, and how many the server has.
+    pub async fn exposed_tools(&self, name: &str) -> Result<(Vec<String>, usize)> {
+        let server = self.server(name)?.clone();
+        let client = self.connect(name).await?;
+        let tools = client
+            .list_all_tools()
+            .await
+            .map_err(|e| anyhow!("listing tools on `{name}`: {e}"))?;
+        let exposed = tools
+            .iter()
+            .filter(|t| server.tool_allowed(t.name.as_ref()))
+            .map(|t| t.name.to_string())
+            .collect();
+        Ok((exposed, tools.len()))
     }
 
     /// Full tool list + JSON schemas for one server (filtered by its allowlist).
@@ -240,14 +316,8 @@ impl McpManager {
     }
 }
 
-/// Build a streamable-HTTP transport, applying any configured request headers.
-fn http_transport(
-    url: &str,
-    headers: &std::collections::BTreeMap<String, String>,
-) -> Result<StreamableHttpClientTransport<reqwest::Client>> {
-    if headers.is_empty() {
-        return Ok(StreamableHttpClientTransport::from_uri(url));
-    }
+/// The HTTP client for a server, carrying any configured request headers.
+fn http_client(headers: &std::collections::BTreeMap<String, String>) -> Result<reqwest::Client> {
     use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
     let mut map = HeaderMap::new();
     for (k, v) in headers {
@@ -256,14 +326,10 @@ fn http_transport(
         let val = HeaderValue::from_str(v).map_err(|e| anyhow!("invalid header `{k}`: {e}"))?;
         map.insert(name, val);
     }
-    let client = reqwest::Client::builder()
+    reqwest::Client::builder()
         .default_headers(map)
         .build()
-        .map_err(|e| anyhow!("building HTTP client: {e}"))?;
-    Ok(StreamableHttpClientTransport::with_client(
-        client,
-        StreamableHttpClientTransportConfig::with_uri(url),
-    ))
+        .map_err(|e| anyhow!("building HTTP client: {e}"))
 }
 
 /// Flatten an MCP tool result into a text observation for the agent.

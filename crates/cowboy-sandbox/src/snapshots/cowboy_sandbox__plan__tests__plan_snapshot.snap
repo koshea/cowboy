@@ -30,7 +30,7 @@ seccomp
 limits
   memory 4096 MiB, cpu 2 cores, processes 4096, build jobs 2
 
-never grantable at any approval scope (26 paths)
+never grantable at any approval scope (30 paths)
   /home/dev/.aws
   /home/dev/.cargo/credentials.toml
   /home/dev/.claude
@@ -49,6 +49,7 @@ never grantable at any approval scope (26 paths)
   /home/dev/.gnupg
   /home/dev/.grok
   /home/dev/.kube
+  /home/dev/.local/share/containers
   /home/dev/.local/share/keyrings
   /home/dev/.mozilla
   /home/dev/.netrc
@@ -56,5 +57,8 @@ never grantable at any approval scope (26 paths)
   /home/dev/.password-store
   /home/dev/.pypirc
   /home/dev/.ssh
+  /run/docker.sock
+  /run/podman
   /usr/bin/cowboy
+  /var/run/docker.sock
   (plus .cowboy/, security.yaml, models.yaml, providers.yaml anywhere)

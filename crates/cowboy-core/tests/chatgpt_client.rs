@@ -143,6 +143,57 @@ async fn a_refused_token_is_refreshed_once_and_the_request_retried() {
     assert_eq!(body["instructions"], "sys");
 }
 
+/// Seen live: one 403 `subscription_sharing_user_not_eligible` on an eligible plan,
+/// with the next request fine. It gets a couple of quick retries, which carry the
+/// turn through a hiccup, and a real refusal still fails after those alone.
+#[tokio::test]
+async fn not_eligible_is_retried_briefly_then_reported() {
+    let dir = assert_fs::TempDir::new().unwrap();
+    signed_in(dir.path());
+    let server = MockServer::start().await;
+    let refusal = || {
+        ResponseTemplate::new(403).set_body_json(json!({"error": {
+            "code": "subscription_sharing_user_not_eligible", "message": "no"}}))
+    };
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(refusal())
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            sse(&[
+                json!({"type": "response.output_text.delta", "delta": "ok"}),
+                json!({"type": "response.completed", "response": {"status": "completed"}}),
+            ]),
+            "text/event-stream",
+        ))
+        .mount(&server)
+        .await;
+    let r = client(dir.path(), &server)
+        .chat(&[Message::user("x")], &[], None)
+        .await
+        .expect("a flap is retried");
+    assert_eq!(r.content.as_deref(), Some("ok"));
+
+    // Persistent: one request plus two retries, then the error.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(refusal())
+        .expect(3)
+        .mount(&server)
+        .await;
+    let e = client(dir.path(), &server)
+        .chat(&[Message::user("x")], &[], None)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("also on retry"), "{e}");
+}
+
 #[tokio::test]
 async fn a_usage_limit_is_reported_and_not_retried() {
     let dir = assert_fs::TempDir::new().unwrap();

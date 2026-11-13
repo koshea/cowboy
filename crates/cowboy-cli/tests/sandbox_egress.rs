@@ -802,3 +802,74 @@ except Exception as e:
     );
     s.stop().await;
 }
+
+// ---------------------------------------------------------------------------
+// Published host ports
+// ---------------------------------------------------------------------------
+
+/// A host service on `127.0.0.1` that answers every connection, and counts them.
+fn host_service() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::io::Write;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = accepted.clone();
+    std::thread::spawn(move || {
+        for mut conn in listener.incoming().flatten() {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = conn.write_all(b"HOST-SERVICE\n");
+        }
+    });
+    (port, accepted)
+}
+
+/// The host's loopback is reachable only on a port the host published, decided
+/// by the engine, and unpublishing takes it away again. Without publishing,
+/// `127.0.0.1` inside is the sandbox's own loopback, where nothing listens.
+#[tokio::test]
+async fn a_published_host_port_is_reachable_and_nothing_else_is() {
+    skip_if_unsupported!();
+    let p = Project::new();
+    let approver = FixedApprover::new(Verdict::Allow);
+    // Allow-everything for the host class: publishing must still be what decides.
+    let policy = NetworkPolicy {
+        default_host: DefaultVerdict::Allow,
+        ..Default::default()
+    };
+    let s = sandbox_with(&p.path(), policy, approver.clone());
+    let (published, accepted) = host_service();
+    let (other, other_accepted) = host_service();
+
+    let (_, before) = run(&s, &connect_probe("127.0.0.1", published)).await;
+    assert!(
+        !before.contains("CONNECTED yes"),
+        "not yet published: {before}"
+    );
+
+    s.publish_host_port(published).await.unwrap();
+    let (_, out) = run(&s, &connect_probe("127.0.0.1", published)).await;
+    assert!(out.contains("CONNECTED yes"), "a published port: {out}");
+    // The positive case reached the host service through the engine.
+    assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    assert!(approver.events().iter().any(|(a, v)| a.port == published
+        && *v == Verdict::Allow
+        && a.ip.is_some_and(|ip| ip.is_loopback())));
+
+    let (_, out) = run(&s, &connect_probe("127.0.0.1", other)).await;
+    assert!(
+        !out.contains("CONNECTED yes"),
+        "an unpublished host port: {out}"
+    );
+    assert_eq!(other_accepted.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(
+        approver.questions().is_empty(),
+        "host loopback is never put to the approver"
+    );
+
+    s.unpublish_host_port(published).await.unwrap();
+    let before = accepted.load(std::sync::atomic::Ordering::SeqCst);
+    let (_, out) = run(&s, &connect_probe("127.0.0.1", published)).await;
+    assert!(!out.contains("CONNECTED yes"), "unpublished again: {out}");
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), before);
+    s.stop().await;
+}

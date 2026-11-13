@@ -1401,6 +1401,18 @@ fn poll_subagent_journal(app: &mut App, path: &std::path::Path, pos: u64) -> u64
 /// wheel scroll.
 fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
     use crossterm::event::{MouseButton, MouseEventKind};
+    // A click on a link in an open prompt (a sign-in URL) opens it. The TUI captures
+    // the mouse, so the terminal's own link handling never sees the click.
+    if let MouseEventKind::Down(MouseButton::Left) = me.kind {
+        if let Some(url) = app.prompt_link_at(me.column, me.row) {
+            app.status = if open_in_browser(&url) {
+                "opened the link in your browser".into()
+            } else {
+                "could not open a browser; Ctrl+Y copies the link".into()
+            };
+            return;
+        }
+    }
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => app.begin_selection(me.column, me.row),
         MouseEventKind::Drag(MouseButton::Left) => app.drag_selection(me.column, me.row),
@@ -1411,6 +1423,19 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
         // Keep the highlight after release; `y` copies it (vim-style yank).
         MouseEventKind::Up(MouseButton::Left) => {
             app.end_selecting();
+            // A click (no drag) on a transcript link opens it: with the mouse
+            // captured, the terminal cannot.
+            if app.selection_is_click() {
+                if let Some(url) = app.transcript_link_at(me.column, me.row) {
+                    app.finish_selection();
+                    app.status = if open_in_browser(&url) {
+                        "opened the link".into()
+                    } else {
+                        "could not open the link (no browser opener)".into()
+                    };
+                    return;
+                }
+            }
             if app.has_selection() {
                 app.status = "y: copy selection · Esc: clear".into();
             }
@@ -1424,6 +1449,22 @@ fn handle_mouse(me: crossterm::event::MouseEvent, app: &mut App) {
 }
 
 use cowboy_core::time::now_ms;
+
+/// Ask the system browser (on the machine running this TUI) to open `url`.
+fn open_in_browser(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    std::process::Command::new(opener)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
 
 /// Mutable context handed to the key handler.
 struct KeyCtx<'a> {
@@ -1907,6 +1948,19 @@ fn handle_key(event: Event, key: KeyEvent, app: &mut App, mut ctx: KeyCtx) -> bo
         }
     }
 
+    // Ctrl+Y copies a prompt's link (a sign-in URL), which is otherwise hard to get
+    // out of a modal: the TUI captures the mouse, so the terminal cannot select it.
+    if matches!(app.mode, Mode::AwaitingChoice | Mode::AwaitingInput(_))
+        && key.code == KeyCode::Char('y')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        match app.prompt_link() {
+            Some(url) => app.request_copy(url),
+            None => app.status = "this question has no link to copy".into(),
+        }
+        return false;
+    }
+
     // Approval modal (network egress, or a credential mount/injection).
     if let Mode::Approval(_) = &app.mode {
         let decision = match key.code {
@@ -2294,7 +2348,14 @@ fn handle_command(input: &str, app: &mut App, ctx: &mut KeyCtx) -> bool {
                 "usage: /after <message> — queues it to run after the current turn",
             ),
         },
-        "mcp" => mcp_command(app, &ctx.session.root),
+        // The worker's interactive menu (sign-in needs the host); without a worker
+        // there is nothing to sign in for, so the report stands in.
+        "mcp" => match ctx.task_tx.as_ref() {
+            Some(tx) => {
+                let _ = tx.send(AgentCmd::Command(input.to_string()));
+            }
+            None => mcp_command(app, &ctx.session.root),
+        },
         "context" => context_command(app),
         "artifacts" => open_artifacts(app, ctx.session),
         // Collapse the mechanics of turns you have already read, so a long session

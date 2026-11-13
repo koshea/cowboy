@@ -91,6 +91,10 @@ over a unix socket.
   Host-capability *unit* tests (`doctor::this_host_reports_no_sandbox_failures`,
   `preflight::the_host_meets_every_requirement`) honour the same switch. They used to
   assert unconditionally, which failed on any host that cannot sandbox — including CI.
+- **Container tests** (`tests/sandbox_containers.rs`) need a running engine with
+  `nginx:alpine` and `alpine` pulled, and are **opt-in** because they start real
+  containers on your engine: `COWBOY_DOCKER_TESTS=1` runs them, `=required` also
+  fails on a skip.
 - **Cgroup tests** have their own switch, `COWBOY_CGROUP_TESTS=required`. Resource
   limits are deliberately **not** part of the boundary, so `COWBOY_SANDBOX_TESTS`
   must not demand them: a CI runner has no delegated subtree and should still be able
@@ -269,6 +273,17 @@ can't). Concretely:
   credential denylist is re-checked **at use**, not only at write.
 - Default policy `ask` **fails closed** with no approver. Never substitute
   prompting for enforcement.
+- **The agent never gets the container engine's socket.** It gets the container
+  proxy (`sandbox/containers/`), which judges every Docker API request host-side
+  from the parsed body (symlinks resolved first; an unrecognised `HostConfig` field
+  is refused, not forwarded): mounts only from the project and session scratch, no
+  privilege, no host namespaces, internal networks only, no push, and only the
+  session's own (labelled) objects. One request per connection, `Connection:
+  close`. The engine socket and image store are denylisted. `sandbox.containers`
+  lives only in host-owned `security.yaml`.
+- **The host's loopback is reachable only on a published port**, decided by the
+  engine's own set (`GatewayState::decide_host_loopback`), never by `default_host`
+  or a prompt. The nft `hostports` set only makes those ports reach the relay.
 - Resource limits (cgroup v2) are **not** part of the boundary. Keep that
   distinction: `doctor` warns for them and fails for the rest.
 

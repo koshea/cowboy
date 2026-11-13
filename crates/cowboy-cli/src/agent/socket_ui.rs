@@ -213,6 +213,9 @@ struct Inner {
     budget: std::sync::Mutex<Option<(bool, u32)>>,
     /// The session's reasoning level, for `/reasoning`.
     reasoning: std::sync::Mutex<crate::agent::commands::ReasoningView>,
+    /// The session's MCP servers, for the `/mcp` menu. `None` when none is enabled,
+    /// in which case `/mcp` is the plain report.
+    mcp: std::sync::Mutex<Option<Arc<crate::mcp::McpManager>>>,
     /// Where this session's socket lives, so ending can remove it.
     socket_path: std::path::PathBuf,
     /// Fired by [`SocketUi::end`] to stop the accept loop.
@@ -367,6 +370,7 @@ impl SocketUi {
             models: std::sync::Mutex::new((Vec::new(), None)),
             budget: std::sync::Mutex::new(None),
             reasoning: std::sync::Mutex::new(Default::default()),
+            mcp: std::sync::Mutex::new(None),
             socket_path: socket_path.to_path_buf(),
             closed: tokio_util::sync::CancellationToken::new(),
         });
@@ -381,6 +385,16 @@ impl SocketUi {
     }
 
     /// Record the configured models for `/model`.
+    /// Give `/mcp` the session's MCP servers (the same manager the agent calls them
+    /// through, so a sign-in reaches the agent's next call).
+    pub fn set_mcp(&self, manager: Arc<crate::mcp::McpManager>) {
+        *self
+            .inner
+            .mcp
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(manager);
+    }
+
     pub fn set_models(&self, names: Vec<String>, current: Option<String>) {
         *self
             .inner
@@ -422,6 +436,27 @@ impl SocketUi {
     /// mistyped command is answered rather than sent to the model.
     fn run_command(&self, text: &str, cmd_tx: &mpsc::UnboundedSender<ClientMsg>) -> Option<String> {
         use crate::agent::commands::{expand, CommandCtx, Expansion};
+        // `/mcp` is interactive (a sign-in waits minutes on a browser), so it runs on
+        // its own task, as prompts every client renders, instead of as a reply.
+        let (cmd, arg) = text
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(c, r)| (c, r.trim()))
+            .unwrap_or((text.trim(), ""));
+        if cmd == "mcp" {
+            let manager = self
+                .inner
+                .mcp
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(manager) = manager {
+                let ui = self.clone();
+                let arg = arg.to_string();
+                tokio::spawn(async move { crate::mcp::menu::run(&ui, &manager, &arg).await });
+                return None;
+            }
+        }
         let (root, workstream) = {
             let j = self
                 .inner
@@ -834,6 +869,84 @@ impl SocketUi {
                 }
             }
         }
+    }
+}
+
+/// Withdraws an outstanding ask from every client when the future awaiting it is
+/// dropped, so a prompt overtaken by events (a sign-in completed in the browser)
+/// does not linger as a question nobody is waiting on.
+struct AskGuard {
+    ui: SocketUi,
+    id: u64,
+}
+
+impl Drop for AskGuard {
+    fn drop(&mut self) {
+        self.ui.resolve_ask(self.id, String::new());
+    }
+}
+
+impl SocketUi {
+    /// [`AgentUi::ask_user_rich`] for a task: awaits instead of blocking a thread.
+    /// `None` when nobody is attached, on timeout, or for an empty answer.
+    pub async fn request_ask(&self, question: String, choices: Vec<AskChoice>) -> Option<String> {
+        if self.attached() == 0 {
+            return None;
+        }
+        let id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        {
+            let mut publication = self
+                .inner
+                .journal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = self.inner.live.send(ServerMsg::Ask {
+                id,
+                question: question.clone(),
+                options: labels(&choices),
+                choices: choices.clone(),
+            });
+            publication.pending_asks.insert(
+                id,
+                PendingAsk {
+                    question,
+                    choices,
+                    reply: tx,
+                },
+            );
+            self.publish_status_locked(&mut publication);
+        }
+        let _guard = AskGuard {
+            ui: self.clone(),
+            id,
+        };
+        let timeouts = self.inner.prompt_timeouts;
+        let deadline = tokio::time::Instant::now() + timeouts.ask_absolute;
+        let mut disconnect = DisconnectGrace::new(&self.inner);
+        loop {
+            match rx.try_recv() {
+                Ok(answer) => return Some(answer).filter(|a| !a.trim().is_empty()),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+            if disconnect.expired(&self.inner, timeouts.reconnect_grace)
+                || tokio::time::Instant::now() >= deadline
+            {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::mcp::menu::Prompter for SocketUi {
+    async fn choose(&self, question: String, choices: Vec<AskChoice>) -> Option<String> {
+        self.request_ask(question, choices).await
+    }
+    fn notice(&self, text: String) {
+        self.emit(UiEventMsg::Notice(text));
     }
 }
 
@@ -1981,6 +2094,73 @@ mod tests {
                 other => panic!("expected ApprovalResolved, got {other:?}"),
             }
         }
+    }
+
+    /// The async ask behind `/mcp`: answered like any ask, and withdrawn from every
+    /// client when the task stops waiting (a sign-in finished in the browser).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_async_ask_is_answered_and_withdrawn_when_dropped() {
+        let tmp = assert_fs::TempDir::new().unwrap();
+        let sock = tmp.path().join("s.sock");
+        let (ui, _cmd_rx) = SocketUi::bind(&sock, &tmp.path().join("events.jsonl"), info())
+            .await
+            .unwrap();
+        assert_eq!(ui.request_ask("q".into(), vec![]).await, None, "no client");
+
+        let (mut reader, mut w) = attach_client(&sock).await;
+        async fn next_ask(
+            reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        ) -> (u64, Vec<AskChoice>) {
+            loop {
+                match read_msg(reader).await {
+                    ServerMsg::Ask { id, choices, .. } => return (id, choices),
+                    // The previous ask's dismissal, and lifecycle updates.
+                    ServerMsg::AskResolved { .. }
+                    | ServerMsg::Status(_)
+                    | ServerMsg::Snapshot { .. } => {}
+                    other => panic!("expected Ask, got {other:?}"),
+                }
+            }
+        }
+
+        let asker = ui.clone();
+        let answer = tokio::spawn(async move {
+            asker
+                .request_ask("pick".into(), vec![AskChoice::from("Cancel")])
+                .await
+        });
+        let (id, choices) = next_ask(&mut reader).await;
+        assert_eq!(choices[0].label, "Cancel");
+        send_client(
+            &mut w,
+            &ClientMsg::AskReply {
+                id,
+                answer: "http://127.0.0.1:1/auth/callback?code=c".into(),
+            },
+        )
+        .await;
+        assert_eq!(
+            answer.await.unwrap().as_deref(),
+            Some("http://127.0.0.1:1/auth/callback?code=c")
+        );
+
+        let asker = ui.clone();
+        let waiting = tokio::spawn(async move { asker.request_ask("wait".into(), vec![]).await });
+        let (id, _) = next_ask(&mut reader).await;
+        waiting.abort();
+        let _ = waiting.await;
+        loop {
+            match read_msg(&mut reader).await {
+                ServerMsg::AskResolved { id: rid } if rid == id => break,
+                ServerMsg::AskResolved { .. } | ServerMsg::Status(_) => {}
+                other => panic!("expected AskResolved, got {other:?}"),
+            }
+        }
+        let publication = ui.inner.journal.lock().unwrap();
+        assert!(
+            pending_prompts(&publication).is_empty(),
+            "nothing left outstanding"
+        );
     }
 
     #[tokio::test]

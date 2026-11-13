@@ -230,6 +230,7 @@ pub(crate) fn describe(root: &Path) -> Result<String> {
         agent_home: &agent_home,
         git_identity: None,
         overlay: None,
+        container_socket_dir: None,
         platform: cowboy_sandbox::plan::Platform::host(),
     };
     let plan = SandboxPlan::build(&inputs, &probe)?;

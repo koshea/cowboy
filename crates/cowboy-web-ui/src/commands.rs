@@ -57,7 +57,7 @@ pub const HELP: &[(&str, &str, &str)] = &[
     ("fold", "", "collapse command output and diffs"),
     ("unfold", "", "expand them again"),
     ("skills", "", "list skills; run one as /<name> [args]"),
-    ("mcp", "", "the MCP servers this session can use"),
+    ("mcp", "[server]", "MCP servers: sign in (OAuth), sign out, test a connection"),
     ("boundary", "", "what the sandbox exposes"),
     (
         "crew",
