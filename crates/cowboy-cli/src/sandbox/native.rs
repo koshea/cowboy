@@ -68,6 +68,9 @@ struct Background {
 /// Shared with the container proxy's task, which holds no `&NativeSandbox`. The
 /// engine's set decides; the session ruleset only makes the ports reachable, and is
 /// brought in line here after each change.
+// The ruleset and the container proxy are Linux-only; on macOS this only carries
+// the holder pid nothing reads.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct HostPorts {
     engine: Arc<GatewayState>,
     /// The session holder, whose namespaces hold the ruleset; 0 with no session.
@@ -90,6 +93,7 @@ impl HostPorts {
 
     /// Make the container-published set exactly `ports`. The engine is updated
     /// before the ruleset, so a port is refused the moment it is withdrawn.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn set_containers(&self, ports: BTreeSet<u16>) {
         let mut cur = self.containers.lock().expect("host ports poisoned");
         if *cur == ports {
